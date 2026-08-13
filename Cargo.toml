@@ -1,5 +1,5 @@
 [package]
-name = "libkore"
+name = "kore"
 version = "0.1.0"
 edition = "2024"
 
