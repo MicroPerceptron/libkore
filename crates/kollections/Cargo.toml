@@ -1,0 +1,11 @@
+[package]
+name = "kollections"
+version = "0.1.0"
+edition = "2024"
+description = "optimized lock-free and arena-parameterized collections: atomic bitmaps, generational ids, and bit matrices."
+
+[features]
+default = ["alloc"]
+alloc = []
+
+[dependencies]
