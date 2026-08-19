@@ -13,4 +13,4 @@ crate-type = ["cdylib", "rlib"]
 [workspace]
 members = ["crates/kollections"]
 
-exclude = ["vendor", "user"]
+exclude = ["vendor", "extern"]

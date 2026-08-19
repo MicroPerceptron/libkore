@@ -21,7 +21,7 @@
 //!
 //! # Allocator integration
 //!
-//! Backed by `alloc::Vec<_, &'static A>`.  Construction takes a static
+//! Backed by `alloc::Vec<_, &'a A>`.  Construction takes a static
 //! reference to your allocator (a [`super::TestArena`], in practice);
 //! the bitvec lives as long as the allocator does.  Drop is the Vec's
 //! drop, which on `TestArena` is a no-op (the arena never reclaims).
@@ -85,10 +85,10 @@ const fn atomic_bitvec_storage(bits: usize) -> usize {
 /// Runtime-sized single-threaded bitset.
 ///
 /// Storage layout matches [`super::BitSet`]: one flat
-/// `Vec<u128, &'static A>` holding `data ‖ nonzero ‖ full`.
+/// `Vec<u128, &'a A>` holding `data ‖ nonzero ‖ full`.
 #[derive(Debug)]
-pub struct BitVec<A: Allocator + 'static> {
-    storage: Vec<u128, &'static A>,
+pub struct BitVec<'a, A: Allocator + 'a> {
+    storage: Vec<u128, &'a A>,
     bits: usize,
     /// Cached offsets into `storage`.  Computed once at construction;
     /// every access path uses these instead of recomputing from `bits`.
@@ -97,14 +97,14 @@ pub struct BitVec<A: Allocator + 'static> {
     full_at: usize,
 }
 
-impl<A: Allocator + 'static> BitVec<A> {
+impl<'a, A: Allocator + 'a> BitVec<'a, A> {
     /// Build a `BitVec` holding `bits` bits, backed by `alloc`.  Every
     /// bit starts cleared.
     ///
     /// # Panics
     ///
     /// Panics if `alloc` cannot satisfy the storage allocation.
-    pub fn new_in(bits: usize, alloc: &'static A) -> Self {
+    pub fn new_in(bits: usize, alloc: &'a A) -> Self {
         let words = words_128(bits);
         let summary = words_128(words);
         let total = bitvec_storage(bits);
@@ -318,7 +318,7 @@ impl<A: Allocator + 'static> BitVec<A> {
 /// Runtime-sized SMP-safe bitset.
 ///
 /// Storage layout matches [`super::AtomicBitSet`]: one flat
-/// `Vec<AtomicU64, &'static A>` holding `data ‖ nonzero`.  No `full`
+/// `Vec<AtomicU64, &'a A>` holding `data ‖ nonzero`.  No `full`
 /// summary — the racy ordering required to keep it consistent breaks
 /// `find_first_clear_from`'s strict-first contract under concurrent
 /// writers.  `find_first_clear_from` falls back to a linear data-word
@@ -327,21 +327,21 @@ impl<A: Allocator + 'static> BitVec<A> {
 /// Summary semantics, ordering rules, and racing-writer hints are
 /// identical to [`super::AtomicBitSet`]; see its docs for the contract.
 #[derive(Debug)]
-pub struct AtomicBitVec<A: Allocator + 'static> {
-    storage: Vec<AtomicU64, &'static A>,
+pub struct AtomicBitVec<'a, A: Allocator + 'a> {
+    storage: Vec<AtomicU64, &'a A>,
     bits: usize,
     words: usize,
     nonzero_at: usize,
 }
 
-impl<A: Allocator + 'static> AtomicBitVec<A> {
+impl<'a, A: Allocator + 'a> AtomicBitVec<'a, A> {
     /// Build an `AtomicBitVec` holding `bits` bits, backed by `alloc`.
     /// Every bit starts cleared.
     ///
     /// # Panics
     ///
     /// Panics if `alloc` cannot satisfy the storage allocation.
-    pub fn new_in(bits: usize, alloc: &'static A) -> Self {
+    pub fn new_in(bits: usize, alloc: &'a A) -> Self {
         let words = words_64(bits);
         let total = atomic_bitvec_storage(bits);
         debug_assert_eq!(total, words + words_64(words));

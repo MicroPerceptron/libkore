@@ -1,1 +1,1 @@
-# Rust and C system APIs for the `kore` kernel
+# System APIs for the kore kernel
