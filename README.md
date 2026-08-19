@@ -1,1 +1,1 @@
-# libkore - the Rust and C system APIs
+# Rust and C system APIs for the `kore` kernel
