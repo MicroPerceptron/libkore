@@ -2,6 +2,7 @@
 name = "kore"
 version = "0.1.0"
 edition = "2024"
+license = "Mozilla Public License 2.0"
 
 [dependencies]
 cbindgen = { version = "0.29.4" }
