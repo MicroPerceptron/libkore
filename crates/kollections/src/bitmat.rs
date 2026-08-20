@@ -118,21 +118,21 @@ pub fn for_each_set(row: &[u128], limit: usize, mut f: impl FnMut(usize)) {
 /// `cols` bits wide.  Single-threaded — share behind a lock
 /// ([`SpinLock`](crate::sync::SpinLock)) like any other plain collection.
 #[derive(Debug)]
-pub struct BitMat<A: Allocator + 'static> {
-    storage: Vec<u128, &'static A>,
+pub struct BitMat<'a, A: Allocator + 'a> {
+    storage: Vec<u128, &'a A>,
     rows: usize,
     cols: usize,
     /// Words per row (`cols` rounded up to whole words).
     row_words: usize,
 }
 
-impl<A: Allocator + 'static> BitMat<A> {
+impl<'a, A: Allocator + 'a> BitMat<'a, A> {
     /// Build a zeroed `rows × cols` matrix backed by `alloc`.
     ///
     /// # Panics
     ///
     /// Panics if `alloc` cannot satisfy the storage allocation.
-    pub fn new_in(rows: usize, cols: usize, alloc: &'static A) -> Self {
+    pub fn new_in(rows: usize, cols: usize, alloc: &'a A) -> Self {
         let row_words = words_for(cols);
         let total = rows * row_words;
         let mut storage = Vec::with_capacity_in(total, alloc);
