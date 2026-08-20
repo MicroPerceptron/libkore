@@ -21,7 +21,7 @@
 //!
 //! # Allocator integration
 //!
-//! Backed by `alloc::Vec<_, &'a A>`.  Construction takes a static
+//! Backed by `alloc::Vec<_, &'a A>`.  Construction takes an `&'a A`
 //! reference to your allocator (a [`super::TestArena`], in practice);
 //! the bitvec lives as long as the allocator does.  Drop is the Vec's
 //! drop, which on `TestArena` is a no-op (the arena never reclaims).
