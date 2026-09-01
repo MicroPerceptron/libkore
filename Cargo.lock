@@ -11,6 +11,10 @@ name = "kore"
 version = "0.1.0"
 
 [[package]]
+name = "kore-addresses"
+version = "0.1.0"
+
+[[package]]
 name = "kore-driver"
 version = "0.1.0"
 

@@ -16,6 +16,7 @@ members = [
     "crates/linker",
     "crates/macros",
     "crates/ring",
+    "crates/addresses",
 ]
 
 exclude = ["vendor", "extern"]
