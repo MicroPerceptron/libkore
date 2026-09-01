@@ -231,7 +231,7 @@ impl<'a, A: Allocator + 'a> BitMat<'a, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::TestArena;
+    use crate::test::TestArena;
 
     static TEST_ARENA: TestArena<{ 1 << 16 }> = TestArena::new();
 

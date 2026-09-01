@@ -75,7 +75,7 @@ mod genid;
 mod slotmap;
 
 #[cfg(all(test, feature = "alloc"))]
-mod testing;
+mod test;
 
 #[cfg(feature = "alloc")]
 pub use bitmat::{

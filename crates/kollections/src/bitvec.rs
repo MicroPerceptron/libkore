@@ -602,7 +602,7 @@ impl<'a, A: Allocator + 'a> AtomicBitVec<'a, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::TestArena;
+    use crate::test::TestArena;
 
     // 1 MiB test arena — generous for tests that build a few bitvecs.
     static TEST_ARENA: TestArena<{ 1 << 20 }> = TestArena::new();
