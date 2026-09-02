@@ -1,0 +1,73 @@
+name: Audit
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'ft/**'
+    # Dependency surface only — the advisory database is checked on the
+    # schedule below, so there is no reason to re-run it on every code push.
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/*/Cargo.toml'
+      - '.github/workflows/audit.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/*/Cargo.toml'
+  # An advisory can land against a dependency that has not changed, so the
+  # gate has to run on time as well as on diff.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: audit-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: rustup show active-toolchain
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit advisories
+        run: cargo audit --deny warnings
+
+  lockfile:
+    name: Lockfile currency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: rustup show active-toolchain
+
+      # `--locked` fails if Cargo.lock would need to change. A manifest edit
+      # committed without its lockfile update is caught here rather than by
+      # the next person to build.
+      - name: Verify Cargo.lock is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
