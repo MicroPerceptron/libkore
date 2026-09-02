@@ -3,10 +3,6 @@
 version = 4
 
 [[package]]
-name = "kollections"
-version = "0.1.0"
-
-[[package]]
 name = "kore"
 version = "0.1.0"
 
@@ -16,6 +12,10 @@ version = "0.1.0"
 dependencies = [
  "static_assertions",
 ]
+
+[[package]]
+name = "kore-collections"
+version = "0.1.0"
 
 [[package]]
 name = "kore-driver"
