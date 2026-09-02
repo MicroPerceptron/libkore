@@ -1,39 +1,5 @@
 //! Unsigned integer traits.
 
-use core::mem::size_of;
-
-#[repr(C)]
-union Cast<T: Copy, U: Copy> {
-    from: T,
-    to: U,
-}
-
-#[inline]
-const fn into_usize<T: Unsigned>(value: T) -> usize {
-    if size_of::<T>() == 2 {
-        let c = Cast::<T, u16> { from: value };
-        unsafe { c.to as usize }
-    } else if size_of::<T>() == 4 {
-        let c = Cast::<T, u32> { from: value };
-        unsafe { c.to as usize }
-    } else {
-        let c = Cast::<T, usize> { from: value };
-        unsafe { c.to }
-    }
-}
-
-#[inline]
-const fn from_usize<T: Unsigned>(value: usize) -> T {
-    assert!(value <= T::MAX);
-    if size_of::<T>() == 4 {
-        let c = Cast::<usize, T> { from: value };
-        unsafe { c.to }
-    } else {
-        let c = Cast::<usize, T> { from: value };
-        unsafe { c.to }
-    }
-}
-
 pub trait IntoUsize {
     fn into_usize(self) -> usize;
 }
@@ -82,13 +48,14 @@ macro_rules! impl_unsigned {
     ($t:ty) => {
         impl IntoUsize for $t {
             fn into_usize(self) -> usize {
-                into_usize(self)
+                self as usize
             }
         }
 
         impl FromUsize for $t {
             fn from_usize(value: usize) -> Self {
-                from_usize(value)
+                assert!(value <= <$t>::MAX as usize);
+                value as $t
             }
         }
 
@@ -117,6 +84,8 @@ macro_rules! impl_unsigned {
 impl_unsigned!(u8);
 impl_unsigned!(u16);
 impl_unsigned!(u32);
+#[cfg(target_pointer_width = "64")]
+impl_unsigned!(u64);
 impl_unsigned!(usize);
 
 #[cfg(test)]
