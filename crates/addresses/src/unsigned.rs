@@ -1,10 +1,10 @@
 //! Unsigned integer traits.
 
-pub trait IntoUsize {
+pub trait IntoUsize: Copy + Ord + Sized {
     fn into_usize(self) -> usize;
 }
 
-pub trait FromUsize {
+pub trait FromUsize: Copy + Ord + Sized {
     fn from_usize(value: usize) -> Self;
 }
 
