@@ -12,7 +12,7 @@ crate-type = ["rlib"]
 [workspace]
 members = [
     "crates/driver",
-    "crates/kollections",
+    "crates/collections",
     "crates/linker",
     "crates/macros",
     "crates/ring",
