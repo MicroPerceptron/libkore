@@ -84,6 +84,7 @@ macro_rules! impl_unsigned {
 impl_unsigned!(u8);
 impl_unsigned!(u16);
 impl_unsigned!(u32);
+#[cfg(target_pointer_width = "64")]
 impl_unsigned!(u64);
 impl_unsigned!(usize);
 
