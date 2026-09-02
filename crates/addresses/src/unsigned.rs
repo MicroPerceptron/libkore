@@ -45,6 +45,33 @@ pub trait FromUsize {
 pub trait Unsigned: Copy + Ord + Sized + IntoUsize + FromUsize {
     const MAX: usize;
 
+    fn align_up(self, alignment: usize) -> Option<Self> {
+        if alignment == 0 {
+            return Some(self);
+        }
+        let mask = alignment - 1;
+        let value = self.into_usize();
+        let aligned = value.checked_add(mask)?;
+        let aligned = aligned & !mask;
+        if aligned > Self::MAX {
+            return None;
+        }
+        Some(Self::from_usize(aligned))
+    }
+
+    fn align_down(self, alignment: usize) -> Option<Self> {
+        if alignment == 0 {
+            return Some(self);
+        }
+        let mask = alignment - 1;
+        let value = self.into_usize();
+        let aligned = value.checked_sub(value & mask)?;
+        if aligned > Self::MAX {
+            return None;
+        }
+        Some(Self::from_usize(aligned))
+    }
+
     fn checked_add(self, offset: usize) -> Option<Self>;
     fn checked_sub(self, offset: usize) -> Option<Self>;
     fn checked_mul(self, offset: usize) -> Option<Self>;
@@ -283,6 +310,22 @@ mod tests {
         fn test_checked_div_returns_none_when_offset_does_not_fit_target_type() {
             let result = <u8 as Unsigned>::checked_div(u8::MAX, usize::from(u8::MAX) + 1);
             assert_eq!(result, None);
+        }
+    }
+
+    mod tests_align {
+        use super::*;
+
+        #[test]
+        fn test_align_up_returns_none_when_offset_does_not_fit_target_type() {
+            let result = <u8 as Unsigned>::align_up(u8::MAX, usize::from(u8::MAX) + 1);
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn test_align_down_returns_zero_when_alignment_exceeds_target_type() {
+            let result = <u8 as Unsigned>::align_down(u8::MAX, usize::from(u8::MAX) + 1);
+            assert_eq!(result, Some(0));
         }
     }
 }
