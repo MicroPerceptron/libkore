@@ -2,4 +2,13 @@
 
 #![no_std]
 
-pub(crate) mod unsigned;
+#[cfg(test)]
+extern crate std;
+
+mod address;
+mod context;
+mod unsigned;
+
+pub use address::MemoryAddress;
+pub use context::MemoryContext;
+pub use unsigned::{FromUsize, IntoUsize, Unsigned};
