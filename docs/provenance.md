@@ -71,3 +71,14 @@ input produced the acknowledged 16-byte write, explicit shortening to length 2
 and absence after removal, with the final prompt decoded from the real display.
 Boot manifests, both architecture payload digests and all shipped lockfiles were
 verified again after image generation.
+
+The first GitHub advisory audit passed the facade lockfile and blocked on the
+full native lockfile: [RUSTSEC-2026-0192](https://rustsec.org/advisories/RUSTSEC-2026-0192)
+marks `ttf-parser 0.25.1` unmaintained, with no patched version. The dependency
+comes from the extraction worker, reachable through native DagFS's optional
+`index` feature; it is absent from the facade's current application lockfile.
+This is an unmaintained-dependency warning, not a reported vulnerability in this
+audit. The inherited `--deny warnings` policy remains enabled. Replacing that
+parser belongs in its owning Kore extraction implementation, with its format
+contracts and tests validated before re-export; this draft does not suppress the
+advisory or silently remove the optional native functionality.
