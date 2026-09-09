@@ -36,6 +36,9 @@ fn main() {
     let status = Command::new(&zig)
         .args([
             "build-obj",
+            // Rust host tests are PIE on Linux; foreign objects must support
+            // relocation without weakening the executable's link policy.
+            "-fPIC",
             "-O",
             "ReleaseFast",
             "--dep",
