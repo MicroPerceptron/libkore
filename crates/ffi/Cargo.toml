@@ -1,0 +1,13 @@
+[package]
+name = "kore-ffi"
+version = "0.1.0-alpha.1"
+edition = "2024"
+publish = false
+[dependencies]
+kore = { package = "kore-std", path = "../.." }
+
+[features]
+# Host-only executable C/Zig ABI tests; no target runtime dependency.
+test-foreign = []
+[build-dependencies]
+cc = "1"

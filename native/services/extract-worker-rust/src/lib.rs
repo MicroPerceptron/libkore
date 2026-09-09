@@ -11,6 +11,7 @@ extern crate std;
 pub use kore_svc_extract::{registry, schema};
 
 mod coverage;
+mod sfnt;
 pub mod formats;
 
 pub use coverage::production_coverage;

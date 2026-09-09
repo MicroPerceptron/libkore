@@ -25,7 +25,13 @@ jobs:
             target
           key: alpha-host-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - run: cargo fetch --locked
-      - run: make fmt test check docs owners
+      - name: Install pinned binding tools
+        run: |
+          cargo install cbindgen --version 0.29.4 --locked
+          python3 tools/install-zig.py "$RUNNER_TEMP/libkore-tools" > "$RUNNER_TEMP/zig-path"
+          echo "ZIG=$(cat "$RUNNER_TEMP/zig-path")" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/libkore-zig-cache" >> "$GITHUB_ENV"
+      - run: make fmt test check docs owners bindings-check
       # Negative control plus a patched Git consumer, using the exported tree
       # as the local native owner. No cross-repository credential is needed.
       - name: Native type composition
@@ -48,7 +54,7 @@ jobs:
             ~/.cargo/git
             target
           key: alpha-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - run: cargo check --locked -p kore-std --all-features --target targets/${{ matrix.arch }}-unknown-kore-user.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+      - run: cargo check --locked -p kore-std -p kore-ffi --all-features --target targets/${{ matrix.arch }}-unknown-kore-user.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
   miri:
     runs-on: ubuntu-latest
     timeout-minutes: 30

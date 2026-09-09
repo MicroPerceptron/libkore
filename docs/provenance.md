@@ -72,13 +72,39 @@ and absence after removal, with the final prompt decoded from the real display.
 Boot manifests, both architecture payload digests and all shipped lockfiles were
 verified again after image generation.
 
-The first GitHub advisory audit passed the facade lockfile and blocked on the
-full native lockfile: [RUSTSEC-2026-0192](https://rustsec.org/advisories/RUSTSEC-2026-0192)
-marks `ttf-parser 0.25.1` unmaintained, with no patched version. The dependency
-comes from the extraction worker, reachable through native DagFS's optional
-`index` feature; it is absent from the facade's current application lockfile.
-This is an unmaintained-dependency warning, not a reported vulnerability in this
-audit. The inherited `--deny warnings` policy remains enabled. Replacing that
-parser belongs in its owning Kore extraction implementation, with its format
-contracts and tests validated before re-export; this draft does not suppress the
-advisory or silently remove the optional native functionality.
+## C/Zig and extraction follow-up
+
+The first GitHub advisory audit blocked the full native lockfile on
+[RUSTSEC-2026-0192](https://rustsec.org/advisories/RUSTSEC-2026-0192):
+`ttf-parser 0.25.1` is unmaintained, with no patched version. Its owner was the
+extraction worker reachable through DagFS's optional `index` feature. The warning
+was not a reported exploit, but unchanged vendoring would not address maintenance.
+
+Kore `9836aa3c68308d2b3f03de72289f5afdc5765537` replaces that worker dependency
+with a bounded, allocation-free SFNT metadata derivative of the upstream checks
+it actually used. The MIT notice and exact source provenance accompany it. This
+is not a replacement outline renderer or whole-font validator. Its parser identity
+is version 2, so the changed validation contract cannot reuse version-1 results.
+Both distribution lockfiles now omit `ttf-parser`; CI still denies advisory
+warnings. Axiom's independent rendering dependency remains in Kore and is outside
+this export's dependency closure.
+
+Native worker tests and Miri passed. A differential run over 370 installed
+TTF/OTF/TTC files matched all glyph counts with no stricter refusals. Comparable
+single-host benchmark samples were 1,434 ns/op before and 1,413 ns/op after, both
+with a 400-byte output; this is not a statistically established speedup. No system
+fonts were copied into either repository.
+
+After this source change, Kore passed the full host suite, all architecture
+checks, separate production/test builds, kernel QEMU boottest, the founded
+filesystem command gate, manifests, both payload digests and lockfile checks.
+The production gate again failed solely on the missing `net-load: PASS` witness;
+there is still no clean-main A/B proof or new physical hardware acceptance.
+
+The foreign adapter passed host tests including linked C and translated Zig calls,
+Clippy, documentation, owner uniqueness, all three actual Kore user targets and
+Rust Miri checks. Generated declarations and ABI assertions compile for all three
+freestanding ISAs; the Zig build-system module also passed. The local/Git
+composition fixture proves that `kore-ffi::Session` consumes the same native
+`Fs` as the Rust facade after owner overrides. These are not a standalone
+C/Zig-founded process boot witness; see [language contracts](languages.md).

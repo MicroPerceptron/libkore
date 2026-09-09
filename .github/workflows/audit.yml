@@ -12,6 +12,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/**/Cargo.toml'
+      - 'crates/**/Cargo.toml'
       - 'native/**/Cargo.toml'
       - 'native/Cargo.lock'
       - '.github/workflows/audit.yml'
@@ -23,6 +24,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/**/Cargo.toml'
+      - 'crates/**/Cargo.toml'
       - 'native/**/Cargo.toml'
       - 'native/Cargo.lock'
   # An advisory can land against a dependency that has not changed, so the

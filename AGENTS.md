@@ -19,10 +19,18 @@ its committed dependency closure, tracked by `native/provenance.json`.
 - Driver wrappers must account for register side effects and DMA completion/retire
   lifetimes, not just address bounds. Lua probes need a concrete native owner.
 - Keep the export coherent, update both Cargo.lock files, and run `make fmt test check docs
-  owners cross miri`. Use `tools/check-local.py` to prove composition with local
+  owners cross miri bindings-check`. Use `tools/check-local.py` to prove composition with local
   Kore clients before claiming a local override works.
 - Changes affecting native owners belong upstream until those packages are
   deliberately extracted once. Re-run Kore's full image/gate matrix for such
   changes; this repo's compiler/Miri checks are not boot or hardware evidence.
 - Record provenance and distinguish implemented APIs from aspirational design.
   Do not publish a registry release or claim ABI stability as part of a source PR.
+
+- `crates/ffi` owns only the foreign adapter, never native Fs/View semantics.
+  Preserve callback-local pointer lifetimes, one outstanding request, scoped
+  generations, acknowledged counts, provider errors and cancellation quarantine.
+  Keep the native-executor turn budget so ready-only callbacks cannot starve it.
+- C headers come from cbindgen 0.29.4; Zig aliases come from those declarations
+  and target layouts from Zig 0.15.2 translation. Regenerate before checking.
+  `test-foreign` is a host-test feature; never add a runtime C/Zig build dependency.

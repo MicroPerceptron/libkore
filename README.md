@@ -3,6 +3,8 @@
 `0.1.0-alpha.1` is the first **Rust foundation**, replacing the aspirational
 scaffold on `alpha`. It provides a real filesystem API, common prelude, native
 runtime macros, clocks, process/random facilities and an opt-in driver substrate.
+The `kore-ffi` package adds generated C bindings and a translated Zig module for
+filesystem requests and native clocks, driven by a Rust-founded host.
 It is `no_std`; all authority comes from the application's actual endowments.
 
 ```toml
@@ -54,8 +56,11 @@ clone needs no sibling checkout, private cross-repository token or submodule set
 ```sh
 cargo fetch --locked
 make fmt test check docs owners cross
-make miri
+make miri bindings-check
 ```
+
+For the full workspace checks, install the pinned C/Zig generation tools as
+described in [language integration](https://github.com/MicroPerceptron/libkore/blob/alpha/docs/languages.md). Ordinary Rust dependency builds do not need them.
 
 The roughly 5 MiB `native/` export contains 14 required packages, including optional
 and test dependencies, with unchanged source paths and manifests. It contains no
@@ -67,14 +72,15 @@ a local Kore tree, follow [local integration](https://github.com/MicroPerceptron
 | Language | This alpha |
 | --- | --- |
 | Rust | Working foundation with native ownership types |
-| C | Planned generated ABI; no exported C functions yet |
-| Zig | Planned translated C surface and allocator adapter |
+| C | Generated filesystem/clock ABI over a Rust-owned callback driver |
+| Zig | Target-specific C translation and generated `fs`/`time` modules |
 | Lua / Python | Planned handwritten ownership/scheduling adapters |
 
 Filesystem support remains a requirement for **every initial language surface**.
-A clocks-only foreign binding would not satisfy that requirement. Managed foreign
-handles, declarative bindings and the bounded Lua driver experiment interface
-are follow-on work, not features claimed by this version.
+A clocks-only foreign binding would not satisfy that requirement. The C/Zig owner uses scoped generational handles and bounded copied buffers;
+callbacks return to the native executor for each request. Standalone foreign
+entry/CRT, allocator adapters and the bounded Lua driver experiment interface
+remain follow-on work. See [the language contract](https://github.com/MicroPerceptron/libkore/blob/alpha/docs/languages.md) for ownership, cancellation and validation boundaries.
 
 The previous sketches and address/collection experiments remain in Git history
 at `8a6381c`; their parallel runtime, allocator placeholder and empty language

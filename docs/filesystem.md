@@ -33,15 +33,17 @@ An outstanding request owns the data window. A subsequent write must refuse
 before modifying it. Cancellation is not completion: keep the owner alive and
 use the native request/reply lifecycle to reconcile an outstanding operation.
 
-## Close and future foreign owners
+## Close and foreign owners
 
 `close_checked` owns the view while pending and returns success only after an
 acknowledged close. On refusal it returns the exact view with the error; retry matches an outstanding close and
 cannot consume another handle's late reply. Drive that future to completion:
 dropping it is not an acknowledged close or a managed cancellation mechanism.
 
-The future C/Lua owner must retain requests and views independently of a script's
-stack, use generation-checked handles scoped to one owner, and complete or retire
-the owner before releasing windows. Neither raw `Handle` integers nor `Drop`
-alone provide this lifecycle. This alpha does not expose an unsafe foreign
-handle table in place of that design.
+The C/Zig `kore-ffi::Session` retains native views and copied buffers behind
+owner-scoped generational handles. It drives one native request at a time,
+returns completions through a callback, and quarantines an uncertain/cancelled
+owner until task retirement. It never represents `Drop` as acknowledged cleanup.
+The callback-only pointer and host integration contracts are specified in
+[languages.md](languages.md). Lua/Python adapters still need their own script
+lifetime and scheduling integration above this native owner.

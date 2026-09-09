@@ -16,7 +16,7 @@ Then export a committed revision:
 python3 tools/sync-native.py /absolute/path/to/kore --revision COMMIT
 cargo fetch
 cargo fetch --manifest-path native/Cargo.toml
-make fmt test check docs owners cross miri
+make fmt test check docs owners cross miri bindings-check
 ```
 
 The importer follows normal, optional, target-specific, build and test path
@@ -61,14 +61,15 @@ python3 tools/check-local.py /path/to/kore
 It first requires the owner checker to reject an unpatched mixed graph. Then
 it applies the complete override, checks uniqueness again and compiles functions
 that pass native ABI, runtime, filesystem and affine view types across the
-facade boundary. A stale checkout must fail compilation, not be bypassed with
+facade boundary, including consumption of the same native `Fs` by
+`kore-ffi::Session`. A stale checkout must fail compilation, not be bypassed with
 casts. Downstream applications with additional independent pins must reconcile
 those as well. Local overrides change the consumer's lock; do not substitute it
 for either distribution lock.
 
 ## Bootstrap and future ownership
 
-The initial export includes Kore #962 plus its runtime task-provenance repair;
+The initial export includes Kore #962 plus its runtime task-provenance repair and bounded SFNT metadata owner;
 the exact source commit is in `native/provenance.json`. #962 is still open and
 provides required offset I/O, checked-close and macro behavior that current Kore
 main alone does not yet provide.

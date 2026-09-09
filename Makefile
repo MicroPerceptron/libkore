@@ -1,3 +1,6 @@
+ZIG ?= zig
+export ZIG
+
 .PHONY: test check fmt docs owners cross miri native-check
 
 test:
@@ -11,7 +14,8 @@ check:
 	python3 tools/check-native.py
 
 fmt:
-	cargo fmt -p kore-std -p libkore-consumer --check
+	cargo fmt -p kore-std -p libkore-consumer -p kore-ffi --check
+	$(ZIG) fmt --check build.zig build.zig.zon crates/ffi/tests/consumer.zig extern/zig/src/root.zig
 
 docs:
 	cargo doc --locked --workspace --all-features
@@ -26,7 +30,7 @@ owners:
 # x86_64-unknown-none check alone cannot certify this interface.
 cross:
 	@set -eu; for arch in x86_64 aarch64 riscv64gc; do \
-	  cargo check --locked -p kore-std --all-features \
+	  cargo check --locked -p kore-std -p kore-ffi --all-features \
 	    --target "targets/$$arch-unknown-kore-user.json" \
 	    -Z build-std=core,alloc,compiler_builtins \
 	    -Z build-std-features=compiler-builtins-mem; \
@@ -38,3 +42,10 @@ miri:
 
 native-check:
 	python3 tools/check-native.py
+
+.PHONY: bindings bindings-check
+bindings:
+	python3 tools/generate-bindings.py
+
+bindings-check:
+	python3 tools/check-bindings.py

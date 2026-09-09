@@ -213,6 +213,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-ffi"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "cc",
+ "kore-std",
+]
+
+[[package]]
 name = "kore-hint"
 version = "0.0.0"
 dependencies = [

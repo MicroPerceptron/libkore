@@ -5,7 +5,6 @@ use heapless::{String, Vec};
 use tar_no_std::TarArchiveRef;
 use tinybmp::RawBmp;
 use tinyzip::{Archive, Compression};
-use ttf_parser::Face;
 use xmlparser::{ElementEnd, Token, Tokenizer};
 
 use crate::{
@@ -434,14 +433,18 @@ pub fn parse_bmp(input: InputIdentity, bytes: &[u8]) -> Result<NormalizedResult,
 
 pub fn parse_ttf(input: InputIdentity, bytes: &[u8]) -> Result<NormalizedResult, AdapterError> {
     check_input(input, bytes, TTF)?;
-    let face = Face::parse(bytes, 0).map_err(|_| AdapterError::Malformed)?;
+    let glyphs = crate::sfnt::glyph_count(bytes, declaration(TTF).limits.max_members)
+        .map_err(|error| match error {
+            crate::sfnt::Error::Malformed => AdapterError::Malformed,
+            crate::sfnt::Error::MemberLimit => AdapterError::MemberLimit,
+        })?;
     let mut builder = start(input, TTF);
     media(&mut builder, "font/ttf")?;
     unsigned(
         &mut builder,
         FactKind::GlyphCount,
         "glyphs",
-        u64::from(face.number_of_glyphs()),
+        u64::from(glyphs),
         None,
     )?;
     Ok(builder.finish())
@@ -963,7 +966,7 @@ mod tests {
         bench("xmlparser", xml, parse_xml);
         let tar = tar_one(b"hello.txt", b"hello");
         bench("tar-no-std", &tar, parse_tar);
-        bench("ttf-parser", DEMO_TTF, parse_ttf);
+        bench("sfnt-metadata-v2", DEMO_TTF, parse_ttf);
         let mut bmp = [0u8; 58];
         bmp[0..2].copy_from_slice(b"BM");
         bmp[2..6].copy_from_slice(&58u32.to_le_bytes());
