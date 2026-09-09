@@ -26,7 +26,10 @@ class DistributionContract(unittest.TestCase):
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
         dependencies = manifest["dependencies"]
         paths = manifest["package"]["metadata"]["kore"]["owner-paths"]
-        self.assertEqual(set(dependencies), set(paths))
+        native_roots = {name for name, dep in dependencies.items()
+                        if name.startswith("kore-") or
+                        (isinstance(dep, dict) and dep.get("path", "").startswith("native/"))}
+        self.assertEqual(native_roots, set(paths))
         record = json.loads((ROOT / "native/provenance.json").read_text())
         self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", record["revision"]))
         for name, path in paths.items():

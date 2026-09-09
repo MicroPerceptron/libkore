@@ -13,8 +13,11 @@
 pub use kore_abi as abi;
 pub use kore_app as app;
 pub use kore_rt as runtime;
+pub use kore_rt::process;
 pub use kore_rt::{Bundle, ExitCode, main, spmd, task};
-pub use kore_rt::{process, random};
+pub mod random;
+pub use kore_rt::executor as task;
+pub use kore_rt::thread;
 
 /// Native driver substrate: capability-backed registers, bounded DMA and rings.
 /// Hardware effects still require a device-specific owner and lifecycle policy.
@@ -26,7 +29,21 @@ pub mod time {
     pub use core::time::Duration;
     pub use kore_abi::clock::{TimerError, TimerResult, UnixTime, Uptime};
     pub use kore_rt::clock::{calibration, uptime, uptime_from, wall, wall_from};
-    pub use kore_rt::{sleep_for, sleep_until};
+    /// Raw relative nanoseconds, retained for compatibility.
+    pub use kore_rt::sleep_for;
+    pub use kore_rt::sleep_until as sleep_until_ns;
+
+    /// Suspend on the native executor for a checked duration.
+    pub async fn sleep(duration: Duration) -> TimerResult<()> {
+        let ns = u64::try_from(duration.as_nanos()).map_err(|_| TimerError::OutOfRange)?;
+        kore_rt::sleep_for(ns).await;
+        Ok(())
+    }
+
+    /// Suspend until an absolute monotonic instant; wall time is not accepted.
+    pub async fn sleep_until(deadline: Uptime) {
+        kore_rt::sleep_until(deadline.as_nanos()).await;
+    }
 }
 
 #[cfg(feature = "fs")]
@@ -40,4 +57,24 @@ pub mod prelude {
     pub use kore_abi::clock::{UnixTime, Uptime};
     pub use kore_app::prelude::*;
     pub use kore_rt::{ExitCode, entry::Rt};
+}
+
+#[cfg(test)]
+mod time_tests {
+    use core::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+        time::Duration,
+    };
+    #[test]
+    fn oversized_sleep_refuses_before_requiring_an_executor() {
+        let mut future = pin!(crate::time::sleep(Duration::MAX));
+        assert_eq!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(crate::time::TimerError::OutOfRange))
+        );
+    }
 }

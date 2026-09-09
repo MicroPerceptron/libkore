@@ -2,9 +2,11 @@
 
 `0.1.0-alpha.1` is the first **Rust foundation**, replacing the aspirational
 scaffold on `alpha`. It provides a real filesystem API, common prelude, native
-runtime macros, clocks, process/random facilities and an opt-in driver substrate.
+runtime macros, typed sleep, process facilities, automatically seeded random
+values and an opt-in driver substrate.
 The `kore-ffi` package adds generated C bindings and a translated Zig module for
-filesystem requests and native clocks, driven by a Rust-founded host.
+filesystem requests, clocks/sleep, random values, async task preparation and
+joined thread/SPMD scopes, driven by a Rust-founded host.
 It is `no_std`; all authority comes from the application's actual endowments.
 
 ```toml
@@ -48,6 +50,9 @@ The driver feature does not turn arbitrary register sequences into safe hardware
 experiments. Device-specific lifecycle, register semantics and DMA completion
 ownership still belong to the driver.
 
+See [time and concurrency](docs/runtime.md) and [random values](docs/random.md)
+for API examples, admission and failure contracts.
+
 ## Build and integration
 
 The toolchain, dependency locks and native source revision are pinned. A normal
@@ -72,8 +77,8 @@ a local Kore tree, follow [local integration](https://github.com/MicroPerceptron
 | Language | This alpha |
 | --- | --- |
 | Rust | Working foundation with native ownership types |
-| C | Generated filesystem/clock ABI over a Rust-owned callback driver |
-| Zig | Target-specific C translation and generated `fs`/`time` modules |
+| C | Generated filesystem, time, random, task and joined worker APIs |
+| Zig | Target-specific C translation and generated module namespaces |
 | Lua / Python | Planned handwritten ownership/scheduling adapters |
 
 Filesystem support remains a requirement for **every initial language surface**.

@@ -1,4 +1,4 @@
-/* Kore alpha ABI v1. No ambient POSIX namespace or synchronous blocking I/O. */
+/* Kore alpha ABI v1. Capability-owned APIs; scoped worker calls join synchronously. */
 
 #ifndef KORE_H
 #define KORE_H
@@ -60,6 +60,22 @@
 
 #define KORE_OP_LINK 12
 
+#define KORE_OP_SLEEP_FOR 13
+
+#define KORE_OP_SLEEP_UNTIL 14
+
+#define KORE_OP_YIELD 15
+
+#define KORE_TASK_CAPACITY 4
+
+#define KORE_TASK_DONE 0
+
+#define KORE_TASK_YIELD 1
+
+#define KORE_TASK_SLEEP_FOR 2
+
+#define KORE_TASK_SLEEP_UNTIL 3
+
 /**
  * Submission status is distinct from the later operation's completion status.
  */
@@ -87,6 +103,44 @@ enum KoreStatus
 typedef enum KoreStatus KoreStatus;
 #else
 typedef uint32_t KoreStatus;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+enum KoreRandomStatus
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  KORE_RANDOM_STATUS_OK = 0,
+  KORE_RANDOM_STATUS_INVALID_ARGUMENT = 1,
+  KORE_RANDOM_STATUS_ENTROPY_UNAVAILABLE = 2,
+  KORE_RANDOM_STATUS_INVALID_RANGE = 3,
+  KORE_RANDOM_STATUS_SAMPLING_EXHAUSTED = 4,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum KoreRandomStatus KoreRandomStatus;
+#else
+typedef uint32_t KoreRandomStatus;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+enum KoreTaskState
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  KORE_TASK_STATE_PENDING = 0,
+  KORE_TASK_STATE_COMPLETE = 1,
+  KORE_TASK_STATE_CANCELLED = 2,
+  KORE_TASK_STATE_INVALID_ACTION = 3,
+  KORE_TASK_STATE_STALE = 4,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum KoreTaskState KoreTaskState;
+#else
+typedef uint32_t KoreTaskState;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
@@ -198,6 +252,20 @@ typedef uint32_t KoreProviderError;
 typedef struct KoreFsContext KoreFsContext;
 
 /**
+ * Rust-owned optional generator for repeated foreign draws. Never copy its
+ * bytes or share it concurrently. The free functions need no owner argument.
+ */
+typedef struct KoreRandom KoreRandom;
+
+/**
+ * Bootstrap-only batch of native task tokens. Prepare from C/Zig, then use
+ * `take` with the existing entry API or `admit` on the founded executor.
+ * Dropping an unadmitted batch drops its native tokens and cancels its jobs.
+ * The foreign handles remain queryable until explicitly released.
+ */
+typedef struct KoreTaskBatch KoreTaskBatch;
+
+/**
  * Scoped generational name. Copying its bits does not duplicate native ownership.
  */
 typedef struct KoreFsHandle {
@@ -211,6 +279,37 @@ typedef struct KoreFsEntry {
   uint32_t name_length;
   uint32_t kind;
 } KoreFsEntry;
+
+/**
+ * Called on native worker threads. Its range is a disjoint partition of the
+ * requested tile span, not a worker identifier or a CPU number.
+ */
+typedef void (*KoreSpmdStep)(void*, uint32_t, uint32_t);
+
+typedef struct KoreDispatch {
+  uint32_t workers;
+  uint32_t tiles;
+} KoreDispatch;
+
+typedef void (*KoreThreadStep)(void*);
+
+typedef struct KoreTaskAction {
+  uint32_t operation;
+  uint32_t reserved;
+  uint64_t nanoseconds;
+} KoreTaskAction;
+
+/**
+ * Return an action, then relinquish control to the native executor. The callback
+ * receives no waker pointer or borrowed Rust future. It must return promptly.
+ */
+typedef struct KoreTaskAction (*KoreTaskStep)(void*);
+
+typedef struct KoreTaskHandle {
+  uint64_t generation;
+  uint32_t slot;
+  uint32_t reserved;
+} KoreTaskHandle;
 
 typedef struct KoreClockReading {
   uint64_t nanoseconds;
@@ -379,6 +478,89 @@ KoreStatus kore_dag_link(struct KoreFsContext *ctx,
 KoreStatus kore_fs_entry(struct KoreFsContext *ctx, uint32_t index, struct KoreFsEntry *out);
 
 /**
+ * Run a joined SPMD region through the existing native founding and width policy.
+ * Refused means no callback was launched. A post-launch join refusal retains
+ * the borrowed frame in the native owner; it never returns for serial replay.
+ * This blocks the calling thread: use a worker, not an executor callback.
+ * # Safety
+ * step and user remain valid until return; calls may run concurrently over
+ * disjoint tile ranges. Shared data must be synchronized. No unwind/longjmp,
+ * nested native dispatch, or retained user pointers. out is writable, aligned
+ * and disjoint from user storage. No per-worker capabilities are added.
+ */
+KoreStatus kore_spmd_dispatch(uint32_t tiles,
+                              KoreSpmdStep step,
+                              void *user,
+                              struct KoreDispatch *out);
+
+/**
+ * Execute one callback on a native worker and join it before returning.
+ * No detached owner, native ticket fabrication, or callback lifetime extension.
+ * # Safety
+ * step/user are valid on the worker until return, with no unwind/longjmp or
+ * retained pointers. The caller must not concurrently access unsynchronized
+ * user storage. This blocks; do not call from a native executor callback.
+ */
+KoreStatus kore_thread_run(KoreThreadStep step, void *user);
+
+/**
+ * Automatically seed and fill the whole buffer. Any failure leaves it unchanged.
+ * # Safety
+ * dst is null for zero length, or names length writable bytes.
+ */
+KoreRandomStatus kore_random_fill(uint8_t *dst, size_t length);
+
+/**
+ * Reuse a private, automatically seeded generator for repeated fills.
+ * # Safety
+ * rng is a live exclusive Rust-founded generator; dst names length writable
+ * bytes disjoint from rng (or is null for zero length).
+ */
+KoreRandomStatus kore_random_fill_from(struct KoreRandom *rng, uint8_t *dst, size_t length);
+
+/**
+ * A uniformly distributed u64. Failure leaves out unchanged.
+ * # Safety
+ * out is aligned writable storage for one u64.
+ */
+KoreRandomStatus kore_random_u64(uint64_t *out);
+
+/**
+ * A uniformly distributed value in [start, end). Failure leaves out unchanged.
+ * # Safety
+ * out is aligned writable storage for one u64.
+ */
+KoreRandomStatus kore_random_range(uint64_t start, uint64_t end, uint64_t *out);
+
+/**
+ * Prepare a callback as one of the native statically declared tasks. Queued
+ * means prepared, not executor admission. Rust founding must take/admit tokens.
+ * # Safety
+ * batch is live and exclusively accessed. out is aligned writable storage
+ * disjoint from batch and user. step/user remain valid until a terminal state
+ * is observed, even if the batch is moved or forgotten; forgetting a token is
+ * not cancellation. No concurrent accesses to unsynchronized user storage,
+ * retained callback-local pointers, unwind or longjmp. Handles name completion,
+ * not kernel authority, and never grant a task new capabilities.
+ */
+KoreStatus kore_task_prepare(struct KoreTaskBatch *batch,
+                             KoreTaskStep step,
+                             void *user,
+                             struct KoreTaskHandle *out);
+
+/**
+ * Acquire a completion witness. Pending never permits reclaiming user storage.
+ * Stale means the record was already released/reused, not that work was cancelled.
+ */
+KoreTaskState kore_task_poll(struct KoreTaskHandle handle);
+
+/**
+ * Release a terminal record. Pending refuses; stale copies cannot release a
+ * newer generation, including concurrent release/reuse. No native task is killed.
+ */
+KoreStatus kore_task_release(struct KoreTaskHandle handle);
+
+/**
  * Read the native monotonic domain, in nanoseconds since boot.
  * # Safety
  * out is null or aligned writable storage for one KoreClockReading.
@@ -391,6 +573,28 @@ KoreStatus kore_time_uptime(struct KoreClockReading *out);
  * out is null or aligned writable storage for one KoreClockReading.
  */
 KoreStatus kore_time_wall(struct KoreClockReading *out);
+
+/**
+ * Suspend this callback program for relative nanoseconds on the native executor.
+ * Submission is asynchronous; return from the callback after Queued.
+ * # Safety
+ * ctx is this callback's exclusive live filesystem context.
+ */
+KoreStatus kore_time_sleep_for(struct KoreFsContext *ctx, uint64_t nanoseconds);
+
+/**
+ * Suspend until absolute monotonic nanoseconds; never pass wall-clock time.
+ * # Safety
+ * ctx is this callback's exclusive live filesystem context.
+ */
+KoreStatus kore_time_sleep_until(struct KoreFsContext *ctx, uint64_t nanoseconds);
+
+/**
+ * Cooperatively yield this callback program to the native executor.
+ * # Safety
+ * ctx is this callback's exclusive live filesystem context.
+ */
+KoreStatus kore_time_yield(struct KoreFsContext *ctx);
 
 #ifdef __cplusplus
 }  // extern "C"

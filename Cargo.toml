@@ -20,6 +20,8 @@ driver = ["dep:kore-driver", "kore-driver/service"]
 
 # Byte-exact native export; source revision and hashes live in native/provenance.json.
 [dependencies]
+chacha20 = { version = "0.10.2", default-features = false, features = ["rng", "zeroize"] }
+zeroize = { version = "1.8.1", default-features = false }
 kore-abi = { path = "native/crates/abi" }
 kore-app = { path = "native/crates/app" }
 kore-rt = { path = "native/crates/rt", default-features = false }

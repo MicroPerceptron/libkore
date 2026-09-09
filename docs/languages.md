@@ -5,7 +5,7 @@
 integer-representation types. The namespace generator groups those exported
 names into `extern/zig/src/root.zig`. Zig 0.15.2 translates the C header for the
 consumer's target at build time; generated host-specific layouts are not checked
-in. `build.zig` exports the `kore` module, with `kore.fs`, `kore.dag`, `kore.time`, and the
+in. `build.zig` exports the `kore` module, with filesystem, graph, time, random, task, thread and SPMD namespaces, and the
 complete declarations/constants under `kore.abi`.
 
 Generation is inexpensive once the boundary exists. Rust lifetimes, affine
@@ -122,3 +122,11 @@ These checks prove declarations, layouts, linked foreign calls, and admission
 contracts. They do not claim that a C/Zig-founded standalone process has booted
 on hardware. The concrete Rust-owned driver calls the existing native `Fs`
 implementation; its founding/entry integration remains explicit in the host.
+
+## Runtime and random extensions
+
+The generated API also includes [native sleep, async task preparation and joined
+worker scopes](runtime.md), plus [automatically seeded random values](random.md).
+Async callbacks return to the existing executor; synchronous worker scopes retain
+the native join owner. No foreign macro translation, second scheduler, TLS RNG,
+or global entropy lock is required.

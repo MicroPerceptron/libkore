@@ -108,3 +108,22 @@ freestanding ISAs; the Zig build-system module also passed. The local/Git
 composition fixture proves that `kore-ffi::Session` consumes the same native
 `Fs` as the Rust facade after owner overrides. These are not a standalone
 C/Zig-founded process boot witness; see [language contracts](languages.md).
+
+## Runtime and random surfaces
+
+The next alpha slice adds checked Duration/monotonic sleep, direct native task
+and thread module paths, automatically seeded random values, and generated
+C/Zig sleep, task preparation and joined worker APIs. The native export and
+its source revision are unchanged. Foreign task batches produce actual native
+SpawnTokens; the composition test also checks their type identity after Git/path
+overrides. No new executor, raw capability owner, TLS layout or native worker
+implementation is introduced.
+
+The full local host/Clippy/docs/owner/custom-target/Miri/generated-binding matrix
+passed, as did the negative-control local/Git composition fixture. Linked C/Zig
+fixtures execute callback action returns and verify real native token cancellation
+before admission. Random tests cover a ChaCha known answer, typed draws, bounded
+unbiased sampling and unchanged output after initial/reseed failures. Host
+parallel tests establish pre-launch refusal without callbacks or output writes.
+These do not constitute a new native guest or hardware witness for foreign
+worker execution; the prior Kore production-gate limitation remains unchanged.

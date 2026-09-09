@@ -33,7 +33,7 @@ def check(tree: Path):
         files = subprocess.check_output(
             ["git", "ls-files", "-c", "-o", "--exclude-standard", "-z", "--",
              "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md", "LICENSE",
-             ".cargo", "src", "tests/consumer", "native", "crates/ffi", "extern"], cwd=ROOT,
+             ".cargo", "src", "docs", "tests/consumer", "native", "crates/ffi", "extern"], cwd=ROOT,
         ).decode().split("\0")
         for name in sorted(set(files)):
             if not name or not (ROOT / name).is_file():
@@ -66,6 +66,7 @@ pub fn abi_identity(slot: kore_abi::session::SlotRef) -> sdk::abi::session::Slot
 pub fn runtime_identity(rt: kore_rt::entry::Rt) -> sdk::runtime::entry::Rt { rt }
 pub fn fs_identity<'w, 't>(fs: kore_dagfs::Fs<'w, 't>) -> sdk::fs::Fs<'w, 't> { fs }
 pub fn view_identity(view: kore_dagfs::View) -> sdk::fs::View { view }
+pub fn foreign_task_tokens(batch: &mut ffi::KoreTaskBatch, slot: usize) -> Option<kore_rt::executor::SpawnToken> { batch.take(slot) }
 pub fn foreign_owner<'w, 't>(fs: kore_dagfs::Fs<'w, 't>) -> Result<ffi::Session<'w, 't>, kore_dagfs::Fs<'w, 't>> { ffi::Session::new(fs) }
 ''')
         # Keep the distribution lock untouched; this consumer has its own lock.

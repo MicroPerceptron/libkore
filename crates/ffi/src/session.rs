@@ -85,7 +85,14 @@ impl<'w, 't> Session<'w, 't> {
             self.context.completion = KoreFsCompletion {
                 abi_version: KORE_ABI_VERSION,
                 operation: command.op,
-                handle: if matches!(command.op, KORE_OP_OPEN | KORE_OP_CREATE) {
+                handle: if matches!(
+                    command.op,
+                    KORE_OP_OPEN
+                        | KORE_OP_CREATE
+                        | KORE_OP_SLEEP_FOR
+                        | KORE_OP_SLEEP_UNTIL
+                        | KORE_OP_YIELD
+                ) {
                     KoreFsHandle::default()
                 } else {
                     self.context.handle(command.slot)
@@ -122,6 +129,9 @@ impl<'w, 't> Session<'w, 't> {
     async fn execute(&mut self, command: Command) -> Result<(), Refusal> {
         let slot = command.slot;
         match command.op {
+            KORE_OP_SLEEP_FOR => kore::time::sleep_for(command.offset).await,
+            KORE_OP_SLEEP_UNTIL => kore::time::sleep_until_ns(command.offset).await,
+            KORE_OP_YIELD => kore::runtime::executor::yield_now().await,
             KORE_OP_OPEN => {
                 let view = self
                     .fs

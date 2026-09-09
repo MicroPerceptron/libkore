@@ -5,6 +5,7 @@
 //! driver. Arguments are copied before returning to C. No C stack pointer is
 //! retained while a request is pending. See `Session` and the generated header.
 #![no_std]
+#![feature(type_alias_impl_trait)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::{
@@ -14,9 +15,15 @@ use core::{
 use kore::fs::dag::{self, FsError, Name, ObjectKind, Refusal, Rights};
 use kore::fs::{Fs, View};
 
+mod parallel;
+mod random;
 mod session;
+mod task;
 mod time;
+pub use parallel::*;
+pub use random::*;
 pub use session::{RunError, Session};
+pub use task::*;
 pub use time::*;
 
 pub const KORE_ABI_VERSION: u32 = 1;
@@ -44,6 +51,9 @@ pub const KORE_OP_UNLINK: u32 = 9;
 pub const KORE_OP_LIST: u32 = 10;
 pub const KORE_OP_DETACH: u32 = 11;
 pub const KORE_OP_LINK: u32 = 12;
+pub const KORE_OP_SLEEP_FOR: u32 = 13;
+pub const KORE_OP_SLEEP_UNTIL: u32 = 14;
+pub const KORE_OP_YIELD: u32 = 15;
 
 const _: () =
     assert!(KORE_FS_HANDLE_CAPACITY + dag::PEAK_HANDLES <= dag::bounds::MAX_HANDLES_PER_SESSION);
@@ -776,6 +786,8 @@ mod tests {
         unsafe extern "C" {
             fn c_submit_write(ctx: *mut KoreFsContext, handle: KoreFsHandle) -> u32;
             fn c_read_completion(ctx: *mut KoreFsContext, result: *const KoreFsCompletion) -> u32;
+            fn c_sleep_and_random(ctx: *mut KoreFsContext) -> u32;
+            fn zig_check_random() -> u32;
             fn zig_submit_create(ctx: *mut KoreFsContext, handle: KoreFsHandle) -> u32;
         }
         let mut ctx = opened();
@@ -796,6 +808,12 @@ mod tests {
             assert_eq!(command.op, KORE_OP_CREATE);
             assert_eq!(command.destination, 1);
             assert_eq!(command.name.unwrap().as_bytes(), b"zig-file");
+            ctx.phase = Phase::Callback;
+            ctx.command = None;
+            assert_eq!(c_sleep_and_random(&mut ctx), 0);
+            assert_eq!(ctx.command.unwrap().op, KORE_OP_SLEEP_FOR);
+            assert_eq!(ctx.command.unwrap().offset, 1_250_000);
+            assert_eq!(zig_check_random(), 0);
         }
     }
 }

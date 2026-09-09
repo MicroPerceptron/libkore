@@ -34,3 +34,10 @@ its committed dependency closure, tracked by `native/provenance.json`.
 - C headers come from cbindgen 0.29.4; Zig aliases come from those declarations
   and target layouts from Zig 0.15.2 translation. Regenerate before checking.
   `test-foreign` is a host-test feature; never add a runtime C/Zig build dependency.
+
+- Random generation uses the maintained ChaCha owner, native seeding and zeroize.
+  Preserve all-or-nothing fill errors and bounded reseed/rejection behavior; never
+  substitute a deterministic seed on entropy failure or add a global/TLS stream.
+- Foreign task preparation returns actual native SpawnTokens. Terminal records
+  publish callback writes before reclamation; generation and state share one
+  atomic. Scoped parallel callbacks must remain borrowed until native join.

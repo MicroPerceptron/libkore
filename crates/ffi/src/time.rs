@@ -68,6 +68,45 @@ pub unsafe extern "C" fn kore_time_wall(out: *mut KoreClockReading) -> KoreStatu
     unsafe { reading(out, kore::time::wall().map(|time| time.as_nanos())) }
 }
 
+/// Suspend this callback program for relative nanoseconds on the native executor.
+/// Submission is asynchronous; return from the callback after Queued.
+/// # Safety
+/// ctx is this callback's exclusive live filesystem context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kore_time_sleep_for(
+    ctx: *mut crate::KoreFsContext,
+    nanoseconds: u64,
+) -> KoreStatus {
+    unsafe { queue_time(ctx, crate::KORE_OP_SLEEP_FOR, nanoseconds) }
+}
+/// Suspend until absolute monotonic nanoseconds; never pass wall-clock time.
+/// # Safety
+/// ctx is this callback's exclusive live filesystem context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kore_time_sleep_until(
+    ctx: *mut crate::KoreFsContext,
+    nanoseconds: u64,
+) -> KoreStatus {
+    unsafe { queue_time(ctx, crate::KORE_OP_SLEEP_UNTIL, nanoseconds) }
+}
+/// Cooperatively yield this callback program to the native executor.
+/// # Safety
+/// ctx is this callback's exclusive live filesystem context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kore_time_yield(ctx: *mut crate::KoreFsContext) -> KoreStatus {
+    unsafe { queue_time(ctx, crate::KORE_OP_YIELD, 0) }
+}
+unsafe fn queue_time(ctx: *mut crate::KoreFsContext, op: u32, ns: u64) -> KoreStatus {
+    // SAFETY: exported calls require exclusive callback-local access.
+    let ctx = match unsafe { crate::context(ctx) } {
+        Ok(ctx) => ctx,
+        Err(e) => return e,
+    };
+    let mut command = crate::Command::new(op);
+    command.offset = ns;
+    ctx.queue(command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
