@@ -13,6 +13,8 @@
 pub use kore_abi as abi;
 pub use kore_app as app;
 pub use kore_rt as runtime;
+/// Process-local atomic-word waits, including native async waits.
+pub use kore_rt::futex;
 pub use kore_rt::process;
 pub use kore_rt::{Bundle, ExitCode, main, spmd, task};
 pub mod collections;

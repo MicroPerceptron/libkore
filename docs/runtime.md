@@ -135,3 +135,33 @@ The call shapes follow the Open Group specifications for
 [`pthread_join`](https://pubs.opengroup.org/onlinepubs/009695399/functions/pthread_join.html)
 and [`pthread_detach`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_detach.html);
 the supported subset above is deliberately narrower than those full contracts.
+
+## Atomic-word waits
+
+Rust applications can use `kore::futex::{wait, wait_async, wake, wake_all,
+WaitOutcome}` directly. These are reexports of the existing runtime owner;
+there is no second wait registry. Use `wait_async` in Rust executor tasks.
+
+C exposes `kore_futex_available`, `kore_futex_wait`, `kore_futex_wake` and
+`kore_futex_wake_all` in `<kore.h>`; Zig exposes `kore.futex.*`. The foreign
+wait blocks a native thread and must not run inside an executor callback.
+Timeouts are relative nanoseconds; zero is a deadline of zero and
+`KORE_FUTEX_INFINITE` requests an unbounded wait. Retry, spurious wake, timeout,
+unsupported context and invalid pointer shape remain distinct outcomes.
+Unsupported is a refusal, not a reason to spin or a fabricated timeout.
+
+Words are caller-owned, writable 32-bit storage aligned to at least four bytes,
+kept at a stable address until all waits and wakes finish. All concurrent accesses
+must be compatible 32-bit atomics. For C, use atomic builtins on the `uint32_t`
+word; for Zig, use `@atomicLoad`/`@atomicStore`. Publish the changed condition with
+a sequentially consistent store **before** wake, and re-check the condition in a
+loop after retry/wake. The pointer signature does not authorize ordinary C loads
+and stores during concurrent use. Null and misalignment are rejected; other
+pointer validity and lifetime requirements belong to the caller.
+
+Wake-one returns whether a direct or relay notice was posted. Wake-all returns
+the posted-notice count, potentially including one relay notice. These results
+are telemetry, not waiter counts or proof that the condition holds. Both return
+`KORE_FUTEX_INVALID_ARGUMENT` for invalid pointer shape. This API is process-local;
+it is neither a Linux futex syscall ABI nor a cross-process synchronization API.
+Foreign async wait submission is not provided by this blocking adapter.

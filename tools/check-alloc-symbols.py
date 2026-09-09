@@ -6,7 +6,8 @@ from pathlib import Path
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-SYMBOLS = {'malloc', 'calloc', 'realloc', 'free', 'pthread_create', 'pthread_join', 'pthread_detach'}
+SYMBOLS = {'malloc', 'calloc', 'realloc', 'free', 'pthread_create', 'pthread_join', 'pthread_detach',
+           'kore_futex_available', 'kore_futex_wait', 'kore_futex_wake', 'kore_futex_wake_all'}
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
@@ -29,5 +30,5 @@ if __name__ == '__main__':
         ], text=True)
         defined = {line.split()[0] for line in output.splitlines() if line.strip()}
         if missing := SYMBOLS - defined:
-            raise SystemExit(f'{arch}: missing C allocation/thread symbols: {sorted(missing)}')
-        print(f'freestanding C allocation/thread symbols: {arch}', flush=True)
+            raise SystemExit(f'{arch}: missing C allocation/thread/futex symbols: {sorted(missing)}')
+        print(f'freestanding C allocation/thread/futex symbols: {arch}', flush=True)

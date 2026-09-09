@@ -56,3 +56,13 @@ uint32_t c_check_thread_refusal(void) {
     if (pthread_join(NULL, NULL) != KORE_THREAD_EINVAL) return 3;
     return pthread_detach(NULL) == KORE_THREAD_EINVAL ? 0 : 4;
 }
+
+uint32_t c_check_futex(void) {
+    _Alignas(4) uint32_t word = 7;
+    __atomic_store_n(&word, 8, __ATOMIC_SEQ_CST);
+    if (kore_futex_available() != 0) return 1;
+    if (kore_futex_wait(&word, 8, 0) != KORE_FUTEX_OUTCOME_UNSUPPORTED) return 2;
+    if (kore_futex_wait(NULL, 8, KORE_FUTEX_INFINITE) != KORE_FUTEX_OUTCOME_INVALID_ARGUMENT) return 3;
+    if (kore_futex_wake(&word) != 0 || kore_futex_wake_all(&word) != 0) return 4;
+    return kore_futex_wake(NULL) == KORE_FUTEX_INVALID_ARGUMENT ? 0 : 5;
+}

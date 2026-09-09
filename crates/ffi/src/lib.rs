@@ -19,6 +19,8 @@ use kore::fs::{Fs, View};
 
 mod alloc;
 pub use alloc::*;
+mod futex;
+pub use futex::*;
 mod hash;
 pub use hash::*;
 mod parallel;
@@ -796,6 +798,8 @@ mod tests {
             fn c_read_completion(ctx: *mut KoreFsContext, result: *const KoreFsCompletion) -> u32;
             fn c_sleep_and_random(ctx: *mut KoreFsContext) -> u32;
             fn zig_check_random() -> u32;
+            fn c_check_futex() -> u32;
+            fn zig_check_futex() -> u32;
             fn c_check_thread_refusal() -> u32;
             fn zig_check_thread_refusal() -> u32;
             fn zig_submit_create(ctx: *mut KoreFsContext, handle: KoreFsHandle) -> u32;
@@ -824,6 +828,8 @@ mod tests {
             assert_eq!(ctx.command.unwrap().op, KORE_OP_SLEEP_FOR);
             assert_eq!(ctx.command.unwrap().offset, 1_250_000);
             assert_eq!(zig_check_random(), 0);
+            assert_eq!(c_check_futex(), 0);
+            assert_eq!(zig_check_futex(), 0);
             assert_eq!(c_check_thread_refusal(), 0);
             assert_eq!(zig_check_thread_refusal(), 0);
         }

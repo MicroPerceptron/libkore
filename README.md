@@ -102,3 +102,7 @@ join may originate on another worker and detached threads are reaped after exit.
 attributes, and `c-stdlib` supplies their freestanding linker symbols. See
 [thread lifecycle and TLS](docs/runtime.md#independent-foreign-threads) for the
 ownership contract and the remaining POSIX boundaries.
+
+Atomic-word synchronization is available through `kore::futex` (including Rust
+async waits), `kore_futex_*` in C, and `kore.futex.*` in Zig. Foreign waits block
+native threads; see [runtime contracts](docs/runtime.md#atomic-word-waits).

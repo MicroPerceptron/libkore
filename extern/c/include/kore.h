@@ -71,6 +71,16 @@
  */
 #define KORE_ALLOC_MIN_ALIGNMENT 16
 
+/**
+ * Pass as timeout_ns to wait indefinitely. All other values are relative ns.
+ */
+#define KORE_FUTEX_INFINITE 18446744073709551615ull
+
+/**
+ * Wake argument was null or misaligned; no native wake was attempted.
+ */
+#define KORE_FUTEX_INVALID_ARGUMENT -1
+
 #define KORE_HASH_OK 0
 
 #define KORE_HASH_MISSING 1
@@ -134,6 +144,37 @@ enum KoreStatus
 typedef enum KoreStatus KoreStatus;
 #else
 typedef uint32_t KoreStatus;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Native wait outcomes, with an additional adapter argument refusal.
+ */
+enum KoreFutexOutcome
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * The word differed from expected; re-check the caller's condition.
+   */
+  KORE_FUTEX_OUTCOME_RETRY = 0,
+  /**
+   * A wake may be spurious; re-check the caller's condition.
+   */
+  KORE_FUTEX_OUTCOME_WOKEN = 1,
+  KORE_FUTEX_OUTCOME_TIMED_OUT = 2,
+  /**
+   * This native thread cannot park. Do not retry in a busy loop.
+   */
+  KORE_FUTEX_OUTCOME_UNSUPPORTED = 3,
+  KORE_FUTEX_OUTCOME_INVALID_ARGUMENT = 4,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum KoreFutexOutcome KoreFutexOutcome;
+#else
+typedef uint32_t KoreFutexOutcome;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
@@ -595,6 +636,45 @@ void kore_alloc_free(void *data);
  * Borrows no context. Explicit table allocators can still be supplied.
  */
 struct KoreHashAllocator kore_alloc_hash_allocator(void);
+
+/**
+ * Whether the current native thread can wait (1=yes, 0=no).
+ */
+uint32_t kore_futex_available(void);
+
+/**
+ * Block this native thread only while word equals expected. timeout_ns is
+ * relative; KORE_FUTEX_INFINITE means unbounded. Always re-check the condition
+ * after Retry/Woken; Unsupported is a permanent refusal for this context.
+ * Process-local only. Do not call from executor callbacks: Rust tasks should
+ * use kore::futex::wait_async instead.
+ * # Safety
+ * word is null, misaligned, or points to a live writable 32-bit word aligned
+ * to at least 4 bytes. Valid storage must stay at the same address throughout
+ * all waits/wakes. All concurrent accesses must be compatible 32-bit atomic
+ * operations (C atomic builtins or Zig atomics); never mix ordinary accesses
+ * or differently sized atomics. Publish the condition with a sequentially
+ * consistent atomic store BEFORE waking. No address-space sharing is implied.
+ */
+KoreFutexOutcome kore_futex_wait(uint32_t *ptr, uint32_t expected, uint64_t timeout_ns);
+
+/**
+ * Wake one waiter. Returns 1 if a direct or relay notice was posted, 0 if no
+ * waiter was reached, or KORE_FUTEX_INVALID_ARGUMENT. Zero does not prove no
+ * waiter exists; one does not prove a condition is satisfied. Not a fair queue.
+ * # Safety
+ * Same atomic storage/lifetime and store-before-wake contract as kore_futex_wait.
+ */
+int32_t kore_futex_wake(uint32_t *ptr);
+
+/**
+ * Wake all registered waiters. Returns posted-notice count, including at most
+ * one relay notice, or KORE_FUTEX_INVALID_ARGUMENT. The count is telemetry,
+ * not a count of resumed threads or a synchronization guarantee.
+ * # Safety
+ * Same atomic storage/lifetime and store-before-wake contract as kore_futex_wait.
+ */
+int32_t kore_futex_wake_all(uint32_t *ptr);
 
 /**
  * Create a table, returning null for invalid callbacks or allocation failure.

@@ -94,3 +94,13 @@ export fn zig_check_thread_refusal() callconv(.c) u32 {
     if (kore.thread.join(null, null) != c.KORE_THREAD_EINVAL) return 3;
     return if (kore.thread.detach(null) == c.KORE_THREAD_EINVAL) 0 else 4;
 }
+
+export fn zig_check_futex() callconv(.c) u32 {
+    var word: u32 align(4) = 7;
+    @atomicStore(u32, &word, 8, .seq_cst);
+    if (kore.futex.available() != 0) return 1;
+    if (kore.futex.wait(&word, 8, 0) != c.KORE_FUTEX_OUTCOME_UNSUPPORTED) return 2;
+    if (kore.futex.wait(null, 8, c.KORE_FUTEX_INFINITE) != c.KORE_FUTEX_OUTCOME_INVALID_ARGUMENT) return 3;
+    if (kore.futex.wake(&word) != 0 or kore.futex.wake_all(&word) != 0) return 4;
+    return if (kore.futex.wake(null) == c.KORE_FUTEX_INVALID_ARGUMENT) 0 else 5;
+}

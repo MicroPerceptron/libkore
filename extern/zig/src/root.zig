@@ -27,6 +27,12 @@ pub const fs = struct {
     pub const unlink = abi.kore_fs_unlink;
     pub const write = abi.kore_fs_write;
 };
+pub const futex = struct {
+    pub const available = abi.kore_futex_available;
+    pub const wait = abi.kore_futex_wait;
+    pub const wake = abi.kore_futex_wake;
+    pub const wake_all = abi.kore_futex_wake_all;
+};
 pub const hash = struct {
     pub const table_clear = abi.kore_hash_table_clear;
     pub const table_create = abi.kore_hash_table_create;
