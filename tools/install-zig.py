@@ -18,7 +18,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('destination', type=Path)
     args = parser.parse_args()
-    arch, expected = PINS[(platform.system(), platform.machine())]
+    key = (platform.system(), platform.machine())
+    pin = PINS.get(key)
+    if pin is None:
+        supported = ", ".join(f"{sys}/{arch}" for (sys, arch) in sorted(PINS))
+        raise SystemExit(f"unsupported platform {key[0]}/{key[1]} (supported: {supported})")
+    arch, expected = pin
     folder = f'zig-{arch}-{VERSION}'
     destination = args.destination.resolve()
     if (destination / folder).exists():
@@ -34,5 +39,8 @@ if __name__ == '__main__':
             raise SystemExit('Zig archive checksum mismatch')
         archive.seek(0)
         with tarfile.open(fileobj=archive, mode='r:xz') as contents:
-            contents.extractall(destination, filter='data')
+            try:
+                contents.extractall(destination, filter='data')
+            except TypeError:
+                contents.extractall(destination)
     print(destination / folder / 'zig')
