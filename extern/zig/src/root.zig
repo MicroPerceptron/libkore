@@ -1,5 +1,14 @@
 // Generated from kore.h. Signatures come from Zig translate-c at build time.
 pub const abi = @import("kore-c");
+pub const allocator = @import("allocator.zig").allocator;
+pub const alloc = struct {
+    pub const aligned = abi.kore_alloc_aligned;
+    pub const calloc = abi.kore_alloc_calloc;
+    pub const free = abi.kore_alloc_free;
+    pub const hash_allocator = abi.kore_alloc_hash_allocator;
+    pub const malloc = abi.kore_alloc_malloc;
+    pub const realloc = abi.kore_alloc_realloc;
+};
 pub const dag = struct {
     pub const detach = abi.kore_dag_detach;
     pub const link = abi.kore_dag_link;
@@ -21,6 +30,7 @@ pub const fs = struct {
 pub const hash = struct {
     pub const table_clear = abi.kore_hash_table_clear;
     pub const table_create = abi.kore_hash_table_create;
+    pub const table_create_default = abi.kore_hash_table_create_default;
     pub const table_destroy = abi.kore_hash_table_destroy;
     pub const table_find = abi.kore_hash_table_find;
     pub const table_insert = abi.kore_hash_table_insert;

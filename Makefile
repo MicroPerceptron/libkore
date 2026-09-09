@@ -15,7 +15,7 @@ check:
 
 fmt:
 	cargo fmt -p kore-std -p libkore-consumer -p kore-ffi --check
-	$(ZIG) fmt --check build.zig build.zig.zon crates/ffi/tests/consumer.zig extern/zig/src/root.zig
+	$(ZIG) fmt --check build.zig build.zig.zon crates/ffi/tests/consumer.zig extern/zig/src/root.zig extern/zig/src/allocator.zig
 
 docs:
 	cargo doc --locked --workspace --all-features
@@ -35,6 +35,7 @@ cross:
 	    -Z build-std=core,alloc,compiler_builtins \
 	    -Z build-std-features=compiler-builtins-mem; \
 	done
+	python3 tools/check-alloc-symbols.py
 
 miri:
 	cargo miri test --locked --workspace --all-features

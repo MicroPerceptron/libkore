@@ -290,6 +290,16 @@ pub unsafe extern "C" fn kore_hash_table_visit(
     KORE_HASH_OK
 }
 
+/// Create a caller-owned table using the application's installed global heap.
+/// Entries remain caller-owned. Null indicates capacity/allocation failure.
+/// Destroy with kore_hash_table_destroy; the installed allocator must remain
+/// compatible with all allocations made during this table's lifetime.
+#[unsafe(no_mangle)]
+pub extern "C" fn kore_hash_table_create_default(capacity: usize) -> *mut KoreHashTable {
+    // SAFETY: adapter uses the installed allocator; no borrowed context.
+    unsafe { kore_hash_table_create(crate::kore_alloc_hash_allocator(), capacity) }
+}
+
 #[cfg(all(test, feature = "test-foreign", not(miri), not(target_os = "none")))]
 #[test]
 fn compiled_c_hash_contract() {

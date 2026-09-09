@@ -26,8 +26,9 @@ from the Rust adapter, as for the other foreign surfaces.
 
 A `KoreHashTable *` is opaque and uniquely owned. Creation takes a
 `KoreHashAllocator` (context, allocate, deallocate) and initial capacity.
-Both the handle and buckets use those callbacks. No implicit global allocator
-is selected by this API. Null creation means invalid callbacks or allocation
+Both the handle and buckets use those callbacks. This explicit constructor does not select a global allocator.
+`kore_hash_table_create_default` selects the installed process allocator; see
+[the C and Zig allocator API](allocators.md). Null creation means invalid callbacks or allocation
 failure. Destroy accepts null and releases only table storage.
 
 Insert accepts a caller-supplied 64-bit hash, non-null entry pointer, equality

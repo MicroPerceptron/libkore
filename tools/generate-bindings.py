@@ -30,6 +30,7 @@ def generate(check=False):
         groups.setdefault(group, []).append((name, function))
     zig = '// Generated from kore.h. Signatures come from Zig translate-c at build time.\n'
     zig += 'pub const abi = @import("kore-c");\n'
+    zig += 'pub const allocator = @import("allocator.zig").allocator;\n'
     for group, names in sorted(groups.items()):
         zig += f'pub const {group} = struct {{\n'
         for name, function in names:
@@ -39,7 +40,17 @@ def generate(check=False):
     if subprocess.check_output([zig_tool, 'version'], text=True).strip() != '0.16.0':
         raise SystemExit('Zig 0.16.0 is required')
     zig = subprocess.check_output([zig_tool, 'fmt', '--stdin'], input=zig, text=True)
-    for relative, data in [('extern/c/include/kore.h', source), ('extern/zig/src/root.zig', zig)]:
+    # Opt-in source aliases only: all signatures still come from cbindgen.
+    stdlib = '/* Generated allocation aliases. Include instead of host stdlib.h. */\n'
+    stdlib += '#ifndef KORE_STDLIB_H\n#define KORE_STDLIB_H\n#include "../kore.h"\n'
+    for name in ['malloc', 'calloc', 'realloc', 'free']:
+        symbol = f'kore_alloc_{name}'
+        if symbol not in functions:
+            raise SystemExit(f'missing allocator export: {symbol}')
+        stdlib += f'#define {name} {symbol}\n'
+    stdlib += '#endif\n'
+    for relative, data in [('extern/c/include/kore.h', source), ('extern/zig/src/root.zig', zig),
+                           ('extern/c/include/kore/stdlib.h', stdlib)]:
         path = ROOT / relative
         if check:
             if not path.exists() or path.read_text() != data:

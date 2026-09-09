@@ -11,6 +11,8 @@ header = "/* Kore alpha ABI v1. Capability-owned APIs; scoped worker calls join 
 [parse]
 parse_deps = false
 [export]
+# Optional bare C symbols use the same declarations via kore/stdlib.h aliases.
+exclude = ["malloc", "calloc", "realloc", "free"]
 include = ["KoreHashEqual", "KoreHashVisit", "KoreFsStep", "KoreFsCompletion", "KoreFsError", "KoreTaskStep", "KoreTaskAction", "KoreSpmdStep", "KoreThreadStep"]
 [enum]
 prefix_with_name = true

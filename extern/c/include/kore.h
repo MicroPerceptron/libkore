@@ -66,6 +66,11 @@
 
 #define KORE_OP_YIELD 15
 
+/**
+ * Minimum alignment of malloc/calloc results on all supported Kore targets.
+ */
+#define KORE_ALLOC_MIN_ALIGNMENT 16
+
 #define KORE_HASH_OK 0
 
 #define KORE_HASH_MISSING 1
@@ -517,6 +522,51 @@ KoreStatus kore_dag_link(struct KoreFsContext *ctx,
 KoreStatus kore_fs_entry(struct KoreFsContext *ctx, uint32_t index, struct KoreFsEntry *out);
 
 /**
+ * Allocate size bytes using the application's installed global allocator.
+ * Returns null on allocation/layout failure. Zero size requests allocate a
+ * unique freeable block when successful. No allocator is installed by libkore.
+ */
+void *kore_alloc_malloc(size_t size);
+
+/**
+ * Allocate count * size zeroed bytes. Multiplication overflow returns null.
+ * Zero size follows kore_alloc_malloc. This API does not set errno.
+ */
+void *kore_alloc_calloc(size_t count, size_t size);
+
+/**
+ * Allocate size bytes aligned to a nonzero power of two. Size need not be an
+ * alignment multiple. Null means invalid layout or allocation failure.
+ * Free with kore_alloc_free. Reallocation preserves the alignment.
+ */
+void *kore_alloc_aligned(size_t size, size_t alignment);
+
+/**
+ * Resize an allocation, preserving min(old size, new size) bytes and alignment.
+ * Null input behaves as malloc. Non-null input with zero size is freed and
+ * returns null. Other failures leave the original allocation live and intact.
+ * # Safety
+ * Non-null data is a live, exclusively owned pointer from kore_alloc_*.
+ * Never pass a Rust allocation, another allocator's pointer, or an interior
+ * pointer. The installed allocator must remain compatible for its lifetime.
+ */
+void *kore_alloc_realloc(void *data, size_t size);
+
+/**
+ * Release a kore_alloc_* allocation. Null is a no-op.
+ * # Safety
+ * Same allocation provenance as kore_alloc_realloc. Release exactly once;
+ * callers must stop accessing the allocation before it is freed.
+ */
+void kore_alloc_free(void *data);
+
+/**
+ * Callback adapter using the application's installed global allocator.
+ * Borrows no context. Explicit table allocators can still be supplied.
+ */
+struct KoreHashAllocator kore_alloc_hash_allocator(void);
+
+/**
  * Create a table, returning null for invalid callbacks or allocation failure.
  * # Safety
  * Callbacks obey KoreHashAllocator and never unwind; their context outlives the table.
@@ -600,6 +650,14 @@ void kore_hash_table_clear(struct KoreHashTable *table);
 int32_t kore_hash_table_visit(const struct KoreHashTable *table,
                               KoreHashVisit visit,
                               void *context);
+
+/**
+ * Create a caller-owned table using the application's installed global heap.
+ * Entries remain caller-owned. Null indicates capacity/allocation failure.
+ * Destroy with kore_hash_table_destroy; the installed allocator must remain
+ * compatible with all allocations made during this table's lifetime.
+ */
+struct KoreHashTable *kore_hash_table_create_default(size_t capacity);
 
 /**
  * Run a joined SPMD region through the existing native founding and width policy.

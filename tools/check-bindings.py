@@ -21,7 +21,7 @@ if __name__ == '__main__':
     for arch, c_target, zig_target in TARGETS:
         subprocess.run([os.environ.get('CLANG', 'clang'), '-target', c_target, '-ffreestanding',
                         '-std=c11', '-Werror', '-fsyntax-only', '-I', 'extern/c/include',
-                        'crates/ffi/tests/consumer.c'], cwd=ROOT, check=True)
+                        'crates/ffi/tests/consumer.c', 'crates/ffi/tests/alloc.c'], cwd=ROOT, check=True)
         translated = destination / f'{arch}-c.zig'
         with translated.open('w') as output:
             subprocess.run([zig, 'translate-c', '-target', zig_target, 'extern/c/include/kore.h'],

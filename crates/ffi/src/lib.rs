@@ -17,6 +17,8 @@ use core::{
 use kore::fs::dag::{self, FsError, Name, ObjectKind, Refusal, Rights};
 use kore::fs::{Fs, View};
 
+mod alloc;
+pub use alloc::*;
 mod hash;
 pub use hash::*;
 mod parallel;

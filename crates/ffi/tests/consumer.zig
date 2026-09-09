@@ -62,3 +62,24 @@ export fn zig_check_hash() callconv(.c) u32 {
     kore.hash.table_destroy(table);
     return if (arena.live == 0) 0 else 5;
 }
+
+export fn zig_check_alloc() callconv(.c) u32 {
+    const std = @import("std");
+    const allocator = kore.allocator;
+    var list: std.ArrayList(u64) = .empty;
+    defer list.deinit(allocator);
+    for (0..100) |i| list.append(allocator, @intCast(i)) catch return 1;
+    if (list.items[99] != 99) return 2;
+    const p = allocator.alignedAlloc(u8, .@"64", 33) catch return 3;
+    @memset(p, 81);
+    const q = allocator.realloc(p, 300) catch {
+        allocator.free(p);
+        return 4;
+    };
+    defer allocator.free(q);
+    if (@intFromPtr(q.ptr) % 64 != 0 or q[32] != 81) return 5;
+    const table = kore.hash.table_create_default(4) orelse return 6;
+    defer kore.hash.table_destroy(table);
+    if (kore.hash.table_reserve(table, 100) != c.KORE_HASH_OK) return 7;
+    return 0;
+}

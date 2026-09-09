@@ -7,7 +7,8 @@ values, hash collections and an opt-in driver substrate.
 The `kore-ffi` package adds generated C bindings and a translated Zig module for
 filesystem requests, clocks/sleep, random values, async task preparation and
 joined thread/SPMD scopes, driven by a Rust-founded host. It also exposes
-caller-allocated opaque hash tables.
+opaque hash tables, C allocation functions and a Zig `std.mem.Allocator`
+adapter over the application's installed heap.
 It is `no_std`; all authority comes from the application's actual endowments.
 
 ```toml
@@ -51,7 +52,7 @@ The driver feature does not turn arbitrary register sequences into safe hardware
 experiments. Device-specific lifecycle, register semantics and DMA completion
 ownership still belong to the driver.
 
-See [hash collections](docs/collections.md), [time and concurrency](docs/runtime.md)
+See [C and Zig allocation](docs/allocators.md), [hash collections](docs/collections.md), [time and concurrency](docs/runtime.md)
 and [random values](docs/random.md) for API examples, admission and failure contracts.
 
 ## Build and integration
