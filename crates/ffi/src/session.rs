@@ -245,11 +245,11 @@ impl<'w, 't> Session<'w, 't> {
                 Ok(()) => self.context.retire(slot),
                 Err(failure) => {
                     self.views[slot] = Some(failure.view);
-                    self.context.phase = if matches!(failure.error, Refusal::Pair) {
-                        Phase::Quarantined
-                    } else {
-                        Phase::Finished
-                    };
+                    if matches!(failure.error, Refusal::Pair) {
+                        self.context.phase = Phase::Quarantined;
+                        return Err(RunError::Quarantined);
+                    }
+                    self.context.phase = Phase::Finished;
                     return Err(RunError::Cleanup(failure.error));
                 }
             }
