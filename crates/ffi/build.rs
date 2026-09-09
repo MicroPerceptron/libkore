@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    env,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 fn main() {
     println!("cargo:rerun-if-env-changed=ZIG");
     println!("cargo:rerun-if-changed=tests/consumer.c");
@@ -15,15 +19,20 @@ fn main() {
     let version = Command::new(&zig)
         .arg("version")
         .output()
-        .expect("Zig 0.15.2 is required for test-foreign");
+        .expect("Zig 0.16.0 is required for test-foreign");
     assert!(
-        version.status.success() && version.stdout == b"0.15.2\n",
-        "Zig 0.15.2 is required"
+        version.status.success() && version.stdout == b"0.16.0\n",
+        "Zig 0.16.0 is required"
     );
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let translated = output.join("kore-c.zig");
+    // Write translation directly to its artifact, as the binding checker does.
+    // Zig 0.16 on macOS can spin in fcopyfile when stdout is a captured pipe.
     let result = Command::new(&zig)
         .args(["translate-c", "../../extern/c/include/kore.h"])
+        .stdout(Stdio::from(
+            std::fs::File::create(&translated).expect("create C translation"),
+        ))
         .output()
         .expect("run Zig translator");
     assert!(
@@ -31,7 +40,6 @@ fn main() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    std::fs::write(&translated, result.stdout).unwrap();
     let object = output.join("zig-consumer.o");
     let status = Command::new(&zig)
         .args([

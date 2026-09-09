@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install checksum-pinned official Zig 0.15.2 into a caller-selected directory."""
+"""Install checksum-pinned official Zig 0.16.0 into a caller-selected directory."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -9,10 +9,10 @@ import tempfile
 import urllib.request
 
 PINS = {
-    ('Linux', 'x86_64'): ('x86_64-linux', '02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239'),
-    ('Darwin', 'arm64'): ('aarch64-macos', '3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b'),
+    ('Linux', 'x86_64'): ('x86_64-linux', '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00'),
+    ('Darwin', 'arm64'): ('aarch64-macos', 'b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489'),
 }
-VERSION = '0.15.2'
+VERSION = '0.16.0'
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)

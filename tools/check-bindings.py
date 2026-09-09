@@ -13,8 +13,8 @@ TARGETS = [
 
 if __name__ == '__main__':
     zig = os.environ.get('ZIG', 'zig')
-    if subprocess.check_output([zig, 'version'], text=True).strip() != '0.15.2':
-        raise SystemExit('Zig 0.15.2 is required')
+    if subprocess.check_output([zig, 'version'], text=True).strip() != '0.16.0':
+        raise SystemExit('Zig 0.16.0 is required')
     subprocess.run(['python3', 'tools/generate-bindings.py', '--check'], cwd=ROOT, check=True)
     destination = ROOT / 'target/foreign'
     destination.mkdir(parents=True, exist_ok=True)

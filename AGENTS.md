@@ -32,7 +32,7 @@ its committed dependency closure, tracked by `native/provenance.json`.
   generations, acknowledged counts, provider errors and cancellation quarantine.
   Keep the native-executor turn budget so ready-only callbacks cannot starve it.
 - C headers come from cbindgen 0.29.4; Zig aliases come from those declarations
-  and target layouts from Zig 0.15.2 translation. Regenerate before checking.
+  and target layouts from Zig 0.16.0 translation. Regenerate before checking.
   `test-foreign` is a host-test feature; never add a runtime C/Zig build dependency.
 
 - Random generation uses the maintained ChaCha owner, native seeding and zeroize.

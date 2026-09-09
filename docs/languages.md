@@ -3,7 +3,7 @@
 `kore-ffi` provides a Rust-founded embedding ABI. cbindgen 0.29.4 generates
 `extern/c/include/kore.h` from its actual `extern "C"` functions and `repr(C)` /
 integer-representation types. The namespace generator groups those exported
-names into `extern/zig/src/root.zig`. Zig 0.15.2 translates the C header for the
+names into `extern/zig/src/root.zig`. Zig 0.16.0 translates the C header for the
 consumer's target at build time; generated host-specific layouts are not checked
 in. `build.zig` exports the `kore` module, with filesystem, graph, time, random, task, thread and SPMD namespaces, and the
 complete declarations/constants under `kore.abi`.
@@ -12,7 +12,7 @@ Generation is inexpensive once the boundary exists. Rust lifetimes, affine
 `View` ownership, futures, slices and native error enums are not themselves a C
 ABI. The adapter below establishes those semantics; neither cbindgen nor Zig's
 translator invents them. See [cbindgen's supported API shapes](https://github.com/mozilla/cbindgen/blob/v0.29.4/docs.md#writing-your-c-api)
-and [Zig C translation](https://ziglang.org/documentation/0.15.2/#C-Translation).
+and [Zig C translation](https://ziglang.org/documentation/0.16.0/#C-Translation).
 
 ## Native scheduling owns the request
 
@@ -95,7 +95,7 @@ Normal Rust consumers need neither generation tool. To develop this repository:
 
 ```sh
 cargo install cbindgen --version 0.29.4 --locked
-# Or use an existing official Zig 0.15.2 installation.
+# Or use an existing official Zig 0.16.0 installation.
 python3 tools/install-zig.py /tmp/libkore-tools
 export ZIG=/path/printed/by/the/installer
 make bindings
@@ -103,7 +103,7 @@ make fmt test check docs owners cross miri bindings-check
 ```
 
 The installer supports the CI Linux x86_64 and local macOS arm64 hosts and verifies
-pinned official archive checksums. Other hosts can supply an official Zig 0.15.2
+pinned official archive checksums. Other hosts can supply an official Zig 0.16.0
 binary through `ZIG`. `CBINDGEN` and `CLANG` also accept explicit tool paths.
 
 `test-foreign` on `kore-ffi` links compiled C and translated Zig consumers into
@@ -113,10 +113,8 @@ drift, compiles C and Zig consumers for x86_64, aarch64 and riscv64, and exercis
 the Zig build-system module. Native Rust target checks use Kore's actual JSON
 user targets, not merely stock bare-metal targets.
 
-Local macOS package validation used the installed macOS 15.4 SDK selected for
-that invocation only. This host's selected SDK lacks the `arm64-macos` libSystem
-exports that Zig 0.15.2's build runner needs; C translation and freestanding
-compilation do not have that dependency. No global SDK selection was changed.
+Local macOS package validation with Zig 0.16.0 uses the host-selected SDK;
+no global SDK selection change or per-invocation SDK override is needed.
 
 These checks prove declarations, layouts, linked foreign calls, and admission
 contracts. They do not claim that a C/Zig-founded standalone process has booted

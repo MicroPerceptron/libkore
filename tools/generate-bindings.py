@@ -36,8 +36,8 @@ def generate(check=False):
             zig += f'    pub const @"{name}" = abi.{function};\n'
         zig += '};\n'
     zig_tool = os.environ.get('ZIG', 'zig')
-    if subprocess.check_output([zig_tool, 'version'], text=True).strip() != '0.15.2':
-        raise SystemExit('Zig 0.15.2 is required')
+    if subprocess.check_output([zig_tool, 'version'], text=True).strip() != '0.16.0':
+        raise SystemExit('Zig 0.16.0 is required')
     zig = subprocess.check_output([zig_tool, 'fmt', '--stdin'], input=zig, text=True)
     for relative, data in [('extern/c/include/kore.h', source), ('extern/zig/src/root.zig', zig)]:
         path = ROOT / relative
