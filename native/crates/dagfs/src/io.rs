@@ -3,12 +3,12 @@
 //! Nothing here allocates: a reader consumes each chunk in place from the
 //! window (or copies it into storage it owns), and a writer stages each
 //! chunk into the window before the request names it. Every transfer is
-//! bounded by the window and by [`MAX_TRANSFER`], and a reply may never
+//! bounded by the window and by the limit the service advertised at attach
+//! (never below [`MAX_TRANSFER`](crate::bounds::MAX_TRANSFER)), and a reply may never
 //! claim more bytes than were asked for.
 
 use crate::{
     ANY_REVISION, Fs, FsError, FsRequest, FsResponse, Refusal, View, WALK_READ,
-    bounds::MAX_TRANSFER,
 };
 
 #[cfg(feature = "index")]
@@ -27,9 +27,9 @@ pub(crate) fn read_transfer_count(reply: FsResponse, requested: usize) -> Result
     Ok(count)
 }
 
-/// The request must fit both the actual window and the frozen wire limit.
+/// The request must fit the negotiated window and the wire byte-count field.
 fn transfer_len(offset: u64, bytes: usize, window: usize) -> Result<usize, Refusal> {
-    let count = bytes.min(window).min(MAX_TRANSFER);
+    let count = bytes.min(window).min(u32::MAX as usize);
     if count == 0 {
         return Err(Refusal::Fs(FsError::NoWindow));
     }
@@ -57,10 +57,11 @@ pub enum SaveOutcome {
 
 impl<'w, 't> Fs<'w, 't> {
     /// The largest single transfer this face can carry: the data window,
-    /// capped at the protocol's [`MAX_TRANSFER`]. Zero means no window was
+    /// capped at the limit the service advertised when the window attached
+    /// ([`FsResponse::WindowAttached`]). Zero means no window was
     /// attached, which every bulk verb refuses as [`FsError::NoWindow`].
     pub fn chunk(&self) -> usize {
-        self.window.len().min(MAX_TRANSFER)
+        self.window.len().min(self.client.transfer_limit())
     }
 
     /// Read at most one transfer window into caller-owned storage.
@@ -296,13 +297,18 @@ impl<'w, 't> Fs<'w, 't> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bounds::MAX_TRANSFER;
 
     #[test]
     fn bounded_offset_requests_reject_overflow_before_publication() {
         assert_eq!(transfer_len(5, 17, 8).unwrap(), 8);
+        // Durable backends advertise larger windows; the old 4 KiB floor
+        // must not silently cap offset I/O after negotiation.
+        assert_eq!(transfer_len(0, 128 * 1024, 64 * 1024).unwrap(), 64 * 1024);
+        assert_eq!(transfer_len(0, 64 * 1024, MAX_TRANSFER).unwrap(), MAX_TRANSFER);
         assert_eq!(
             transfer_len(0, usize::MAX, usize::MAX).unwrap(),
-            MAX_TRANSFER
+            u32::MAX as usize
         );
         assert!(matches!(
             transfer_len(0, 1, 0),

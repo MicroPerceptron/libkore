@@ -158,8 +158,13 @@ pub const MAX_BLOCK_EXTENT_NODES: usize = MAX_TRACKED_BLOCK_EXTENTS * 2 + 1;
 /// [`FsError::OutOfStorage`](crate::FsError::OutOfStorage).
 pub const MAX_CHUNKS_PER_OBJECT: usize = 16;
 
-/// Largest byte count one read or write request may transfer.  Bounds the
-/// engine's per-request work independently of the file size.
+/// The transfer floor: the byte count every backend admits in one read or
+/// write request, and the size of the scratch buffers that copy through
+/// the CPU (extraction, the index source).  A backend may admit more — the
+/// durable block provider admits 64 KiB — and says so at window attach
+/// ([`FsResponse::WindowAttached`](crate::FsResponse::WindowAttached)); a
+/// client sizes its chunks from that answer and falls back to this floor.
+/// Raising this raises those stack buffers with it, so it stays the floor.
 pub const MAX_TRANSFER: usize = 4096;
 
 // ── Extraction snapshots and derived data ──────────────────────────────────

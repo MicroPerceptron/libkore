@@ -13,8 +13,10 @@ POSIX permissions. A global POSIX namespace is not part of this contract.
 
 ## Transfer and failure
 
-`Fs::read_at` and `Fs::write_at` transfer at most the actual shared window and
-wire limit. Reads validate the reply count before copying into caller storage;
+`Fs::read_at` and `Fs::write_at` transfer at most the actual shared window,
+the service-advertised transfer limit, and the wire byte-count limit. The
+4 KiB protocol floor is not a ceiling: durable providers can advertise 64 KiB.
+The C/Zig callback adapter still uses its explicitly bounded 4 KiB scratch buffer. Reads validate the reply count before copying into caller storage;
 a short read need not be EOF. Zero bytes read is EOF. The existing zero-copy
 `read_chunk` remains available when the owner can consume its borrowed window.
 

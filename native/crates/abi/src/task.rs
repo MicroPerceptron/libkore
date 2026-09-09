@@ -35,6 +35,46 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::session::SlotRef;
 
+/// Which core class a task would rather run on — a **preference** the
+/// scheduler weighs, never a pin.
+///
+/// An I/O-bound service whose threads spend their time parked on a
+/// completion (a filesystem worker, a block driver, a swap device) does
+/// its useful work in a few microseconds between parks and gains nothing
+/// from a performance core; leaving those cores to the tasks that saturate
+/// them is the whole system's latency.  Declared once by the service
+/// ([`SystemService::CORE_PREFERENCE`]), cited by the founding manifest,
+/// and applied at every placement as an attenuation on the non-preferred
+/// class — so a preferred core that is far busier still loses.
+///
+/// `Any` is the default and the only value a homogeneous machine ever
+/// distinguishes; a preference for a class the machine lacks is inert.
+///
+/// [`SystemService::CORE_PREFERENCE`]: ../../kore_rt/service/trait.SystemService.html#associatedconstant.CORE_PREFERENCE
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CorePreference {
+    /// No preference: every class scores on load and locality alone.
+    #[default]
+    Any = 0,
+    /// Prefer efficiency cores (Intel E-core, ARM LITTLE).
+    Efficient = 1,
+    /// Prefer performance cores.
+    Performance = 2,
+}
+
+impl CorePreference {
+    /// Decode a stored byte; unknown values read as `Any`, never as a
+    /// preference the caller did not declare.
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Efficient,
+            2 => Self::Performance,
+            _ => Self::Any,
+        }
+    }
+}
+
 /// Well-known startup-handle roles — a task discovers its delegated caps by
 /// role. Values at or above [`USER_BASE`](role::USER_BASE) are caller-assigned.
 pub mod role {

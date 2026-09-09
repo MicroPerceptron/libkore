@@ -10,6 +10,7 @@ publish = false
 # generic over it. Production userland, kernel-internal first-light, and
 # cfg(test) hardware doubles are distinct compositions over that seam.
 [dependencies]
+virtio-accel-core = { version = "=0.3.7", default-features = false, optional = true }
 kore-abi = { path = "../abi" }
 # Bitflag sets for the device-MMU common layer's neutral permission/attribute
 # types (`common::flags`) — the same crate + major line kore-abi already uses,
@@ -34,6 +35,8 @@ crc = { version = "3.4.0", default-features = false }
 bytemuck = { version = "1.25.2", default-features = false }
 
 [features]
+# Native launch and health hooks over the allocation-free upstream lifecycle.
+accel = ["dep:virtio-accel-core"]
 # Userland posture: size the cookie table exactly to the negotiated ring
 # depth through the global allocator (which in kore-rt IS the mm-backed heap).
 # Off (the kernel boot-test): a fixed inline ceiling, heapless.

@@ -379,6 +379,16 @@ pub enum FsResponse {
     Granted {
         grant: GrantId,
     },
+    /// The data window is attached, and this is the largest byte count one
+    /// bulk verb may move through it: the backend's own per-request limit
+    /// (64 KiB on the durable block provider, the protocol floor on RAM),
+    /// folded to the smaller across regions.  A client sizes its chunks from
+    /// this rather than from [`bounds::MAX_TRANSFER`](crate::bounds::MAX_TRANSFER),
+    /// which stays the floor every backend admits.  Zero means the service
+    /// did not say; the floor applies.
+    WindowAttached {
+        max_transfer: u32,
+    },
     /// The operation succeeded and has nothing to report.
     Done,
     VersionLent {

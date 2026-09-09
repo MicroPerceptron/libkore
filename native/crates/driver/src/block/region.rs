@@ -155,6 +155,14 @@ impl<D: DirectBlockDevice> DirectBlockDevice for RegionDevice<D> {
         self.device.liveness()
     }
 
+    // Nor about what time it is: the clock is the backend's, and a clamp
+    // that swallowed it would turn a timed channel into an unmeasured one
+    // (`status fs` read "backend publishes no clock" on metal for exactly
+    // this reason — dagfs narrows its lane onto the designated extent).
+    fn clock_ns(&self) -> Option<u64> {
+        self.device.clock_ns()
+    }
+
     fn submit(
         &mut self,
         command: DeviceCommand,
@@ -230,6 +238,27 @@ mod tests {
 
     fn device() -> Device {
         Device::new(512, 8).unwrap()
+    }
+
+    /// The clamp forwards the backend's clock, so a channel over a narrowed
+    /// region still books latency — the shape dagfs runs on metal.
+    #[test]
+    fn a_narrowed_region_still_times_completions() {
+        let mut backend = device();
+        backend.set_clock(500, 2_000);
+        let region = RegionDevice::whole(backend)
+            .unwrap()
+            .narrow(2, 4)
+            .map_err(|(_, error)| error)
+            .unwrap();
+        assert_eq!(region.clock_ns(), Some(500));
+        let mut channel: BlockChannel<_, 2, 4> =
+            BlockChannel::new(region, CompletionMode::Poll).unwrap();
+        let id = channel.submit_flush().unwrap();
+        assert_eq!(channel.poll().unwrap().request, id);
+        let books = channel.stats().latency;
+        assert_eq!((books.samples, books.sum_ns, books.max_ns), (1, 2_000, 2_000));
+        assert!(books.snapshot(channel.stats().max_outstanding).measured());
     }
 
     #[test]

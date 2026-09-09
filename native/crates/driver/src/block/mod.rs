@@ -18,6 +18,8 @@
 
 use core::{cell::Cell, marker::PhantomData};
 
+use kore_abi::monitor::FilesystemLatencySnapshot;
+
 pub mod memory;
 pub mod region;
 pub mod shared;
@@ -41,6 +43,11 @@ pub struct BlockIoHints {
     pub optimal_write_blocks: u32,
     /// Optimal I/O boundary in logical blocks (0 = unspecified).
     pub optimal_boundary_blocks: u32,
+    /// Every logical block size the device could be formatted to, as a
+    /// mask: bit `k` = `512 << k` bytes (0 = unknown).  Descriptive only —
+    /// changing the format is a destructive operator action, never a
+    /// hint the channel acts on.
+    pub supported_block_sizes: u32,
 }
 
 impl BlockIoHints {
@@ -49,6 +56,7 @@ impl BlockIoHints {
         write_alignment_blocks: 0,
         optimal_write_blocks: 0,
         optimal_boundary_blocks: 0,
+        supported_block_sizes: 0,
     };
 }
 
@@ -247,6 +255,75 @@ pub struct ChannelStats {
     pub max_outstanding: u16,
     pub registered_bytes: usize,
     pub peak_registered_bytes: usize,
+    /// Completion latency at the depth the channel drove — measured only
+    /// when the backend publishes a clock ([`DirectBlockDevice::clock_ns`]).
+    pub latency: LatencyBooks,
+}
+
+/// Completion-latency books: a base-2 histogram over nanoseconds plus the
+/// moments that turn it into "how fast is this device at the depth we
+/// drive it" — the channel-side twin of
+/// `kore_abi::monitor::FilesystemLatencySnapshot`, whose bucket geometry
+/// this shares so the two never disagree about what a bucket means.
+///
+/// Every field saturates: a pinned bucket says "many", never a wrong
+/// number.  Zero `samples` is the unmeasured posture — a backend with no
+/// clock records nothing rather than guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LatencyBooks {
+    /// Completions whose latency was measured.
+    pub samples: u64,
+    /// Sum of measured latencies, nanoseconds.
+    pub sum_ns: u64,
+    /// Slowest measured completion, nanoseconds.
+    pub max_ns: u64,
+    /// Sum over samples of the commands already in flight when each was
+    /// submitted — `depth_sum / samples` is the mean queue depth the
+    /// latencies were measured at.
+    pub depth_sum: u64,
+    /// `buckets[i]` counts latencies below the bucket's upper bound; the
+    /// last bucket is open-ended.  Geometry:
+    /// [`FilesystemLatencySnapshot::bucket_index`].
+    pub buckets: [u32; FilesystemLatencySnapshot::BUCKETS],
+}
+
+impl Default for LatencyBooks {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl LatencyBooks {
+    pub const EMPTY: Self = Self {
+        samples: 0,
+        sum_ns: 0,
+        max_ns: 0,
+        depth_sum: 0,
+        buckets: [0; FilesystemLatencySnapshot::BUCKETS],
+    };
+
+    /// Book one completion that took `latency_ns`, submitted while `depth`
+    /// other commands were already in flight.
+    pub fn record(&mut self, latency_ns: u64, depth: u16) {
+        self.samples = self.samples.saturating_add(1);
+        self.sum_ns = self.sum_ns.saturating_add(latency_ns);
+        self.max_ns = self.max_ns.max(latency_ns);
+        self.depth_sum = self.depth_sum.saturating_add(u64::from(depth));
+        let bucket = &mut self.buckets[FilesystemLatencySnapshot::bucket_index(latency_ns)];
+        *bucket = bucket.saturating_add(1);
+    }
+
+    /// The wire form, with the channel's deepest queue beside it.
+    pub fn snapshot(&self, max_outstanding: u16) -> FilesystemLatencySnapshot {
+        FilesystemLatencySnapshot::new(
+            max_outstanding,
+            self.samples,
+            self.sum_ns,
+            self.max_ns,
+            self.depth_sum,
+            self.buckets,
+        )
+    }
 }
 
 /// A DMA-suitable registered buffer, abstract above the device boundary.
@@ -420,6 +497,20 @@ pub trait DirectBlockDevice {
         Liveness::Unknown
     }
 
+    /// A monotonic clock reading in nanoseconds, if this backend's task can
+    /// read one — what the channel stamps each submission with so a
+    /// completion can be timed ([`ChannelStats::latency`]).
+    ///
+    /// The default is `None`: a backend that cannot read a clock measures
+    /// nothing rather than fabricating a sample, and the books stay at the
+    /// unmeasured posture.  A founded backend answers from the
+    /// founder-published clock page (`kore_rt::clock::uptime`); a test
+    /// backend answers from a value the test sets.  Must not block or
+    /// allocate — it runs on the submit and completion paths.
+    fn clock_ns(&self) -> Option<u64> {
+        None
+    }
+
     /// Sample physical-device health on the infrequent control plane.
     /// Backends without a health protocol report `Unsupported`; callers must
     /// keep geometry/status available rather than fabricate a healthy sample.
@@ -508,6 +599,11 @@ struct Pending {
     id: RequestId,
     buffer: Option<BufferId>,
     cancelled: bool,
+    /// The backend's clock at submission, when it had one — the latency
+    /// sample's start.
+    submitted_ns: Option<u64>,
+    /// Commands already in flight when this one was submitted.
+    depth: u16,
 }
 
 struct Registered<B> {
@@ -850,6 +946,13 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
         };
         let pending = self.pending[slot].take().expect("located pending request");
         self.stats.completions = self.stats.completions.saturating_add(1);
+        // A sample needs both ends read off the same clock; a backend that
+        // answered at submit but not now (or the reverse) books nothing.
+        if let (Some(start), Some(now)) = (pending.submitted_ns, self.device.clock_ns()) {
+            self.stats
+                .latency
+                .record(now.saturating_sub(start), pending.depth);
+        }
         let finish = if let Some(buffer) = pending.buffer {
             match self.buffer_slot(buffer) {
                 Ok(buffer_slot) => self
@@ -1087,10 +1190,15 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
             }
             return Err(error);
         }
+        // Depth is what was in flight *before* this command — the queue it
+        // will wait behind — read before the slot is filled.
+        let depth = self.outstanding() as u16;
         self.pending[request_slot] = Some(Pending {
             id,
             buffer,
             cancelled: false,
+            submitted_ns: self.device.clock_ns(),
+            depth,
         });
         self.stats.submissions = self.stats.submissions.saturating_add(1);
         self.stats.max_outstanding = self.stats.max_outstanding.max(self.outstanding() as u16);

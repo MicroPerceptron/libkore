@@ -486,6 +486,16 @@ impl<'a, D: DirectBlockDevice, const LANES: usize, const INFLIGHT: usize> Direct
         }
     }
 
+    /// The shared backend's clock.  A momentarily borrowed book reads as
+    /// "no clock" — that costs one unmeasured sample, never a wrong one.
+    fn clock_ns(&self) -> Option<u64> {
+        self.core
+            .inner
+            .try_borrow()
+            .ok()
+            .and_then(|inner| inner.device.clock_ns())
+    }
+
     fn submit(
         &mut self,
         command: DeviceCommand,

@@ -2416,6 +2416,8 @@ pub enum PowerTransition {
     /// transition is non-terminal: a wake interrupt resumes the existing
     /// machine and its userland tasks.
     SuspendToIdle = 2,
+    /// Service-selected lid policy: hold until the observed lid opens.
+    SuspendWhileLidClosed = 3,
 }
 
 /// Argument payload for a **system power** derive (`Derive × SystemPower`,
@@ -2521,6 +2523,104 @@ pub enum SystemMetric {
     ProcessorCache = 15,
     /// Per-CPU cumulative busy time and static frequency envelope.
     ProcessorRuntime = 16,
+    /// Portable suspend status encoded as SleepStatus::to_observation().
+    /// Snapshot only: this does not authorize a transition.
+    Sleep = 17,
+    /// Last lid level and close-edge generation; see LidSnapshot.
+    Lid = 18,
+}
+
+/// Read-only lid mechanism data. Generation advances only on a runtime close
+/// edge; a machine discovered with its lid closed starts at generation zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LidSnapshot {
+    pub closed: Option<bool>,
+    pub generation: u32,
+}
+
+impl LidSnapshot {
+    pub const fn to_observation(self) -> (u64, u64) {
+        (match self.closed { None => 0, Some(false) => 1, Some(true) => 2 }, self.generation as u64)
+    }
+
+    pub fn from_observation(value: u64, aux: u64) -> Option<Self> {
+        let closed = match value { 0 => None, 1 => Some(false), 2 => Some(true), _ => return None };
+        let generation = u32::try_from(aux).ok()?;
+        if closed.is_none() && generation != 0 { return None; }
+        Some(Self { closed, generation })
+    }
+}
+
+/// End-to-end suspend availability, including scheduler, clock and wake route.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, KnownLayout, Immutable, Unaligned)]
+pub enum SleepSupport {
+    Unsupported = 0,
+    Unavailable = 1,
+    Ready = 2,
+}
+
+/// Latest machine-wide attempt. Accepted is admission, not completed sleep.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, KnownLayout, Immutable, Unaligned)]
+pub enum SleepPhase {
+    Idle = 0,
+    Accepted = 1,
+    Preparing = 2,
+    Quiesced = 3,
+    Resumed = 4,
+    Aborted = 5,
+    Failed = 6,
+    /// Scheduler is live; the display owner must still restore panel control.
+    Restoring = 7,
+}
+
+/// Latest attempt's result; no claim of device retention or deep residency.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, KnownLayout, Immutable, Unaligned)]
+pub enum SleepFailure {
+    None = 0,
+    Busy = 1,
+    Unsupported = 2,
+    Park = 3,
+    Resume = 4,
+    Mechanism = 5,
+    /// Display preparation or exact restoration did not complete.
+    Display = 6,
+}
+
+/// Portable status data. Snapshot of the latest attempt, not a completion
+/// ticket for a particular caller. Hardware residency is deliberately absent.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, KnownLayout, Immutable, Unaligned)]
+pub struct SleepStatus {
+    pub support: SleepSupport,
+    pub phase: SleepPhase,
+    pub failure: SleepFailure,
+}
+
+impl SleepStatus {
+    pub const fn encode(self) -> [u8; 3] {
+        [self.support as u8, self.phase as u8, self.failure as u8]
+    }
+
+    pub fn decode(bytes: [u8; 3]) -> Option<Self> {
+        Self::try_read_from_bytes(&bytes).ok()
+    }
+
+    pub const fn to_observation(self) -> (u64, u64) {
+        (
+            self.support as u64 | (self.phase as u64) << 8 | (self.failure as u64) << 16,
+            0,
+        )
+    }
+
+    pub fn from_observation(value: u64, aux: u64) -> Option<Self> {
+        if value >> 24 != 0 || aux != 0 {
+            return None;
+        }
+        Self::decode([value as u8, (value >> 8) as u8, (value >> 16) as u8])
+    }
 }
 
 /// Argument for [`DERIVE_KIND_SYSTEM_OBSERVE`].
@@ -4201,7 +4301,7 @@ mod tests {
     }
 
     /// The power-transition ABI is append-only and exact: terminal values keep
-    /// their frozen encodings, suspend-to-idle takes value 2, and the next byte
+    /// their frozen encodings, the two reversible modes take 2/3, and the next byte
     /// remains invalid rather than being guessed as a transition.
     #[test]
     fn power_transition_vocabulary_is_exact_and_fail_closed() {
@@ -4211,6 +4311,7 @@ mod tests {
             (0, PowerTransition::PowerOff),
             (1, PowerTransition::Reboot),
             (2, PowerTransition::SuspendToIdle),
+            (3, PowerTransition::SuspendWhileLidClosed),
         ] {
             let bytes = [raw, 0, 0, 0, 0, 0, 0, 0];
             let (req, rest) = PowerReq::try_ref_from_prefix(&bytes[..])
@@ -4220,7 +4321,7 @@ mod tests {
         }
 
         assert!(
-            PowerReq::try_ref_from_prefix(&[3, 0, 0, 0, 0, 0, 0, 0][..]).is_err(),
+            PowerReq::try_ref_from_prefix(&[4, 0, 0, 0, 0, 0, 0, 0][..]).is_err(),
             "the next unregistered transition must fail closed"
         );
         assert_eq!(core::mem::size_of::<PowerReq>(), PowerReq::WIRE);

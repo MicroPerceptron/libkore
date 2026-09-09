@@ -64,7 +64,7 @@ use kore_abi::cap::{ResourceKind, Rights};
 use kore_abi::device::DeviceSpecies;
 use kore_abi::mem::DmaClass;
 use kore_abi::session::SlotRef;
-use kore_abi::task::{Bootstrap, Profile};
+use kore_abi::task::{Bootstrap, CorePreference, Profile};
 
 /// One declared worker thread of a service ([`SystemService::WORKERS`]).
 ///
@@ -309,6 +309,17 @@ pub trait SystemService: crate::svc::SvcProtocol + Sized {
     /// class against its selector at build time.  A row with a DMA-capable
     /// selector and no class is a build error.
     const DEVICE_CLASSES: &'static [DeviceClass] = &[];
+
+    /// **Which core class this service's threads would rather run on** — a
+    /// scheduler preference, never a pin ([`CorePreference`]).
+    ///
+    /// An I/O-bound service (a filesystem worker, a block or swap driver)
+    /// parks on completions for most of its life and does its work in a few
+    /// microseconds between parks; declaring `Efficient` keeps it off the
+    /// performance cores the compute-bound tasks need, and costs it nothing
+    /// a completion wait would notice.  Cited by the manifest generator per
+    /// row, like [`DEVICES`](Self::DEVICES); inert on a homogeneous machine.
+    const CORE_PREFERENCE: CorePreference = CorePreference::Any;
 
     /// **The service's worker threads** — declared, not hand-spawned.
     ///

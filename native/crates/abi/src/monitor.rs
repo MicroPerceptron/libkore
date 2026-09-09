@@ -354,7 +354,22 @@ impl FilesystemStorageSnapshot {
     const READ_ONLY: u32 = 1 << 1;
     const FLUSH: u32 = 1 << 2;
     const DISCARD: u32 = 1 << 3;
-    const KNOWN_FLAGS: u32 = Self::AVAILABLE | Self::READ_ONLY | Self::FLUSH | Self::DISCARD;
+    /// Bits 8..16: every logical block size the device could be formatted
+    /// to, bit `8 + k` = `512 << k` bytes.  Zero = unknown.
+    const FORMATS_SHIFT: u32 = 8;
+    const FORMATS_MASK: u32 = 0xff << Self::FORMATS_SHIFT;
+    /// Bits 16..21: `log2` of the device's preferred write granularity in
+    /// bytes, zero = unspecified.  Bits 21..26: the same for its optimal
+    /// write size.  Packed into the flag word because the launch page that
+    /// carries this record has no byte to spare (`process.rs`).
+    const PREFERRED_SHIFT: u32 = 16;
+    const OPTIMAL_SHIFT: u32 = 21;
+    const LOG2_MASK: u32 = 0x1f;
+    const LAYOUT_MASK: u32 = Self::FORMATS_MASK
+        | (Self::LOG2_MASK << Self::PREFERRED_SHIFT)
+        | (Self::LOG2_MASK << Self::OPTIMAL_SHIFT);
+    const KNOWN_FLAGS: u32 =
+        Self::AVAILABLE | Self::READ_ONLY | Self::FLUSH | Self::DISCARD | Self::LAYOUT_MASK;
 
     pub const EMPTY: Self = Self {
         flags: U32::new(0),
@@ -402,6 +417,56 @@ impl FilesystemStorageSnapshot {
     pub const fn with_health(mut self, health: FilesystemHealthSnapshot) -> Self {
         self.health = health;
         self
+    }
+
+    /// Attach the device's layout facts: the block sizes it could be
+    /// formatted to (bit `k` = `512 << k`), and its preferred and optimal
+    /// write sizes in bytes (zero = unspecified).  A size that is not a
+    /// power of two in `[2, 2^31]` is recorded as unspecified rather than
+    /// rounded.
+    pub const fn with_layout(
+        mut self,
+        supported_block_sizes: u32,
+        preferred_write_bytes: u64,
+        optimal_write_bytes: u64,
+    ) -> Self {
+        const fn log2_field(bytes: u64) -> u32 {
+            if bytes >= 2 && bytes.is_power_of_two() && bytes <= (1 << 31) {
+                bytes.trailing_zeros()
+            } else {
+                0
+            }
+        }
+        let mut flags = self.flags.get() & !Self::LAYOUT_MASK;
+        flags |= (supported_block_sizes & 0xff) << Self::FORMATS_SHIFT;
+        flags |= log2_field(preferred_write_bytes) << Self::PREFERRED_SHIFT;
+        flags |= log2_field(optimal_write_bytes) << Self::OPTIMAL_SHIFT;
+        self.flags = U32::new(flags);
+        self
+    }
+
+    /// Copy another record's layout facts — the router's fold, where two
+    /// regions share one physical namespace.
+    pub const fn with_layout_of(mut self, other: Self) -> Self {
+        let flags = (self.flags.get() & !Self::LAYOUT_MASK) | (other.flags.get() & Self::LAYOUT_MASK);
+        self.flags = U32::new(flags);
+        self
+    }
+
+    /// Every block size the device could be formatted to, as a mask: bit
+    /// `k` = `512 << k` bytes.  Zero = the device did not say.
+    pub fn supported_block_sizes(self) -> u32 {
+        (self.flags.get() & Self::FORMATS_MASK) >> Self::FORMATS_SHIFT
+    }
+    /// The device's preferred write granularity in bytes, if it stated one.
+    pub fn preferred_write_bytes(self) -> Option<u64> {
+        let log2 = (self.flags.get() >> Self::PREFERRED_SHIFT) & Self::LOG2_MASK;
+        (log2 != 0).then(|| 1u64 << log2)
+    }
+    /// The device's optimal write size in bytes, if it stated one.
+    pub fn optimal_write_bytes(self) -> Option<u64> {
+        let log2 = (self.flags.get() >> Self::OPTIMAL_SHIFT) & Self::LOG2_MASK;
+        (log2 != 0).then(|| 1u64 << log2)
     }
 
     pub fn available(self) -> bool {
@@ -460,6 +525,197 @@ impl Default for FilesystemStorageSnapshot {
     }
 }
 
+/// Block-channel completion latency and queue depth, as the channel that
+/// submitted the commands measured them — a base-4 histogram over
+/// nanoseconds plus the moments a reader needs to turn it into "how fast is
+/// this disk at the depth we drive it".
+///
+/// The first measurement `res/RESIDENCY.md` §8 asks for is NVMe read latency
+/// **at queue depth**, not at depth 1: `depth_sum / samples` is the mean
+/// number of commands in flight when each sampled command was submitted, so
+/// the latency figures beside it are already "at depth".  Every field is a
+/// saturating count; a bucket that pins at `u32::MAX` says "many", never a
+/// wrong number.  Zero samples is the unmeasured posture — a channel whose
+/// backend publishes no clock records nothing rather than guessing.
+///
+/// This record rides the filesystem status wire (`FsSystemStatusWire`).  It
+/// does **not** ride the launch page: the page's frozen header has 21 bytes
+/// of headroom under the widest bounded reply, so the page carries only the
+/// derived moments ([`FilesystemSnapshot::latency_mean_ns`] and kin) and the
+/// histogram waits for a launcher that can hand `status fs` the whole wire.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct FilesystemLatencySnapshot {
+    /// Deepest the channel's pending table ever got — the queue depth the
+    /// device was actually driven at.  A channel's table is bounded far
+    /// below this width.
+    max_outstanding: U16,
+    /// `buckets[i]` counts completions with latency below
+    /// [`bucket_upper_ns(i)`](Self::bucket_upper_ns) and at or above the
+    /// previous bound; the last bucket is open-ended.
+    buckets: [U32; Self::BUCKETS],
+    /// Completions whose latency was measured.
+    samples: U64,
+    /// Sum of measured latencies, nanoseconds.
+    sum_ns: U64,
+    /// Slowest measured completion, nanoseconds.
+    max_ns: U64,
+    /// Sum over samples of the commands in flight when each was submitted.
+    depth_sum: U64,
+}
+
+impl FilesystemLatencySnapshot {
+    /// Histogram width.  Eight base-4 buckets from 2 µs to 8 ms cover a
+    /// healthy NVMe command (single-digit µs) through a controller stalled
+    /// in garbage collection, with the open last bucket for anything worse.
+    pub const BUCKETS: usize = 8;
+    /// `log2` of the first bucket's upper bound in nanoseconds (`2^11` =
+    /// 2048 ns).  Chosen so the fastest bucket still separates a ~2 µs NVMe
+    /// read from the 8 µs bucket above it.
+    pub const FIRST_UPPER_LOG2_NS: u32 = 11;
+    /// `log2` of the ratio between neighbouring bucket bounds (base 4).
+    pub const STEP_LOG2: u32 = 2;
+
+    pub const EMPTY: Self = Self {
+        max_outstanding: U16::new(0),
+        buckets: [U32::new(0); Self::BUCKETS],
+        samples: U64::new(0),
+        sum_ns: U64::new(0),
+        max_ns: U64::new(0),
+        depth_sum: U64::new(0),
+    };
+
+    pub const fn new(
+        max_outstanding: u16,
+        samples: u64,
+        sum_ns: u64,
+        max_ns: u64,
+        depth_sum: u64,
+        buckets: [u32; Self::BUCKETS],
+    ) -> Self {
+        let mut wire = [U32::new(0); Self::BUCKETS];
+        let mut i = 0;
+        while i < Self::BUCKETS {
+            wire[i] = U32::new(buckets[i]);
+            i += 1;
+        }
+        Self {
+            max_outstanding: U16::new(max_outstanding),
+            buckets: wire,
+            samples: U64::new(samples),
+            sum_ns: U64::new(sum_ns),
+            max_ns: U64::new(max_ns),
+            depth_sum: U64::new(depth_sum),
+        }
+    }
+
+    /// The bucket a latency of `ns` lands in.
+    pub const fn bucket_index(ns: u64) -> usize {
+        if ns < (1u64 << Self::FIRST_UPPER_LOG2_NS) {
+            return 0;
+        }
+        let index = ((ns.ilog2() - Self::FIRST_UPPER_LOG2_NS) / Self::STEP_LOG2 + 1) as usize;
+        if index >= Self::BUCKETS {
+            Self::BUCKETS - 1
+        } else {
+            index
+        }
+    }
+
+    /// The exclusive upper bound of bucket `index`, nanoseconds — `None` for
+    /// the open last bucket (and for an index past the histogram).
+    pub const fn bucket_upper_ns(index: usize) -> Option<u64> {
+        if index + 1 >= Self::BUCKETS {
+            None
+        } else {
+            Some(1u64 << (Self::FIRST_UPPER_LOG2_NS + Self::STEP_LOG2 * index as u32))
+        }
+    }
+
+    /// Fold the sum of two histograms — the router's per-region fold.
+    /// Depth takes the maximum (one shared controller queue, two logical
+    /// regions); every other figure adds, saturating.
+    pub fn folded_with(self, other: Self) -> Self {
+        let mut buckets = [0u32; Self::BUCKETS];
+        for (i, slot) in buckets.iter_mut().enumerate() {
+            *slot = self.buckets[i].get().saturating_add(other.buckets[i].get());
+        }
+        Self::new(
+            self.max_outstanding.get().max(other.max_outstanding.get()),
+            self.samples.get().saturating_add(other.samples.get()),
+            self.sum_ns.get().saturating_add(other.sum_ns.get()),
+            self.max_ns.get().max(other.max_ns.get()),
+            self.depth_sum.get().saturating_add(other.depth_sum.get()),
+            buckets,
+        )
+    }
+
+    /// Whether anything was measured.
+    pub fn measured(self) -> bool {
+        self.samples.get() != 0
+    }
+    pub fn max_outstanding(self) -> u16 {
+        self.max_outstanding.get()
+    }
+    pub fn samples(self) -> u64 {
+        self.samples.get()
+    }
+    pub fn sum_ns(self) -> u64 {
+        self.sum_ns.get()
+    }
+    pub fn max_ns(self) -> u64 {
+        self.max_ns.get()
+    }
+    pub fn depth_sum(self) -> u64 {
+        self.depth_sum.get()
+    }
+    pub fn bucket(self, index: usize) -> u32 {
+        self.buckets.get(index).map_or(0, |b| b.get())
+    }
+    /// Mean latency, nanoseconds — `None` unmeasured.
+    pub fn mean_ns(self) -> Option<u64> {
+        let samples = self.samples.get();
+        (samples != 0).then(|| self.sum_ns.get() / samples)
+    }
+    /// Mean in-flight depth at submission, in thousandths — `None` unmeasured.
+    pub fn mean_depth_milli(self) -> Option<u64> {
+        let samples = self.samples.get();
+        (samples != 0).then(|| self.depth_sum.get().saturating_mul(1000) / samples)
+    }
+    /// The exclusive upper bound, nanoseconds, of the bucket that holds the
+    /// `permille`-th percentile sample — `Some(bound)` when that bucket is
+    /// closed, `None` when nothing was measured or the percentile falls in
+    /// the open last bucket ("worse than the histogram resolves").
+    pub fn percentile_upper_ns(self, permille: u64) -> Option<u64> {
+        let samples = self.samples.get();
+        if samples == 0 {
+            return None;
+        }
+        // The rank of the percentile sample, 1-based, rounding up so the
+        // 100th percentile is the last sample and the 0th is the first.
+        let rank = samples
+            .saturating_mul(permille.min(1000))
+            .div_ceil(1000)
+            .max(1);
+        let mut seen = 0u64;
+        for index in 0..Self::BUCKETS {
+            seen = seen.saturating_add(u64::from(self.buckets[index].get()));
+            if seen >= rank {
+                return Self::bucket_upper_ns(index);
+            }
+        }
+        None
+    }
+}
+
+impl Default for FilesystemLatencySnapshot {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// Filesystem-service posture and load, as the launcher captured it.
 ///
 /// Aggregates only: no name, path, scope, or per-session figure — the record
@@ -497,6 +753,29 @@ pub struct FilesystemSnapshot {
     slow_waits: U64,
     leaked_placements: U64,
     abandoned_reclaims: U64,
+    // ── ABI 10: the completion-latency moments, derived by the launcher
+    // from the status wire, in the 20 bytes the launch page's header has
+    // left under its widest bounded reply.  Every word saturates.  The
+    // histogram and the channel census stay on the wire.
+    /// Completions whose latency was measured (saturating).
+    latency_samples: U32,
+    /// Mean completion latency, nanoseconds (saturating at ~4.29 s).
+    latency_mean_ns: U32,
+    /// Slowest measured completion, nanoseconds (saturating at ~4.29 s).
+    latency_max_ns: U32,
+    /// Mean commands in flight at submission, in thousandths (saturating).
+    mean_depth_milli: U16,
+    /// Deepest the channel's pending table ever got.
+    max_outstanding: U16,
+    /// Commands submitted and not yet completed at capture (saturating).
+    in_flight: U16,
+    // ── ABI 11: the read-ahead hit share, in the one word ABI 10 held in
+    // reserve.  The counts themselves ride the wire.
+    /// Payload reads served from the provider's held read-ahead window, per
+    /// thousand payload reads that reached the provider, stored plus one so
+    /// that zero — the page's "nothing published" value — means no payload
+    /// read has been served yet.
+    readahead_share: U16,
 }
 
 impl FilesystemSnapshot {
@@ -556,8 +835,20 @@ impl FilesystemSnapshot {
         slow_waits: U64::new(0),
         leaked_placements: U64::new(0),
         abandoned_reclaims: U64::new(0),
+        latency_samples: U32::new(0),
+        latency_mean_ns: U32::new(0),
+        latency_max_ns: U32::new(0),
+        mean_depth_milli: U16::new(0),
+        max_outstanding: U16::new(0),
+        in_flight: U16::new(0),
+        readahead_share: U16::new(0),
     };
 
+    /// `io` = reads, writes, flushes, rollbacks, late; `pacing` = parks,
+    /// fires, spins; `pressure` = expired, slow, leaked, abandoned;
+    /// `latency` = the wire histogram, of which the page keeps the derived
+    /// moments; `in_flight` = submissions − completions at capture;
+    /// `readahead` = window hits, window-filling device reads.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         posture: u16,
@@ -576,7 +867,32 @@ impl FilesystemSnapshot {
         io: [u64; 5],
         pacing: [u64; 3],
         pressure: [u64; 4],
+        latency: FilesystemLatencySnapshot,
+        in_flight: u64,
+        readahead: [u64; 2],
     ) -> Self {
+        const fn narrow32(value: u64) -> U32 {
+            U32::new(if value > u32::MAX as u64 { u32::MAX } else { value as u32 })
+        }
+        const fn narrow16(value: u64) -> U16 {
+            U16::new(if value > u16::MAX as u64 { u16::MAX } else { value as u16 })
+        }
+        let served = readahead[0].saturating_add(readahead[1]);
+        let readahead_share = if served == 0 {
+            0
+        } else {
+            // hits ≤ served, so the quotient is at most 1000.
+            (readahead[0].saturating_mul(1000) / served) as u16 + 1
+        };
+        let samples = latency.samples.get();
+        let (mean_ns, mean_depth_milli) = if samples == 0 {
+            (0, 0)
+        } else {
+            (
+                latency.sum_ns.get() / samples,
+                latency.depth_sum.get().saturating_mul(1000) / samples,
+            )
+        };
         Self {
             flags: U16::new(AVAILABLE_U16),
             posture: U16::new(posture),
@@ -604,6 +920,13 @@ impl FilesystemSnapshot {
             slow_waits: U64::new(pressure[1]),
             leaked_placements: U64::new(pressure[2]),
             abandoned_reclaims: U64::new(pressure[3]),
+            latency_samples: narrow32(samples),
+            latency_mean_ns: narrow32(mean_ns),
+            latency_max_ns: narrow32(latency.max_ns.get()),
+            mean_depth_milli: narrow16(mean_depth_milli),
+            max_outstanding: latency.max_outstanding,
+            in_flight: narrow16(in_flight),
+            readahead_share: U16::new(readahead_share),
         }
     }
 
@@ -611,10 +934,11 @@ impl FilesystemSnapshot {
         self.flags.get() == AVAILABLE_U16
     }
     pub fn validate(self) -> bool {
-        self == Self::EMPTY
-            || (self.available()
-                && self.storage.validate()
-                && self.durable() == self.storage.available())
+        self.readahead_share.get() <= 1001
+            && (self == Self::EMPTY
+                || (self.available()
+                    && self.storage.validate()
+                    && self.durable() == self.storage.available()))
     }
     pub fn durable(self) -> bool {
         self.posture.get() & Self::DURABLE != 0
@@ -712,6 +1036,41 @@ impl FilesystemSnapshot {
     /// Namespace reclaim walks abandoned after a structural or contention bound.
     pub fn abandoned_reclaims(self) -> u64 {
         self.abandoned_reclaims.get()
+    }
+    /// Whether any completion latency was measured (the backend published
+    /// a clock).
+    pub fn latency_measured(self) -> bool {
+        self.latency_samples.get() != 0
+    }
+    pub fn latency_samples(self) -> u32 {
+        self.latency_samples.get()
+    }
+    /// Mean completion latency, nanoseconds — `None` unmeasured.
+    pub fn latency_mean_ns(self) -> Option<u32> {
+        self.latency_measured().then(|| self.latency_mean_ns.get())
+    }
+    /// Slowest measured completion, nanoseconds.
+    pub fn latency_max_ns(self) -> u32 {
+        self.latency_max_ns.get()
+    }
+    /// Mean commands in flight at submission, in thousandths — `None`
+    /// unmeasured.  The depth the latency figures were measured at.
+    pub fn mean_depth_milli(self) -> Option<u16> {
+        self.latency_measured().then(|| self.mean_depth_milli.get())
+    }
+    /// Deepest the channel's pending table ever got.
+    pub fn max_outstanding(self) -> u16 {
+        self.max_outstanding.get()
+    }
+    /// Commands in flight when the snapshot was taken.
+    pub fn in_flight(self) -> u16 {
+        self.in_flight.get()
+    }
+    /// Share of payload reads the provider answered from its held
+    /// read-ahead window, per thousand — `None` until a payload read has
+    /// been served.
+    pub fn readahead_permille(self) -> Option<u16> {
+        self.readahead_share.get().checked_sub(1)
     }
 }
 
@@ -1064,7 +1423,10 @@ const _: () = {
     assert!(core::mem::size_of::<MemorySnapshot>() == 64);
     assert!(core::mem::size_of::<FilesystemHealthSnapshot>() == 40);
     assert!(core::mem::size_of::<FilesystemStorageSnapshot>() == 80);
-    assert!(core::mem::size_of::<FilesystemSnapshot>() == 216);
+    assert!(core::mem::size_of::<FilesystemLatencySnapshot>() == 2 + 8 * 4 + 4 * 8); // 66
+    // 216 through `abandoned_reclaims`, then three 32-bit latency moments
+    // and four 16-bit depth words.
+    assert!(core::mem::size_of::<FilesystemSnapshot>() == 216 + 3 * 4 + 4 * 2); // 236
     // 16-byte link head (2 reserved) ‖ 24-byte counters ‖ 36-byte radio block.
     assert!(core::mem::size_of::<NetSnapshot>() == 76);
     assert!(core::mem::size_of::<ManifoldSnapshot>() == 40);
@@ -1123,6 +1485,85 @@ mod tests {
         let live = NetSnapshot::new(Some(facts), None);
         assert!(live.validate());
         assert_eq!(live.counters(), facts.counters, "the counters ride the link facts");
+    }
+
+    #[test]
+    fn storage_layout_facts_pack_into_the_flag_word() {
+        let base = FilesystemStorageSnapshot::new(512, 1 << 30, 1 << 20, 0, 256 << 10, false, true, true);
+        assert_eq!(base.supported_block_sizes(), 0);
+        assert_eq!(base.preferred_write_bytes(), None);
+        let laid = base.with_layout((1 << 0) | (1 << 3), 4096, 128 << 10);
+        assert!(laid.validate());
+        assert_eq!(laid.supported_block_sizes(), 0b1001);
+        assert_eq!(laid.preferred_write_bytes(), Some(4096));
+        assert_eq!(laid.optimal_write_bytes(), Some(128 << 10));
+        assert!(laid.flush() && laid.discard() && !laid.read_only());
+        // Not a power of two, or out of range: unspecified, never rounded.
+        let odd = base.with_layout(0, 3000, 1 << 40);
+        assert_eq!(odd.preferred_write_bytes(), None);
+        assert_eq!(odd.optimal_write_bytes(), None);
+        // The fold copies layout without touching the rest.
+        let other = FilesystemStorageSnapshot::new(512, 1, 1, 1, 512, true, false, false)
+            .with_layout_of(laid);
+        assert!(other.read_only() && !other.flush());
+        assert_eq!(other.optimal_write_bytes(), Some(128 << 10));
+        assert!(other.validate());
+    }
+
+    #[test]
+    fn latency_buckets_are_base_four_from_two_microseconds() {
+        type L = FilesystemLatencySnapshot;
+        assert_eq!(L::bucket_index(0), 0);
+        assert_eq!(L::bucket_index(2_047), 0);
+        assert_eq!(L::bucket_index(2_048), 1);
+        assert_eq!(L::bucket_index(8_191), 1);
+        assert_eq!(L::bucket_index(8_192), 2);
+        assert_eq!(L::bucket_index((1 << 21) - 1), 5);
+        assert_eq!(L::bucket_index(1 << 21), 6);
+        assert_eq!(L::bucket_index(1 << 23), L::BUCKETS - 1);
+        assert_eq!(L::bucket_index(u64::MAX), L::BUCKETS - 1);
+        assert_eq!(L::bucket_upper_ns(0), Some(2_048));
+        assert_eq!(L::bucket_upper_ns(1), Some(8_192));
+        assert_eq!(L::bucket_upper_ns(6), Some(1 << 23));
+        assert_eq!(L::bucket_upper_ns(7), None);
+        assert_eq!(L::bucket_upper_ns(99), None);
+        // Every bound is the previous one times four, so the index and the
+        // bound agree on every edge.
+        for i in 0..L::BUCKETS - 1 {
+            let upper = L::bucket_upper_ns(i).unwrap();
+            assert_eq!(L::bucket_index(upper - 1), i);
+            assert_eq!(L::bucket_index(upper), i + 1);
+        }
+    }
+
+    #[test]
+    fn latency_percentiles_and_folds_read_off_the_histogram() {
+        type L = FilesystemLatencySnapshot;
+        assert_eq!(L::EMPTY.percentile_upper_ns(500), None);
+        assert_eq!(L::EMPTY.mean_ns(), None);
+        let mut buckets = [0u32; L::BUCKETS];
+        buckets[0] = 90; // < 2 µs
+        buckets[2] = 9; // < 32 µs
+        buckets[7] = 1; // open: worse than 8 ms
+        let a = L::new(4, 100, 100 * 1_500, 40_000_000, 250, buckets);
+        assert_eq!(a.percentile_upper_ns(0), Some(2_048));
+        assert_eq!(a.percentile_upper_ns(500), Some(2_048));
+        assert_eq!(a.percentile_upper_ns(900), Some(2_048));
+        assert_eq!(a.percentile_upper_ns(990), Some(32_768));
+        assert_eq!(a.percentile_upper_ns(1000), None, "the slowest sample is off the scale");
+        assert_eq!(a.mean_depth_milli(), Some(2_500));
+        // Folding two regions: depth takes the max, everything else adds,
+        // and a bucket pins rather than wrapping.
+        let mut hot = [u32::MAX; L::BUCKETS];
+        hot[3] = 1;
+        let b = L::new(7, 3, 30, 20, 9, hot);
+        let folded = a.folded_with(b);
+        assert_eq!(folded.max_outstanding(), 7);
+        assert_eq!(folded.samples(), 103);
+        assert_eq!(folded.max_ns(), 40_000_000);
+        assert_eq!(folded.bucket(0), u32::MAX);
+        assert_eq!(folded.bucket(3), 1);
+        assert!(FilesystemSnapshot::EMPTY.validate());
     }
 
     #[test]

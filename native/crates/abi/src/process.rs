@@ -418,16 +418,24 @@ const _: () = assert!(
 /// Header bytes before the argument and alternating payload arrays: 8 fixed
 /// (`abi`/`flags`/`arg_len`/`output_len`) + the embedded [`TelemetrySnapshot`]
 /// (224 — the IOMMU census plus the manifold's own state) + the launcher's
-/// [`FilesystemSnapshot`] (216, including physical storage geometry, pressure,
-/// health, and bounded reclamation outcomes) + the launcher's
-/// [`NetSnapshot`](crate::monitor::NetSnapshot) (76: the link's facts, the
-/// device's counters, and the bound radio's) + 16 reserved.
+/// [`FilesystemSnapshot`] (236, including physical storage geometry, pressure,
+/// health, bounded reclamation outcomes and the derived completion-latency
+/// moments) + the launcher's [`NetSnapshot`](crate::monitor::NetSnapshot) (76:
+/// the link's facts, the device's counters, and the bound radio's) + 16
+/// reserved.
+///
+/// The header's ceiling is the widest bounded reply any status view must
+/// fit: the maximal `status sys <first-core>` report needs 3099 output bytes
+/// (and `status input i2c` 3072), so with the 540-byte header of ABI 11 the
+/// output had 33 bytes to give.  ABI 12 takes 20 of them for the filesystem's
+/// latency moments; 13 remain, and the next byte past them costs that report
+/// a row.
 ///
 /// The page is a fixed [`PROCESS_IO_BYTES`], so this constant and
 /// [`PROCESS_OUTPUT_BYTES`] move together: every byte the header gains is a
 /// byte of command output given up, and `size_of::<ProcessIo>()` asserts the
 /// two stay in step.
-const HEADER_BYTES: usize = 540;
+const HEADER_BYTES: usize = 560;
 /// Maximum bytes a foreground command can return to its launcher.
 pub const PROCESS_OUTPUT_BYTES: usize = PROCESS_IO_BYTES - HEADER_BYTES - PROCESS_ARG_BYTES;
 /// Layout version.  Zeroed/uninitialized pages fail closed.
@@ -441,9 +449,12 @@ pub const PROCESS_OUTPUT_BYTES: usize = PROCESS_IO_BYTES - HEADER_BYTES - PROCES
 /// bounded-failure counters into the launch snapshot. `10` adds the launcher's
 /// frame-service snapshot (the link's facts and the bound radio's); `11`
 /// widens it by the device's counters, paid for out of the argument buffer
-/// again. Each change shifts the payload offset and therefore burns a
-/// version.
-pub const PROCESS_IO_ABI: u16 = 11;
+/// again. `12` carries the filesystem's derived completion-latency moments —
+/// 20 bytes of the output's remaining slack — and gives the word held in
+/// reserve beside them a meaning, the read-ahead hit share: an `11` reader
+/// would take that word for zero-or-corrupt. Each change shifts an offset or
+/// a meaning and therefore burns a version.
+pub const PROCESS_IO_ABI: u16 = 12;
 
 /// One launch-time snapshot of exec's bounded process table.
 ///
@@ -924,7 +935,10 @@ mod tests {
         // argument buffer gave back the 64 bytes it held above any launcher's
         // longest command line; the snapshot's 24-byte counters block came
         // out of the argument buffer the same way, so the output stayed put.
-        assert_eq!(PROCESS_OUTPUT_BYTES, 3132);
+        // 3132 -> 3112 is the filesystem snapshot's 20-byte completion-latency
+        // moments, leaving 13 bytes under the widest bounded report (`status
+        // sys <first-core>` at 3099; `status input i2c` needs 3072).
+        assert_eq!(PROCESS_OUTPUT_BYTES, 3112);
     }
 
     /// The two snapshots have different producers — the monitor federates
@@ -1026,6 +1040,16 @@ mod tests {
             [2, 3, 2, 0, 0],
             [9, 9, 0],
             [4, 3, 2, 1],
+            crate::monitor::FilesystemLatencySnapshot::new(
+                8, 39, 39 * 3_000, 20_000, 39 * 4, {
+                    let mut b = [0u32; crate::monitor::FilesystemLatencySnapshot::BUCKETS];
+                    b[1] = 38;
+                    b[3] = 1;
+                    b
+                },
+            ),
+            u64::from(u16::MAX) + 1,
+            [3, 1],
         );
         page.write_filesystem(fs).unwrap();
         let read = page.filesystem().unwrap();
@@ -1041,6 +1065,8 @@ mod tests {
         assert_eq!(read.storage().physical_bytes(), 1 << 30);
         assert_eq!(read.storage().health().temperature_celsius(), 36);
         assert_eq!(read.commits(), 7);
+        assert_eq!(read.readahead_permille(), Some(750));
+        assert_eq!(FilesystemSnapshot::EMPTY.readahead_permille(), None);
         assert_eq!((read.parks(), read.fires(), read.spins()), (9, 9, 0));
         assert_eq!(
             (
@@ -1051,6 +1077,15 @@ mod tests {
             ),
             (4, 3, 2, 1)
         );
+        // The census the page used to drop, and the latency histogram, ride
+        // the same publish.
+        assert_eq!(read.max_outstanding(), 8);
+        assert_eq!(read.in_flight(), u16::MAX, "a narrow counter pins, never wraps");
+        assert!(read.latency_measured());
+        assert_eq!(read.latency_samples(), 39);
+        assert_eq!(read.latency_mean_ns(), Some(3_000));
+        assert_eq!(read.latency_max_ns(), 20_000);
+        assert_eq!(read.mean_depth_milli(), Some(4_000));
         // The telemetry half is untouched by a filesystem publish.
         assert_eq!(
             page.telemetry().unwrap(),

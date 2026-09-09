@@ -261,6 +261,7 @@ dependencies = [
  "kore-driver",
  "kore-ring",
  "kore-rt",
+ "virtio-accel-core",
  "zerocopy",
 ]
 
@@ -553,6 +554,22 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "virtio-accel-core"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16f492bc8552960b9097c81dbd9891f4644f360af7d750b42385a7019bad8d5c"
+dependencies = [
+ "bitflags",
+ "virtio-accel-transport",
+]
+
+[[package]]
+name = "virtio-accel-transport"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2290cbfb4871f6c8f077b00ff712d848e941a6af5c819fbbd8ae628c0c3ef7cc"
 
 [[package]]
 name = "winnow"

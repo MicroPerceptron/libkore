@@ -69,8 +69,9 @@ for either distribution lock.
 
 ## Bootstrap and future ownership
 
-The initial export includes Kore #962 plus its runtime task-provenance repair and bounded SFNT metadata owner;
-the exact source commit is in `native/provenance.json`. #962 is still open and
+The export includes Kore #962, its runtime task-provenance repair and bounded
+SFNT metadata owner, resynchronized with current mainline. The exact source
+commit is in `native/provenance.json`. #962 is still open and
 provides required offset I/O, checked-close and macro behavior that current Kore
 main alone does not yet provide.
 

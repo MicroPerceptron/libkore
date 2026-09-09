@@ -254,6 +254,21 @@ pub fn split<S: EventState, R: RingRecord>(
 }
 
 impl<S: EventState, R: RingRecord> EventSource<'_, S, R> {
+    /// Replace level state only when it changes. The sole producer can read
+    /// its own state without a seqlock retry; consumers never write it.
+    /// Returns whether the batch needs publishing through [`commit`](Self::commit).
+    pub fn replace_state(&mut self, next: S) -> bool
+    where
+        S: PartialEq,
+    {
+        // SAFETY: bind validated the storage; this half is its sole writer.
+        if unsafe { core::ptr::read(self.raw.state) } == next {
+            return false;
+        }
+        self.state(|state| *state = next);
+        true
+    }
+
     /// Republish the state: read-modify-write under the seqlock.
     ///
     /// The write is torn from a concurrent reader's point of view; the

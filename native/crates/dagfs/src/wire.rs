@@ -1114,6 +1114,10 @@ pub fn encode_rep(rep: &FsResponse, grants: u8) -> FsRepWire {
             w.status = FsRepWire::STATUS_OK;
             w.handle = U64::new(grant.to_bits());
         }
+        FsResponse::WindowAttached { max_transfer } => {
+            w.status = FsRepWire::STATUS_OK;
+            w.count = U32::new(max_transfer);
+        }
         FsResponse::Done => {
             w.status = FsRepWire::STATUS_OK;
         }
@@ -1335,8 +1339,10 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         FsRequest::TakeAdmission => FsResponse::PeerAdmitted {
             peer: kore_rt::svc::PeerId::from_arrival(u16::try_from(w.handle.get()).ok()?)?,
         },
-        FsRequest::AttachWindow { .. }
-        | FsRequest::RegisterSystemView { .. }
+        FsRequest::AttachWindow { .. } => FsResponse::WindowAttached {
+            max_transfer: w.count.get(),
+        },
+        FsRequest::RegisterSystemView { .. }
         | FsRequest::RegisterPrivateView { .. }
         | FsRequest::ApplyView { .. }
         | FsRequest::BindView { .. }
@@ -1470,8 +1476,12 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
             | (FsRequest::Search { .. }, FsResponse::Searched { .. })
             | (FsRequest::TakeAdmission, FsResponse::PeerAdmitted { .. })
             | (
-                FsRequest::AttachWindow { .. }
-                    | FsRequest::RegisterSystemView { .. }
+                FsRequest::AttachWindow { .. },
+                FsResponse::WindowAttached { .. }
+            )
+            | (
+                FsRequest::RegisterSystemView { .. }
+                    | FsRequest::RegisterPrivateView { .. }
                     | FsRequest::RegisterPrivateView { .. }
                     | FsRequest::ApplyView { .. }
                     | FsRequest::BindView { .. }
@@ -1572,6 +1582,32 @@ mod tests {
         let mut wide = wire;
         wide.reserved0 = U32::new(0x100);
         assert_eq!(decode_rep_for(&stat, &wide), None);
+
+        // An attach answers with the advertised transfer limit, and a
+        // service that says nothing decodes as zero: the floor applies.
+        let attach = FsRequest::AttachWindow {
+            slot: 3,
+            bytes: 0x1_0000,
+        };
+        let attached = encode_rep(
+            &FsResponse::WindowAttached {
+                max_transfer: 0x1_0000,
+            },
+            0,
+        );
+        assert_eq!(
+            decode_rep_for(&attach, &attached),
+            Some((
+                FsResponse::WindowAttached {
+                    max_transfer: 0x1_0000
+                },
+                0
+            ))
+        );
+        assert_eq!(
+            decode_rep_for(&attach, &encode_rep(&FsResponse::Done, 0)),
+            Some((FsResponse::WindowAttached { max_transfer: 0 }, 0))
+        );
 
         // A reply that does not describe an object may not carry one.
         let done = encode_rep(&FsResponse::Done, 0);

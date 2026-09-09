@@ -127,3 +127,31 @@ unbiased sampling and unchanged output after initial/reseed failures. Host
 parallel tests establish pre-launch refusal without callbacks or output writes.
 These do not constitute a new native guest or hardware witness for foreign
 worker execution; the prior Kore production-gate limitation remains unchanged.
+
+## Mainline resynchronization
+
+The native export now comes from Kore
+`75b8256ea60d4fc4a63bb17fc1379c21a98ce06d`, the #962 merge of main through
+`75ca434a9`. It contains 14 native packages and 221 source files. This brings
+in the memory/status, power/event, DagFS negotiated-transfer and driver changes
+without importing the kernel, services or firmware payloads into libkore.
+
+The offset-I/O merge preserves the service-advertised transfer limit instead of
+capping every Rust operation at the 4 KiB protocol floor; requests still fit the
+actual window, wire byte count and checked offset range. The foreign callback
+adapter retains its explicit 4 KiB copied-buffer contract. The driver export now
+contains the native accelerator extensions over published `virtio-accel-core`
+0.3.7; its optional dependency is recorded in the native workspace lockfile.
+
+For this export, `make fmt test check docs owners cross miri bindings-check`
+passed with Zig 0.16.0. Both local/Git composition fixtures passed: one against
+the exported workspace and one against the merged Kore checkout, including the
+mixed-owner negative controls. The root dependency lock remains unchanged;
+the native workspace lock adds only the newly reachable optional accelerator
+packages. These checks do not establish physical-device acceptance.
+
+Kore's resynchronized source also passed its full host suite, all three kernel
+architecture checks, separate production/test builds, serial QEMU boottest,
+production QEMU boot gate and founded filesystem command gate. The production
+gate includes `net-load: PASS`, clearing the earlier missing-witness blocker on
+this merged tree. No physical-hardware acceptance is inferred from these runs.

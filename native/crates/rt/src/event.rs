@@ -41,7 +41,7 @@ use crate::transport::Transport;
 /// whatever the cookie says (the doorbell mux contract, §3.1).
 pub const COOKIE_EVENT: u64 = 0x6B72_5F65_7665_6E74;
 
-/// How a [`wait_past`] ended.  Both answers mean "look at the channel":
+/// How an event wait ended. Every answer means "recheck your sources":
 /// a deadline does not promise nothing changed (the change may have
 /// landed as the wait expired), and `Changed` does not promise the
 /// caller's condition holds — only that the word moved.
@@ -51,6 +51,8 @@ pub enum EventWait {
     Changed,
     /// The deadline elapsed first.
     TimedOut,
+    /// Another executor event woke a composed waiter; recheck all inputs.
+    Woken,
 }
 
 /// Pre-park monitor budget: how many monitored turns, and the cap on
@@ -93,6 +95,29 @@ pub async fn wait_past<S: EventState, R: RingRecord>(
     sink: &EventSink<'_, S, R>,
     seen: u32,
     timeout: Option<Duration>,
+) -> EventWait {
+    wait_with(sink, seen, timeout, false).await
+}
+
+/// Run the event wait ladder once, returning on any executor wake. Use this
+/// for a task that also handles input, cancellation, or other channels. Read
+/// `seen` before draining every source; a return never promises which changed.
+/// `TimedOut` is reported only when the deadline had already passed before
+/// the park; after one park the answer is `Changed` or `Woken`, and the caller
+/// keeps its own deadline.  Dropping this future withdraws the park intent.
+pub async fn wait_once<S: EventState, R: RingRecord>(
+    sink: &EventSink<'_, S, R>,
+    seen: u32,
+    timeout: Option<Duration>,
+) -> EventWait {
+    wait_with(sink, seen, timeout, true).await
+}
+
+async fn wait_with<S: EventState, R: RingRecord>(
+    sink: &EventSink<'_, S, R>,
+    seen: u32,
+    timeout: Option<Duration>,
+    once: bool,
 ) -> EventWait {
     // Rung 1 — check.
     if sink.seq() != seen {
@@ -151,6 +176,16 @@ pub async fn wait_past<S: EventState, R: RingRecord>(
                 crate::executor::next_wake_for(at - now).await;
             }
         }
+        if once {
+            // One park is the composed waiter's whole turn: say whether the
+            // word moved and let the caller recheck its other inputs and its
+            // own deadline — no second clock read for an answer nobody acts on.
+            return if sink.seq() != seen {
+                EventWait::Changed
+            } else {
+                EventWait::Woken
+            };
+        }
     }
 }
 
@@ -177,4 +212,36 @@ pub async fn commit_and_kick<S: EventState, R: RingRecord, T: Transport>(
     })
     .await
     .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::future::Future;
+    use core::sync::atomic::Ordering;
+    use core::task::{Context, Poll, Waker};
+
+    #[test]
+    fn cancelling_a_composed_wait_withdraws_its_intent() {
+        const BYTES: usize = kore_ring::event::region_bytes::<u32, kore_abi::svc::OutChunk>(1);
+        #[repr(align(64))]
+        struct Window([u8; BYTES]);
+        let mut window = Window([0; BYTES]);
+        let (mut source, sink) = kore_ring::event::split::<u32, kore_abi::svc::OutChunk>(
+            &mut window.0, 1,
+        ).unwrap();
+        let seen = sink.seq();
+        {
+            let mut wait = core::pin::pin!(wait_once(&sink, seen, None));
+            let mut cx = Context::from_waker(Waker::noop());
+            // The first poll arms the event and yields before entering any
+            // executor-specific wake handling. Cancellation is a real owner
+            // dropping that Pending future, as an input-select would do.
+            assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+            assert_eq!(sink.parked_word().load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(sink.parked_word().load(Ordering::SeqCst), 0);
+        assert!(!source.commit(), "a cancelled waiter is owed no notice");
+        assert!(!sink.park(seen), "publication still invalidates the old snapshot");
+    }
 }

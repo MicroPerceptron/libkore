@@ -169,6 +169,9 @@ pub struct SearchResultPage {
 /// The typed client.
 pub struct FsClient<T: Transport> {
     transport: T,
+    /// The per-request transfer limit the service advertised at attach;
+    /// the protocol floor until then.
+    transfer_limit: u32,
 }
 
 /// The production asynchronous filesystem client over one generic service
@@ -178,6 +181,9 @@ pub struct RingFs<'w, 't, T: rt_transport::Transport> {
     pair: SvcClient<'w, 't, T, crate::DagfsProtocol>,
     return_tx: SlotRef,
     return_land: SlotRef,
+    /// The per-request transfer limit the service advertised at attach;
+    /// the protocol floor until then.
+    transfer_limit: u32,
 }
 
 /// Failure of the production ring client, preserving the distinction between
@@ -277,6 +283,7 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
             pair,
             return_tx,
             return_land,
+            transfer_limit: crate::bounds::MAX_TRANSFER as u32,
         }
     }
 
@@ -391,13 +398,32 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         reply: kore_rt::svc::CallReply<FsResponse>,
     ) -> Result<(), RingFsError> {
         match self.finish(reply).map_err(RingFsError::Infrastructure)? {
-            FsResponse::Done => Ok(()),
+            FsResponse::WindowAttached { max_transfer } => {
+                self.adopt_transfer_limit(max_transfer);
+                Ok(())
+            }
             FsResponse::Refused(error) => Err(RingFsError::Refused(error)),
             _ => {
                 self.pair.poison();
                 Err(RingFsError::Wire)
             }
         }
+    }
+
+    /// Keep the limit the service advertised at attach; zero (a service
+    /// that did not say) leaves the protocol floor in force.
+    fn adopt_transfer_limit(&mut self, max_transfer: u32) {
+        if max_transfer != 0 {
+            self.transfer_limit = max_transfer;
+        }
+    }
+
+    /// Largest byte count one bulk verb may move through the attached
+    /// window — the service's [`FsResponse::WindowAttached`] answer, or the
+    /// protocol floor [`MAX_TRANSFER`](crate::bounds::MAX_TRANSFER) before
+    /// any window is attached.
+    pub fn transfer_limit(&self) -> usize {
+        self.transfer_limit as usize
     }
 
     pub async fn open_root(&mut self, rights: Rights) -> Result<Opened, RingFsError> {
@@ -1085,7 +1111,23 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
 
 impl<T: Transport> FsClient<T> {
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            transfer_limit: crate::bounds::MAX_TRANSFER as u32,
+        }
+    }
+
+    /// Largest byte count one bulk verb may move through the attached
+    /// window — the service's [`FsResponse::WindowAttached`] answer, or the
+    /// protocol floor before any window is attached.
+    pub fn transfer_limit(&self) -> usize {
+        self.transfer_limit as usize
+    }
+
+    fn adopt_transfer_limit(&mut self, max_transfer: u32) {
+        if max_transfer != 0 {
+            self.transfer_limit = max_transfer;
+        }
     }
 
     /// The transport, for host tests that want to inspect the far side.
@@ -1132,7 +1174,11 @@ impl<T: Transport> FsClient<T> {
     /// arena slot it went to and how long it is. Until this succeeds, every
     /// bulk verb refuses [`FsError::NoWindow`].
     pub fn attach_window(&mut self, slot: u32, bytes: u32) -> FsResult<()> {
-        self.checked(&FsRequest::AttachWindow { slot, bytes })?;
+        if let FsResponse::WindowAttached { max_transfer } =
+            self.checked(&FsRequest::AttachWindow { slot, bytes })?
+        {
+            self.adopt_transfer_limit(max_transfer);
+        }
         Ok(())
     }
 

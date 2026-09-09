@@ -41,6 +41,8 @@ extern crate alloc;
 /// The pluggable device-MMU library (page-table walker + format plugins) —
 /// shared machinery for any driver whose device embeds its own MMU behind the
 /// platform IOMMU (SMMUv3-in-device first).  See the module docs.
+#[cfg(feature = "accel")]
+pub mod accel;
 pub mod block;
 pub mod common;
 pub mod cookie;

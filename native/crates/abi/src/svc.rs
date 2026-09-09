@@ -282,6 +282,16 @@ impl PowerReqWire {
     pub const OP_RETIRE_PEER: u8 = 6;
     pub const OP_CONFIRM_RETIRED: u8 = 7;
     pub const OP_CLOSE_PEER: u8 = 8;
+    pub const OP_STATUS: u8 = 9;
+    /// Fixed display owner retained-standby acknowledgement and next command.
+    pub const OP_DISPLAY_POLL: u8 = 10;
+    pub const OP_DISPLAY_STATUS: u8 = 11;
+    /// Fixed owner: five-byte startup diagnostic, then two zero bytes.
+    pub const OP_DISPLAY_REPORT: u8 = 12;
+    /// Read the immutable startup diagnostic; all argument bytes are zero.
+    pub const OP_DISPLAY_DIAGNOSTIC: u8 = 13;
+    /// Read the cached lid level and runtime close generation; no side effects.
+    pub const OP_LID_STATUS: u8 = 14;
 }
 
 /// The power reply wire form.  A power service mints no authority, so
@@ -299,15 +309,19 @@ pub struct PowerRepWire {
 }
 
 impl PowerRepWire {
-    /// The transition was **accepted**, not performed: the kernel latched it
-    /// for the run-loop bottom half. Terminal requests drive teardown and the
-    /// firmware trigger; suspend-to-idle instead latches a reversible attempt
-    /// that may still abort during preparation. If idle is entered, the
-    /// existing machine resumes after wake. A reply may arrive before either
-    /// kind of transition begins.
+    /// The request was accepted. Administrative/report requests acknowledge
+    /// receipt; a transition acknowledgement does not prove completion.
+    /// Terminal requests are kernel-latched; coordinated suspend may first
+    /// prepare its display owner, and either preparation or entry may abort.
     pub const TAG_ACCEPTED: u8 = 1;
     pub const TAG_REFUSED: u8 = 2;
     pub const TAG_PEER_ADMITTED: u8 = 3;
+    pub const TAG_STATUS: u8 = 4;
+    pub const TAG_DISPLAY_COMMAND: u8 = 5;
+    pub const TAG_DISPLAY_STATUS: u8 = 6;
+    pub const TAG_DISPLAY_DIAGNOSTIC: u8 = 7;
+    /// Level (0 unknown, 1 open, 2 closed), followed by a little-endian u32 generation.
+    pub const TAG_LID_STATUS: u8 = 8;
 
     /// The session refused the transition.  Authority (`MODIFY` absent) and
     /// feasibility (no firmware backend realizes it) are **not separable
@@ -2235,12 +2249,13 @@ impl InputRepWire {
 /// all-zero (unseeded) record is invalid, never a verb.
 ///
 /// **The console data plane is not a verb.**  Guest console bytes ride
-/// two SPSC planes appended to this pair's window (the display
-/// commit-plane discipline): an [`OutChunk`] plane the service produces
-/// (guest → terminal, [`HYPERVISOR_CONSOLE_OUT_CAP`]) and an [`InChunk`]
-/// plane the client produces (terminal → guest,
-/// [`HYPERVISOR_CONSOLE_IN_CAP`]).  The verbs below only found a guest
-/// and pace the client's wake edge.
+/// two planes appended to this pair's window (the display commit-plane
+/// discipline): an event channel the service produces (guest → terminal —
+/// a [`HypervisorConsoleState`] level beside an [`OutChunk`] record ring,
+/// [`HYPERVISOR_CONSOLE_OUT_CAP`]) and an [`InChunk`] SPSC plane the client
+/// produces (terminal → guest, [`HYPERVISOR_CONSOLE_IN_CAP`]).  The verbs
+/// below only found a guest and route its console; the event's wake word is
+/// the client's wait and its `halted` level the terminal edge.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -2258,11 +2273,9 @@ impl HypervisorReqWire {
     /// [`HypervisorRepWire::TAG_VM_BUSY`] while any guest is live or the
     /// startup acceptance lifecycle has not completed.
     pub const OP_SPAWN_ECHO: u8 = 2;
-    /// `HypervisorRequest::ConsoleWait` — the client's console wake edge:
-    /// held unanswered (the `request_ready` discipline) until guest
-    /// console output is pending in the out-plane or the guest reached
-    /// terminal, then answered [`HypervisorRepWire::TAG_CONSOLE`].  Data
-    /// never rides the reply — the client drains the plane.
+    /// `HypervisorRequest::ConsoleWait` — an immediate terminal-state query,
+    /// answered [`HypervisorRepWire::TAG_CONSOLE`]. Console waiters use the
+    /// output event plane; data never rides this compatibility reply.
     pub const OP_CONSOLE_WAIT: u8 = 3;
     /// `HypervisorRequest::SpawnHlt` — found and start the acceptance-HLT
     /// guest (one `hlt` at entry) as a *client* guest: it reaches terminal
@@ -2294,8 +2307,9 @@ impl HypervisorReqWire {
     /// while leaving the guest, its vCPU, and its memory intact.
     pub const OP_DETACH_CONSOLE: u8 = 9;
     /// `HypervisorRequest::Stop` — request orderly retirement of the one live
-    /// guest.  Completion remains observable through `OP_CONSOLE_WAIT`'s
-    /// terminal edge; accepting this verb means retirement was queued.
+    /// guest.  Completion is observable as the console event's `halted`
+    /// level ([`HypervisorConsoleState`]); accepting this verb means
+    /// retirement was queued.
     pub const OP_STOP: u8 = 10;
     /// `HypervisorRequest::Status` — one coherent, data-only snapshot of the
     /// service's single-guest and text-console books.
@@ -2303,7 +2317,8 @@ impl HypervisorReqWire {
 }
 
 /// Capacity of the hypervisor pair window's **guest-output** console
-/// plane (`spsc<OutChunk>`, service-produced).  64 chunks = 1.5 KiB of
+/// plane (`event<HypervisorConsoleState, OutChunk>`, service-produced).
+/// 64 chunks = 1.5 KiB of
 /// text in flight — a whole marker burst without a single wake of the
 /// consumer, while the plane stays comfortably inside the frozen 3-page
 /// pair window beside its sibling.
@@ -2347,10 +2362,10 @@ impl HypervisorRepWire {
     pub const TAG_PONG: u8 = 1;
     /// `HypervisorResponse::Spawned` — the echo guest founded and started.
     pub const TAG_SPAWNED: u8 = 2;
-    /// `HypervisorResponse::Console` — the console wake edge fired:
-    /// output is pending in the out-plane and/or the guest halted
-    /// (`served` = [`CONSOLE_HALTED`](Self::CONSOLE_HALTED) when terminal).
-    /// The client drains the plane either way.
+    /// `HypervisorResponse::Console` — an immediate snapshot of the terminal
+    /// level (`served` = [`CONSOLE_HALTED`](Self::CONSOLE_HALTED) when
+    /// terminal), the reply to the reserved `OP_CONSOLE_WAIT`.  No client
+    /// waits on it: the console event's wake word is the wait.
     pub const TAG_CONSOLE: u8 = 3;
     /// `HypervisorResponse::VmBusy` — `SpawnEcho` refused: a guest is
     /// live, or the startup acceptance lifecycle has not completed.
@@ -2379,8 +2394,9 @@ impl HypervisorRepWire {
     pub const TAG_STATUS_UNAVAILABLE: u8 = 12;
 
     /// [`TAG_CONSOLE`](Self::TAG_CONSOLE)'s `served` value once the guest
-    /// reached terminal and was reaped — the relay's exit edge.  `0` =
-    /// the guest is still running.
+    /// reached terminal and was reaped — the same level
+    /// [`HypervisorConsoleState::halted`] publishes.  `0` = the guest is
+    /// still running.
     pub const CONSOLE_HALTED: u32 = 1;
 }
 
@@ -2416,6 +2432,18 @@ pub struct HypervisorStatusWire {
     pub console_dropped_bytes: U64,
     /// Architecture-neutral terminal reason or bounded hardware fault detail.
     pub last_reason: U64,
+}
+
+/// Console event level state. Output records share this event's wake word;
+/// consumed input bytes also advance it so a full input producer can resume.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct HypervisorConsoleState {
+    pub halted: u8,
+    pub reserved: [u8; 7],
+    pub input_consumed: U64,
 }
 
 impl HypervisorStatusWire {
@@ -2619,7 +2647,7 @@ impl AccelReqWire {
     /// geometry in `target[0..24]`: group count `[u32; 3]`, then local size
     /// `[u32; 3]`, all LE. Every axis is nonzero and `target[24..48]` is zero.
     /// No SIMD/subgroup width is client-selected. Support is advertised by
-    /// `contract::Capabilities::EXPLICIT_WORKGROUPS`; an older decoder rejects
+    /// `contract::EXPLICIT_WORKGROUPS`; an older decoder rejects
     /// the unknown opcode instead of silently treating it as `Submit`.
     pub const OP_SUBMIT_LAUNCH: u8 = 18;
     /// Fund initial accelerator capacity: `a` = retained supply landing,
@@ -3162,10 +3190,13 @@ const _: () = {
                 + size_of::<ImageName>()
     ); // 864
     assert!(size_of::<TaskReqWire>() == 864);
-    // 456 ‖ the 76-byte NetSnapshot ‖ the two pages.
+    // 16-byte head ‖ 224 telemetry ‖ 236 filesystem (with the derived
+    // completion-latency moments) ‖ the 76-byte NetSnapshot ‖ the two pages.
     assert!(
         size_of::<TaskRepWire>()
-            == 456
+            == 16
+                + size_of::<crate::monitor::TelemetrySnapshot>()
+                + size_of::<crate::monitor::FilesystemSnapshot>()
                 + size_of::<crate::monitor::NetSnapshot>()
                 + size_of::<crate::processor_status::ProcessorPage>()
                 + size_of::<crate::device::DeviceCensusPage>()
@@ -3192,6 +3223,7 @@ const _: () = {
     assert!(size_of::<HypervisorReqWire>() == 8);
     assert!(size_of::<HypervisorRepWire>() == 8);
     assert!(size_of::<HypervisorStatusWire>() == 72);
+    assert!(size_of::<HypervisorConsoleState>() == 16);
     assert!(size_of::<BlockReqWire>() == 16);
     assert!(size_of::<BlockRepWire>() == 32);
     // The filesystem pair: 8-byte head ‖ 4×8 handles/offsets ‖ 4×4 window,
@@ -3206,8 +3238,9 @@ const _: () = {
     assert!(size_of::<FsGrantEntryWire>() == 16 + FS_NAME_BYTES); // 48
     assert!(size_of::<FsGrantEntryWire>() == FsGrantEntryWire::BYTES);
     // 12-byte counters ‖ 2×4 tree counts ‖ 4 reserved ‖ the 80-byte physical
-    // storage + health aggregate ‖ 27×8 posture/stats.
-    assert!(size_of::<FsSystemStatusWire>() == 24 + 80 + 27 * 8); // 320
+    // storage + health aggregate ‖ 27×8 posture/stats ‖ the 66-byte latency
+    // histogram.
+    assert!(size_of::<FsSystemStatusWire>() == 24 + 80 + 29 * 8 + 66); // 402
     assert!(size_of::<FsSystemStatusWire>() == FsSystemStatusWire::BYTES);
     // Both 8-deep rings must fit ONE founded pair window, and the filesystem
     // now asks the founding for `SvcProtocol::SERVE_PAIRS` of them — so this
@@ -4519,11 +4552,22 @@ pub struct FsSystemStatusWire {
     /// forever, because an unbounded retry inside the founded filesystem is a
     /// wedge no one can observe, and a bounded leak is at least this number.
     pub abandoned_reclaims: U64,
+    /// Provider: payload reads answered from the read-ahead window the
+    /// provider already held — no device command at all.
+    pub readahead_hits: U64,
+    /// Provider: device reads issued to fill that window.  Hits over hits
+    /// plus reads is the share of payload reads that cost no command.
+    pub readahead_reads: U64,
+    /// Channel: completion latency and queue depth as the block channel
+    /// measured them — the `res/RESIDENCY.md` §8 "NVMe latency at queue
+    /// depth" figure, read off the box instead of a datasheet.  Empty when
+    /// the backend publishes no clock.
+    pub latency: crate::monitor::FilesystemLatencySnapshot,
 }
 
 impl FsSystemStatusWire {
     /// Bytes the record occupies in the data window.
-    pub const BYTES: usize = 320;
+    pub const BYTES: usize = 402;
     /// The backend mounted a durable volume (unset: the RAM posture).
     pub const FLAG_DURABLE: u16 = 1 << 0;
     /// The durable mount recovered degraded and is read-only.
@@ -4557,4 +4601,84 @@ impl FsSystemStatusWire {
     pub const LIFECYCLE_REBUILT: u16 = 6;
     /// The mounted region was recovered without a rebuild and is current.
     pub const LIFECYCLE_CURRENT: u16 = 7;
+}
+
+/// Startup-only display owner evidence. Data only; reporting never admits sleep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DisplayProbe {
+    NoReport = 0,
+    Ready = 1,
+    Absent = 2,
+    Identity = 3,
+    Clock = 4,
+    Mmio = 5,
+    Psr = 6,
+    NoPanel = 7,
+    ManyPanels = 8,
+    PanelStatus = 9,
+    PanelControl = 10,
+    PanelTiming = 11,
+    AuxBusy = 12,
+    WaitTimeout = 13,
+    AuxStatus = 14,
+    AuxReply = 15,
+    SinkCaps = 16,
+    ManySinks = 17,
+    BacklightOff = 18,
+    Unsupported = 19,
+    Changed = 20,
+    Restore = 21,
+    MmioAllOnes = 22,
+ }
+impl DisplayProbe {
+    pub fn decode(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Self::NoReport,
+            1 => Self::Ready,
+            2 => Self::Absent,
+            3 => Self::Identity,
+            4 => Self::Clock,
+            5 => Self::Mmio,
+            6 => Self::Psr,
+            7 => Self::NoPanel,
+            8 => Self::ManyPanels,
+            9 => Self::PanelStatus,
+            10 => Self::PanelControl,
+            11 => Self::PanelTiming,
+            12 => Self::AuxBusy,
+            13 => Self::WaitTimeout,
+            14 => Self::AuxStatus,
+            15 => Self::AuxReply,
+            16 => Self::SinkCaps,
+            17 => Self::ManySinks,
+            18 => Self::BacklightOff,
+            19 => Self::Unsupported,
+            20 => Self::Changed,
+            21 => Self::Restore,
+            22 => Self::MmioAllOnes,
+            _ => return None,
+        })
+    }
+}
+/// The fixed five-byte startup report fits the existing eight-byte power forms.
+/// `detail` is evidence interpreted by the probe, never a pointer or authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayDiagnostic {
+    pub probe: DisplayProbe,
+    pub detail: u32,
+}
+impl DisplayDiagnostic {
+    pub const NONE: Self = Self::new(DisplayProbe::NoReport, 0);
+    pub const fn new(probe: DisplayProbe, detail: u32) -> Self { Self { probe, detail } }
+    pub fn encode(self) -> [u8; 5] {
+        let b = self.detail.to_le_bytes();
+        [self.probe as u8, b[0], b[1], b[2], b[3]]
+    }
+    pub fn decode(bytes: [u8; 5]) -> Option<Self> {
+        let probe = DisplayProbe::decode(bytes[0])?;
+        let detail = u32::from_le_bytes(bytes[1..].try_into().ok()?);
+        if probe == DisplayProbe::NoReport && detail != 0 { return None; }
+        Some(Self::new(probe, detail))
+    }
 }

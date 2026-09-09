@@ -40,6 +40,15 @@ pub struct MemoryBlockDevice<const DISK_BYTES: usize, const BUFFER_BYTES: usize>
     submissions: u64,
     publishes: u64,
     liveness: crate::block::Liveness,
+    /// The clock this double reports through
+    /// [`DirectBlockDevice::clock_ns`] — `None` (the default) is a backend
+    /// with no time source, so nothing is measured; a test that wants
+    /// latency books sets it and gives it a per-poll step.
+    clock_ns: Option<u64>,
+    /// Nanoseconds the clock advances on every `poll` — time passing while
+    /// a command is in flight, so a completion is observed later than its
+    /// submission.
+    clock_step_ns: u64,
 }
 
 impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize>
@@ -75,7 +84,18 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize>
             publishes: 0,
             // A double has no register to read; say so rather than vouch.
             liveness: crate::block::Liveness::Unknown,
+            clock_ns: None,
+            clock_step_ns: 0,
         })
+    }
+
+    /// Give the double a clock reading, so the channel above books latency:
+    /// `now_ns` at once, advancing by `step_ns` on every poll — the stand-in
+    /// for time passing between a submission and its completion.  Set on
+    /// the control plane before anything is outstanding.
+    pub fn set_clock(&mut self, now_ns: u64, step_ns: u64) {
+        self.clock_ns = Some(now_ns);
+        self.clock_step_ns = step_ns;
     }
 
     pub fn inject(&mut self, error: BlockError) {
@@ -146,6 +166,10 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize> DirectBlockDevice
 
     fn liveness(&mut self) -> crate::block::Liveness {
         self.liveness
+    }
+
+    fn clock_ns(&self) -> Option<u64> {
+        self.clock_ns
     }
 
     fn geometry(&self) -> BlockGeometry {
@@ -232,6 +256,9 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize> DirectBlockDevice
         if self.hold || self.queued == 0 {
             return None;
         }
+        // Time passes while a command is in flight: the clock the channel
+        // reads at completion is a step past the one it read at submission.
+        self.clock_ns = self.clock_ns.map(|now| now.saturating_add(self.clock_step_ns));
         let completion = self.completions[self.head].take();
         self.head = (self.head + 1) % COMPLETIONS;
         self.queued -= 1;
@@ -254,7 +281,7 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize> DirectBlockDevice
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{BlockChannel, ChannelState, CompletionMode, RequestId};
+    use crate::block::{BlockChannel, ChannelState, CompletionMode, LatencyBooks, RequestId};
 
     type Device = MemoryBlockDevice<8192, 4096>;
     type Channel = BlockChannel<Device, 2, 4>;
@@ -325,6 +352,48 @@ mod tests {
         assert_eq!(channel.quiesce(), Ok(()));
         assert_eq!(channel.state(), ChannelState::Revoked);
         assert_eq!(channel.submit_flush(), Err(BlockError::Revoked));
+    }
+
+    /// Latency is booked only when the backend publishes a clock, at the
+    /// depth each command was submitted behind, into the shared base-2
+    /// histogram.
+    #[test]
+    fn latency_is_measured_at_depth_only_when_the_backend_has_a_clock() {
+        // No clock: nothing measured, and that is a posture, not a zero.
+        let mut blind = channel();
+        let id = blind.submit_flush().unwrap();
+        assert_eq!(blind.poll().unwrap().request, id);
+        assert_eq!(blind.stats().latency, LatencyBooks::EMPTY);
+        assert!(!blind.stats().latency.snapshot(1).measured());
+
+        // A clock that reads 1 µs now and moves 3 µs per poll: three
+        // commands submitted back to back complete 3, 6 and 9 µs later.
+        let mut channel = channel();
+        channel.control(|device| device.set_clock(1_000, 3_000)).unwrap();
+        let mut ids = [RequestId(0); 3];
+        for id in &mut ids {
+            *id = channel.submit_flush().unwrap();
+        }
+        for expected in ids {
+            assert_eq!(channel.poll().unwrap().request, expected);
+        }
+        let books = channel.stats().latency;
+        assert_eq!(books.samples, 3);
+        assert_eq!(books.sum_ns, 18_000);
+        assert_eq!(books.max_ns, 9_000);
+        // Submitted behind 0, 1 and 2 commands respectively.
+        assert_eq!(books.depth_sum, 3);
+        type L = kore_abi::monitor::FilesystemLatencySnapshot;
+        // 3 µs and 6 µs share the <8 µs bucket; 9 µs is the next one up.
+        assert_eq!(books.buckets[L::bucket_index(3_000)], 2);
+        assert_eq!(books.buckets[L::bucket_index(9_000)], 1);
+        assert_eq!(books.buckets.iter().map(|b| u64::from(*b)).sum::<u64>(), 3);
+        let snapshot = books.snapshot(channel.stats().max_outstanding);
+        assert_eq!(snapshot.max_outstanding(), 3);
+        assert_eq!(snapshot.mean_ns(), Some(6_000));
+        assert_eq!(snapshot.mean_depth_milli(), Some(1_000));
+        assert_eq!(snapshot.percentile_upper_ns(500), Some(8_192));
+        assert_eq!(snapshot.percentile_upper_ns(990), Some(32_768));
     }
 
     #[test]
