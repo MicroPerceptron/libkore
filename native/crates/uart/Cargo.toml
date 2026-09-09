@@ -1,0 +1,19 @@
+[package]
+name = "kore-uart"
+version = "0.0.0"
+edition = "2024"
+description = "kore UART register-layout backends (16550 / PL011) over a mechanism-agnostic RegisterAccess seam — shared by the kernel console and userland serial services."
+publish = false
+
+# Deliberately dependency-free. This crate is the *register logic* only: it
+# never names a kernel type, a firmware table, or an access mechanism, so
+# both ring 0 (direct MMIO / port `in`/`out`) and ring 3 (capability-mediated
+# access) can link it without dragging the other's world in.
+[dependencies]
+
+[features]
+default = []
+# Expose `MockRegisters` outside `cfg(test)` so downstream crates can unit-test
+# their own `RegisterAccess` impls against the same RAM-backed model the
+# backend tests use.
+mock = []

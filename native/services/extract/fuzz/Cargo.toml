@@ -1,0 +1,32 @@
+[package]
+name = "kore-extract-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+heapless = { version = "0.9.3", default-features = false }
+kore-svc-extract = { path = ".." }
+kore-svc-extract-worker-rust = { path = "../../extract-worker-rust" }
+kore-svc-extract-worker-c = { path = "../../extract-worker-c" }
+
+[[bin]]
+name = "adapters"
+path = "fuzz_targets/adapters.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalized_validator"
+path = "fuzz_targets/normalized_validator.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

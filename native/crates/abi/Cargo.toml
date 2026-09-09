@@ -1,0 +1,15 @@
+[package]
+name = "kore-abi"
+version = "0.1.4"
+edition = "2024"
+description = "kore kernel <-> user ABI contract: pure types and layouts, zero kernel behavior."
+
+# Deliberately minimal + no_std + no nightly features, so a userland driver
+# can build the contract trivially. The ONLY dependency is bitflags (for the
+# rights/attribute bit vocabularies). No crypto, no allocator, no kernel deps.
+[dependencies]
+bitflags = { version = "2.13.0", default-features = false }
+# Wire layouts derive their byte-validity and endianness contracts
+# (TryFromBytes / IntoBytes / Unaligned + U16<LE>-style fields) — safe
+# derives only, consistent with #![forbid(unsafe_code)].
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }

@@ -1,0 +1,18 @@
+[package]
+name = "kore-ring"
+version = "0.0.0"
+edition = "2024"
+description = "kore ring protocols over shared windows: an idiomatic Rust ring API (io-uring-crate-shaped) over the kore_abi::uring wire types (#148 / #95)."
+publish = false
+
+# Only kore-abi (the wire types) + zerocopy (the spsc RingRecord bound —
+# records are any-bit-pattern-valid shared-window bytes). Both ring families
+# are allocation-free views over caller-provided shared windows.
+#
+# TRIPWIRE (#487): this dep set is PINNED.  The kernel links this crate as
+# a ring endpoint, so its dependency closure is kernel dependency closure.
+# The day this crate wants a third dependency, the spsc core splits into a
+# crate the kernel links and the extra dep stays userland-side.
+[dependencies]
+kore-abi = { path = "../abi" }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }

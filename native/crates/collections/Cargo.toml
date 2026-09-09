@@ -1,0 +1,24 @@
+[package]
+name = "kore-collections"
+version = "0.1.0"
+edition = "2024"
+description = "kore's lock-free and arena-parameterized collections: atomic bitmaps, generational ids, and bit matrices."
+
+[features]
+# Kernel and allocator-owning consumers retain the complete surface by
+# default. Allocation-free programs opt out and still receive BitSet,
+# AtomicBitSet, and generational ids without linking `alloc` at all.
+default = ["alloc"]
+alloc = []
+
+# Deliberately DEPENDENCY-FREE and no_std. These structures are the
+# substrate the kernel's concurrency rests on (res/KRAPH.md's no-global-locks
+# rule is enforced by having lock-free primitives at hand), so they must be
+# buildable by anything: the kernel, a userland service, a sibling repo's
+# test harness. Not even bitflags — `core` is the whole dependency set.
+#
+# Allocation is `allocator_api`-parameterized where it exists at all: every
+# owning structure here takes an `A: Allocator` and there is no global
+# allocator anywhere in this crate (res/ALLOC.md — named arenas, never
+# `alloc::alloc::Global`).
+[dependencies]

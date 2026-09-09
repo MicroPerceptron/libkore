@@ -1,0 +1,25 @@
+[package]
+name = "kore-window"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Capability-scoped window protocol and receiver-mapped client surfaces"
+
+[features]
+default = ["runtime"]
+runtime = [
+    "dep:kore-ring",
+    "dep:kore-rt",
+    "dep:kore-svc-output",
+    "dep:zerocopy",
+]
+
+[dependencies]
+kore-abi = { path = "../abi" }
+kore-ring = { path = "../ring", optional = true }
+kore-rt = { path = "../rt", optional = true }
+kore-svc-output = { path = "../../services/output", optional = true }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"], optional = true }
+
+[dev-dependencies]
+kore-rt = { path = "../rt", features = ["std"] }
