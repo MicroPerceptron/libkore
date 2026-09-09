@@ -1,11 +1,13 @@
-//! Allocation-free C ABI over a Rust-owned native filesystem session.
+//! C ABI over native runtime APIs and caller-allocated hash tables.
 //!
 //! The host supplies an attached `Fs`; C cannot manufacture one from a slot.
 //! Each callback queues at most one operation and returns to the native async
 //! driver. Arguments are copied before returning to C. No C stack pointer is
-//! retained while a request is pending. See `Session` and the generated header.
+//! retained while a request is pending. Hash tables retain their caller-provided
+//! allocator and entry pointers until explicitly released. See `Session` and
+//! the generated header for the separate ownership contracts.
 #![no_std]
-#![feature(type_alias_impl_trait)]
+#![feature(type_alias_impl_trait, allocator_api)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::{
@@ -15,6 +17,8 @@ use core::{
 use kore::fs::dag::{self, FsError, Name, ObjectKind, Refusal, Rights};
 use kore::fs::{Fs, View};
 
+mod hash;
+pub use hash::*;
 mod parallel;
 mod random;
 mod session;

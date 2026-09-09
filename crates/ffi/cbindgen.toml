@@ -11,7 +11,7 @@ header = "/* Kore alpha ABI v1. Capability-owned APIs; scoped worker calls join 
 [parse]
 parse_deps = false
 [export]
-include = ["KoreFsStep", "KoreFsCompletion", "KoreFsError", "KoreTaskStep", "KoreTaskAction", "KoreSpmdStep", "KoreThreadStep"]
+include = ["KoreHashEqual", "KoreHashVisit", "KoreFsStep", "KoreFsCompletion", "KoreFsError", "KoreTaskStep", "KoreTaskAction", "KoreSpmdStep", "KoreThreadStep"]
 [enum]
 prefix_with_name = true
 rename_variants = "ScreamingSnakeCase"

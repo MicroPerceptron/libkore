@@ -18,6 +18,17 @@ pub const fs = struct {
     pub const unlink = abi.kore_fs_unlink;
     pub const write = abi.kore_fs_write;
 };
+pub const hash = struct {
+    pub const table_clear = abi.kore_hash_table_clear;
+    pub const table_create = abi.kore_hash_table_create;
+    pub const table_destroy = abi.kore_hash_table_destroy;
+    pub const table_find = abi.kore_hash_table_find;
+    pub const table_insert = abi.kore_hash_table_insert;
+    pub const table_len = abi.kore_hash_table_len;
+    pub const table_remove = abi.kore_hash_table_remove;
+    pub const table_reserve = abi.kore_hash_table_reserve;
+    pub const table_visit = abi.kore_hash_table_visit;
+};
 pub const random = struct {
     pub const fill = abi.kore_random_fill;
     pub const fill_from = abi.kore_random_fill_from;

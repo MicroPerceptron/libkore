@@ -15,6 +15,7 @@ pub use kore_app as app;
 pub use kore_rt as runtime;
 pub use kore_rt::process;
 pub use kore_rt::{Bundle, ExitCode, main, spmd, task};
+pub mod collections;
 pub mod random;
 pub use kore_rt::executor as task;
 pub use kore_rt::thread;
@@ -51,6 +52,7 @@ pub mod fs;
 
 /// Common application types. Raw slots and kernel verbs stay explicitly named.
 pub mod prelude {
+    pub use crate::collections::{HashMap, HashSet, HashTable};
     #[cfg(feature = "fs")]
     pub use crate::fs::{Fs, View};
     pub use core::time::Duration;

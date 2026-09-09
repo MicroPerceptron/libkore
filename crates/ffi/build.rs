@@ -6,6 +6,7 @@ use std::{
 fn main() {
     println!("cargo:rerun-if-env-changed=ZIG");
     println!("cargo:rerun-if-changed=tests/consumer.c");
+    println!("cargo:rerun-if-changed=tests/hash.c");
     println!("cargo:rerun-if-changed=tests/consumer.zig");
     println!("cargo:rerun-if-changed=../../extern/c/include/kore.h");
     println!("cargo:rerun-if-changed=../../extern/zig/src/root.zig");
@@ -63,6 +64,7 @@ fn main() {
     assert!(status.success(), "compile Zig consumer");
     cc::Build::new()
         .file("tests/consumer.c")
+        .file("tests/hash.c")
         .include("../../extern/c/include")
         .flag("-std=c11")
         .warnings_into_errors(true)

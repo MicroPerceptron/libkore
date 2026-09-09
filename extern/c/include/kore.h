@@ -66,6 +66,16 @@
 
 #define KORE_OP_YIELD 15
 
+#define KORE_HASH_OK 0
+
+#define KORE_HASH_MISSING 1
+
+#define KORE_HASH_REPLACED 2
+
+#define KORE_HASH_INVALID -1
+
+#define KORE_HASH_NO_MEMORY -2
+
 #define KORE_TASK_CAPACITY 4
 
 #define KORE_TASK_DONE 0
@@ -252,6 +262,11 @@ typedef uint32_t KoreProviderError;
 typedef struct KoreFsContext KoreFsContext;
 
 /**
+ * Opaque, uniquely owned table. Never construct, copy, or inspect its layout.
+ */
+typedef struct KoreHashTable KoreHashTable;
+
+/**
  * Rust-owned optional generator for repeated foreign draws. Never copy its
  * bytes or share it concurrently. The free functions need no owner argument.
  */
@@ -279,6 +294,30 @@ typedef struct KoreFsEntry {
   uint32_t name_length;
   uint32_t kind;
 } KoreFsEntry;
+
+/**
+ * Allocation callbacks must obey Rust's `core::alloc::Allocator` contract. Their context
+ * must remain live until table destruction; allocation returns null on OOM.
+ * Allocate receives (context, size, alignment) and returns disjoint storage
+ * valid for that layout. Deallocate receives the same pointer and layout.
+ * Callbacks may not unwind or reenter the table. Changing an application-wide
+ * default must not invalidate callbacks or allocations retained by a live table.
+ */
+typedef struct KoreHashAllocator {
+  void *context;
+  void *(*allocate)(void*, size_t, size_t);
+  void (*deallocate)(void*, void*, size_t, size_t);
+} KoreHashAllocator;
+
+/**
+ * Return nonzero when an existing entry equals the caller's query.
+ */
+typedef int32_t (*KoreHashEqual)(const void*, const void*, void*);
+
+/**
+ * Return nonzero to continue visiting; zero stops traversal.
+ */
+typedef int32_t (*KoreHashVisit)(void*, void*);
 
 /**
  * Called on native worker threads. Its range is a disjoint partition of the
@@ -476,6 +515,91 @@ KoreStatus kore_dag_link(struct KoreFsContext *ctx,
  * disjoint from ctx and remains valid for this call.
  */
 KoreStatus kore_fs_entry(struct KoreFsContext *ctx, uint32_t index, struct KoreFsEntry *out);
+
+/**
+ * Create a table, returning null for invalid callbacks or allocation failure.
+ * # Safety
+ * Callbacks obey KoreHashAllocator and never unwind; their context outlives the table.
+ */
+struct KoreHashTable *kore_hash_table_create(struct KoreHashAllocator allocator, size_t capacity);
+
+/**
+ * Destroy table storage, leaving all entries owned by the caller. Null is OK.
+ * # Safety
+ * Non-null table is live, uniquely owned, and is destroyed exactly once.
+ */
+void kore_hash_table_destroy(struct KoreHashTable *table);
+
+/**
+ * Return the entry count (zero for null).
+ * # Safety
+ * Non-null table is live and not concurrently mutated.
+ */
+size_t kore_hash_table_len(const struct KoreHashTable *table);
+
+/**
+ * Reserve additional entries, preserving contents on failure.
+ * # Safety
+ * Non-null table is live and exclusively borrowed for this call.
+ */
+int32_t kore_hash_table_reserve(struct KoreHashTable *table, size_t additional);
+
+/**
+ * Insert or replace an equal entry; return the replaced pointer through old.
+ * # Safety
+ * KoreHashTable is live/exclusive; entry stays live and its key/hash immutable until
+ * removed. KoreHashEqual never mutates/reenters this table or unwinds; equal keys have
+ * equal hashes. Old is writable, aligned and disjoint from table/entry storage.
+ */
+int32_t kore_hash_table_insert(struct KoreHashTable *table,
+                               uint64_t hash,
+                               void *entry,
+                               KoreHashEqual equal,
+                               void *context,
+                               void **old);
+
+/**
+ * Find an entry, returning MISSING and a null output when absent.
+ * # Safety
+ * KoreHashTable is live/not concurrently mutated; query/context satisfy the equality
+ * callback, which never mutates/reenters this table or unwinds. Out is writable,
+ * aligned and disjoint from table and callback input storage.
+ */
+int32_t kore_hash_table_find(const struct KoreHashTable *table,
+                             uint64_t hash,
+                             const void *query,
+                             KoreHashEqual equal,
+                             void *context,
+                             void **out);
+
+/**
+ * Remove an entry and return its caller-owned pointer.
+ * # Safety
+ * Same contract as find, with exclusive access to the table.
+ */
+int32_t kore_hash_table_remove(struct KoreHashTable *table,
+                               uint64_t hash,
+                               const void *query,
+                               KoreHashEqual equal,
+                               void *context,
+                               void **out);
+
+/**
+ * Remove all entries without destroying them or releasing table capacity.
+ * # Safety
+ * Non-null table is live and exclusively borrowed.
+ */
+void kore_hash_table_clear(struct KoreHashTable *table);
+
+/**
+ * KoreHashVisit entries in unspecified order, stopping if visit returns zero.
+ * # Safety
+ * KoreHashTable is live/not concurrently mutated. KoreHashVisit/context remain valid and
+ * never mutate/reenter this table or unwind.
+ */
+int32_t kore_hash_table_visit(const struct KoreHashTable *table,
+                              KoreHashVisit visit,
+                              void *context);
 
 /**
  * Run a joined SPMD region through the existing native founding and width policy.
