@@ -18,7 +18,7 @@ pub use kore_rt::{Bundle, ExitCode, main, spmd, task};
 pub mod collections;
 pub mod random;
 pub use kore_rt::executor as task;
-pub use kore_rt::thread;
+pub use kore_rt::{thread, thread_controller};
 
 /// Native driver substrate: capability-backed registers, bounded DMA and rings.
 /// Hardware effects still require a device-specific owner and lifecycle policy.

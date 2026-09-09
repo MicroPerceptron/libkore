@@ -10,6 +10,7 @@ fn main() {
     println!("cargo:rerun-if-changed=tests/alloc.c");
     println!("cargo:rerun-if-changed=../../extern/zig/src/allocator.zig");
     println!("cargo:rerun-if-changed=../../extern/c/include/kore/stdlib.h");
+    println!("cargo:rerun-if-changed=../../extern/c/include/kore/pthread.h");
     println!("cargo:rerun-if-changed=tests/consumer.zig");
     println!("cargo:rerun-if-changed=../../extern/c/include/kore.h");
     println!("cargo:rerun-if-changed=../../extern/zig/src/root.zig");

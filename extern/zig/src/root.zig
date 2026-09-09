@@ -54,6 +54,9 @@ pub const task = struct {
     pub const release = abi.kore_task_release;
 };
 pub const thread = struct {
+    pub const create = abi.kore_thread_create;
+    pub const detach = abi.kore_thread_detach;
+    pub const join = abi.kore_thread_join;
     pub const run = abi.kore_thread_run;
 };
 pub const time = struct {

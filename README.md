@@ -5,8 +5,9 @@ scaffold on `alpha`. It provides a real filesystem API, common prelude, native
 runtime macros, typed sleep, process facilities, automatically seeded random
 values, hash collections and an opt-in driver substrate.
 The `kore-ffi` package adds generated C bindings and a translated Zig module for
-filesystem requests, clocks/sleep, random values, async task preparation and
-joined thread/SPMD scopes, driven by a Rust-founded host. It also exposes
+filesystem requests, clocks/sleep, random values, async task preparation,
+joined thread/SPMD scopes and independent native create/join/detach, driven by
+a Rust-founded host. It also exposes
 opaque hash tables, C allocation functions and a Zig `std.mem.Allocator`
 adapter over the application's installed heap.
 It is `no_std`; all authority comes from the application's actual endowments.
@@ -93,3 +94,11 @@ The previous sketches and address/collection experiments remain in Git history
 at `8a6381c`; their parallel runtime, allocator placeholder and empty language
 headers are no longer part of the active library. See [provenance](https://github.com/MicroPerceptron/libkore/blob/alpha/docs/provenance.md)
 for upstream dependencies, licensing records and validation boundaries.
+
+
+Pthread-shaped C/Zig lifecycle calls use a process-lifetime native controller;
+join may originate on another worker and detached threads are reaped after exit.
+`kore/pthread.h` provides source aliases for create/join/detach with default
+attributes, and `c-stdlib` supplies their freestanding linker symbols. See
+[thread lifecycle and TLS](docs/runtime.md#independent-foreign-threads) for the
+ownership contract and the remaining POSIX boundaries.

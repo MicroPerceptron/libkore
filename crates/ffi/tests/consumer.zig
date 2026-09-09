@@ -83,3 +83,14 @@ export fn zig_check_alloc() callconv(.c) u32 {
     if (kore.hash.table_reserve(table, 100) != c.KORE_HASH_OK) return 7;
     return 0;
 }
+
+fn threadIdentity(argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    return argument;
+}
+export fn zig_check_thread_refusal() callconv(.c) u32 {
+    var thread: ?*c.KoreThread = @ptrFromInt(16);
+    if (kore.thread.create(&thread, null, threadIdentity, null) != c.KORE_THREAD_EAGAIN) return 1;
+    if (@intFromPtr(thread.?) != 16) return 2;
+    if (kore.thread.join(null, null) != c.KORE_THREAD_EINVAL) return 3;
+    return if (kore.thread.detach(null) == c.KORE_THREAD_EINVAL) 0 else 4;
+}

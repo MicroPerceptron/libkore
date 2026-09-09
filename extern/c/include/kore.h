@@ -91,6 +91,22 @@
 
 #define KORE_TASK_SLEEP_UNTIL 3
 
+#define KORE_THREAD_OK 0
+
+#define KORE_THREAD_ESRCH 3
+
+#define KORE_THREAD_EAGAIN 11
+
+#define KORE_THREAD_ENOMEM 12
+
+#define KORE_THREAD_EBUSY 16
+
+#define KORE_THREAD_EINVAL 22
+
+#define KORE_THREAD_EDEADLK 35
+
+#define KORE_THREAD_ECANCELED 125
+
 /**
  * Submission status is distinct from the later operation's completion status.
  */
@@ -286,6 +302,18 @@ typedef struct KoreRandom KoreRandom;
 typedef struct KoreTaskBatch KoreTaskBatch;
 
 /**
+ * Opaque join handle. Transfer between native workers; do not copy ownership.
+ * Successful join/detach consumes it. Concurrent operations on the same handle
+ * or use after consumption are invalid, including through a copied pointer.
+ */
+typedef struct KoreThread KoreThread;
+
+/**
+ * Reserved attributes. Only a null attributes pointer is currently supported.
+ */
+typedef struct KoreThreadAttr KoreThreadAttr;
+
+/**
  * Scoped generational name. Copying its bits does not duplicate native ownership.
  */
 typedef struct KoreFsHandle {
@@ -354,6 +382,8 @@ typedef struct KoreTaskHandle {
   uint32_t slot;
   uint32_t reserved;
 } KoreTaskHandle;
+
+typedef void *(*KoreThreadStart)(void*);
 
 typedef struct KoreClockReading {
   uint64_t nanoseconds;
@@ -741,6 +771,43 @@ KoreTaskState kore_task_poll(struct KoreTaskHandle handle);
  * newer generation, including concurrent release/reuse. No native task is killed.
  */
 KoreStatus kore_task_release(struct KoreTaskHandle handle);
+
+/**
+ * Start an independent native thread; return zero or a KORE_THREAD_E* code.
+ * Default attributes only. Lazily starts the process-lifetime controller.
+ * Uses the installed process allocator. A failed create leaves out unchanged
+ * and never retains the caller's argument. Calls block on native workers;
+ * they must not run inside an executor callback that owes sibling polls.
+ * # Safety
+ * out is aligned, writable and disjoint from callback storage. start/argument
+ * remain valid through callback termination, including after detach. The
+ * callback synchronizes shared data and must not unwind or longjmp across Rust.
+ * Its returned pointer must remain valid for the joining caller. No TLS
+ * destructors, cancellation, explicit pthread_exit or custom stacks are supplied.
+ */
+int32_t kore_thread_create(struct KoreThread **out,
+                           const struct KoreThreadAttr *attributes,
+                           KoreThreadStart start,
+                           void *argument);
+
+/**
+ * Join from any native worker. Success and ECANCELED consume the handle; other
+ * errors retain it for retry. A null result pointer discards the return value.
+ * # Safety
+ * thread is a live uniquely owned handle from create, with no concurrent
+ * join/detach. result, when nonnull, is aligned, writable and disjoint from the
+ * handle. See create's callback and returned-pointer lifetime contracts.
+ */
+int32_t kore_thread_join(struct KoreThread *thread, void **result);
+
+/**
+ * Relinquish joining. Success consumes the handle; the controller retains and
+ * reaps the native thread and its callback context after termination.
+ * # Safety
+ * thread is a live uniquely owned handle from create, with no concurrent
+ * join/detach. Caller-owned callback storage remains valid through termination.
+ */
+int32_t kore_thread_detach(struct KoreThread *thread);
 
 /**
  * Read the native monotonic domain, in nanoseconds since boot.

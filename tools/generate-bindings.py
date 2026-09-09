@@ -49,8 +49,17 @@ def generate(check=False):
             raise SystemExit(f'missing allocator export: {symbol}')
         stdlib += f'#define {name} {symbol}\n'
     stdlib += '#endif\n'
+    pthread = '/* Generated lifecycle aliases; default attributes only, not a complete POSIX API. */\n'
+    pthread += '#ifndef KORE_PTHREAD_H\n#define KORE_PTHREAD_H\n#include "../kore.h"\n'
+    pthread += 'typedef struct KoreThread *pthread_t;\ntypedef struct KoreThreadAttr pthread_attr_t;\n'
+    for name in ['create', 'join', 'detach']:
+        symbol = f'kore_thread_{name}'
+        if symbol not in functions:
+            raise SystemExit(f'missing thread export: {symbol}')
+        pthread += f'#define pthread_{name} {symbol}\n'
+    pthread += '#endif\n'
     for relative, data in [('extern/c/include/kore.h', source), ('extern/zig/src/root.zig', zig),
-                           ('extern/c/include/kore/stdlib.h', stdlib)]:
+                           ('extern/c/include/kore/stdlib.h', stdlib), ('extern/c/include/kore/pthread.h', pthread)]:
         path = ROOT / relative
         if check:
             if not path.exists() or path.read_text() != data:

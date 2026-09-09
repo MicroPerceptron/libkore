@@ -130,7 +130,7 @@ worker execution; the prior Kore production-gate limitation remains unchanged.
 
 ## Mainline resynchronization
 
-The native export now comes from Kore
+That resynchronization exported Kore
 `75b8256ea60d4fc4a63bb17fc1379c21a98ce06d`, the #962 merge of main through
 `75ca434a9`. It contains 14 native packages and 221 source files. This brings
 in the memory/status, power/event, DagFS negotiated-transfer and driver changes
@@ -155,3 +155,22 @@ architecture checks, separate production/test builds, serial QEMU boottest,
 production QEMU boot gate and founded filesystem command gate. The production
 gate includes `net-load: PASS`, clearing the earlier missing-witness blocker on
 this merged tree. No physical-hardware acceptance is inferred from these runs.
+
+
+## Native TLS and independent thread lifecycle
+
+The current export records Kore `dec012bf4584080a802a18468899890e8937ef6d`
+from PR #962: 14 native packages and 223 exact source files. It adds native TLS
+provisioning, owner-checked native tickets and a process-lifetime controller for
+cross-worker create/join/detach. Loader publication and the founded guest witness
+remain in Kore; libkore imports their runtime contracts without copying kernel
+or service implementations. Both workspace dependency locks are unchanged.
+
+The C/Zig adapter generates default-attribute pthread-shaped lifecycle calls,
+source aliases and optional freestanding linker symbols. Its callback context is
+retained until native reclamation, and its shared result uses a pointer-typed
+atomic. Host/Clippy/docs/owner/custom-target/Miri/generated-binding checks passed,
+including real C/Zig host-refusal consumers and the returned-pointer provenance
+check. Object inspection verifies all three thread linker symbols on every Kore
+ISA. These checks do not establish physical-hardware acceptance or a standalone
+foreign-founded process boot witness.

@@ -108,6 +108,7 @@ pub mod session;
 pub mod stack_arena;
 pub mod svc;
 pub mod thread;
+pub mod thread_controller;
 pub mod transport;
 #[cfg(feature = "validate")]
 pub mod validate;
@@ -140,3 +141,5 @@ pub use transport::{Committed, Transport};
 // namespace, and one name for the one model is the point:
 // `#[kore_rt::spmd(x, y, z)]` launches what `kore_rt::spmd` implements.
 pub use kore_rt_macros::{Bundle, main, spmd, task};
+
+pub mod tls;

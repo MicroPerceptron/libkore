@@ -46,3 +46,13 @@ uint32_t c_sleep_and_random(KoreFsContext *ctx) {
     if (kore_time_sleep_for(ctx, 1250000) != KORE_STATUS_QUEUED) return 3;
     return kore_time_yield(ctx) == KORE_STATUS_BUSY ? 0 : 4;
 }
+
+#include "kore/pthread.h"
+static void *c_thread_identity(void *argument) { return argument; }
+uint32_t c_check_thread_refusal(void) {
+    pthread_t thread = (pthread_t)(uintptr_t)16;
+    if (pthread_create(&thread, NULL, c_thread_identity, NULL) != KORE_THREAD_EAGAIN) return 1;
+    if (thread != (pthread_t)(uintptr_t)16) return 2;
+    if (pthread_join(NULL, NULL) != KORE_THREAD_EINVAL) return 3;
+    return pthread_detach(NULL) == KORE_THREAD_EINVAL ? 0 : 4;
+}

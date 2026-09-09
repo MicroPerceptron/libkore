@@ -7,7 +7,7 @@ publish = false
 kore = { package = "kore-std", path = "../.." }
 
 [features]
-# Export standard C allocation symbols on freestanding Kore targets only.
+# Export standard C allocation and thread lifecycle symbols on Kore targets only.
 c-stdlib = []
 # Host-only executable C/Zig ABI tests; no target runtime dependency.
 test-foreign = []

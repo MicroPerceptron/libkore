@@ -77,9 +77,61 @@ means no callback launched; after release, an uncertain join never returns for
 serial replay or lets the borrowed frame die. This preserves native fail-stop
 behavior and means a post-launch lifecycle failure can keep the scope blocked.
 No detached ticket table, arbitrary per-worker capability grant, nested dispatch,
-or pthread-style ambient authority is introduced.
+or extra device authority is introduced by scoped dispatch.
 
 Foreign callbacks must obey native thread restrictions, synchronize shared data,
 return promptly where cooperative scheduling requires it, and never unwind or
 longjmp across Rust. These are native-code FFI contracts, not script isolation.
 Zig exposes the generated names under `task`, `thread`, `spmd` and `time`.
+
+
+## Independent foreign threads
+
+`kore_thread_create(&thread, NULL, start, argument)` starts a native callback;
+`kore_thread_join(thread, &result)` joins it from any native worker and
+`kore_thread_detach(thread)` gives up joining while retaining native reclamation.
+Zig generates the same `thread.create`, `thread.join` and `thread.detach` faces.
+Include `<kore/pthread.h>` for `pthread_t` and source aliases for those three
+calls. `kore-ffi/c-stdlib` additionally emits their actual freestanding linker
+names on Kore targets; it never interposes host pthreads.
+
+The first create starts one process-lifetime controller. It owns all native join
+capabilities; portable handles contain identifiers, never arena slot authority.
+Calls use bounded shared records and paced parks, including a 1 ms controller
+scan while idle. They must run on native threads, not executor callbacks that
+owe other futures progress. Capacity depends on native bands and the controller's
+capability arena; ordinary slot exhaustion is refused before spending a band.
+
+Create uses the installed process allocator for its handle and callback context.
+On error the output is unchanged and the argument is not retained. On success,
+the callback may already be running: synchronize argument access accordingly.
+Join success consumes the handle and publishes the callback's pointer result;
+ECANCELED also consumes it, reporting native termination without callback return.
+Other errors retain the handle for retry. Detach success consumes the handle but
+keeps callback context alive until native reclamation. A per-result `Arc` and
+pointer-typed atomic preserve the result's provenance and lifetime across that
+handoff. Caller-owned arguments and returned pointees retain their own lifetime
+requirements; a pointer into an exited thread's stack is not a valid result.
+
+Return values are positive `KORE_THREAD_E*` constants (zero means success), not
+writes to `errno`. Only null/default attributes are accepted. Native workers
+receive a derived process heap, not arbitrary capabilities held by their creator.
+Do not concurrently join/detach or reuse a consumed foreign handle. This is a
+pthread-shaped lifecycle subset, not a complete POSIX implementation: custom
+stacks/attributes, pthread-specific keys/destructors, compiler TLS destructors,
+cancellation, cleanup stacks, `pthread_self`, `pthread_exit`, and inheritance of
+the requesting thread's signal/floating-point environment remain unsupported.
+
+The native loader now retains pristine `.tdata`/`.tbss` templates and provisions
+each new native thread's own architecture-correct TLS/TCB. Async tasks still see
+the TLS of whichever native worker polls them; task-local state is separate.
+Native guest witnesses cover TLS isolation, cross-worker joins, self-join refusal,
+repeated detached cleanup and recovery after refused creates. Host adapter tests
+prove refusal and pointer/lifetime behavior; they do not simulate a native thread.
+
+
+The call shapes follow the Open Group specifications for
+[`pthread_create`](https://pubs.opengroup.org/onlinepubs/000095399/functions/pthread_create.html),
+[`pthread_join`](https://pubs.opengroup.org/onlinepubs/009695399/functions/pthread_join.html)
+and [`pthread_detach`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_detach.html);
+the supported subset above is deliberately narrower than those full contracts.

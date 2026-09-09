@@ -25,11 +25,13 @@ mod parallel;
 mod random;
 mod session;
 mod task;
+mod thread;
 mod time;
 pub use parallel::*;
 pub use random::*;
 pub use session::{RunError, Session};
 pub use task::*;
+pub use thread::*;
 pub use time::*;
 
 pub const KORE_ABI_VERSION: u32 = 1;
@@ -794,6 +796,8 @@ mod tests {
             fn c_read_completion(ctx: *mut KoreFsContext, result: *const KoreFsCompletion) -> u32;
             fn c_sleep_and_random(ctx: *mut KoreFsContext) -> u32;
             fn zig_check_random() -> u32;
+            fn c_check_thread_refusal() -> u32;
+            fn zig_check_thread_refusal() -> u32;
             fn zig_submit_create(ctx: *mut KoreFsContext, handle: KoreFsHandle) -> u32;
         }
         let mut ctx = opened();
@@ -820,6 +824,8 @@ mod tests {
             assert_eq!(ctx.command.unwrap().op, KORE_OP_SLEEP_FOR);
             assert_eq!(ctx.command.unwrap().offset, 1_250_000);
             assert_eq!(zig_check_random(), 0);
+            assert_eq!(c_check_thread_refusal(), 0);
+            assert_eq!(zig_check_thread_refusal(), 0);
         }
     }
 }
