@@ -1,0 +1,21 @@
+[package]
+name = "kore-svc-extract-worker-rust"
+version = "0.0.1"
+edition = "2024"
+description = "Pure-Rust bounded format adapters for kore content extraction."
+publish = false
+
+[features]
+default = []
+# Declared only so the shared adapter source can exclude its C-only section.
+c-json = []
+
+[dependencies]
+kore-svc-extract = { path = "../extract" }
+heapless = { version = "0.9.3", default-features = false }
+blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
+core-json = { version = "0.4.0", default-features = false }
+tar-no-std = { version = "0.4.2", default-features = false }
+tinybmp = { version = "0.7.0", default-features = false }
+tinyzip = { version = "0.4.0", default-features = false }
+xmlparser = { version = "0.13.6", default-features = false }

@@ -1,0 +1,20 @@
+[package]
+name = "kore-rt-macros"
+version = "0.0.0"
+edition = "2024"
+description = "kore runtime declarations: #[kore_rt::main] (the §5.4 entry contract), #[kore_rt::task] (bounded executor storage), and #[derive(kore_rt::Bundle)] (one static authority declaration for founding and fail-closed possession). Host-compiled proc-macro crate (res/USERLAND.md §1.1): cargo builds proc-macro dependencies for the host even under the build-std/JSON-target regime, so it is exempt from the no_std gates while its behavior is proven by kore-rt's test suite."
+publish = false
+
+[lib]
+proc-macro = true
+
+# The standard proc-macro trio — already in the workspace graph through
+# zerocopy-derive, so no new dependency tree enters the lockfile; `full`
+# is the fn-item grammar the two attributes parse.
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+# Host-only dependency-name resolution, including a renamed kore-std facade.
+proc-macro-crate = "3.5"

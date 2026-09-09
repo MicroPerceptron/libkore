@@ -1,22 +1,33 @@
 [package]
-name = "kore"
-version = "0.1.0"
+name = "kore-std"
+version = "0.1.0-alpha.1"
 edition = "2024"
-license = "Mozilla Public License 2.0"
-
-[lib]
-crate-type = ["rlib"]
-
-[dependencies]
+publish = false
+description = "Kore application standard library over native capability owners"
+repository = "https://github.com/MicroPerceptron/libkore"
 
 [workspace]
-members = [
-    "crates/driver",
-    "crates/collections",
-    "crates/linker",
-    "crates/macros",
-    "crates/ring",
-    "crates/addresses",
-]
+resolver = "3"
+members = ["tests/consumer", "crates/ffi"]
+exclude = ["native"]
 
-exclude = ["vendor", "extern"]
+[features]
+default = ["fs"]
+fs = ["dep:kore-dagfs", "kore-dagfs/runtime"]
+heap = ["kore-rt/heap"]
+crt0 = ["kore-rt/crt0"]
+driver = ["dep:kore-driver", "kore-driver/service"]
+
+# Byte-exact native export; source revision and hashes live in native/provenance.json.
+[dependencies]
+chacha20 = { version = "0.10.2", default-features = false, features = ["rng", "zeroize"] }
+zeroize = { version = "1.8.1", default-features = false }
+kore-abi = { path = "native/crates/abi" }
+kore-app = { path = "native/crates/app" }
+kore-rt = { path = "native/crates/rt", default-features = false }
+kore-dagfs = { path = "native/crates/dagfs", optional = true }
+kore-driver = { path = "native/crates/driver", optional = true }
+
+[package.metadata.kore]
+# Used by tools/local-kore.py to construct one coherent local source override.
+owner-paths = { kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver" }

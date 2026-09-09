@@ -1,0 +1,56 @@
+[package]
+name = "kore-driver"
+version = "0.0.0"
+edition = "2024"
+description = "kore driver substrate: the platform seam (Regs/Dma/DmaPool) + the shared async ring mechanics (producer SubRing + phase/cycle-polled CompRing + cookie correlation + stats) every native driver whose control plane is an SQ/CQ ring pair composes from — proven first by kore-nvme, second by kore-xhci."
+publish = false
+
+# Pure logic over the kore-abi device ABI's typed addresses ([`IovaAddr`]).  No
+# hardware, no kernel: the seam abstracts both, and the ring mechanics are
+# generic over it. Production userland, kernel-internal first-light, and
+# cfg(test) hardware doubles are distinct compositions over that seam.
+[dependencies]
+virtio-accel-core = { version = "=0.3.7", default-features = false, optional = true }
+kore-abi = { path = "../abi" }
+# Bitflag sets for the device-MMU common layer's neutral permission/attribute
+# types (`common::flags`) — the same crate + major line kore-abi already uses,
+# so a format impl's `AccessFlags` reads identically on both sides of the seam.
+bitflags = { version = "2.13.0", default-features = false }
+# The userland driver-process host (`service` feature only): `CapRegs`/`CapPool`
+# over kore-rt capability windows + the `DeviceEndowment` bundle (the #101
+# device-cap intake).  Optional and OFF by default, so the kernel (default
+# features) never pulls kore-rt into its binary — the discipline kore-nvme
+# states.
+kore-rt = { path = "../rt", optional = true }
+kore-collections = { path = "../collections", optional = true }
+# The frozen spsc window layout the per-vif network ring geometry computes
+# from (`net::window`).  Duplicating `region_bytes` here would be a second
+# copy of a kernel-grade ABI, and the two would drift.
+kore-ring = { path = "../ring" }
+# Wire records for the network class contract: a shared-window descriptor must
+# decode from any bytes, because the peer across the window is untrusted.
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+gpt_disk_types = { version = "0.16.1", default-features = false, features = ["bytemuck"] }
+crc = { version = "3.4.0", default-features = false }
+bytemuck = { version = "1.25.2", default-features = false }
+
+[features]
+# Native launch and health hooks over the allocation-free upstream lifecycle.
+accel = ["dep:virtio-accel-core"]
+# Userland posture: size the cookie table exactly to the negotiated ring
+# depth through the global allocator (which in kore-rt IS the mm-backed heap).
+# Off (the kernel boot-test): a fixed inline ceiling, heapless.
+alloc = []
+# The host-memory DMA double (`kore_driver::host_double`): a `DmaPool` over
+# leaked page-aligned process memory for a driver core's mock device.  Test
+# builds only — a driver crate turns it on in `[dev-dependencies]`.
+host-double = ["alloc"]
+# The userland driver-task host — the #101 device-cap intake over kore-rt
+# caps (`kore_driver::host`).  Pulls kore-rt; kept off the kernel's
+# default-feature build.
+service = ["dep:kore-rt", "dep:kore-collections"]
+
+# The self-dev-dependency turns `service` on for this crate's own test
+# builds, so the service face stays test-compiled.
+[dev-dependencies]
+kore-driver = { path = ".", features = ["service"] }

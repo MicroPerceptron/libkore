@@ -1,215 +1,64 @@
-name: CI
-
+name: Alpha CI
 on:
   pull_request:
-    # `pull_request.branches` filters on the BASE branch. Stacked PRs retarget
-    # onto another in-review branch, so `ft/**` must be listed or a stacked PR
-    # runs no checks at all — with a green-looking checks tab, because there
-    # are none.
-    branches:
-      - main
-      - 'ft/**'
-    types: [opened, synchronize, reopened]
-  # Deliberately NOT widened to `ft/**`: a push to a feature branch already
-  # runs through its pull request. Adding it here would run every job twice.
+    branches: [alpha, main, 'ft/**']
   push:
-    branches:
-      - main
+    branches: [alpha, main]
   workflow_dispatch:
-
-# A newer run for the same PR/ref supersedes the older one.
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-  # Any rustc warning fails the build. Registry dependencies are exempt —
-  # cargo applies `--cap-lints allow` to non-path deps — so this binds the
-  # workspace only.
-  RUSTFLAGS: -D warnings
-
+concurrency:
+  group: alpha-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 jobs:
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # The toolchain, its components and its targets are pinned by
-      # `rust-toolchain.toml`. rustup installs them on first proxied command,
-      # so CI never restates the pin and cannot drift from it.
-      - name: Install toolchain (pinned by rust-toolchain.toml)
-        run: rustup show active-toolchain
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain (pinned by rust-toolchain.toml)
-        run: rustup show active-toolchain
-
-      - name: Cache Cargo downloads
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-downloads-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-downloads-
-
-      - name: Cache job build outputs
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ github.job }}-target-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ github.job }}-target-${{ hashFiles('rust-toolchain.toml') }}-
-
-      # `--all-targets` covers tests and benches, not just the lib: a lint
-      # regression inside `#[cfg(test)]` is still a regression.
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    name: Host tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain (pinned by rust-toolchain.toml)
-        run: rustup show active-toolchain
-
-      - name: Cache Cargo downloads
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-downloads-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-downloads-
-
-      - name: Cache job build outputs
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ github.job }}-target-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ github.job }}-target-${{ hashFiles('rust-toolchain.toml') }}-
-
-      - name: Run workspace tests
-        run: cargo test --workspace
-
-  miri:
-    name: Miri
+  host:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Requires `miri` in the `components` list of `rust-toolchain.toml`.
-      - name: Install toolchain (pinned by rust-toolchain.toml)
-        run: rustup show active-toolchain
-
-      - name: Cache Cargo downloads
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-downloads-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-downloads-
-
-      # This crate set is integer and pointer arithmetic in a `no_std` library
-      # other crates link. Black-box tests cannot catch a union read of
-      # uninitialised padding — the value comes back correct whenever the stack
-      # happens to be zero — so miri is a required gate, not a nicety.
-      - name: Miri
-        run: cargo miri test --workspace
+            target
+          key: alpha-host-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo fetch --locked
+      - name: Install pinned binding tools
+        run: |
+          cargo install cbindgen --version 0.29.4 --locked
+          python3 tools/install-zig.py "$RUNNER_TEMP/libkore-tools" > "$RUNNER_TEMP/zig-path"
+          echo "ZIG=$(cat "$RUNNER_TEMP/zig-path")" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/libkore-zig-cache" >> "$GITHUB_ENV"
+      - run: make fmt test check docs owners bindings-check
+      # Negative control plus a patched Git consumer, using the exported tree
+      # as the local native owner. No cross-repository credential is needed.
+      - name: Native type composition
+        run: python3 tools/check-local.py native
 
   targets:
-    name: Check ${{ matrix.target }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-none
-          - aarch64-unknown-none
-          - riscv64gc-unknown-none-elf
+        arch: [x86_64, aarch64, riscv64gc]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain (pinned by rust-toolchain.toml)
-        run: rustup show active-toolchain
-
-      - name: Cache Cargo downloads
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-downloads-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-downloads-
-
-      - name: Cache job build outputs
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ github.job }}-${{ matrix.target }}-target-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ github.job }}-${{ matrix.target }}-target-${{ hashFiles('rust-toolchain.toml') }}-
-
-      # Proc-macro crates (`crates/macros`) are always built for the host, so
-      # `--workspace` is correct here and needs no exclusion.
-      - name: Check bare-metal target
-        run: cargo check --workspace --target ${{ matrix.target }}
-
-  docs:
-    name: Docs
+            target
+          key: alpha-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo check --locked -p kore-std -p kore-ffi --all-features --target targets/${{ matrix.arch }}-unknown-kore-user.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+  miri:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      # A broken intra-doc link in a published library is a broken link for
-      # every reader of docs.rs.
-      RUSTDOCFLAGS: -D warnings
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain (pinned by rust-toolchain.toml)
-        run: rustup show active-toolchain
-
-      - name: Cache Cargo downloads
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-downloads-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-downloads-
-
-      - name: Build documentation
-        run: cargo doc --workspace --no-deps
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - run: make miri

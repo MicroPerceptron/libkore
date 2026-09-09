@@ -1,0 +1,107 @@
+[package]
+name = "kore-rt"
+version = "0.0.1"
+edition = "2024"
+description = "kore runtime core: capability witnesses + the metal kernel-verb seam, the session builder + flows, the sharded heap engine, and the SystemService framework over the frozen kore-abi contracts (res/USERLAND.md §1.1)."
+publish = false
+
+# kore-abi (the frozen ABI) + alloc — and nothing else: the concrete
+# services (kore-svc-*) and the drivers all depend on this crate, so it
+# stays at the bottom of the userland graph.  The `heap` module (the
+# global allocator engine) necessarily uses raw pointers + atomics over
+# mapped extents — it is the thing that *provides* the heap, so it cannot
+# use one.
+[dependencies]
+kore-abi = { path = "../abi" }
+# The bounded arena-slot planner uses the same dependency-free bitset as the
+# kernel.  Keeping this at the bottom of the userland graph is lawful:
+# `kore-collections` is `no_std`, allocator-free, and has no dependencies.
+kore-collections = { path = "../collections", default-features = false }
+# The ring family the §5.3 request path rides (`svc` — request/reply
+# `ring::spsc`s in the pair's shared window).  Phase S promotes this from
+# a dev-dependency: kore-ring is pure data structures over kore-abi (no
+# deps beyond it), so the bottom of the userland graph is now the pair
+# {kore-abi, kore-ring} with kore-rt directly above.
+kore-ring = { path = "../ring" }
+# The `#[kore_rt::main]` / `#[kore_rt::task]` attributes (res/USERLAND.md
+# §1.1): host-compiled proc-macro crate, re-exported here so service
+# crates never depend on the macro crate directly (§5.4).
+kore-rt-macros = { path = "../rt-macros" }
+# Trait-level only (no derive): the entry contract reinterprets the
+# parent-written boot page through the frozen kore-abi layouts'
+# `FromBytes` faces (`entry::boot_context`).
+zerocopy = { version = "0.8", default-features = false }
+
+# The shared address monitor — every architecture, not just x86. The crate is
+# the same one the kernel links; what stays in `src/hint.rs` here is only where
+# the counter rate comes from (this runtime's clock page).
+kore-hint = { path = "../hint" }
+
+# **CPUID, on the one architecture that has it.** Target-gated, so the userland
+# graph is unchanged on aarch64 and riscv64 — and on x86 it is not a new crate
+# for this tree at all: the kernel already reads its feature bits through the
+# same version, with the same `default-features = false` no_std posture. The
+# address monitor's detection is a per-vendor question across two leaves (Intel
+# `WAITPKG` at 07H.0:ECX[5], AMD `MONITORX` at 8000_0001H:ECX[29]); those are
+# exactly the "plausible encoding" trap, and this crate already answers both.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+raw-cpuid = { version = "11.6.0", default-features = false }
+
+# Host-parallel support: `std` swaps the single-task shard constant for the
+# injective per-thread TLS map (heap/shard.rs) — what the integration tests
+# need to drive the sharded heap with real threads.  Freestanding builds
+# stay single-task until the kore-rt spawn TLS lands.
+[features]
+# Everything a userland *program* wants.  Off only for the one consumer
+# that runs before a program exists — see `heap`.
+default = ["heap"]
+
+std = []
+
+# Metal self-validation (`res/SPMD.md` §11 proof column): typed
+# exercises of machinery whose behavior only exists on the metal target
+# — the thread-group launch/barrier/join loop first.  A binary built
+# with this runs an exercise and prints the witness line its gate
+# demands; the exercises themselves return typed reports and never
+# print (the console belongs to the consumer).  OFF by default: the
+# validation statics (a group ctx, its counters) have no business in a
+# production image.
+validate = []
+
+# The global-allocator engine, and with it this crate's only non-test use
+# of `alloc`.  ON by default: every service and userland binary needs a
+# heap, and `default-features = false` would be a surprising thing to have
+# to write for the ordinary case.
+#
+# OFF for the **linker stub** (`user/runtime/ld-stub`), which runs inside a child
+# before any runtime exists there and has no allocator to register.  What
+# it needs — `SessionBuilder`, `TrapTransport`, `cap::verbs`, the flows —
+# is allocator-free already: `SessionBuilder` is inline arrays behind a
+# `const fn new`, `TrapTransport` is a ZST, and the only state the trap
+# reads is the scratch window — which `entry::boot_context` installs from
+# the boot page, the same page the stub already reads `.kore.ld` out of.
+#
+# So the stub's old "cannot use kore-rt" was never a layering law: it was
+# this crate's granularity, and nothing else.  crt0 — the thing that
+# comment named — is already off by default for the same reason, and is
+# the precedent for this.
+heap = []
+
+# The userland-binary entry (crt0): the per-arch naked `_start`,
+# `crt0_start`, and the `__kore_rt_main` extern the `#[kore_rt::main]`
+# expansion (or a service image's thin `__kore_rt_main`) satisfies.  OFF by
+# default so kore-rt as a LIBRARY dependency — the concrete `kore-svc-*`
+# services, and the kernel boot image that links the founder (U3b dep-move)
+# — brings no `_start` to collide with the host's own ELF entry.  A userland
+# ELF (the `svc-*` and userland-gate images) turns it on (`features = ["crt0"]`); it
+# is inert off the `target_os = "none"` metal targets regardless.
+crt0 = []
+
+# The self-dev-dependency turns `std` on for this crate's own test builds
+# (feature unification), so integration tests get the parallel shard map.
+# zerocopy (kore-abi's own version) lets the session tests re-read
+# finished descriptors through the same trait calls the kernel decode
+# performs.
+[dev-dependencies]
+kore-rt = { path = ".", features = ["std"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }

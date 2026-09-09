@@ -1,0 +1,62 @@
+{
+  "arch": "riscv64",
+  "code-model": "medium",
+  "cpu": "generic-rv64",
+  "crt-objects-fallback": "false",
+  "crt-static-default": false,
+  "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
+  "dynamic-linking": true,
+  "eh-frame-header": false,
+  "emit-debug-gdb-scripts": false,
+  "features": "+m,+a,+f,+d,+c,+zicsr,+zifencei",
+  "has-thread-local": true,
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-abiname": "lp64d",
+  "llvm-target": "riscv64",
+  "max-atomic-width": 64,
+  "metadata": {
+    "description": "kore userland riscv64gc: lp64d PIC/PIE ET_DYN under the res/IMAGE.md section-7 flag regime (os stays 'none'; kore has no target_os yet)",
+    "host_tools": false,
+    "std": false,
+    "tier": 2
+  },
+  "panic-strategy": "abort",
+  "plt-by-default": false,
+  "position-independent-executables": true,
+  "pre-link-args": {
+    "gnu": [
+      "-z",
+      "now",
+      "-z",
+      "relro",
+      "-z",
+      "text",
+      "-z",
+      "noexecstack",
+      "-z",
+      "separate-loadable-segments",
+      "-z",
+      "max-page-size=4096",
+      "-Bsymbolic-functions"
+    ],
+    "gnu-lld": [
+      "-z",
+      "now",
+      "-z",
+      "relro",
+      "-z",
+      "text",
+      "-z",
+      "noexecstack",
+      "-z",
+      "separate-loadable-segments",
+      "-z",
+      "max-page-size=4096",
+      "-Bsymbolic-functions"
+    ]
+  },
+  "relocation-model": "pic",
+  "relro-level": "full",
+  "target-pointer-width": 64
+}

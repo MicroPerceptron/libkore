@@ -1,2 +1,5 @@
 /target
+/native/target
 .zig-cache
+__pycache__/
+*.pyc

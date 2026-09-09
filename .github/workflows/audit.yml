@@ -3,6 +3,7 @@ name: Audit
 on:
   pull_request:
     branches:
+      - alpha
       - main
       - 'ft/**'
     # Dependency surface only — the advisory database is checked on the
@@ -10,15 +11,22 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'crates/*/Cargo.toml'
+      - 'tests/**/Cargo.toml'
+      - 'crates/**/Cargo.toml'
+      - 'native/**/Cargo.toml'
+      - 'native/Cargo.lock'
       - '.github/workflows/audit.yml'
   push:
     branches:
+      - alpha
       - main
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'crates/*/Cargo.toml'
+      - 'tests/**/Cargo.toml'
+      - 'crates/**/Cargo.toml'
+      - 'native/**/Cargo.toml'
+      - 'native/Cargo.lock'
   # An advisory can land against a dependency that has not changed, so the
   # gate has to run on time as well as on diff.
   schedule:
@@ -53,7 +61,9 @@ jobs:
           tool: cargo-audit
 
       - name: Audit advisories
-        run: cargo audit --deny warnings
+        run: |
+          cargo audit --deny warnings
+          cargo audit --file native/Cargo.lock --deny warnings
 
   lockfile:
     name: Lockfile currency
@@ -70,4 +80,6 @@ jobs:
       # committed without its lockfile update is caught here rather than by
       # the next person to build.
       - name: Verify Cargo.lock is current
-        run: cargo metadata --locked --format-version 1 > /dev/null
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo metadata --locked --manifest-path native/Cargo.toml --format-version 1 > /dev/null

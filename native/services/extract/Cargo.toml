@@ -1,0 +1,14 @@
+[package]
+name = "kore-svc-extract"
+version = "0.0.1"
+edition = "2024"
+description = "Source-neutral, bounded content-extraction broker and normalized parser result contract."
+publish = false
+
+[dependencies]
+heapless = { version = "0.9.3", default-features = false }
+blake3 = { version = "1.8.7", default-features = false, features = ["pure"] }
+kore-rt = { path = "../../crates/rt" }
+
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }

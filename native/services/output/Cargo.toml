@@ -1,0 +1,16 @@
+[package]
+name = "kore-svc-output"
+version = "0.0.1"
+edition = "2024"
+description = "kore output service: the generic byte stream from one client to a backend provider (res/USERLAND.md §5.9) — control plane over the svc framework, SPSC data plane, kore-uart register backends."
+publish = false
+
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+kore-ring = { path = "../../crates/ring" }
+kore-rt = { path = "../../crates/rt" }
+kore-uart = { path = "../../crates/uart" }
+
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }
+kore-uart = { path = "../../crates/uart", features = ["mock"] }

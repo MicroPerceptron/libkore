@@ -1,3 +1,0 @@
-//! Memory
-
-pub mod allocator;

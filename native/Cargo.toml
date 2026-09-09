@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/abi",
+    "crates/app",
+    "crates/collections",
+    "crates/dagfs",
+    "crates/driver",
+    "crates/hint",
+    "crates/ring",
+    "crates/rt",
+    "crates/rt-macros",
+    "crates/uart",
+    "crates/window",
+    "services/extract",
+    "services/extract-worker-rust",
+    "services/output",
+]

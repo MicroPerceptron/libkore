@@ -1,0 +1,7 @@
+.{
+    .name = .kore,
+    .fingerprint = 0xae39ada0a267fed9,
+    .version = "0.1.0-alpha.1",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "extern", "crates/ffi/tests/consumer.zig" },
+}

@@ -1,0 +1,11 @@
+[package]
+name = "kore-app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Typed, capability-inert application bundle presets for Kore"
+
+[dependencies]
+kore-abi = { path = "../abi" }
+kore-dagfs = { path = "../dagfs" }
+kore-window = { path = "../window", default-features = false }

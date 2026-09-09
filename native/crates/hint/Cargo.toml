@@ -1,0 +1,21 @@
+[package]
+name = "kore-hint"
+version = "0.0.0"
+edition = "2024"
+description = "The hardware address monitor: UMONITOR/UMWAIT + TPAUSE, MONITORX/MWAITX, WFE(T), WRS.STO behind one arch-neutral seam, shared by the kernel and kore-rt."
+publish = false
+
+# Extracted from `kore-rt` so the KERNEL can use it too. Userland reached this
+# first only because it had to: ring 3 cannot issue `MONITOR`/`MWAIT`, so the
+# runtime was forced to build the WAITPKG / `MONITORX` seam properly. The
+# kernel could always fall back to `hlt`, so it never grew a *timed*
+# equivalent — and the one path that genuinely needs one (pre-scheduler AML
+# `Sleep`) spins instead. Same instructions, same contract, one implementation.
+#
+# TRIPWIRE (mirroring kore-ring): the kernel links this crate, so its
+# dependency closure IS kernel dependency closure. `raw-cpuid` is here because
+# feature detection must not be hand-decoded — two different CPUID leaves, and
+# getting either wrong is a fault rather than a wrong answer. The day this
+# crate wants a second dependency, ask whether the kernel should be linking it.
+[dependencies]
+raw-cpuid = { version = "11.6.0", default-features = false }

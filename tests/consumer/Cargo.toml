@@ -1,0 +1,10 @@
+[package]
+name = "libkore-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# A real downstream manifest: no direct runtime or ABI dependency to hide a
+# broken procedural-macro expansion. Also renamed again inside the source.
+[dependencies]
+system = { package = "kore-std", path = "../.." }
