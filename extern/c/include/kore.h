@@ -679,17 +679,16 @@ uint32_t kore_futex_available(void);
  * Process-local only. Do not call from executor callbacks: Rust tasks should
  * use kore::futex::wait_async instead.
  * # Safety
- * word is null, misaligned, or points to a live writable 32-bit word aligned
+ * ptr is null, misaligned, or points to a live writable 32-bit word aligned
  * to at least 4 bytes. Valid storage must stay at the same address throughout
  * all waits/wakes. All concurrent accesses must be compatible 32-bit atomic
  * operations (C atomic builtins or Zig atomics); never mix ordinary accesses
  * or differently sized atomics. Managed-thread waits are cancellation points:
- * they may exit without stack unwinding, as specified by kore_thread_testcancel. Publish the condition with a sequentially
- * consistent atomic store BEFORE waking. No address-space sharing is implied.
+ * they may exit without stack unwinding, as specified by kore_thread_testcancel.
+ * Publish the condition with a sequentially consistent atomic store BEFORE waking.
+ * No address-space sharing is implied.
  */
-KoreFutexOutcome kore_futex_wait(uint32_t *ptr,
-                                 uint32_t expected,
-                                 uint64_t timeout_ns);
+KoreFutexOutcome kore_futex_wait(uint32_t *ptr, uint32_t expected, uint64_t timeout_ns);
 
 /**
  * Wake one waiter. Returns 1 if a direct or relay notice was posted, 0 if no

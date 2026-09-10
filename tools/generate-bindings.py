@@ -52,28 +52,17 @@ def generate(check=False):
     pthread = '/* Generated lifecycle aliases; default attributes only, not a complete POSIX API. */\n'
     pthread += '#ifndef KORE_PTHREAD_H\n#define KORE_PTHREAD_H\n#include "../kore.h"\n'
     pthread += 'typedef struct KoreThread *pthread_t;\ntypedef struct KoreThreadAttr pthread_attr_t;\n'
-    for name in [
-        'create',
-        'join',
-        'detach',
-        'cancel',
-        'key_create',
-        'key_delete',
-        'setspecific',
-        'getspecific',
-        'setcancelstate',
-        'setcanceltype',
-        'testcancel',
-        'exit',
-        'atexit',
-        'canceled',
-        'cleanup_push',
-        'cleanup_pop',
-    ]:
+    aliases = ['create', 'join', 'detach', 'cancel', 'key_create', 'key_delete',
+               'setspecific', 'getspecific', 'setcancelstate', 'setcanceltype',
+               'testcancel', 'exit']
+    # Macro helpers need exports too, but must not become function aliases:
+    # cleanup push/pop own a lexical scope and canceled supplies a sentinel.
+    for name in aliases + ['canceled', 'cleanup_push', 'cleanup_pop']:
         symbol = f'kore_thread_{name}'
         if symbol not in functions:
             raise SystemExit(f'missing thread export: {symbol}')
-        pthread += f'#define pthread_{name} {symbol}\n'
+    for name in aliases:
+        pthread += f'#define pthread_{name} kore_thread_{name}\n'
     pthread += 'typedef KoreThreadKey pthread_key_t;\n'
     for name in ['CANCEL_ENABLE', 'CANCEL_DISABLE', 'CANCEL_DEFERRED', 'CANCEL_ASYNCHRONOUS',
                  'DESTRUCTOR_ITERATIONS', 'KEYS_MAX']:
