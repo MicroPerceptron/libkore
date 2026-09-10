@@ -58,5 +58,6 @@
   },
   "relocation-model": "pic",
   "relro-level": "full",
-  "target-pointer-width": 64
+  "target-pointer-width": 64,
+  "tls-model": "initial-exec"
 }

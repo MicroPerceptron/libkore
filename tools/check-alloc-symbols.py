@@ -7,6 +7,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 SYMBOLS = {'malloc', 'calloc', 'realloc', 'free', 'pthread_create', 'pthread_join', 'pthread_detach',
+           '__cxa_thread_atexit', '__cxa_thread_atexit_impl', 'pthread_cancel', 'pthread_key_create', 'pthread_key_delete', 'pthread_setspecific', 'pthread_getspecific', 'pthread_setcancelstate', 'pthread_setcanceltype', 'pthread_testcancel', 'pthread_exit',
            'kore_futex_available', 'kore_futex_wait', 'kore_futex_wake', 'kore_futex_wake_all'}
 
 if __name__ == '__main__':
@@ -29,6 +30,12 @@ if __name__ == '__main__':
             '--format=posix', str(object_file),
         ], text=True)
         defined = {line.split()[0] for line in output.splitlines() if line.strip()}
+        undefined = subprocess.check_output([
+            os.environ.get('LLVM_NM', 'llvm-nm'), '--undefined-only', '--extern-only',
+            '--format=posix', str(object_file),
+        ], text=True)
+        if '__tls_get_addr' in undefined:
+            raise SystemExit(f'{arch}: dynamic TLS resolver dependency; static initial-exec TLS required')
         if missing := SYMBOLS - defined:
             raise SystemExit(f'{arch}: missing C allocation/thread/futex symbols: {sorted(missing)}')
         print(f'freestanding C allocation/thread/futex symbols: {arch}', flush=True)

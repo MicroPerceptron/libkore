@@ -60,7 +60,8 @@ pub extern "C" fn kore_futex_available() -> u32 {
 /// to at least 4 bytes. Valid storage must stay at the same address throughout
 /// all waits/wakes. All concurrent accesses must be compatible 32-bit atomic
 /// operations (C atomic builtins or Zig atomics); never mix ordinary accesses
-/// or differently sized atomics. Publish the condition with a sequentially
+/// or differently sized atomics. Managed-thread waits are cancellation points:
+/// they may exit without stack unwinding, as specified by kore_thread_testcancel. Publish the condition with a sequentially
 /// consistent atomic store BEFORE waking. No address-space sharing is implied.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kore_futex_wait(
@@ -72,7 +73,37 @@ pub unsafe extern "C" fn kore_futex_wait(
         return KoreFutexOutcome::InvalidArgument;
     };
     let timeout = (timeout_ns != KORE_FUTEX_INFINITE).then(|| Duration::from_nanos(timeout_ns));
-    futex::wait(word, expected, timeout).into()
+    if !crate::thread_local::cancellable() {
+        return futex::wait(word, expected, timeout).into();
+    }
+    // A bounded native park makes cancellation observable even without a peer
+    // kick capability. Recompute against one deadline; slices never restart it.
+    unsafe { crate::kore_thread_testcancel() };
+    let start = match kore::time::uptime() {
+        Ok(time) => time.as_nanos(),
+        Err(_) => return KoreFutexOutcome::Unsupported,
+    };
+    let deadline = timeout.map(|_| start.saturating_add(timeout_ns));
+    loop {
+        unsafe { crate::kore_thread_testcancel() };
+        let now = match kore::time::uptime() {
+            Ok(time) => time.as_nanos(),
+            Err(_) => return KoreFutexOutcome::Unsupported,
+        };
+        let slice = deadline.map_or(1_000_000, |end| end.saturating_sub(now).min(1_000_000));
+        let outcome = futex::wait(word, expected, Some(Duration::from_nanos(slice)));
+        unsafe { crate::kore_thread_testcancel() };
+        if outcome != futex::WaitOutcome::TimedOut {
+            return outcome.into();
+        }
+        if let Some(end) = deadline {
+            match kore::time::uptime() {
+                Ok(time) if time.as_nanos() < end => {}
+                Ok(_) => return KoreFutexOutcome::TimedOut,
+                Err(_) => return KoreFutexOutcome::Unsupported,
+            }
+        }
+    }
 }
 
 /// Wake one waiter. Returns 1 if a direct or relay notice was posted, 0 if no

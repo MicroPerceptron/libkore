@@ -98,8 +98,10 @@ for upstream dependencies, licensing records and validation boundaries.
 
 Pthread-shaped C/Zig lifecycle calls use a process-lifetime native controller;
 join may originate on another worker and detached threads are reaped after exit.
-`kore/pthread.h` provides source aliases for create/join/detach with default
-attributes, and `c-stdlib` supplies their freestanding linker symbols. See
+`kore/pthread.h` provides lifecycle, TLS-key, cleanup and deferred-cancellation
+aliases with default attributes; `c-stdlib` supplies their freestanding linker
+symbols and compiler TLS destructor registration. Managed threads run TLS
+destructors before native reclamation. Asynchronous cancellation is refused. See
 [thread lifecycle and TLS](docs/runtime.md#independent-foreign-threads) for the
 ownership contract and the remaining POSIX boundaries.
 

@@ -159,7 +159,7 @@ this merged tree. No physical-hardware acceptance is inferred from these runs.
 
 ## Native TLS and independent thread lifecycle
 
-The current export records Kore `dec012bf4584080a802a18468899890e8937ef6d`
+The current export records Kore `2a45f8bce5db65e7713f11c89d7eb5d2d9a04d3f`
 from PR #962: 14 native packages and 223 exact source files. It adds native TLS
 provisioning, owner-checked native tickets and a process-lifetime controller for
 cross-worker create/join/detach. Loader publication and the founded guest witness
@@ -174,3 +174,17 @@ including real C/Zig host-refusal consumers and the returned-pointer provenance
 check. Object inspection verifies all three thread linker symbols on every Kore
 ISA. These checks do not establish physical-hardware acceptance or a standalone
 foreign-founded process boot witness.
+
+The export revision also contains the loader fix for pure zero-initialized TLS:
+zero `.tdata` bytes require no source lease, while TLS allocation geometry remains
+present. The runtime also releases the child TLS scratch-slot reservation on success
+and refusal, and exposes its existing deadline-park helper for foreign join
+without requiring doorbell authority. The loader itself remains upstream. Application targets select initial-exec TLS.
+
+Managed foreign callbacks now have key/compiler TLS destructors, cleanup handlers,
+explicit exit and deferred cancellation. Host/Miri tests cover key-generation
+reuse, destructor repopulation/order, registration during teardown and cancellation
+state. The checked-in guest harness exercises the actual adapter in founded
+`hello`, with C-ABI Rust callbacks; separate C/Zig consumers verify generated
+language bindings. It does not claim a C/Zig CRT, automatic stack unwinding,
+initial-process exit hooks, asynchronous cancellation or physical acceptance.

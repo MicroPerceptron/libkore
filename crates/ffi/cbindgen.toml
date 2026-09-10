@@ -12,7 +12,7 @@ header = "/* Kore alpha ABI v1. Capability-owned APIs; scoped worker calls join 
 parse_deps = false
 [export]
 # Optional bare C symbols use the same declarations via kore/stdlib.h aliases.
-exclude = ["malloc", "calloc", "realloc", "free", "pthread_create", "pthread_join", "pthread_detach"]
+exclude = ["malloc", "calloc", "realloc", "free", "pthread_create", "pthread_join", "pthread_detach", "pthread_cancel", "pthread_key_create", "pthread_key_delete", "pthread_setspecific", "pthread_getspecific", "pthread_setcancelstate", "pthread_setcanceltype", "pthread_testcancel", "pthread_exit", "__cxa_thread_atexit", "__cxa_thread_atexit_impl"]
 include = ["KoreHashEqual", "KoreHashVisit", "KoreFsStep", "KoreFsCompletion", "KoreFsError", "KoreTaskStep", "KoreTaskAction", "KoreSpmdStep", "KoreThreadStep", "KoreThreadStart"]
 [enum]
 prefix_with_name = true

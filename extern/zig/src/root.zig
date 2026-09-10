@@ -60,10 +60,23 @@ pub const task = struct {
     pub const release = abi.kore_task_release;
 };
 pub const thread = struct {
+    pub const atexit = abi.kore_thread_atexit;
+    pub const cancel = abi.kore_thread_cancel;
+    pub const canceled = abi.kore_thread_canceled;
+    pub const cleanup_pop = abi.kore_thread_cleanup_pop;
+    pub const cleanup_push = abi.kore_thread_cleanup_push;
     pub const create = abi.kore_thread_create;
     pub const detach = abi.kore_thread_detach;
+    pub const exit = abi.kore_thread_exit;
+    pub const getspecific = abi.kore_thread_getspecific;
     pub const join = abi.kore_thread_join;
+    pub const key_create = abi.kore_thread_key_create;
+    pub const key_delete = abi.kore_thread_key_delete;
     pub const run = abi.kore_thread_run;
+    pub const setcancelstate = abi.kore_thread_setcancelstate;
+    pub const setcanceltype = abi.kore_thread_setcanceltype;
+    pub const setspecific = abi.kore_thread_setspecific;
+    pub const testcancel = abi.kore_thread_testcancel;
 };
 pub const time = struct {
     pub const sleep_for = abi.kore_time_sleep_for;

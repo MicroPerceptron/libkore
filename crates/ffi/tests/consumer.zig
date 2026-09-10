@@ -104,3 +104,18 @@ export fn zig_check_futex() callconv(.c) u32 {
     if (kore.futex.wake(&word) != 0 or kore.futex.wake_all(&word) != 0) return 4;
     return if (kore.futex.wake(null) == c.KORE_FUTEX_INVALID_ARGUMENT) 0 else 5;
 }
+
+fn tlsDestructor(_: ?*anyopaque) callconv(.c) void {}
+export fn zig_check_teardown_api() callconv(.c) u32 {
+    var key: c.KoreThreadKey = 0;
+    var old: c_int = 79;
+    if (kore.thread.key_create(&key, tlsDestructor) != 0) return 1;
+    if (kore.thread.getspecific(key) != null) return 2;
+    if (kore.thread.setspecific(key, null) != c.KORE_THREAD_EAGAIN) return 3;
+    if (kore.thread.key_delete(key) != 0 or kore.thread.key_delete(key) != c.KORE_THREAD_EINVAL) return 4;
+    if (kore.thread.cancel(null) != c.KORE_THREAD_EINVAL) return 5;
+    if (kore.thread.setcanceltype(c.KORE_THREAD_CANCEL_ASYNCHRONOUS, &old) != c.KORE_THREAD_ENOTSUP or old != 79) return 6;
+    if (kore.thread.setcancelstate(c.KORE_THREAD_CANCEL_DISABLE, &old) != c.KORE_THREAD_EAGAIN or old != 79) return 7;
+    kore.thread.testcancel();
+    return if (@intFromPtr(kore.thread.canceled()) == ~@as(usize, 0)) 0 else 8;
+}

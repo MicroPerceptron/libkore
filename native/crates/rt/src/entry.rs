@@ -2941,7 +2941,12 @@ pub(crate) fn install_child_tls(page: &'static [u8]) -> bool {
         return false;
     };
     if !migrate_thread_block(tp) {
+        geometry::release_cap_slot(slot);
         return false;
     }
-    crate::cap::verbs::set_thread_pointer(space, tp, slot)
+    let installed = crate::cap::verbs::set_thread_pointer(space, tp, slot);
+    // SET_TP is an effect: its result remains vacant on success or refusal.
+    // On success the copied block is now active and owns this reservation.
+    geometry::release_cap_slot(slot);
+    installed
 }

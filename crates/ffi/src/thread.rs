@@ -1,6 +1,6 @@
 //! Pthread-shaped lifecycle over the native process-lifetime controller.
 extern crate alloc as rust_alloc;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use core::{
     alloc::{Allocator, Layout},
     ffi::c_void,
@@ -28,16 +28,37 @@ pub const KORE_THREAD_EBUSY: i32 = 16;
 pub const KORE_THREAD_EINVAL: i32 = 22;
 pub const KORE_THREAD_EDEADLK: i32 = 35;
 pub const KORE_THREAD_ECANCELED: i32 = 125;
+pub const KORE_THREAD_ENOTSUP: i32 = 95;
 
 static THREADS: Controller = Controller::new();
 struct Ticket {
     id: Id,
-    result: Arc<AtomicPtr<c_void>>,
+    control: Arc<Control>,
 }
 struct StartContext {
     call: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
     argument: *mut c_void,
-    result: Arc<AtomicPtr<c_void>>,
+    control: Arc<Control>,
+}
+pub(crate) struct Control {
+    result: AtomicPtr<c_void>,
+    outcome: AtomicU32,
+    retired: AtomicU32,
+    pub(crate) cancel: AtomicBool,
+}
+impl Control {
+    pub(crate) fn new() -> Self {
+        Self {
+            result: AtomicPtr::new(ptr::null_mut()),
+            outcome: AtomicU32::new(0),
+            retired: AtomicU32::new(0),
+            cancel: AtomicBool::new(false),
+        }
+    }
+    pub(crate) fn finish(&self, value: *mut c_void, outcome: u32) {
+        self.result.store(value, Ordering::Relaxed);
+        self.outcome.store(outcome, Ordering::Release);
+    }
 }
 fn status(error: Error) -> i32 {
     match error {
@@ -66,14 +87,19 @@ fn invoke(argument: usize) -> usize {
 }
 fn call_context(context: &StartContext) -> usize {
     // SAFETY: forwarded foreign callback and argument lifetime contract.
+    crate::thread_local::enter(&context.control);
     let value = unsafe { (context.call)(context.argument) };
-    context.result.store(value, Ordering::Release);
+    crate::thread_local::finish(false);
+    context.control.finish(value, 1);
+    crate::thread_local::leave();
     0
 }
 fn retire(argument: usize) {
     // SAFETY: called exactly once by native owner after successful reclamation.
     unsafe {
-        release(NonNull::new_unchecked(argument as *mut StartContext));
+        let context = NonNull::new_unchecked(argument as *mut StartContext);
+        context.as_ref().control.retired.store(1, Ordering::Release);
+        release(context);
     }
 }
 
@@ -86,8 +112,10 @@ fn retire(argument: usize) {
 /// out is aligned, writable and disjoint from callback storage. start/argument
 /// remain valid through callback termination, including after detach. The
 /// callback synchronizes shared data and must not unwind or longjmp across Rust.
-/// Its returned pointer must remain valid for the joining caller. No TLS
-/// destructors, cancellation, explicit pthread_exit or custom stacks are supplied.
+/// Its returned pointer must remain valid for the joining caller. No automatic
+/// cleanup unwinding is supplied for Rust/C++ stack objects; register explicit
+/// cleanup handlers. TLS teardown and deferred cancellation apply to managed
+/// threads created here. Custom stacks and asynchronous cancellation are refused.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kore_thread_create(
     out: *mut *mut KoreThread,
@@ -105,7 +133,7 @@ pub unsafe extern "C" fn kore_thread_create(
         Ok(()) | Err(Error::Busy) => {}
         Err(error) => return status(error),
     }
-    let Ok(result) = Arc::try_new(AtomicPtr::new(ptr::null_mut())) else {
+    let Ok(control) = Arc::try_new(Control::new()) else {
         return KORE_THREAD_ENOMEM;
     };
     let Some(ticket) = allocate::<Ticket>() else {
@@ -123,7 +151,7 @@ pub unsafe extern "C" fn kore_thread_create(
         context.as_ptr().write(StartContext {
             call,
             argument,
-            result: result.clone(),
+            control: control.clone(),
         });
     }
     let id = match THREADS.create_with_cleanup(invoke, context.as_ptr() as usize, Some(retire)) {
@@ -139,7 +167,7 @@ pub unsafe extern "C" fn kore_thread_create(
     };
     // SAFETY: ticket allocation remains exclusively ours; caller provided out.
     unsafe {
-        ticket.as_ptr().write(Ticket { id, result });
+        ticket.as_ptr().write(Ticket { id, control });
         out.write(ticket.as_ptr().cast());
     }
     KORE_THREAD_OK
@@ -147,10 +175,14 @@ pub unsafe extern "C" fn kore_thread_create(
 
 /// Join from any native worker. Success and ECANCELED consume the handle; other
 /// errors retain it for retry. A null result pointer discards the return value.
+/// Deferred cancellation of the joiner leaves the target handle joinable.
+/// A canceled target joins successfully with kore_thread_canceled() as its result.
 /// # Safety
 /// thread is a live uniquely owned handle from create, with no concurrent
 /// join/detach. result, when nonnull, is aligned, writable and disjoint from the
 /// handle. See create's callback and returned-pointer lifetime contracts.
+/// This is a cancellation point; see testcancel's no-stack-unwinding contract.
+/// Cancellation requests borrowing this handle must finish before join consumes it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kore_thread_join(
     thread: *mut KoreThread,
@@ -160,24 +192,43 @@ pub unsafe extern "C" fn kore_thread_join(
         return KORE_THREAD_EINVAL;
     };
     // SAFETY: caller supplies a live exclusive handle; native Id is an identifier.
+    if THREADS.current() == Some(unsafe { ticket.as_ref().id }) {
+        return KORE_THREAD_EDEADLK;
+    }
+    // Wait without claiming the native join record: cancellation must leave the
+    // target joinable. Only the controller can retire native capabilities.
+    loop {
+        unsafe { crate::kore_thread_testcancel() };
+        let control = unsafe { &ticket.as_ref().control };
+        if control.retired.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        // Independent native workers need not own a doorbell. Use the
+        // controller's deadline park, which requires no peer wake capability.
+        if !kore::runtime::pace::cede() {
+            return KORE_THREAD_EAGAIN;
+        }
+    }
     let joined = THREADS.join(unsafe { ticket.as_ref().id });
     match joined {
-        Ok(_) => {
+        Ok(_) | Err(Error::Terminated) => {
             // SAFETY: native reclamation completed; result is caller-owned output.
             unsafe {
                 if !result.is_null() {
-                    result.write(ticket.as_ref().result.load(Ordering::Acquire));
+                    // Outcome publishes the pointer; native abrupt termination
+                    // has no foreign result and preserves caller output.
+                    if ticket.as_ref().control.outcome.load(Ordering::Acquire) != 0 {
+                        result.write(ticket.as_ref().control.result.load(Ordering::Relaxed));
+                    }
                 }
+                let complete = ticket.as_ref().control.outcome.load(Ordering::Acquire) != 0;
                 release(ticket);
+                if complete {
+                    KORE_THREAD_OK
+                } else {
+                    KORE_THREAD_ECANCELED
+                }
             }
-            KORE_THREAD_OK
-        }
-        Err(Error::Terminated) => {
-            // SAFETY: native thread ended without returning, but was reclaimed.
-            unsafe {
-                release(ticket);
-            }
-            KORE_THREAD_ECANCELED
         }
         Err(error) => status(error),
     }
@@ -206,6 +257,25 @@ pub unsafe extern "C" fn kore_thread_detach(thread: *mut KoreThread) -> i32 {
     }
 }
 
+/// Request deferred cancellation. The target acts at testcancel, join or foreign
+/// futex wait. A disabled target retains the request. No asynchronous kill occurs.
+/// # Safety
+/// thread is a live handle. Borrowing cancel calls may run concurrently with one
+/// another, but must finish before a consuming join/detach can free the handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kore_thread_cancel(thread: *mut KoreThread) -> i32 {
+    let Some(ticket) = NonNull::new(thread.cast::<Ticket>()) else {
+        return KORE_THREAD_EINVAL;
+    };
+    let control = unsafe { &ticket.as_ref().control };
+    if control.outcome.load(Ordering::Acquire) != 0 || control.retired.load(Ordering::Acquire) != 0
+    {
+        return KORE_THREAD_ESRCH;
+    }
+    control.cancel.store(true, Ordering::Release);
+    KORE_THREAD_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,20 +285,20 @@ mod tests {
             pointer
         }
         let mut value = 17usize;
-        let result = Arc::try_new(AtomicPtr::new(ptr::null_mut())).unwrap();
+        let control = Arc::try_new(Control::new()).unwrap();
         let context = StartContext {
             call: identity,
             argument: (&raw mut value).cast(),
-            result: result.clone(),
+            control: control.clone(),
         };
         assert_eq!(call_context(&context), 0);
         drop(context);
         // SAFETY: result retains the original pointer to live, exclusive value.
         unsafe {
-            *result.load(Ordering::Acquire).cast::<usize>() = 23;
+            *control.result.load(Ordering::Acquire).cast::<usize>() = 23;
         }
         assert_eq!(value, 23);
-        assert_eq!(Arc::strong_count(&result), 1);
+        assert_eq!(Arc::strong_count(&control), 1);
     }
     #[test]
     fn host_refusal_preserves_output_and_never_calls_foreign_code() {

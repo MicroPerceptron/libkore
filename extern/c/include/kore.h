@@ -117,6 +117,22 @@
 
 #define KORE_THREAD_ECANCELED 125
 
+#define KORE_THREAD_ENOTSUP 95
+
+#define KORE_THREAD_KEYS_MAX 128
+
+#define KORE_THREAD_DESTRUCTOR_ITERATIONS 4
+
+#define KORE_THREAD_TLS_DESTRUCTORS_MAX 128
+
+#define KORE_THREAD_CANCEL_ENABLE 0
+
+#define KORE_THREAD_CANCEL_DISABLE 1
+
+#define KORE_THREAD_CANCEL_DEFERRED 0
+
+#define KORE_THREAD_CANCEL_ASYNCHRONOUS 1
+
 /**
  * Submission status is distinct from the later operation's completion status.
  */
@@ -426,6 +442,20 @@ typedef struct KoreTaskHandle {
 
 typedef void *(*KoreThreadStart)(void*);
 
+typedef uint64_t KoreThreadKey;
+
+typedef void (*KoreThreadDestructor)(void*);
+
+/**
+ * Caller-owned cleanup node. Fields are private implementation state: initialize
+ * through cleanup_push, keep at a stable address, and pop in LIFO order.
+ */
+typedef struct KoreThreadCleanup {
+  struct KoreThreadCleanup *previous;
+  KoreThreadDestructor call;
+  void *argument;
+} KoreThreadCleanup;
+
 typedef struct KoreClockReading {
   uint64_t nanoseconds;
   KoreClockError error;
@@ -653,10 +683,13 @@ uint32_t kore_futex_available(void);
  * to at least 4 bytes. Valid storage must stay at the same address throughout
  * all waits/wakes. All concurrent accesses must be compatible 32-bit atomic
  * operations (C atomic builtins or Zig atomics); never mix ordinary accesses
- * or differently sized atomics. Publish the condition with a sequentially
+ * or differently sized atomics. Managed-thread waits are cancellation points:
+ * they may exit without stack unwinding, as specified by kore_thread_testcancel. Publish the condition with a sequentially
  * consistent atomic store BEFORE waking. No address-space sharing is implied.
  */
-KoreFutexOutcome kore_futex_wait(uint32_t *ptr, uint32_t expected, uint64_t timeout_ns);
+KoreFutexOutcome kore_futex_wait(uint32_t *ptr,
+                                 uint32_t expected,
+                                 uint64_t timeout_ns);
 
 /**
  * Wake one waiter. Returns 1 if a direct or relay notice was posted, 0 if no
@@ -862,8 +895,10 @@ KoreStatus kore_task_release(struct KoreTaskHandle handle);
  * out is aligned, writable and disjoint from callback storage. start/argument
  * remain valid through callback termination, including after detach. The
  * callback synchronizes shared data and must not unwind or longjmp across Rust.
- * Its returned pointer must remain valid for the joining caller. No TLS
- * destructors, cancellation, explicit pthread_exit or custom stacks are supplied.
+ * Its returned pointer must remain valid for the joining caller. No automatic
+ * cleanup unwinding is supplied for Rust/C++ stack objects; register explicit
+ * cleanup handlers. TLS teardown and deferred cancellation apply to managed
+ * threads created here. Custom stacks and asynchronous cancellation are refused.
  */
 int32_t kore_thread_create(struct KoreThread **out,
                            const struct KoreThreadAttr *attributes,
@@ -873,10 +908,14 @@ int32_t kore_thread_create(struct KoreThread **out,
 /**
  * Join from any native worker. Success and ECANCELED consume the handle; other
  * errors retain it for retry. A null result pointer discards the return value.
+ * Deferred cancellation of the joiner leaves the target handle joinable.
+ * A canceled target joins successfully with kore_thread_canceled() as its result.
  * # Safety
  * thread is a live uniquely owned handle from create, with no concurrent
  * join/detach. result, when nonnull, is aligned, writable and disjoint from the
  * handle. See create's callback and returned-pointer lifetime contracts.
+ * This is a cancellation point; see testcancel's no-stack-unwinding contract.
+ * Cancellation requests borrowing this handle must finish before join consumes it.
  */
 int32_t kore_thread_join(struct KoreThread *thread, void **result);
 
@@ -888,6 +927,111 @@ int32_t kore_thread_join(struct KoreThread *thread, void **result);
  * join/detach. Caller-owned callback storage remains valid through termination.
  */
 int32_t kore_thread_detach(struct KoreThread *thread);
+
+/**
+ * Request deferred cancellation. The target acts at testcancel, join or foreign
+ * futex wait. A disabled target retains the request. No asynchronous kill occurs.
+ * # Safety
+ * thread is a live handle. Borrowing cancel calls may run concurrently with one
+ * another, but must finish before a consuming join/detach can free the handle.
+ */
+int32_t kore_thread_cancel(struct KoreThread *thread);
+
+/**
+ * Create a process-local TLS key. No allocator; bounded to KEYS_MAX live keys.
+ * Deleted keys are generation-checked; reuse cannot expose an old TLS value.
+ * # Safety
+ * out is aligned writable storage. Destructor code remains valid until every
+ * possible invocation has finished, including concurrent delete/exit races.
+ */
+int32_t kore_thread_key_create(KoreThreadKey *out, KoreThreadDestructor destructor);
+
+/**
+ * Delete a key without invoking destructors. Values in other threads become
+ * inaccessible; callers retain responsibility for any associated allocations.
+ */
+int32_t kore_thread_key_delete(KoreThreadKey key);
+
+/**
+ * Set this managed native thread's value. Null suppresses its destructor.
+ * # Safety
+ * value and registered destructor obey the application's lifetime contract.
+ * The function retains this pointer until replacement, deletion or thread exit.
+ */
+int32_t kore_thread_setspecific(KoreThreadKey key, const void *value);
+
+/**
+ * Return this managed thread's value, or null for unset/stale/unmanaged keys.
+ */
+void *kore_thread_getspecific(KoreThreadKey key);
+
+/**
+ * Register a compiler TLS destructor in reverse-registration exit order.
+ * Returns EAGAIN for unmanaged threads or exhausted bounded registration space.
+ * # Safety
+ * argument and destructor code must remain valid until invoked on this thread.
+ * Destructors must return normally; they must not exit, unwind or longjmp.
+ */
+int32_t kore_thread_atexit(KoreThreadDestructor destructor, void *argument);
+
+/**
+ * Push a caller-owned cleanup handler. It runs on cancellation/explicit exit,
+ * or an executing pop; ordinary callback return does not invoke handlers.
+ * # Safety
+ * node is exclusive writable storage, not already linked, remaining at a stable
+ * address until popped or invoked. Handler and argument remain live throughout.
+ * Handlers must return normally and may not exit, unwind or longjmp.
+ */
+int32_t kore_thread_cleanup_push(struct KoreThreadCleanup *node,
+                                 KoreThreadDestructor call,
+                                 void *argument);
+
+/**
+ * Pop the most recent cleanup handler, optionally invoking it.
+ * # Safety
+ * node is the live top node returned by cleanup_push. Handler contract as above.
+ */
+int32_t kore_thread_cleanup_pop(struct KoreThreadCleanup *node, int32_t execute);
+
+/**
+ * Sentinel returned by joining a cooperatively canceled managed thread.
+ */
+void *kore_thread_canceled(void);
+
+/**
+ * Enable/disable deferred cancellation. Pending requests survive disable.
+ * Re-enabling does not itself cancel; the next cancellation point checks it.
+ * # Safety
+ * old_state is null or aligned writable output. Managed native threads only.
+ */
+int32_t kore_thread_setcancelstate(int32_t state, int32_t *old_state);
+
+/**
+ * Only deferred cancellation is supported. Asynchronous requests return ENOTSUP
+ * without changing state or output; arbitrary interruption would strand owners.
+ * # Safety
+ * old_type is null or aligned writable storage. Managed native threads only.
+ */
+int32_t kore_thread_setcanceltype(int32_t kind, int32_t *old_type);
+
+/**
+ * Act on a pending enabled cancellation request. No effect on unmanaged threads.
+ * # Safety
+ * This may terminate without unwinding caller stack frames. Only use from a
+ * foreign managed thread with explicit cleanup handlers for stack-owned resources;
+ * never cross live Rust RAII guards or executor callbacks at a cancellation point.
+ */
+void kore_thread_testcancel(void);
+
+/**
+ * Run cleanup handlers and TLS destructors, publish value, then exit this native
+ * thread. Joining reports success with value (including the cancellation sentinel).
+ * # Safety
+ * Must be called on a managed foreign thread, outside teardown. Does not unwind
+ * Rust/C++ stack objects. Cleanups and destructors must return normally. value
+ * remains valid for the joining caller. Never call from an executor callback.
+ */
+void kore_thread_exit(void *value);
 
 /**
  * Read the native monotonic domain, in nanoseconds since boot.

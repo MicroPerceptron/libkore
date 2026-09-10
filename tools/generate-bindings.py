@@ -52,11 +52,19 @@ def generate(check=False):
     pthread = '/* Generated lifecycle aliases; default attributes only, not a complete POSIX API. */\n'
     pthread += '#ifndef KORE_PTHREAD_H\n#define KORE_PTHREAD_H\n#include "../kore.h"\n'
     pthread += 'typedef struct KoreThread *pthread_t;\ntypedef struct KoreThreadAttr pthread_attr_t;\n'
-    for name in ['create', 'join', 'detach']:
+    for name in ['create', 'join', 'detach', 'cancel', 'key_create', 'key_delete', 'setspecific',
+                 'getspecific', 'setcancelstate', 'setcanceltype', 'testcancel', 'exit']:
         symbol = f'kore_thread_{name}'
         if symbol not in functions:
             raise SystemExit(f'missing thread export: {symbol}')
         pthread += f'#define pthread_{name} {symbol}\n'
+    pthread += 'typedef KoreThreadKey pthread_key_t;\n'
+    for name in ['CANCEL_ENABLE', 'CANCEL_DISABLE', 'CANCEL_DEFERRED', 'CANCEL_ASYNCHRONOUS',
+                 'DESTRUCTOR_ITERATIONS', 'KEYS_MAX']:
+        pthread += f'#define PTHREAD_{name} KORE_THREAD_{name}\n'
+    pthread += '#define PTHREAD_CANCELED (kore_thread_canceled())\n'
+    pthread += '#define pthread_cleanup_push(routine, argument) do { KoreThreadCleanup _kore_cleanup; kore_thread_cleanup_push(&_kore_cleanup, (routine), (argument));\n'
+    pthread += '#define pthread_cleanup_pop(execute) kore_thread_cleanup_pop(&_kore_cleanup, (execute)); } while (0)\n'
     pthread += '#endif\n'
     for relative, data in [('extern/c/include/kore.h', source), ('extern/zig/src/root.zig', zig),
                            ('extern/c/include/kore/stdlib.h', stdlib), ('extern/c/include/kore/pthread.h', pthread)]:

@@ -7,7 +7,7 @@
 //! allocator and entry pointers until explicitly released. See `Session` and
 //! the generated header for the separate ownership contracts.
 #![no_std]
-#![feature(type_alias_impl_trait, allocator_api)]
+#![feature(type_alias_impl_trait, allocator_api, thread_local)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::{
@@ -28,6 +28,8 @@ mod random;
 mod session;
 mod task;
 mod thread;
+mod thread_local;
+pub use thread_local::*;
 mod time;
 pub use parallel::*;
 pub use random::*;
@@ -798,6 +800,8 @@ mod tests {
             fn c_read_completion(ctx: *mut KoreFsContext, result: *const KoreFsCompletion) -> u32;
             fn c_sleep_and_random(ctx: *mut KoreFsContext) -> u32;
             fn zig_check_random() -> u32;
+            fn c_check_teardown_api() -> u32;
+            fn zig_check_teardown_api() -> u32;
             fn c_check_futex() -> u32;
             fn zig_check_futex() -> u32;
             fn c_check_thread_refusal() -> u32;
@@ -828,6 +832,8 @@ mod tests {
             assert_eq!(ctx.command.unwrap().op, KORE_OP_SLEEP_FOR);
             assert_eq!(ctx.command.unwrap().offset, 1_250_000);
             assert_eq!(zig_check_random(), 0);
+            assert_eq!(c_check_teardown_api(), 0);
+            assert_eq!(zig_check_teardown_api(), 0);
             assert_eq!(c_check_futex(), 0);
             assert_eq!(zig_check_futex(), 0);
             assert_eq!(c_check_thread_refusal(), 0);
