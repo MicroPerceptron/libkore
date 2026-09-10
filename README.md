@@ -3,10 +3,13 @@
 `0.1.0-alpha.1` is the first **Rust foundation**, replacing the aspirational
 scaffold on `alpha`. It provides a real filesystem API, common prelude, native
 runtime macros, typed sleep, process facilities, automatically seeded random
-values and an opt-in driver substrate.
+values, hash collections and an opt-in driver substrate.
 The `kore-ffi` package adds generated C bindings and a translated Zig module for
-filesystem requests, clocks/sleep, random values, async task preparation and
-joined thread/SPMD scopes, driven by a Rust-founded host.
+filesystem requests, clocks/sleep, random values, async task preparation,
+joined thread/SPMD scopes and independent native create/join/detach, driven by
+a Rust-founded host. It also exposes
+opaque hash tables, C allocation functions and a Zig `std.mem.Allocator`
+adapter over the application's installed heap.
 It is `no_std`; all authority comes from the application's actual endowments.
 
 ```toml
@@ -50,8 +53,8 @@ The driver feature does not turn arbitrary register sequences into safe hardware
 experiments. Device-specific lifecycle, register semantics and DMA completion
 ownership still belong to the driver.
 
-See [time and concurrency](docs/runtime.md) and [random values](docs/random.md)
-for API examples, admission and failure contracts.
+See [C and Zig allocation](docs/allocators.md), [hash collections](docs/collections.md), [time and concurrency](docs/runtime.md)
+and [random values](docs/random.md) for API examples, admission and failure contracts.
 
 ## Build and integration
 
@@ -91,3 +94,17 @@ The previous sketches and address/collection experiments remain in Git history
 at `8a6381c`; their parallel runtime, allocator placeholder and empty language
 headers are no longer part of the active library. See [provenance](https://github.com/MicroPerceptron/libkore/blob/alpha/docs/provenance.md)
 for upstream dependencies, licensing records and validation boundaries.
+
+
+Pthread-shaped C/Zig lifecycle calls use a process-lifetime native controller;
+join may originate on another worker and detached threads are reaped after exit.
+`kore/pthread.h` provides lifecycle, TLS-key, cleanup and deferred-cancellation
+aliases with default attributes; `c-stdlib` supplies their freestanding linker
+symbols and compiler TLS destructor registration. Managed threads run TLS
+destructors before native reclamation. Asynchronous cancellation is refused. See
+[thread lifecycle and TLS](docs/runtime.md#independent-foreign-threads) for the
+ownership contract and the remaining POSIX boundaries.
+
+Atomic-word synchronization is available through `kore::futex` (including Rust
+async waits), `kore_futex_*` in C, and `kore.futex.*` in Zig. Foreign waits block
+native threads; see [runtime contracts](docs/runtime.md#atomic-word-waits).

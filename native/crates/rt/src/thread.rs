@@ -466,6 +466,8 @@ mod child_slot {
 #[must_use = "dropping a Thread detaches it: its band index and its stack stay spent for the task's life"]
 #[derive(Debug)]
 pub struct Thread {
+    /// Process-unique creator arena identity; a slot is not portable authority.
+    owner: usize,
     /// This thread's band index — released LAST, after its memory is gone.
     index: u32,
     /// The parent-arena slot holding the child's task handle: the join
@@ -476,6 +478,7 @@ pub struct Thread {
     /// actually unmaps the band; the parent holds them precisely so that
     /// a dead thread cannot keep its own stack alive.
     provisioned: [SlotRef; 3],
+    tls_region: Option<SlotRef>,
     /// Founding result slots the kernel already scrubbed (the staged
     /// space, the delivered view, the boot delegation, one per
     /// endowment): no capability is left in them, but the *userland* slot
@@ -492,10 +495,10 @@ pub struct Thread {
     strip: Option<crate::stack_arena::Strip>,
 }
 
-/// A [`join`] attempt which learned no terminal fact about the thread.
+/// A [`join`] attempt which did not complete waiting and reclamation.
 ///
 /// The affine [`Thread`] ticket is returned inside the error: a bounded waiter
-/// refusal must not silently detach or kill a still-running thread. Inspect
+/// or teardown refusal must not lose reclamation authority. Inspect
 /// [`cause`](Self::cause), back off when it is
 /// [`TaskWaitError::Retryable`](crate::cap::TaskWaitError::Retryable), then
 /// recover the ticket with [`into_thread`](Self::into_thread) for another
@@ -539,6 +542,12 @@ impl Thread {
     /// exit boundary, and only then call `join` to reclaim its bands and
     /// provisioning without parking an executor thread.
     pub fn poll(&self) -> Result<crate::cap::TaskPollOutcome, crate::cap::TaskWaitError> {
+        #[cfg(target_os = "none")]
+        if crate::entry::geometry::thread_owner_identity() != Some(self.owner) {
+            return Err(crate::cap::TaskWaitError::Refused(
+                kore_abi::session::Status::Denied,
+            ));
+        }
         poll_task_handle(self.handle)
     }
 
@@ -749,7 +758,10 @@ pub fn kick_parent() -> bool {
     let Some(rt) = crate::entry::thread_context() else {
         return false;
     };
-    let Some(slot) = rt.bootstrap().handle(role::DOORBELL, crate::futex::PEER_BASE) else {
+    let Some(slot) = rt
+        .bootstrap()
+        .handle(role::DOORBELL, crate::futex::PEER_BASE)
+    else {
         return false;
     };
     crate::cap::verbs::post_notice(slot, crate::futex::COOKIE_FUTEX, 0)
@@ -864,24 +876,18 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap]) -> Option<Thread> {
     if endow.len() > MAX_WORKER_CAPS {
         return None;
     }
-    // ── An image with static TLS has no per-thread TLS to give a child ──
-    //
-    // A child's thread pointer is its own `thread_block` band slot, and the
-    // band tiles at one page per thread: there is no static TLS block around
-    // it, and nothing builds one.  So in an image the startup linker gave
-    // TLS to, a child's `#[thread_local]` access would compute `tp ±
-    // offset` straight into a *sibling's* block — silent corruption, not a
-    // fault, since the neighbouring slots are mapped.
-    //
-    // Refusing is the honest answer while that is true.  It is not a
-    // placeholder for the feature: an image whose per-thread TLS cannot be
-    // provisioned must never be handed a thread that pretends otherwise,
-    // and this is the only place that can tell.  Per-thread TLS needs a
-    // band whose slot holds `[static TLS | runtime block]` and a retained
-    // template to initialize each one from — `LinkReport`'s `tls_total` /
-    // `tls_align` are already described as "what a future thread-spawn must
-    // allocate", but the init image does not outlive the link.
-    if crate::entry::geometry::has_static_tls() {
+    let template = crate::entry::geometry::tls_template();
+    if (crate::entry::geometry::has_static_tls() && template.is_none())
+        || template.is_some_and(|t| !t.fits_band(MAP_BYTES))
+    {
+        return None;
+    }
+    // A controller is a repeat caller with a bounded capability arena. Refuse
+    // ordinary slot exhaustion before spending a band or provisioning memory,
+    // and leave a report slot available to poll/join existing children.
+    // Session A owns three regions (+ TLS); B owns four results + endowments.
+    let slots_needed = 3 + usize::from(template.is_some()) + 4 + endow.len() + 1;
+    if crate::entry::geometry::available_cap_slots() < slots_needed {
         return None;
     }
     // The caller's own ADDRESS_SPACE slot, cached in its ThreadBlock at
@@ -891,8 +897,16 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap]) -> Option<Thread> {
     // a `ThreadWindows` is proof that every one of them fits its band and
     // touches no sibling's — the arithmetic that used to be open-coded
     // here, seven times, against nothing.
+    let owner = crate::entry::geometry::thread_owner_identity()?;
     let index = claim_thread_index()?;
-    let w = BANDS.windows(index)?;
+    let mut w = BANDS.windows(index)?;
+    let tls = match template {
+        Some(t) => Some(t.place(w.map)?),
+        None => None,
+    };
+    if let Some(p) = tls {
+        w.map = p.remaining;
+    }
 
     // ── The stack: an arena strip for SPMD workers (G4b), the band
     //    slot for plain threads.  Carved here and — exactly like the
@@ -917,6 +931,11 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap]) -> Option<Thread> {
     let stack_res = crate::entry::geometry::acquire_cap_slot()?;
     let tblock_res = crate::entry::geometry::acquire_cap_slot()?;
     let stage_res = crate::entry::geometry::acquire_cap_slot()?;
+    let tls_region = if tls.is_some() {
+        Some(crate::entry::geometry::acquire_cap_slot()?)
+    } else {
+        None
+    };
     let transport = TrapTransport::new();
     let mut a = SessionBuilder::new();
     // REVOKE rides so the boot page's Region can be DELEGATED (the
@@ -952,6 +971,18 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap]) -> Option<Thread> {
         stage_res,
     )
     .ok()?;
+    if let (Some(p), Some(slot)) = (tls, tls_region) {
+        a.map_region(
+            self_space,
+            rights,
+            p.mapping.base(),
+            p.mapping.len(),
+            0,
+            0,
+            slot,
+        )
+        .ok()?;
+    }
     let committed = transport.commit_now(&a).ok()?;
     if committed.status() != kore_abi::session::Status::Ok {
         return None;
@@ -960,7 +991,18 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap]) -> Option<Thread> {
     // ── Stamp the boot page (at its staging VA — the delegation moves
     //    it to `boot_va`, which is what the child receives as `arg`). ──
     let arena_slots: u32 = 64;
-    stamp_stage(&w, endow, entry, stack_base, stack_len, arena_slots)?;
+    if let (Some(t), Some(p)) = (template, tls) {
+        unsafe { t.initialize(p.mapping.base()) };
+    }
+    stamp_stage(
+        &w,
+        endow,
+        entry,
+        stack_base,
+        stack_len,
+        arena_slots,
+        tls.map(|p| p.mapping),
+    )?;
     let stack_top = stack_base + stack_len;
 
     // ── Session B: the founding — views + boot delegation + Found
@@ -1021,9 +1063,11 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap]) -> Option<Thread> {
         spent[3 + i] = e.result;
     }
     Some(Thread {
+        owner,
         index,
         handle: handle_res,
         provisioned: [stack_res, tblock_res, stage_res],
+        tls_region,
         spent,
         spent_len: (3 + endow.len()) as u8,
         strip,
@@ -1044,6 +1088,7 @@ fn stamp_stage(
     stack_base: u64,
     stack_len: u64,
     arena_slots: u32,
+    tls: Option<Window>,
 ) -> Option<()> {
     let block = worker_boot_block(endow)?;
     let mut gblock = GeomBlock::new();
@@ -1074,6 +1119,11 @@ fn stamp_stage(
         || !push_worker_thread_blocks(&mut gblock, w.thread_block)
     {
         return None;
+    }
+    if let Some(window) = tls {
+        if !gblock.push_window(geom::THREAD_BLOCK, 2, window) {
+            return None;
+        }
     }
     let stage_va = w.stage.base();
     let stack_top = stack_base + stack_len;
@@ -1149,7 +1199,11 @@ pub(crate) fn spawn_gang_workers(
     if n == 0 {
         return true;
     }
-    if n > MAX_SESSION_FOUNDS || crate::entry::geometry::has_static_tls() {
+    let template = crate::entry::geometry::tls_template();
+    if n > MAX_SESSION_FOUNDS
+        || (crate::entry::geometry::has_static_tls() && template.is_none())
+        || template.is_some_and(|t| !t.fits_band(MAP_BYTES))
+    {
         return false;
     }
     // Endowments come one of three ways: absent, exactly one explicit
@@ -1167,6 +1221,9 @@ pub(crate) fn spawn_gang_workers(
     let Some(self_space) = crate::entry::geometry::self_space_slot() else {
         return false;
     };
+    let Some(owner) = crate::entry::geometry::thread_owner_identity() else {
+        return false;
+    };
     /// One worker's claims between the two sessions.
     struct Claim {
         index: u32,
@@ -1179,6 +1236,8 @@ pub(crate) fn spawn_gang_workers(
         view_res: SlotRef,
         boot_res: SlotRef,
         handle_res: SlotRef,
+        tls: Option<crate::tls::Placement>,
+        tls_region: Option<SlotRef>,
     }
     let mut claims: [Option<Claim>; MAX_SESSION_FOUNDS] = [const { None }; MAX_SESSION_FOUNDS];
     let arena_slots: u32 = 64;
@@ -1192,8 +1251,28 @@ pub(crate) fn spawn_gang_workers(
         let Some(index) = claim_thread_index() else {
             return false;
         };
-        let Some(w) = BANDS.windows(index) else {
+        let Some(mut w) = BANDS.windows(index) else {
             return false;
+        };
+        let tls = match template {
+            Some(t) => {
+                let Some(p) = t.place(w.map) else {
+                    return false;
+                };
+                Some(p)
+            }
+            None => None,
+        };
+        if let Some(p) = tls {
+            w.map = p.remaining;
+        }
+        let tls_region = if tls.is_some() {
+            let Some(slot) = crate::entry::geometry::acquire_cap_slot() else {
+                return false;
+            };
+            Some(slot)
+        } else {
+            None
         };
         let Some(strip) = crate::spmd::STACKS.carve_guarded(crate::spmd::STACK_GRANULES) else {
             return false;
@@ -1252,7 +1331,24 @@ pub(crate) fn spawn_gang_workers(
         {
             return false;
         }
+        if let (Some(p), Some(slot)) = (tls, tls_region) {
+            if a.map_region(
+                self_space,
+                rights,
+                p.mapping.base(),
+                p.mapping.len(),
+                0,
+                0,
+                slot,
+            )
+            .is_err()
+            {
+                return false;
+            }
+        }
         *slot = Some(Claim {
+            tls,
+            tls_region,
             index,
             w,
             strip,
@@ -1312,6 +1408,9 @@ pub(crate) fn spawn_gang_workers(
     // ── Stamp every worker's boot page. ──
     for (k, claim) in claims.iter().take(n).enumerate() {
         let Some(c) = claim else { return false };
+        if let (Some(t), Some(p)) = (template, c.tls) {
+            unsafe { t.initialize(p.mapping.base()) };
+        }
         if stamp_stage(
             &c.w,
             endow_for(k),
@@ -1319,6 +1418,7 @@ pub(crate) fn spawn_gang_workers(
             c.strip.base(),
             c.strip.bytes() as u64,
             arena_slots,
+            c.tls.map(|p| p.mapping),
         )
         .is_none()
         {
@@ -1420,9 +1520,11 @@ pub(crate) fn spawn_gang_workers(
             spent[3 + i] = e.result;
         }
         out[k] = Some(Thread {
+            owner,
             index: c.index,
             handle: c.handle_res,
             provisioned: [c.stack_res, c.tblock_res, c.stage_res],
+            tls_region: c.tls_region,
             spent,
             spent_len: (3 + endow_lens[k]) as u8,
             strip: Some(c.strip),
@@ -1533,6 +1635,9 @@ extern "C" fn thread_start(page: *const u8, start: *const ThreadStart) -> ! {
         crate::entry::refuse();
     };
     let _ = rt; // the geometry installs are boot_context's side effect
+    if !crate::entry::install_child_tls(page) {
+        crate::entry::refuse();
+    }
     // SAFETY: the parent wrote the start record at the stack top and it
     // outlives the thread (nothing unwinds past the entry).
     let entry = unsafe { (*start).entry };
@@ -1742,6 +1847,12 @@ pub(crate) fn join_reserved_at(
     use crate::session::SessionBuilder;
     use crate::transport::TrapTransport;
 
+    if crate::entry::geometry::thread_owner_identity() != Some(thread.owner) {
+        return Err(ThreadJoinError {
+            thread,
+            cause: crate::cap::TaskWaitError::Refused(Status::Denied),
+        });
+    }
     let transport = TrapTransport::new();
     let status = match join_park(&transport, thread.handle, report) {
         Ok(crate::cap::TaskWaitOutcome::Exited(status)) => Some(status),
@@ -1752,7 +1863,12 @@ pub(crate) fn join_reserved_at(
     let mut b = SessionBuilder::new();
     // The handle first: its revoke IS the reap, and the reap is what
     // drains the child's own holdings.
-    let handle_revoked = b.revoke(thread.handle).is_ok();
+    if status.is_some() && b.revoke(thread.handle).is_err() {
+        return Err(ThreadJoinError {
+            thread,
+            cause: crate::cap::TaskWaitError::Transport,
+        });
+    }
     // The stack and runtime-block regions are parent-held and die here.
     // The STAGE region is deliberately NOT presented: the founding's
     // delegate consumed it (the boot page re-rooted under the child, its
@@ -1762,14 +1878,39 @@ pub(crate) fn join_reserved_at(
     // joined thread's strip and band index since #407 (bounded, and
     // invisible until the G7 retirement witness demanded a real reap);
     // the slot itself is still released below, corpse and all.
-    for slot in [thread.provisioned[0], thread.provisioned[1]] {
+    for slot in [
+        Some(thread.provisioned[0]),
+        Some(thread.provisioned[1]),
+        thread.tls_region,
+    ]
+    .into_iter()
+    .flatten()
+    {
         if b.revoke(slot).is_err() {
-            break;
+            return Err(ThreadJoinError {
+                thread,
+                cause: crate::cap::TaskWaitError::Transport,
+            });
         }
     }
-    let torn_down = handle_revoked
-        && <TrapTransport as crate::transport::Transport>::commit_now(&transport, &b)
-            .is_ok_and(|c| c.status() == Status::Ok);
+    let completion = match transport.commit_now(&b) {
+        Ok(c) => c,
+        Err(_) => {
+            return Err(ThreadJoinError {
+                thread,
+                cause: crate::cap::TaskWaitError::Transport,
+            });
+        }
+    };
+    if completion.status() != Status::Ok {
+        return Err(ThreadJoinError {
+            thread,
+            cause: crate::cap::TaskWaitError::Refused(completion.status()),
+        });
+    }
+    if let Some(slot) = thread.tls_region {
+        crate::entry::geometry::release_cap_slot(slot);
+    }
     for slot in thread.provisioned {
         crate::entry::geometry::release_cap_slot(slot);
     }
@@ -1777,11 +1918,10 @@ pub(crate) fn join_reserved_at(
         crate::entry::geometry::release_cap_slot(*slot);
     }
     crate::entry::geometry::release_cap_slot(thread.handle);
-    // The band (and any arena strip), last — and only if the memory
-    // really went.  A refused teardown leaks them for the task's life,
-    // which is the safe direction: handing either back over live
-    // mappings would corrupt whichever thread got it next.
-    if torn_down {
+    // The band (and any arena strip), last. Every failure above retained
+    // the complete ticket; no reusable slot or address is published until
+    // the reclamation session succeeds.
+    {
         if let Some(strip) = thread.strip.take() {
             crate::spmd::STACKS.release(strip);
         }

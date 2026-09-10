@@ -13,11 +13,14 @@
 pub use kore_abi as abi;
 pub use kore_app as app;
 pub use kore_rt as runtime;
+/// Process-local atomic-word waits, including native async waits.
+pub use kore_rt::futex;
 pub use kore_rt::process;
 pub use kore_rt::{Bundle, ExitCode, main, spmd, task};
+pub mod collections;
 pub mod random;
 pub use kore_rt::executor as task;
-pub use kore_rt::thread;
+pub use kore_rt::{thread, thread_controller};
 
 /// Native driver substrate: capability-backed registers, bounded DMA and rings.
 /// Hardware effects still require a device-specific owner and lifecycle policy.
@@ -51,6 +54,7 @@ pub mod fs;
 
 /// Common application types. Raw slots and kernel verbs stay explicitly named.
 pub mod prelude {
+    pub use crate::collections::{HashMap, HashSet, HashTable};
     #[cfg(feature = "fs")]
     pub use crate::fs::{Fs, View};
     pub use core::time::Duration;

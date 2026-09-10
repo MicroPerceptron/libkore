@@ -66,6 +66,31 @@
 
 #define KORE_OP_YIELD 15
 
+/**
+ * Minimum alignment of malloc/calloc results on all supported Kore targets.
+ */
+#define KORE_ALLOC_MIN_ALIGNMENT 16
+
+/**
+ * Pass as timeout_ns to wait indefinitely. All other values are relative ns.
+ */
+#define KORE_FUTEX_INFINITE 18446744073709551615ull
+
+/**
+ * Wake argument was null or misaligned; no native wake was attempted.
+ */
+#define KORE_FUTEX_INVALID_ARGUMENT -1
+
+#define KORE_HASH_OK 0
+
+#define KORE_HASH_MISSING 1
+
+#define KORE_HASH_REPLACED 2
+
+#define KORE_HASH_INVALID -1
+
+#define KORE_HASH_NO_MEMORY -2
+
 #define KORE_TASK_CAPACITY 4
 
 #define KORE_TASK_DONE 0
@@ -75,6 +100,38 @@
 #define KORE_TASK_SLEEP_FOR 2
 
 #define KORE_TASK_SLEEP_UNTIL 3
+
+#define KORE_THREAD_OK 0
+
+#define KORE_THREAD_ESRCH 3
+
+#define KORE_THREAD_EAGAIN 11
+
+#define KORE_THREAD_ENOMEM 12
+
+#define KORE_THREAD_EBUSY 16
+
+#define KORE_THREAD_EINVAL 22
+
+#define KORE_THREAD_EDEADLK 35
+
+#define KORE_THREAD_ECANCELED 125
+
+#define KORE_THREAD_ENOTSUP 95
+
+#define KORE_THREAD_KEYS_MAX 128
+
+#define KORE_THREAD_DESTRUCTOR_ITERATIONS 4
+
+#define KORE_THREAD_TLS_DESTRUCTORS_MAX 128
+
+#define KORE_THREAD_CANCEL_ENABLE 0
+
+#define KORE_THREAD_CANCEL_DISABLE 1
+
+#define KORE_THREAD_CANCEL_DEFERRED 0
+
+#define KORE_THREAD_CANCEL_ASYNCHRONOUS 1
 
 /**
  * Submission status is distinct from the later operation's completion status.
@@ -103,6 +160,37 @@ enum KoreStatus
 typedef enum KoreStatus KoreStatus;
 #else
 typedef uint32_t KoreStatus;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Native wait outcomes, with an additional adapter argument refusal.
+ */
+enum KoreFutexOutcome
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * The word differed from expected; re-check the caller's condition.
+   */
+  KORE_FUTEX_OUTCOME_RETRY = 0,
+  /**
+   * A wake may be spurious; re-check the caller's condition.
+   */
+  KORE_FUTEX_OUTCOME_WOKEN = 1,
+  KORE_FUTEX_OUTCOME_TIMED_OUT = 2,
+  /**
+   * This native thread cannot park. Do not retry in a busy loop.
+   */
+  KORE_FUTEX_OUTCOME_UNSUPPORTED = 3,
+  KORE_FUTEX_OUTCOME_INVALID_ARGUMENT = 4,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum KoreFutexOutcome KoreFutexOutcome;
+#else
+typedef uint32_t KoreFutexOutcome;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
@@ -252,6 +340,11 @@ typedef uint32_t KoreProviderError;
 typedef struct KoreFsContext KoreFsContext;
 
 /**
+ * Opaque, uniquely owned table. Never construct, copy, or inspect its layout.
+ */
+typedef struct KoreHashTable KoreHashTable;
+
+/**
  * Rust-owned optional generator for repeated foreign draws. Never copy its
  * bytes or share it concurrently. The free functions need no owner argument.
  */
@@ -264,6 +357,18 @@ typedef struct KoreRandom KoreRandom;
  * The foreign handles remain queryable until explicitly released.
  */
 typedef struct KoreTaskBatch KoreTaskBatch;
+
+/**
+ * Opaque join handle. Transfer between native workers; do not copy ownership.
+ * Successful join/detach consumes it. Concurrent operations on the same handle
+ * or use after consumption are invalid, including through a copied pointer.
+ */
+typedef struct KoreThread KoreThread;
+
+/**
+ * Reserved attributes. Only a null attributes pointer is currently supported.
+ */
+typedef struct KoreThreadAttr KoreThreadAttr;
 
 /**
  * Scoped generational name. Copying its bits does not duplicate native ownership.
@@ -279,6 +384,30 @@ typedef struct KoreFsEntry {
   uint32_t name_length;
   uint32_t kind;
 } KoreFsEntry;
+
+/**
+ * Allocation callbacks must obey Rust's `core::alloc::Allocator` contract. Their context
+ * must remain live until table destruction; allocation returns null on OOM.
+ * Allocate receives (context, size, alignment) and returns disjoint storage
+ * valid for that layout. Deallocate receives the same pointer and layout.
+ * Callbacks may not unwind or reenter the table. Changing an application-wide
+ * default must not invalidate callbacks or allocations retained by a live table.
+ */
+typedef struct KoreHashAllocator {
+  void *context;
+  void *(*allocate)(void*, size_t, size_t);
+  void (*deallocate)(void*, void*, size_t, size_t);
+} KoreHashAllocator;
+
+/**
+ * Return nonzero when an existing entry equals the caller's query.
+ */
+typedef int32_t (*KoreHashEqual)(const void*, const void*, void*);
+
+/**
+ * Return nonzero to continue visiting; zero stops traversal.
+ */
+typedef int32_t (*KoreHashVisit)(void*, void*);
 
 /**
  * Called on native worker threads. Its range is a disjoint partition of the
@@ -310,6 +439,22 @@ typedef struct KoreTaskHandle {
   uint32_t slot;
   uint32_t reserved;
 } KoreTaskHandle;
+
+typedef void *(*KoreThreadStart)(void*);
+
+typedef uint64_t KoreThreadKey;
+
+typedef void (*KoreThreadDestructor)(void*);
+
+/**
+ * Caller-owned cleanup node. Fields are private implementation state: initialize
+ * through cleanup_push, keep at a stable address, and pop in LIFO order.
+ */
+typedef struct KoreThreadCleanup {
+  struct KoreThreadCleanup *previous;
+  KoreThreadDestructor call;
+  void *argument;
+} KoreThreadCleanup;
 
 typedef struct KoreClockReading {
   uint64_t nanoseconds;
@@ -478,6 +623,185 @@ KoreStatus kore_dag_link(struct KoreFsContext *ctx,
 KoreStatus kore_fs_entry(struct KoreFsContext *ctx, uint32_t index, struct KoreFsEntry *out);
 
 /**
+ * Allocate size bytes using the application's installed global allocator.
+ * Returns null on allocation/layout failure. Zero size requests allocate a
+ * unique freeable block when successful. No allocator is installed by libkore.
+ */
+void *kore_alloc_malloc(size_t size);
+
+/**
+ * Allocate count * size zeroed bytes. Multiplication overflow returns null.
+ * Zero size follows kore_alloc_malloc. This API does not set errno.
+ */
+void *kore_alloc_calloc(size_t count, size_t size);
+
+/**
+ * Allocate size bytes aligned to a nonzero power of two. Size need not be an
+ * alignment multiple. Null means invalid layout or allocation failure.
+ * Free with kore_alloc_free. Reallocation preserves the alignment.
+ */
+void *kore_alloc_aligned(size_t size, size_t alignment);
+
+/**
+ * Resize an allocation, preserving min(old size, new size) bytes and alignment.
+ * Null input behaves as malloc. Non-null input with zero size is freed and
+ * returns null. Other failures leave the original allocation live and intact.
+ * # Safety
+ * Non-null data is a live, exclusively owned pointer from kore_alloc_*.
+ * Never pass a Rust allocation, another allocator's pointer, or an interior
+ * pointer. The installed allocator must remain compatible for its lifetime.
+ */
+void *kore_alloc_realloc(void *data, size_t size);
+
+/**
+ * Release a kore_alloc_* allocation. Null is a no-op.
+ * # Safety
+ * Same allocation provenance as kore_alloc_realloc. Release exactly once;
+ * callers must stop accessing the allocation before it is freed.
+ */
+void kore_alloc_free(void *data);
+
+/**
+ * Callback adapter using the application's installed global allocator.
+ * Borrows no context. Explicit table allocators can still be supplied.
+ */
+struct KoreHashAllocator kore_alloc_hash_allocator(void);
+
+/**
+ * Whether the current native thread can wait (1=yes, 0=no).
+ */
+uint32_t kore_futex_available(void);
+
+/**
+ * Block this native thread only while word equals expected. timeout_ns is
+ * relative; KORE_FUTEX_INFINITE means unbounded. Always re-check the condition
+ * after Retry/Woken; Unsupported is a permanent refusal for this context.
+ * Process-local only. Do not call from executor callbacks: Rust tasks should
+ * use kore::futex::wait_async instead.
+ * # Safety
+ * ptr is null, misaligned, or points to a live writable 32-bit word aligned
+ * to at least 4 bytes. Valid storage must stay at the same address throughout
+ * all waits/wakes. All concurrent accesses must be compatible 32-bit atomic
+ * operations (C atomic builtins or Zig atomics); never mix ordinary accesses
+ * or differently sized atomics. Managed-thread waits are cancellation points:
+ * they may exit without stack unwinding, as specified by kore_thread_testcancel.
+ * Publish the condition with a sequentially consistent atomic store BEFORE waking.
+ * No address-space sharing is implied.
+ */
+KoreFutexOutcome kore_futex_wait(uint32_t *ptr, uint32_t expected, uint64_t timeout_ns);
+
+/**
+ * Wake one waiter. Returns 1 if a direct or relay notice was posted, 0 if no
+ * waiter was reached, or KORE_FUTEX_INVALID_ARGUMENT. Zero does not prove no
+ * waiter exists; one does not prove a condition is satisfied. Not a fair queue.
+ * # Safety
+ * Same atomic storage/lifetime and store-before-wake contract as kore_futex_wait.
+ */
+int32_t kore_futex_wake(uint32_t *ptr);
+
+/**
+ * Wake all registered waiters. Returns posted-notice count, including at most
+ * one relay notice, or KORE_FUTEX_INVALID_ARGUMENT. The count is telemetry,
+ * not a count of resumed threads or a synchronization guarantee.
+ * # Safety
+ * Same atomic storage/lifetime and store-before-wake contract as kore_futex_wait.
+ */
+int32_t kore_futex_wake_all(uint32_t *ptr);
+
+/**
+ * Create a table, returning null for invalid callbacks or allocation failure.
+ * # Safety
+ * Callbacks obey KoreHashAllocator and never unwind; their context outlives the table.
+ */
+struct KoreHashTable *kore_hash_table_create(struct KoreHashAllocator allocator, size_t capacity);
+
+/**
+ * Destroy table storage, leaving all entries owned by the caller. Null is OK.
+ * # Safety
+ * Non-null table is live, uniquely owned, and is destroyed exactly once.
+ */
+void kore_hash_table_destroy(struct KoreHashTable *table);
+
+/**
+ * Return the entry count (zero for null).
+ * # Safety
+ * Non-null table is live and not concurrently mutated.
+ */
+size_t kore_hash_table_len(const struct KoreHashTable *table);
+
+/**
+ * Reserve additional entries, preserving contents on failure.
+ * # Safety
+ * Non-null table is live and exclusively borrowed for this call.
+ */
+int32_t kore_hash_table_reserve(struct KoreHashTable *table, size_t additional);
+
+/**
+ * Insert or replace an equal entry; return the replaced pointer through old.
+ * # Safety
+ * KoreHashTable is live/exclusive; entry stays live and its key/hash immutable until
+ * removed. KoreHashEqual never mutates/reenters this table or unwinds; equal keys have
+ * equal hashes. Old is writable, aligned and disjoint from table/entry storage.
+ */
+int32_t kore_hash_table_insert(struct KoreHashTable *table,
+                               uint64_t hash,
+                               void *entry,
+                               KoreHashEqual equal,
+                               void *context,
+                               void **old);
+
+/**
+ * Find an entry, returning MISSING and a null output when absent.
+ * # Safety
+ * KoreHashTable is live/not concurrently mutated; query/context satisfy the equality
+ * callback, which never mutates/reenters this table or unwinds. Out is writable,
+ * aligned and disjoint from table and callback input storage.
+ */
+int32_t kore_hash_table_find(const struct KoreHashTable *table,
+                             uint64_t hash,
+                             const void *query,
+                             KoreHashEqual equal,
+                             void *context,
+                             void **out);
+
+/**
+ * Remove an entry and return its caller-owned pointer.
+ * # Safety
+ * Same contract as find, with exclusive access to the table.
+ */
+int32_t kore_hash_table_remove(struct KoreHashTable *table,
+                               uint64_t hash,
+                               const void *query,
+                               KoreHashEqual equal,
+                               void *context,
+                               void **out);
+
+/**
+ * Remove all entries without destroying them or releasing table capacity.
+ * # Safety
+ * Non-null table is live and exclusively borrowed.
+ */
+void kore_hash_table_clear(struct KoreHashTable *table);
+
+/**
+ * KoreHashVisit entries in unspecified order, stopping if visit returns zero.
+ * # Safety
+ * KoreHashTable is live/not concurrently mutated. KoreHashVisit/context remain valid and
+ * never mutate/reenter this table or unwind.
+ */
+int32_t kore_hash_table_visit(const struct KoreHashTable *table,
+                              KoreHashVisit visit,
+                              void *context);
+
+/**
+ * Create a caller-owned table using the application's installed global heap.
+ * Entries remain caller-owned. Null indicates capacity/allocation failure.
+ * Destroy with kore_hash_table_destroy; the installed allocator must remain
+ * compatible with all allocations made during this table's lifetime.
+ */
+struct KoreHashTable *kore_hash_table_create_default(size_t capacity);
+
+/**
  * Run a joined SPMD region through the existing native founding and width policy.
  * Refused means no callback was launched. A post-launch join refusal retains
  * the borrowed frame in the native owner; it never returns for serial replay.
@@ -559,6 +883,154 @@ KoreTaskState kore_task_poll(struct KoreTaskHandle handle);
  * newer generation, including concurrent release/reuse. No native task is killed.
  */
 KoreStatus kore_task_release(struct KoreTaskHandle handle);
+
+/**
+ * Start an independent native thread; return zero or a KORE_THREAD_E* code.
+ * Default attributes only. Lazily starts the process-lifetime controller.
+ * Uses the installed process allocator. A failed create leaves out unchanged
+ * and never retains the caller's argument. Calls block on native workers;
+ * they must not run inside an executor callback that owes sibling polls.
+ * # Safety
+ * out is aligned, writable and disjoint from callback storage. start/argument
+ * remain valid through callback termination, including after detach. The
+ * callback synchronizes shared data and must not unwind or longjmp across Rust.
+ * Its returned pointer must remain valid for the joining caller. No automatic
+ * cleanup unwinding is supplied for Rust/C++ stack objects; register explicit
+ * cleanup handlers. TLS teardown and deferred cancellation apply to managed
+ * threads created here. Custom stacks and asynchronous cancellation are refused.
+ */
+int32_t kore_thread_create(struct KoreThread **out,
+                           const struct KoreThreadAttr *attributes,
+                           KoreThreadStart start,
+                           void *argument);
+
+/**
+ * Join from any native worker. Success and ECANCELED consume the handle; other
+ * errors retain it for retry. A null result pointer discards the return value.
+ * Deferred cancellation of the joiner leaves the target handle joinable.
+ * A canceled target joins successfully with kore_thread_canceled() as its result.
+ * # Safety
+ * thread is a live uniquely owned handle from create, with no concurrent
+ * join/detach. result, when nonnull, is aligned, writable and disjoint from the
+ * handle. See create's callback and returned-pointer lifetime contracts.
+ * This is a cancellation point; see testcancel's no-stack-unwinding contract.
+ * Cancellation requests borrowing this handle must finish before join consumes it.
+ */
+int32_t kore_thread_join(struct KoreThread *thread, void **result);
+
+/**
+ * Relinquish joining. Success consumes the handle; the controller retains and
+ * reaps the native thread and its callback context after termination.
+ * # Safety
+ * thread is a live uniquely owned handle from create, with no concurrent
+ * join/detach. Caller-owned callback storage remains valid through termination.
+ */
+int32_t kore_thread_detach(struct KoreThread *thread);
+
+/**
+ * Request deferred cancellation. The target acts at testcancel, join or foreign
+ * futex wait. A disabled target retains the request. No asynchronous kill occurs.
+ * # Safety
+ * thread is a live handle. Borrowing cancel calls may run concurrently with one
+ * another, but must finish before a consuming join/detach can free the handle.
+ */
+int32_t kore_thread_cancel(struct KoreThread *thread);
+
+/**
+ * Create a process-local TLS key. No allocator; bounded to KEYS_MAX live keys.
+ * Deleted keys are generation-checked; reuse cannot expose an old TLS value.
+ * # Safety
+ * out is aligned writable storage. Destructor code remains valid until every
+ * possible invocation has finished, including concurrent delete/exit races.
+ */
+int32_t kore_thread_key_create(KoreThreadKey *out, KoreThreadDestructor destructor);
+
+/**
+ * Delete a key without invoking destructors. Values in other threads become
+ * inaccessible; callers retain responsibility for any associated allocations.
+ */
+int32_t kore_thread_key_delete(KoreThreadKey key);
+
+/**
+ * Set this managed native thread's value. Null suppresses its destructor.
+ * # Safety
+ * value and registered destructor obey the application's lifetime contract.
+ * The function retains this pointer until replacement, deletion or thread exit.
+ */
+int32_t kore_thread_setspecific(KoreThreadKey key, const void *value);
+
+/**
+ * Return this managed thread's value, or null for unset/stale/unmanaged keys.
+ */
+void *kore_thread_getspecific(KoreThreadKey key);
+
+/**
+ * Register a compiler TLS destructor in reverse-registration exit order.
+ * Returns EAGAIN for unmanaged threads or exhausted bounded registration space.
+ * # Safety
+ * argument and destructor code must remain valid until invoked on this thread.
+ * Destructors must return normally; they must not exit, unwind or longjmp.
+ */
+int32_t kore_thread_atexit(KoreThreadDestructor destructor, void *argument);
+
+/**
+ * Push a caller-owned cleanup handler. It runs on cancellation/explicit exit,
+ * or an executing pop; ordinary callback return does not invoke handlers.
+ * # Safety
+ * node is exclusive writable storage, not already linked, remaining at a stable
+ * address until popped or invoked. Handler and argument remain live throughout.
+ * Handlers must return normally and may not exit, unwind or longjmp.
+ */
+int32_t kore_thread_cleanup_push(struct KoreThreadCleanup *node,
+                                 KoreThreadDestructor call,
+                                 void *argument);
+
+/**
+ * Pop the most recent cleanup handler, optionally invoking it.
+ * # Safety
+ * node is the live top node returned by cleanup_push. Handler contract as above.
+ */
+int32_t kore_thread_cleanup_pop(struct KoreThreadCleanup *node, int32_t execute);
+
+/**
+ * Sentinel returned by joining a cooperatively canceled managed thread.
+ */
+void *kore_thread_canceled(void);
+
+/**
+ * Enable/disable deferred cancellation. Pending requests survive disable.
+ * Re-enabling does not itself cancel; the next cancellation point checks it.
+ * # Safety
+ * old_state is null or aligned writable output. Managed native threads only.
+ */
+int32_t kore_thread_setcancelstate(int32_t state, int32_t *old_state);
+
+/**
+ * Only deferred cancellation is supported. Asynchronous requests return ENOTSUP
+ * without changing state or output; arbitrary interruption would strand owners.
+ * # Safety
+ * old_type is null or aligned writable storage. Managed native threads only.
+ */
+int32_t kore_thread_setcanceltype(int32_t kind, int32_t *old_type);
+
+/**
+ * Act on a pending enabled cancellation request. No effect on unmanaged threads.
+ * # Safety
+ * This may terminate without unwinding caller stack frames. Only use from a
+ * foreign managed thread with explicit cleanup handlers for stack-owned resources;
+ * never cross live Rust RAII guards or executor callbacks at a cancellation point.
+ */
+void kore_thread_testcancel(void);
+
+/**
+ * Run cleanup handlers and TLS destructors, publish value, then exit this native
+ * thread. Joining reports success with value (including the cancellation sentinel).
+ * # Safety
+ * Must be called on a managed foreign thread, outside teardown. Does not unwind
+ * Rust/C++ stack objects. Cleanups and destructors must return normally. value
+ * remains valid for the joining caller. Never call from an executor callback.
+ */
+void kore_thread_exit(void *value);
 
 /**
  * Read the native monotonic domain, in nanoseconds since boot.

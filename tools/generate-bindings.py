@@ -30,6 +30,7 @@ def generate(check=False):
         groups.setdefault(group, []).append((name, function))
     zig = '// Generated from kore.h. Signatures come from Zig translate-c at build time.\n'
     zig += 'pub const abi = @import("kore-c");\n'
+    zig += 'pub const allocator = @import("allocator.zig").allocator;\n'
     for group, names in sorted(groups.items()):
         zig += f'pub const {group} = struct {{\n'
         for name, function in names:
@@ -39,7 +40,39 @@ def generate(check=False):
     if subprocess.check_output([zig_tool, 'version'], text=True).strip() != '0.16.0':
         raise SystemExit('Zig 0.16.0 is required')
     zig = subprocess.check_output([zig_tool, 'fmt', '--stdin'], input=zig, text=True)
-    for relative, data in [('extern/c/include/kore.h', source), ('extern/zig/src/root.zig', zig)]:
+    # Opt-in source aliases only: all signatures still come from cbindgen.
+    stdlib = '/* Generated allocation aliases. Include instead of host stdlib.h. */\n'
+    stdlib += '#ifndef KORE_STDLIB_H\n#define KORE_STDLIB_H\n#include "../kore.h"\n'
+    for name in ['malloc', 'calloc', 'realloc', 'free']:
+        symbol = f'kore_alloc_{name}'
+        if symbol not in functions:
+            raise SystemExit(f'missing allocator export: {symbol}')
+        stdlib += f'#define {name} {symbol}\n'
+    stdlib += '#endif\n'
+    pthread = '/* Generated lifecycle aliases; default attributes only, not a complete POSIX API. */\n'
+    pthread += '#ifndef KORE_PTHREAD_H\n#define KORE_PTHREAD_H\n#include "../kore.h"\n'
+    pthread += 'typedef struct KoreThread *pthread_t;\ntypedef struct KoreThreadAttr pthread_attr_t;\n'
+    aliases = ['create', 'join', 'detach', 'cancel', 'key_create', 'key_delete',
+               'setspecific', 'getspecific', 'setcancelstate', 'setcanceltype',
+               'testcancel', 'exit']
+    # Macro helpers need exports too, but must not become function aliases:
+    # cleanup push/pop own a lexical scope and canceled supplies a sentinel.
+    for name in aliases + ['canceled', 'cleanup_push', 'cleanup_pop']:
+        symbol = f'kore_thread_{name}'
+        if symbol not in functions:
+            raise SystemExit(f'missing thread export: {symbol}')
+    for name in aliases:
+        pthread += f'#define pthread_{name} kore_thread_{name}\n'
+    pthread += 'typedef KoreThreadKey pthread_key_t;\n'
+    for name in ['CANCEL_ENABLE', 'CANCEL_DISABLE', 'CANCEL_DEFERRED', 'CANCEL_ASYNCHRONOUS',
+                 'DESTRUCTOR_ITERATIONS', 'KEYS_MAX']:
+        pthread += f'#define PTHREAD_{name} KORE_THREAD_{name}\n'
+    pthread += '#define PTHREAD_CANCELED (kore_thread_canceled())\n'
+    pthread += '#define pthread_cleanup_push(routine, argument) do { KoreThreadCleanup _kore_cleanup; kore_thread_cleanup_push(&_kore_cleanup, (routine), (argument));\n'
+    pthread += '#define pthread_cleanup_pop(execute) kore_thread_cleanup_pop(&_kore_cleanup, (execute)); } while (0)\n'
+    pthread += '#endif\n'
+    for relative, data in [('extern/c/include/kore.h', source), ('extern/zig/src/root.zig', zig),
+                           ('extern/c/include/kore/stdlib.h', stdlib), ('extern/c/include/kore/pthread.h', pthread)]:
         path = ROOT / relative
         if check:
             if not path.exists() or path.read_text() != data:

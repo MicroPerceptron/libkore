@@ -220,7 +220,8 @@ impl Rt {
         // header + 16 records), so parse it as one — `ref_from_bytes`
         // demands an exact-size slice and refused the whole page, which
         // read as "no passive module page" on every `require`.
-        let bytes = unsafe { core::slice::from_raw_parts(va as *const u8, MODULE_PAGE_BYTES as usize) };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(va as *const u8, MODULE_PAGE_BYTES as usize) };
         let (page, _tail) = ModulePage::ref_from_prefix(bytes).ok()?;
         (page.abi.get() == IMAGE_ABI
             && usize::from(page.count.get()) <= MAX_MODULE_RECORDS
@@ -570,11 +571,17 @@ pub(crate) mod geometry {
         /// pointer ([`migrate_thread_block`](super::migrate_thread_block)
         /// runs only when `kore_ld` built one).
         ///
-        /// Read by [`thread::spawn`](crate::thread::spawn), which must
-        /// refuse while a child's thread pointer would have no TLS behind
-        /// it.  Deliberately *not* inherited: it describes the address the
+        /// Child spawning requires a retained template when this is set.
+        /// Deliberately *not* inherited: it describes the address the
         /// block sits at, and a child's block is its own.
         static_tls: AtomicUsize,
+        // Immutable process-root TLS template, published by the startup linker.
+        tls_template_base: AtomicUsize,
+        tls_template_bytes: AtomicUsize,
+        tls_template_tp: AtomicUsize,
+        tls_template_align: AtomicUsize,
+        thread_owner_next: AtomicUsize,
+        thread_owner_id: AtomicUsize,
     }
 
     // The block must fit the founder's one-page window.
@@ -762,6 +769,61 @@ pub(crate) mod geometry {
         // SAFETY: the anchored thread pointer names the live, founder-mapped
         // block.
         unsafe { &*ptr }
+    }
+
+    /// A process-unique capability-arena identity, preserved across TCB moves
+    /// and never reused when a thread band is reclaimed.
+    #[cfg(target_os = "none")]
+    pub(crate) fn thread_owner_identity() -> Option<usize> {
+        let local = block();
+        let id = local.thread_owner_id.load(Ordering::Acquire);
+        if id != 0 {
+            return Some(id);
+        }
+        let root = process_root_block()?;
+        let id = root
+            .thread_owner_next
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_add(1))
+            .ok()?
+            .checked_add(1)?;
+        match local
+            .thread_owner_id
+            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Some(id),
+            Err(existing) => Some(existing),
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    pub(crate) fn tls_template() -> Option<crate::tls::Template> {
+        let root = process_root_block()?;
+        let base = root.tls_template_base.load(Ordering::Acquire);
+        crate::tls::Template::new(
+            base as u64,
+            root.tls_template_bytes.load(Ordering::Relaxed) as u64,
+            root.tls_template_tp.load(Ordering::Relaxed) as u64,
+            root.tls_template_align.load(Ordering::Relaxed) as u64,
+        )
+    }
+
+    #[cfg(target_os = "none")]
+    pub(crate) unsafe fn publish_tls_template(template: crate::tls::Template) -> bool {
+        let Some(root) = process_root_block() else {
+            return false;
+        };
+        if root.tls_template_base.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        root.tls_template_bytes
+            .store(template.bytes as usize, Ordering::Relaxed);
+        root.tls_template_tp
+            .store(template.tp_offset as usize, Ordering::Relaxed);
+        root.tls_template_align
+            .store(template.align as usize, Ordering::Relaxed);
+        root.tls_template_base
+            .store(template.base as usize, Ordering::Release);
+        true
     }
 
     /// The geometry-stamped process-lifetime runtime block.
@@ -1261,10 +1323,9 @@ pub fn migrate_thread_block(new_va: u64) -> bool {
     unsafe {
         core::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, BLOCK);
         geometry::ThreadBlock::restamp_self(new);
-        // Only `kore_ld` calls this, and only for an image it built a static
-        // TLS block for, so arriving here IS the fact that this image has
-        // one.  `thread::spawn` reads it to refuse a child whose thread
-        // pointer would have no TLS behind it.
+        // The startup linker and child startup call this only for a TCB
+        // built from the static TLS layout, so this image has static TLS. Child spawning requires the process-root template before
+        // allowing another thread to execute TLS-bearing code.
         geometry::mark_static_tls(new);
     }
     true
@@ -2841,4 +2902,51 @@ pub unsafe extern "C" fn _start() -> ! {
         "tail {start}",   // a0 rides through untouched
         start = sym crt0_start,
     )
+}
+
+/// Publish an immutable process-lifetime TLS template during single-threaded startup.
+/// # Safety
+/// Bytes are mapped read-only, initialized, and remain live for the process.
+/// Call exactly once before exposing any worker; no concurrent publisher exists.
+#[cfg(target_os = "none")]
+pub unsafe fn publish_tls_template(template: crate::tls::Template) -> bool {
+    unsafe { geometry::publish_tls_template(template) }
+}
+#[cfg(not(target_os = "none"))]
+pub unsafe fn publish_tls_template(_: crate::tls::Template) -> bool {
+    false
+}
+
+#[cfg(target_os = "none")]
+pub(crate) fn install_child_tls(page: &'static [u8]) -> bool {
+    let Ok((_, Some(geom), _, _, _)) = boot_parse(page) else {
+        return false;
+    };
+    let Some((base, len)) = geom.window_indexed(kore_abi::task::geom::THREAD_BLOCK, 2) else {
+        return geometry::tls_template().is_none();
+    };
+    let Some(template) = geometry::tls_template() else {
+        return false;
+    };
+    if base % template.align != 0 || len < template.bytes {
+        return false;
+    }
+    let Some(tp) = base.checked_add(template.tp_offset) else {
+        return false;
+    };
+    let Some(space) = geometry::self_space_slot() else {
+        return false;
+    };
+    let Some(slot) = geometry::acquire_cap_slot() else {
+        return false;
+    };
+    if !migrate_thread_block(tp) {
+        geometry::release_cap_slot(slot);
+        return false;
+    }
+    let installed = crate::cap::verbs::set_thread_pointer(space, tp, slot);
+    // SET_TP is an effect: its result remains vacant on success or refusal.
+    // On success the copied block is now active and owns this reservation.
+    geometry::release_cap_slot(slot);
+    installed
 }

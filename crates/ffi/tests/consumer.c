@@ -46,3 +46,41 @@ uint32_t c_sleep_and_random(KoreFsContext *ctx) {
     if (kore_time_sleep_for(ctx, 1250000) != KORE_STATUS_QUEUED) return 3;
     return kore_time_yield(ctx) == KORE_STATUS_BUSY ? 0 : 4;
 }
+
+#include "kore/pthread.h"
+static void *c_thread_identity(void *argument) { return argument; }
+uint32_t c_check_thread_refusal(void) {
+    pthread_t thread = (pthread_t)(uintptr_t)16;
+    if (pthread_create(&thread, NULL, c_thread_identity, NULL) != KORE_THREAD_EAGAIN) return 1;
+    if (thread != (pthread_t)(uintptr_t)16) return 2;
+    if (pthread_join(NULL, NULL) != KORE_THREAD_EINVAL) return 3;
+    return pthread_detach(NULL) == KORE_THREAD_EINVAL ? 0 : 4;
+}
+
+uint32_t c_check_futex(void) {
+    _Alignas(4) uint32_t word = 7;
+    __atomic_store_n(&word, 8, __ATOMIC_SEQ_CST);
+    if (kore_futex_available() != 0) return 1;
+    if (kore_futex_wait(&word, 8, 0) != KORE_FUTEX_OUTCOME_UNSUPPORTED) return 2;
+    if (kore_futex_wait(NULL, 8, KORE_FUTEX_INFINITE) != KORE_FUTEX_OUTCOME_INVALID_ARGUMENT) return 3;
+    if (kore_futex_wake(&word) != 0 || kore_futex_wake_all(&word) != 0) return 4;
+    return kore_futex_wake(NULL) == KORE_FUTEX_INVALID_ARGUMENT ? 0 : 5;
+}
+
+static void c_tls_destructor(void *argument) { (void)argument; }
+uint32_t c_check_teardown_api(void) {
+    pthread_key_t key = 0;
+    int old = 79;
+    if (pthread_key_create(&key, c_tls_destructor) != 0) return 1;
+    if (pthread_getspecific(key) != NULL) return 2;
+    if (pthread_setspecific(key, NULL) != KORE_THREAD_EAGAIN) return 3;
+    if (pthread_key_delete(key) != 0 || pthread_key_delete(key) != KORE_THREAD_EINVAL) return 4;
+    if (pthread_cancel(NULL) != KORE_THREAD_EINVAL) return 5;
+    if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old) != KORE_THREAD_ENOTSUP || old != 79) return 6;
+    if (pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old) != KORE_THREAD_EAGAIN || old != 79) return 7;
+    pthread_testcancel();
+    /* Translation/lexical check; registration refuses this unmanaged host. */
+    pthread_cleanup_push(c_tls_destructor, NULL);
+    pthread_cleanup_pop(0);
+    return PTHREAD_CANCELED == (void *)(uintptr_t)UINTPTR_MAX ? 0 : 8;
+}

@@ -149,7 +149,9 @@ pub fn ceding() -> impl FnMut() {
 /// or a thread whose transport refused — and the caller takes the ordinary
 /// monitored probe pause instead. The caller's own attempt or elapsed-time
 /// budget remains authoritative in either posture.
-fn cede() -> bool {
+/// Unlike a futex wait, this needs no doorbell or peer wake authority. Use on
+/// a native worker; blocking an executor callback would stall its sibling tasks.
+pub fn cede() -> bool {
     // The deadline must be strictly in the future, or this is not a park at
     // all: the sleep verb answers an already-past deadline by resolving at
     // once *without descheduling*, which would leave the founder exactly as

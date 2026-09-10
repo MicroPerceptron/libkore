@@ -55,6 +55,11 @@ jobs:
             target
           key: alpha-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - run: cargo check --locked -p kore-std -p kore-ffi --all-features --target targets/${{ matrix.arch }}-unknown-kore-user.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+      - name: Verify freestanding C allocation symbols
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y llvm
+          python3 tools/check-alloc-symbols.py --arch ${{ matrix.arch }}
   miri:
     runs-on: ubuntu-latest
     timeout-minutes: 30
