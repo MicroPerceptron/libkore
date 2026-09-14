@@ -258,7 +258,9 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize> DirectBlockDevice
         }
         // Time passes while a command is in flight: the clock the channel
         // reads at completion is a step past the one it read at submission.
-        self.clock_ns = self.clock_ns.map(|now| now.saturating_add(self.clock_step_ns));
+        self.clock_ns = self
+            .clock_ns
+            .map(|now| now.saturating_add(self.clock_step_ns));
         let completion = self.completions[self.head].take();
         self.head = (self.head + 1) % COMPLETIONS;
         self.queued -= 1;
@@ -369,7 +371,9 @@ mod tests {
         // A clock that reads 1 µs now and moves 3 µs per poll: three
         // commands submitted back to back complete 3, 6 and 9 µs later.
         let mut channel = channel();
-        channel.control(|device| device.set_clock(1_000, 3_000)).unwrap();
+        channel
+            .control(|device| device.set_clock(1_000, 3_000))
+            .unwrap();
         let mut ids = [RequestId(0); 3];
         for id in &mut ids {
             *id = channel.submit_flush().unwrap();

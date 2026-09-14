@@ -505,14 +505,20 @@ mod tests {
             TestRecord { kind: 2, value: 2 },
             TestRecord { kind: 3, value: 3 },
         ];
-        assert!(source.push_slice_lossy(&frame), "an empty ring takes a frame");
+        assert!(
+            source.push_slice_lossy(&frame),
+            "an empty ring takes a frame"
+        );
         assert_eq!(source.dropped(), 0);
         assert_eq!(source.capacity(), CAP);
         assert_eq!(source.capacity_left(), CAP - frame.len() as u32);
 
         // Only one slot left: the three-record frame cannot fit, so none of it
         // may land — a torn frame is worse than a missing one.
-        assert!(!source.push_slice_lossy(&frame), "a partial frame is refused");
+        assert!(
+            !source.push_slice_lossy(&frame),
+            "a partial frame is refused"
+        );
         assert_eq!(
             source.dropped(),
             frame.len() as u64,
@@ -524,7 +530,11 @@ mod tests {
             drained += 1;
         }
         assert_eq!(drained, frame.len(), "only the whole frame was published");
-        assert_eq!(sink.dropped(), frame.len() as u64, "the consumer sees the loss");
+        assert_eq!(
+            sink.dropped(),
+            frame.len() as u64,
+            "the consumer sees the loss"
+        );
     }
 
     /// A single lossy push drops the newest record on a full ring and leaves

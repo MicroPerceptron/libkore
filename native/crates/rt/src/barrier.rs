@@ -220,7 +220,9 @@ impl SpmdBarrier {
             // released worker may re-enter for the next tile and decrement
             // — an unreset counter underflows. The Relaxed store is
             // ordered anyway: re-entrants acquire the flip first.
-            self.pending.0.store(self.parties.load(Ordering::Relaxed), Ordering::Relaxed);
+            self.pending
+                .0
+                .store(self.parties.load(Ordering::Relaxed), Ordering::Relaxed);
             // Store, THEN wake (the futex module's rule): a waiter
             // kicked before the flip is visible re-reads the old
             // generation and sleeps through its own release.

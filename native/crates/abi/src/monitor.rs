@@ -448,7 +448,8 @@ impl FilesystemStorageSnapshot {
     /// Copy another record's layout facts — the router's fold, where two
     /// regions share one physical namespace.
     pub const fn with_layout_of(mut self, other: Self) -> Self {
-        let flags = (self.flags.get() & !Self::LAYOUT_MASK) | (other.flags.get() & Self::LAYOUT_MASK);
+        let flags =
+            (self.flags.get() & !Self::LAYOUT_MASK) | (other.flags.get() & Self::LAYOUT_MASK);
         self.flags = U32::new(flags);
         self
     }
@@ -795,18 +796,14 @@ impl FilesystemSnapshot {
     pub const LIFECYCLE_UNKNOWN: u8 = crate::svc::FsSystemStatusWire::LIFECYCLE_UNKNOWN as u8;
     pub const LIFECYCLE_UNDESIGNATED: u8 =
         crate::svc::FsSystemStatusWire::LIFECYCLE_UNDESIGNATED as u8;
-    pub const LIFECYCLE_REFUSED: u8 =
-        crate::svc::FsSystemStatusWire::LIFECYCLE_REFUSED as u8;
+    pub const LIFECYCLE_REFUSED: u8 = crate::svc::FsSystemStatusWire::LIFECYCLE_REFUSED as u8;
     pub const LIFECYCLE_REFORMATTING: u8 =
         crate::svc::FsSystemStatusWire::LIFECYCLE_REFORMATTING as u8;
-    pub const LIFECYCLE_RESEEDING: u8 =
-        crate::svc::FsSystemStatusWire::LIFECYCLE_RESEEDING as u8;
+    pub const LIFECYCLE_RESEEDING: u8 = crate::svc::FsSystemStatusWire::LIFECYCLE_RESEEDING as u8;
     pub const LIFECYCLE_UNAVAILABLE: u8 =
         crate::svc::FsSystemStatusWire::LIFECYCLE_UNAVAILABLE as u8;
-    pub const LIFECYCLE_REBUILT: u8 =
-        crate::svc::FsSystemStatusWire::LIFECYCLE_REBUILT as u8;
-    pub const LIFECYCLE_CURRENT: u8 =
-        crate::svc::FsSystemStatusWire::LIFECYCLE_CURRENT as u8;
+    pub const LIFECYCLE_REBUILT: u8 = crate::svc::FsSystemStatusWire::LIFECYCLE_REBUILT as u8;
+    pub const LIFECYCLE_CURRENT: u8 = crate::svc::FsSystemStatusWire::LIFECYCLE_CURRENT as u8;
 
     pub const EMPTY: Self = Self {
         flags: U16::new(0),
@@ -872,10 +869,18 @@ impl FilesystemSnapshot {
         readahead: [u64; 2],
     ) -> Self {
         const fn narrow32(value: u64) -> U32 {
-            U32::new(if value > u32::MAX as u64 { u32::MAX } else { value as u32 })
+            U32::new(if value > u32::MAX as u64 {
+                u32::MAX
+            } else {
+                value as u32
+            })
         }
         const fn narrow16(value: u64) -> U16 {
-            U16::new(if value > u16::MAX as u64 { u16::MAX } else { value as u16 })
+            U16::new(if value > u16::MAX as u64 {
+                u16::MAX
+            } else {
+                value as u16
+            })
         }
         let served = readahead[0].saturating_add(readahead[1]);
         let readahead_share = if served == 0 {
@@ -1203,7 +1208,11 @@ impl ManifoldSnapshot {
 
     /// Assemble from the three `SystemMetric` observations, which pack two
     /// scaled `u32`s per `value` word.
-    pub const fn from_metrics(barrier: (u64, u64), field: (u64, u64), volatility: (u64, u64)) -> Self {
+    pub const fn from_metrics(
+        barrier: (u64, u64),
+        field: (u64, u64),
+        volatility: (u64, u64),
+    ) -> Self {
         Self::new(
             barrier.0 as u32,
             (barrier.0 >> 32) as u32,
@@ -1484,12 +1493,17 @@ mod tests {
         };
         let live = NetSnapshot::new(Some(facts), None);
         assert!(live.validate());
-        assert_eq!(live.counters(), facts.counters, "the counters ride the link facts");
+        assert_eq!(
+            live.counters(),
+            facts.counters,
+            "the counters ride the link facts"
+        );
     }
 
     #[test]
     fn storage_layout_facts_pack_into_the_flag_word() {
-        let base = FilesystemStorageSnapshot::new(512, 1 << 30, 1 << 20, 0, 256 << 10, false, true, true);
+        let base =
+            FilesystemStorageSnapshot::new(512, 1 << 30, 1 << 20, 0, 256 << 10, false, true, true);
         assert_eq!(base.supported_block_sizes(), 0);
         assert_eq!(base.preferred_write_bytes(), None);
         let laid = base.with_layout((1 << 0) | (1 << 3), 4096, 128 << 10);
@@ -1550,7 +1564,11 @@ mod tests {
         assert_eq!(a.percentile_upper_ns(500), Some(2_048));
         assert_eq!(a.percentile_upper_ns(900), Some(2_048));
         assert_eq!(a.percentile_upper_ns(990), Some(32_768));
-        assert_eq!(a.percentile_upper_ns(1000), None, "the slowest sample is off the scale");
+        assert_eq!(
+            a.percentile_upper_ns(1000),
+            None,
+            "the slowest sample is off the scale"
+        );
         assert_eq!(a.mean_depth_milli(), Some(2_500));
         // Folding two regions: depth takes the max, everything else adds,
         // and a bucket pins rather than wrapping.
@@ -1568,8 +1586,13 @@ mod tests {
 
     #[test]
     fn provider_snapshots_validate_only_defined_postures() {
-        let system = SystemSnapshot::new(4, 1_000, 500, 16_384, 8_192, 4_096, 2_048, 1_024, 0, 0, 3);
-        assert_eq!(system.fabric_domains(), 3, "the fabric domain count round-trips");
+        let system =
+            SystemSnapshot::new(4, 1_000, 500, 16_384, 8_192, 4_096, 2_048, 1_024, 0, 0, 3);
+        assert_eq!(
+            system.fabric_domains(),
+            3,
+            "the fabric domain count round-trips"
+        );
         let memory = MemorySnapshot::new(8, 3, 10, 7, 2, 0, 1, 12_288);
         let exec = ProcessSnapshot::new(32, 3, 1, 0, 9, 2, 6);
 
@@ -1578,11 +1601,17 @@ mod tests {
 
         let mut corrupt_system = system;
         corrupt_system.flags = U32::new(2);
-        assert!(!TelemetrySnapshot::new(corrupt_system, memory, exec, ManifoldSnapshot::EMPTY).validate());
+        assert!(
+            !TelemetrySnapshot::new(corrupt_system, memory, exec, ManifoldSnapshot::EMPTY)
+                .validate()
+        );
 
         let mut corrupt_memory = memory;
         corrupt_memory.reserved = U32::new(1);
-        assert!(!TelemetrySnapshot::new(system, corrupt_memory, exec, ManifoldSnapshot::EMPTY).validate());
+        assert!(
+            !TelemetrySnapshot::new(system, corrupt_memory, exec, ManifoldSnapshot::EMPTY)
+                .validate()
+        );
     }
 
     #[test]

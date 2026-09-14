@@ -551,11 +551,15 @@ pub async fn next_wake() -> WakeReason {
 /// # Panics
 /// As [`next_wake`]: polled outside the kore executor.
 pub fn quiesce_asked(cx: &core::task::Context<'_>) -> Option<u64> {
-    let hdr = header_of(cx.waker()).expect("quiesce_asked requires the kore executor (foreign waker)");
+    let hdr =
+        header_of(cx.waker()).expect("quiesce_asked requires the kore executor (foreign waker)");
     // SAFETY: `header_of` vouches the header came from this executor's
     // vtable; headers outlive their polls.
     let ctx = unsafe { hdr.as_ref() }.exec.load(Ordering::Relaxed);
-    assert!(!ctx.is_null(), "quiesce_asked polled outside an executor pass");
+    assert!(
+        !ctx.is_null(),
+        "quiesce_asked polled outside an executor pass"
+    );
     // SAFETY: the polling executor set `exec` to its own live ctx for the
     // duration of the pass.
     unsafe { &*ctx }.take_quiesce_ask()

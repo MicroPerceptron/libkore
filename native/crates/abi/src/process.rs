@@ -738,7 +738,10 @@ impl ProcessIo {
     /// Publish the frame-service snapshot before the child starts. Its own
     /// producer and its own record, like the filesystem's; either may be
     /// unavailable on its own.
-    pub fn write_net(&mut self, snapshot: crate::monitor::NetSnapshot) -> Result<(), ProcessIoError> {
+    pub fn write_net(
+        &mut self,
+        snapshot: crate::monitor::NetSnapshot,
+    ) -> Result<(), ProcessIoError> {
         if !self.validate() || !snapshot.validate() {
             return Err(ProcessIoError::Invalid);
         }
@@ -988,9 +991,16 @@ mod tests {
 
         // A malformed record is refused and changes nothing.
         assert!(page.write_net(NetSnapshot::lying_for_test()).is_err());
-        assert_eq!(page.net().unwrap(), only_link, "a refused write changes nothing");
+        assert_eq!(
+            page.net().unwrap(),
+            only_link,
+            "a refused write changes nothing"
+        );
         // And the filesystem record is untouched throughout.
-        assert_eq!(page.filesystem().unwrap(), crate::monitor::FilesystemSnapshot::EMPTY);
+        assert_eq!(
+            page.filesystem().unwrap(),
+            crate::monitor::FilesystemSnapshot::EMPTY
+        );
     }
 
     /// system/memory/exec, the launcher captures the filesystem — so each
@@ -1040,24 +1050,19 @@ mod tests {
             [2, 3, 2, 0, 0],
             [9, 9, 0],
             [4, 3, 2, 1],
-            crate::monitor::FilesystemLatencySnapshot::new(
-                8, 39, 39 * 3_000, 20_000, 39 * 4, {
-                    let mut b = [0u32; crate::monitor::FilesystemLatencySnapshot::BUCKETS];
-                    b[1] = 38;
-                    b[3] = 1;
-                    b
-                },
-            ),
+            crate::monitor::FilesystemLatencySnapshot::new(8, 39, 39 * 3_000, 20_000, 39 * 4, {
+                let mut b = [0u32; crate::monitor::FilesystemLatencySnapshot::BUCKETS];
+                b[1] = 38;
+                b[3] = 1;
+                b
+            }),
             u64::from(u16::MAX) + 1,
             [3, 1],
         );
         page.write_filesystem(fs).unwrap();
         let read = page.filesystem().unwrap();
         assert!(read.available() && read.durable() && read.route_held() && read.channel_lost());
-        assert_eq!(
-            read.user_lifecycle(),
-            FilesystemSnapshot::LIFECYCLE_CURRENT
-        );
+        assert_eq!(read.user_lifecycle(), FilesystemSnapshot::LIFECYCLE_CURRENT);
         assert_eq!(
             read.system_lifecycle(),
             FilesystemSnapshot::LIFECYCLE_REBUILT
@@ -1080,7 +1085,11 @@ mod tests {
         // The census the page used to drop, and the latency histogram, ride
         // the same publish.
         assert_eq!(read.max_outstanding(), 8);
-        assert_eq!(read.in_flight(), u16::MAX, "a narrow counter pins, never wraps");
+        assert_eq!(
+            read.in_flight(),
+            u16::MAX,
+            "a narrow counter pins, never wraps"
+        );
         assert!(read.latency_measured());
         assert_eq!(read.latency_samples(), 39);
         assert_eq!(read.latency_mean_ns(), Some(3_000));

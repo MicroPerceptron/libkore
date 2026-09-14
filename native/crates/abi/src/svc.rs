@@ -2975,6 +2975,15 @@ impl NetRadioWire {
     pub const RADIO_SECURE_BOOT: u8 = 1 << 0;
     /// The MAC's own autoload from the efuse completed.
     pub const RADIO_EFUSE_AUTOLOAD: u8 = 1 << 1;
+    /// Normal DMAC/CMAC0 configuration and the subsequent alive reply
+    /// completed. Does not advertise PHY or frame-path readiness.
+    pub const RADIO_MAC_READY: u8 = 1 << 2;
+    /// BB/RF writes, PHY post-init and RF command TX retirement completed.
+    /// Does not advertise calibration, channel or running BB-MCU readiness.
+    pub const RADIO_PHY_CONFIGURED: u8 = 1 << 3;
+    /// BA-CAM user reservations and offload configuration returned successful
+    /// firmware done acknowledgements, with all command descriptors retired.
+    pub const RADIO_MAC_FEATURES: u8 = 1 << 4;
 
     /// No radio: every field zero.
     pub const EMPTY: Self = Self {
@@ -4630,7 +4639,7 @@ pub enum DisplayProbe {
     Changed = 20,
     Restore = 21,
     MmioAllOnes = 22,
- }
+}
 impl DisplayProbe {
     pub fn decode(value: u8) -> Option<Self> {
         Some(match value {
@@ -4670,7 +4679,9 @@ pub struct DisplayDiagnostic {
 }
 impl DisplayDiagnostic {
     pub const NONE: Self = Self::new(DisplayProbe::NoReport, 0);
-    pub const fn new(probe: DisplayProbe, detail: u32) -> Self { Self { probe, detail } }
+    pub const fn new(probe: DisplayProbe, detail: u32) -> Self {
+        Self { probe, detail }
+    }
     pub fn encode(self) -> [u8; 5] {
         let b = self.detail.to_le_bytes();
         [self.probe as u8, b[0], b[1], b[2], b[3]]
@@ -4678,7 +4689,9 @@ impl DisplayDiagnostic {
     pub fn decode(bytes: [u8; 5]) -> Option<Self> {
         let probe = DisplayProbe::decode(bytes[0])?;
         let detail = u32::from_le_bytes(bytes[1..].try_into().ok()?);
-        if probe == DisplayProbe::NoReport && detail != 0 { return None; }
+        if probe == DisplayProbe::NoReport && detail != 0 {
+            return None;
+        }
         Some(Self::new(probe, detail))
     }
 }

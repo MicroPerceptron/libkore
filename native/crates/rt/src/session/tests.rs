@@ -504,14 +504,28 @@ fn inventory_queries_preserve_record_and_count_modes() {
 #[test]
 fn device_claim_query_is_an_access_only_root_observation() {
     let mut builder = SessionBuilder::new();
-    builder.read_device_claim(SlotRef::from_wire(3), 17, SlotRef::from_wire(8)).unwrap();
+    builder
+        .read_device_claim(SlotRef::from_wire(3), 17, SlotRef::from_wire(8))
+        .unwrap();
     let mut out = [0u8; DESCRIPTOR_MAX];
     let n = builder.finish(&mut out).unwrap();
     let (_, invs, args) = parse(&out[..n]);
     assert_eq!(invs.len(), 1);
     assert_eq!(invs[0].kind, kore_abi::session::DERIVE_KIND_DEVICE_RECORD);
     assert_eq!(invs[0].requested, 0);
-    assert_eq!(args, &[17, 0, 0, 0, kore_abi::session::INVENTORY_QUERY_DEVICE_CLAIM, 0, 0, 0]);
+    assert_eq!(
+        args,
+        &[
+            17,
+            0,
+            0,
+            0,
+            kore_abi::session::INVENTORY_QUERY_DEVICE_CLAIM,
+            0,
+            0,
+            0
+        ]
+    );
 }
 
 /// The park block (Phase A, `res/USERLAND.md` §3.4.2/3): `park_standing`
@@ -2094,4 +2108,54 @@ fn selected_irq_only_and_deadline_waits_fit_the_inline_carrier() {
             19
         );
     }
+}
+
+#[test]
+fn typed_exit_serializes_every_status_bit_and_raw_exit_cannot_bypass_it() {
+    use crate::ExitCode;
+    use kore_abi::session::{DERIVE_KIND_TASK_EXIT, ExitReq};
+    use zerocopy::TryFromBytes;
+    let slot = SlotRef::from_wire(2);
+    for code in [
+        ExitCode::OK,
+        ExitCode::APPLICATION_0,
+        ExitCode::APPLICATION_1,
+        ExitCode::APPLICATION_15,
+        ExitCode::LINK_FAILED,
+        ExitCode::PANIC,
+    ] {
+        let mut builder = SessionBuilder::new();
+        builder.exit(slot, code).unwrap();
+        let mut out = [0u8; DESCRIPTOR_MAX];
+        let len = builder.finish(&mut out).unwrap();
+        let (_, invs, args) = parse(&out[..len]);
+        assert_eq!(invs.len(), 1);
+        assert_eq!(invs[0].kind, DERIVE_KIND_TASK_EXIT);
+        assert_eq!(invs[0].subject.get(), 2);
+        let (req, rest) = ExitReq::try_ref_from_prefix(args).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(req.status.get(), code.get());
+        assert_eq!(req.reserved, [0; 4]);
+    }
+    let mut builder = SessionBuilder::new();
+    assert_eq!(
+        builder.derive_raw(
+            slot,
+            Rights::empty(),
+            DERIVE_KIND_TASK_EXIT,
+            slot,
+            Some(&[0; 8])
+        ),
+        Err(BuildError::UntypedExit)
+    );
+    builder.exit(slot, ExitCode::APPLICATION_1).unwrap();
+    let mut out = [0u8; DESCRIPTOR_MAX];
+    let len = builder.finish(&mut out).unwrap();
+    let (_, invs, args) = parse(&out[..len]);
+    assert_eq!(
+        invs.len(),
+        1,
+        "rejected raw exit must not stage an invocation"
+    );
+    assert_eq!(args.len(), ExitReq::WIRE, "nor consume argument storage");
 }

@@ -92,8 +92,6 @@ pub mod event;
 pub mod executor;
 pub mod exit;
 pub mod futex;
-pub mod spmd;
-mod star;
 #[cfg(feature = "heap")]
 pub mod heap;
 pub mod hint;
@@ -105,7 +103,9 @@ pub mod random;
 pub mod room;
 pub mod service;
 pub mod session;
+pub mod spmd;
 pub mod stack_arena;
+mod star;
 pub mod svc;
 pub mod thread;
 pub mod thread_controller;
@@ -117,18 +117,18 @@ pub mod worker;
 
 pub use barrier::{Arrival, SpmdBarrier};
 pub use block::{block_on, block_on_pinned, try_block_on};
-pub use spmd::{Spmd, SpmdCtx, SpmdEntry, spawn_spmd};
 pub use chan::{CapRx, ChanRx, ChanTx, Delivery, NoticeRx};
 pub use entry::run_service;
-pub use exit::ExitCode;
 pub use executor::{
     Executor, TaskStorage, enable_irq_parks, next_wake_until, retire_irq_parks, sleep_for,
     sleep_until,
 };
+pub use exit::ExitCode;
 #[cfg(feature = "heap")]
 pub use heap::Heap;
 pub use service::SystemService;
 pub use session::SessionBuilder;
+pub use spmd::{Spmd, SpmdCtx, SpmdEntry, spawn_spmd};
 pub use transport::{Committed, Transport};
 
 // The runtime attributes and authority-bundle derive

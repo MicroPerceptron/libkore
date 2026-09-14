@@ -227,9 +227,8 @@ mod tests {
         #[repr(align(64))]
         struct Window([u8; BYTES]);
         let mut window = Window([0; BYTES]);
-        let (mut source, sink) = kore_ring::event::split::<u32, kore_abi::svc::OutChunk>(
-            &mut window.0, 1,
-        ).unwrap();
+        let (mut source, sink) =
+            kore_ring::event::split::<u32, kore_abi::svc::OutChunk>(&mut window.0, 1).unwrap();
         let seen = sink.seq();
         {
             let mut wait = core::pin::pin!(wait_once(&sink, seen, None));
@@ -242,6 +241,9 @@ mod tests {
         }
         assert_eq!(sink.parked_word().load(Ordering::SeqCst), 0);
         assert!(!source.commit(), "a cancelled waiter is owed no notice");
-        assert!(!sink.park(seen), "publication still invalidates the old snapshot");
+        assert!(
+            !sink.park(seen),
+            "publication still invalidates the old snapshot"
+        );
     }
 }

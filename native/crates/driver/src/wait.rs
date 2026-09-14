@@ -141,6 +141,12 @@ impl Budget {
         self.clocked
     }
 
+    /// Absolute alarm for a nonblocking owner to park on. An unclocked
+    /// budget has no alarm; publishing zero would invent a clock reading.
+    pub fn deadline_ns(&self) -> Option<u64> {
+        self.clocked.then_some(self.deadline_ns)
+    }
+
     /// **Whether another wait is allowed**, consuming one probe of an
     /// unclocked budget.
     ///
@@ -636,6 +642,7 @@ mod tests {
 
         let budget = Budget::new(1_000_000_000, 6, dead_clock);
         assert!(!budget.is_clocked());
+        assert_eq!(budget.deadline_ns(), None);
 
         let regs = MockRegs::new();
         let probes = core::cell::Cell::new(0u32);
@@ -650,7 +657,9 @@ mod tests {
 
         // And the clocked case reports itself as such, so a caller can tell
         // whether a timeout it got back is evidence about the device.
-        assert!(Budget::new(1_000, 6, clock).is_clocked());
+        let budget = Budget::new(1_000, 6, clock);
+        assert!(budget.is_clocked());
+        assert_eq!(budget.deadline_ns(), Some(1_000));
     }
 
     /// A clock that stops answering mid-wait ends the wait. Continuing would

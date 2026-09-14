@@ -374,7 +374,10 @@ mod tests {
         let grown = AtomicU64::new(0);
         let total = 0x10_0000;
         // Top-down: two pages off the end.
-        assert_eq!(reserve_top(&reserved, &grown, total, 0x2000), Some(total - 0x2000));
+        assert_eq!(
+            reserve_top(&reserved, &grown, total, 0x2000),
+            Some(total - 0x2000)
+        );
         // Bottom-up growth may use everything below the tail...
         assert!(grow_clears_reserved(0, total - 0x2000, total, 0x2000));
         // ...but not one byte into it.

@@ -12,6 +12,40 @@ also names the native executor module. `kore::thread` names the existing native
 thread API. `kore::spmd` and its macro retain the native grid, capacity, founding,
 join and refusal semantics. Features do not grant worker capabilities.
 
+## Native exit outcomes
+
+`kore::thread::exit` and `kore::runtime::session::SessionBuilder::exit` require
+`ExitCode`. Safe Rust selects a named standard outcome or one of sixteen
+application-reserved slots, `APPLICATION_0` through `APPLICATION_15` (256–271).
+There is no public integer constructor or integer-to-code conversion. Unassigned
+values remain reserved for future standard outcomes.
+
+```rust
+use kore::ExitCode;
+kore::exit_codes! {
+    /// A distinction specific to this application's document format.
+    const BAD_DOCUMENT = ExitCode::APPLICATION_0;
+}
+// At a native thread exit boundary:
+// kore::thread::exit(BAD_DOCUMENT);
+```
+
+Prefer shared outcomes such as `OK`, `USAGE`, `NOT_FOUND`, `DENIED`, `EXHAUSTED`,
+`TIMED_OUT`, and `CANCELLED`; use an application slot when those cannot express
+the distinction. The macro declares aliases of existing typed values and rejects
+duplicates in one declaration. Numeric declarations, `ExitCode::app` and
+`ExitCode::from_raw` are no longer supported. `derive_raw` also refuses TASK_EXIT;
+use its typed builder method.
+
+Only zero means success. The existing wire ABI and native join observations
+preserve the full signed `i32`, including unknown foreign statuses. The shared
+report decoder rejects noncanonical high bits and leftover capability fields;
+it never truncates a malformed report into another exit value. Reading a raw
+join status does not provide an integer constructor for a new native exit.
+
+This is separate from `kore_thread_exit`/`pthread_exit`: those managed foreign
+thread APIs publish an opaque result pointer and retain their existing contract.
+
 ## Foreign sleep and async tasks
 
 A filesystem callback queues `kore_time_sleep_for`, `kore_time_sleep_until`, or

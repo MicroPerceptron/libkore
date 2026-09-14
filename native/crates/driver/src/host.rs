@@ -114,11 +114,20 @@ impl HostDeviceToken {
         }
     }
 
-    fn import_window(&self, supply: DmaImport, iova: u64, device_write: bool) -> Result<DmaWindow, verbs::DmaMapFault> {
+    fn import_window(
+        &self,
+        supply: DmaImport,
+        iova: u64,
+        device_write: bool,
+    ) -> Result<DmaWindow, verbs::DmaMapFault> {
         match self {
             Self::Pci(device) => match supply {
-                DmaImport::Lease(lease) => verbs::import_dma_window(lease, device, iova, device_write),
-                DmaImport::Route { route, bytes } => verbs::import_route_dma_window(route, device, iova, bytes, device_write),
+                DmaImport::Lease(lease) => {
+                    verbs::import_dma_window(lease, device, iova, device_write)
+                }
+                DmaImport::Route { route, bytes } => {
+                    verbs::import_route_dma_window(route, device, iova, bytes, device_write)
+                }
             },
             Self::Platform(_) => Err(verbs::DmaMapFault::Bounds),
         }
@@ -1179,7 +1188,10 @@ pub struct CapBuf {
 }
 
 enum CapBacking {
-    Pool { frames: Rc<AtomicBitVec<dyn Allocator>>, first_frame: usize },
+    Pool {
+        frames: Rc<AtomicBitVec<dyn Allocator>>,
+        first_frame: usize,
+    },
     Imported(Rc<RefCell<ImportedAllocation>>),
 }
 
@@ -1197,25 +1209,37 @@ struct ImportedAllocation {
 /// capacity or gains a MemLease's physical release authority.
 pub enum DmaImport {
     Lease(SupplyToken),
-    Route { route: kore_rt::cap::FabricRouteToken, bytes: u64 },
+    Route {
+        route: kore_rt::cap::FabricRouteToken,
+        bytes: u64,
+    },
 }
 
 impl DmaImport {
-    pub fn claim(owner: kore_rt::cap::ReturnedCapability) -> Result<Self, kore_rt::cap::ReturnedCapability> {
-        let required = kore_abi::cap::Rights::ACCESS | kore_abi::cap::Rights::MODIFY
-            | kore_abi::cap::Rights::DERIVE | kore_abi::cap::Rights::REVOKE;
+    pub fn claim(
+        owner: kore_rt::cap::ReturnedCapability,
+    ) -> Result<Self, kore_rt::cap::ReturnedCapability> {
+        let required = kore_abi::cap::Rights::ACCESS
+            | kore_abi::cap::Rights::MODIFY
+            | kore_abi::cap::Rights::DERIVE
+            | kore_abi::cap::Rights::REVOKE;
         if owner.is_lease_with(required) {
             return verbs::claim_returned_supply(owner).map(Self::Lease);
         }
         let route = owner.try_into_fabric_route(required)?;
         match route.describe() {
-            Ok(info) if info.operation == 1 && info.access & 3 == 3 =>
-                Ok(Self::Route { route, bytes: info.bytes }),
+            Ok(info) if info.operation == 1 && info.access & 3 == 3 => Ok(Self::Route {
+                route,
+                bytes: info.bytes,
+            }),
             _ => Err(route.into_returned_capability()),
         }
     }
     pub fn len(&self) -> u64 {
-        match self { Self::Lease(lease) => lease.len(), Self::Route { bytes, .. } => *bytes }
+        match self {
+            Self::Lease(lease) => lease.len(),
+            Self::Route { bytes, .. } => *bytes,
+        }
     }
     pub fn into_returned_capability(self) -> Result<kore_rt::cap::ReturnedCapability, Self> {
         match self {
@@ -1241,7 +1265,10 @@ impl BufferReturn {
             Self::Scoped(memory) => Ok(memory),
             Self::Imported(ticket) => {
                 let returned = ticket.owner.borrow_mut().returned.take();
-                match returned { Some(memory) => Ok(memory), None => Err(Self::Imported(ticket)) }
+                match returned {
+                    Some(memory) => Ok(memory),
+                    None => Err(Self::Imported(ticket)),
+                }
             }
         }
     }
@@ -1275,7 +1302,8 @@ pub enum BufferExportFault {
 
 /// Reuse follows confirmed descendant retirement, never local handle drop.
 fn retire_completed_loans<T, A: Allocator>(
-    loans: &mut Vec<T, A>, mut retired: impl FnMut(&mut T) -> Result<bool, ()>,
+    loans: &mut Vec<T, A>,
+    mut retired: impl FnMut(&mut T) -> Result<bool, ()>,
     mut release: impl FnMut(T),
 ) -> bool {
     let mut index = 0;
@@ -1300,12 +1328,19 @@ fn retire_imports_and_resume<T, A: Allocator>(
 ) -> bool {
     // Exact IOVA retirement closes the entire requester's DMA latch. Keep
     // every detached owner until the backend proves its admissions quiescent.
-    if !device_idle { return true; }
+    if !device_idle {
+        return true;
+    }
     let mut changed = false;
     let mut index = 0;
     while index < imports.len() {
-        if !released(&imports[index]) { index += 1; continue; }
-        if !retire(&imports[index]) { return false; }
+        if !released(&imports[index]) {
+            index += 1;
+            continue;
+        }
+        if !retire(&imports[index]) {
+            return false;
+        }
         imports.remove(index);
         changed = true;
     }
@@ -1317,13 +1352,18 @@ impl ImportedAllocation {
         // The named IOVA child closes first. Keep registration and CPU-backed
         // allocation custody until device access is proved retired.
         if let Some(window) = self.window.as_mut() {
-            if !window.try_retire_device().is_closed() { return false; }
+            if !window.try_retire_device().is_closed() {
+                return false;
+            }
         }
         if let Some(window) = self.window.take() {
             if self.return_requested {
                 match window.try_into_memory() {
                     Ok(lease) => self.returned = Some(lease),
-                    Err(window) => { self.window = Some(window); return false; }
+                    Err(window) => {
+                        self.window = Some(window);
+                        return false;
+                    }
                 }
             } else if let Err(window) = window.try_retire() {
                 self.window = Some(window);
@@ -1343,7 +1383,9 @@ impl Drop for ImportedAllocation {
 }
 
 impl Dma for CapBuf {
-    fn can_return_to_owner(&self) -> bool { matches!(self.backing, CapBacking::Imported(_)) }
+    fn can_return_to_owner(&self) -> bool {
+        matches!(self.backing, CapBacking::Imported(_))
+    }
 
     fn cpu(&self) -> *mut u8 {
         self.cpu
@@ -1428,7 +1470,10 @@ impl PoolRegion {
                     cpu,
                     iova: IovaAddr(aligned),
                     len: size as usize,
-                    backing: CapBacking::Pool { frames: Rc::clone(&self.frames), first_frame },
+                    backing: CapBacking::Pool {
+                        frames: Rc::clone(&self.frames),
+                        first_frame,
+                    },
                 });
             }
             start = first_frame.checked_add(1)?;
@@ -1474,20 +1519,40 @@ impl DmaPool for CapPool {
 
     fn owns(&self, buffer: &CapBuf) -> bool {
         match &buffer.backing {
-            CapBacking::Pool { frames, .. } => self.regions.borrow().iter().any(|region| Rc::ptr_eq(&region.frames, frames)),
-            CapBacking::Imported(owner) => self.imports.borrow().iter().any(|entry| Rc::ptr_eq(entry, owner))
-                && { let allocation = owner.borrow(); allocation.window.is_some() && !allocation.released },
+            CapBacking::Pool { frames, .. } => self
+                .regions
+                .borrow()
+                .iter()
+                .any(|region| Rc::ptr_eq(&region.frames, frames)),
+            CapBacking::Imported(owner) => {
+                self.imports
+                    .borrow()
+                    .iter()
+                    .any(|entry| Rc::ptr_eq(entry, owner))
+                    && {
+                        let allocation = owner.borrow();
+                        allocation.window.is_some() && !allocation.released
+                    }
+            }
         }
     }
 
     unsafe fn release_quiesced(&self, buffer: CapBuf) -> Result<(), DmaReleaseFailure<CapBuf>> {
         match &buffer.backing {
-            CapBacking::Pool { frames, first_frame } => {
+            CapBacking::Pool {
+                frames,
+                first_frame,
+            } => {
                 let regions = self.regions.borrow();
-                let Some(region) = regions.iter().find(|region| Rc::ptr_eq(&region.frames, frames)) else {
+                let Some(region) = regions
+                    .iter()
+                    .find(|region| Rc::ptr_eq(&region.frames, frames))
+                else {
                     return Err(DmaReleaseFailure::Refused(buffer));
                 };
-                region.frames.release_run(*first_frame, buffer.len / PAGE as usize);
+                region
+                    .frames
+                    .release_run(*first_frame, buffer.len / PAGE as usize);
                 Ok(())
             }
             CapBacking::Imported(owner) => {
@@ -1498,13 +1563,14 @@ impl DmaPool for CapPool {
                 // Stage-1 cleanup can continue for sibling buffers in this
                 // same operation. Do not close BME mid-cleanup: hand the
                 // allocation to the resource owner for boundary retirement.
-                if owner.borrow().released { return Err(DmaReleaseFailure::Refused(buffer)); }
+                if owner.borrow().released {
+                    return Err(DmaReleaseFailure::Refused(buffer));
+                }
                 owner.borrow_mut().released = true;
                 Ok(())
             }
         }
     }
-
 }
 
 /// DMA exists in exactly two host-visible states. Preparation may allocate and
@@ -1521,10 +1587,7 @@ pub enum DmaActive {}
 /// host still controls publication and final containment.
 struct DmaOwner {
     window: Option<DmaWindow>,
-    extensions: Vec<(
-        DmaWindow,
-        Option<SupplyToken>,
-    )>,
+    extensions: Vec<(DmaWindow, Option<SupplyToken>)>,
     regions: Rc<RefCell<Vec<PoolRegion>>>,
     imports: Rc<RefCell<Vec<Rc<RefCell<ImportedAllocation>>>>>,
     loans: RefCell<Vec<PoolLoan>>,
@@ -1545,29 +1608,42 @@ impl DmaOwner {
     /// Remote descendants retain the claim. Only a proven close/retire permits
     /// bitmap reuse; Busy is ordinary outstanding custody, not device loss.
     fn retire_pool_loans(&self) -> bool {
-        retire_completed_loans(&mut self.loans.borrow_mut(), |loan| {
-            match loan.root.as_ref().unwrap().try_close() {
-                Err(verbs::FabricRouteFault::Busy | verbs::FabricRouteFault::Commit(4 | 6)) => return Ok(false),
-                Err(_) => return Err(()),
-                Ok(()) => {},
-            }
-            if let Err(root) = loan.root.take().unwrap().try_retire() {
-                loan.root = Some(root);
-                return Ok(false);
-            }
-            Ok(true)
-        }, |loan| {
-            if let CapBacking::Pool { frames, first_frame } = &loan.buffer.backing {
-                frames.release_run(*first_frame, loan.buffer.len / PAGE as usize);
-            }
-        })
+        retire_completed_loans(
+            &mut self.loans.borrow_mut(),
+            |loan| {
+                match loan.root.as_ref().unwrap().try_close() {
+                    Err(verbs::FabricRouteFault::Busy | verbs::FabricRouteFault::Commit(4 | 6)) => {
+                        return Ok(false);
+                    }
+                    Err(_) => return Err(()),
+                    Ok(()) => {}
+                }
+                if let Err(root) = loan.root.take().unwrap().try_retire() {
+                    loan.root = Some(root);
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+            |loan| {
+                if let CapBacking::Pool {
+                    frames,
+                    first_frame,
+                } = &loan.buffer.backing
+                {
+                    frames.release_run(*first_frame, loan.buffer.len / PAGE as usize);
+                }
+            },
+        )
     }
 
     /// A refused mapping/route close must retain the entire custody chain.
     fn retire_window(window: DmaWindow) -> bool {
         match window.try_retire() {
             Ok(_) => true,
-            Err(window) => { core::mem::forget(window); false }
+            Err(window) => {
+                core::mem::forget(window);
+                false
+            }
         }
     }
 
@@ -1826,7 +1902,9 @@ impl DeviceResources<DmaActive> {
     /// only the released buffer. False defers retirement without dropping any
     /// owner. A false return requires containment of the entire epoch.
     pub fn resume_retired_dma(&self, device_idle: bool) -> bool {
-        let Some(dma) = self.dma.as_ref() else { return false; };
+        let Some(dma) = self.dma.as_ref() else {
+            return false;
+        };
         let mut imports = dma.imports.borrow_mut();
         let healthy = retire_imports_and_resume(
             &mut imports,
@@ -1843,32 +1921,81 @@ impl DeviceResources<DmaActive> {
 
     /// Reserve loan custody before the backend removes its stage-1 mapping.
     /// Call only through the backend's guarded detach preparation callback.
-    pub fn prepare_buffer_export(&self, buffer: &CapBuf) -> Result<BufferExportPlan, BufferExportFault> {
+    pub fn prepare_buffer_export(
+        &self,
+        buffer: &CapBuf,
+    ) -> Result<BufferExportPlan, BufferExportFault> {
         let dma = self.dma.as_ref().ok_or(BufferExportFault::InvalidBuffer)?;
         match &buffer.backing {
             CapBacking::Imported(owner) => {
-                if !dma.imports.borrow().iter().any(|entry| Rc::ptr_eq(entry, owner)) || owner.borrow().released {
+                if !dma
+                    .imports
+                    .borrow()
+                    .iter()
+                    .any(|entry| Rc::ptr_eq(entry, owner))
+                    || owner.borrow().released
+                {
                     return Err(BufferExportFault::InvalidBuffer);
                 }
                 Ok(BufferExportPlan(ExportPlan::Imported(Rc::clone(owner))))
             }
-            CapBacking::Pool { frames, first_frame } => {
-                if !dma.regions.borrow().iter().any(|region| Rc::ptr_eq(&region.frames, frames)) {
+            CapBacking::Pool {
+                frames,
+                first_frame,
+            } => {
+                if !dma
+                    .regions
+                    .borrow()
+                    .iter()
+                    .any(|region| Rc::ptr_eq(&region.frames, frames))
+                {
                     return Err(BufferExportFault::InvalidBuffer);
                 }
-                dma.loans.borrow_mut().try_reserve(1).map_err(|_| BufferExportFault::Capacity)?;
-                let end = buffer.iova.0.checked_add(buffer.len as u64).ok_or(BufferExportFault::InvalidBuffer)?;
-                let window = dma.window.iter().chain(dma.extensions.iter().map(|entry| &entry.0))
-                    .find(|window| buffer.iova.0 >= window.iova() && window.iova().checked_add(window.len()).is_some_and(|limit| end <= limit))
+                dma.loans
+                    .borrow_mut()
+                    .try_reserve(1)
+                    .map_err(|_| BufferExportFault::Capacity)?;
+                let end = buffer
+                    .iova
+                    .0
+                    .checked_add(buffer.len as u64)
+                    .ok_or(BufferExportFault::InvalidBuffer)?;
+                let window = dma
+                    .window
+                    .iter()
+                    .chain(dma.extensions.iter().map(|entry| &entry.0))
+                    .find(|window| {
+                        buffer.iova.0 >= window.iova()
+                            && window
+                                .iova()
+                                .checked_add(window.len())
+                                .is_some_and(|limit| end <= limit)
+                    })
                     .ok_or(BufferExportFault::InvalidBuffer)?;
                 let request = kore_abi::session::FabricRouteScopeReq {
-                    offset: (buffer.iova.0 - window.iova()).into(), bytes: (buffer.len as u64).into(), access: 7, reserved: [0; 7],
+                    offset: (buffer.iova.0 - window.iova()).into(),
+                    bytes: (buffer.len as u64).into(),
+                    access: 7,
+                    reserved: [0; 7],
                 };
-                let root = window.fabric_route().ok_or(BufferExportFault::InvalidBuffer)?
-                    .scope(&request).map_err(BufferExportFault::Route)?;
-                let grant = root.scope(&kore_abi::session::FabricRouteScopeReq { offset: 0.into(), ..request })
+                let root = window
+                    .fabric_route()
+                    .ok_or(BufferExportFault::InvalidBuffer)?
+                    .scope(&request)
                     .map_err(BufferExportFault::Route)?;
-                Ok(BufferExportPlan(ExportPlan::Pool { grant, root, frames: Rc::clone(frames), first_frame: *first_frame, bytes: buffer.len }))
+                let grant = root
+                    .scope(&kore_abi::session::FabricRouteScopeReq {
+                        offset: 0.into(),
+                        ..request
+                    })
+                    .map_err(BufferExportFault::Route)?;
+                Ok(BufferExportPlan(ExportPlan::Pool {
+                    grant,
+                    root,
+                    frames: Rc::clone(frames),
+                    first_frame: *first_frame,
+                    bytes: buffer.len,
+                }))
             }
         }
     }
@@ -1878,24 +2005,64 @@ impl DeviceResources<DmaActive> {
     ///
     /// # Safety
     /// The backend must have quiesced and detached this exact buffer.
-    pub unsafe fn finish_buffer_export(&self, buffer: CapBuf, plan: BufferExportPlan) -> Result<BufferReturn, CapBuf> {
-        let Some(dma) = self.dma.as_ref() else { return Err(buffer); };
+    pub unsafe fn finish_buffer_export(
+        &self,
+        buffer: CapBuf,
+        plan: BufferExportPlan,
+    ) -> Result<BufferReturn, CapBuf> {
+        let Some(dma) = self.dma.as_ref() else {
+            return Err(buffer);
+        };
         match (plan.0, &buffer.backing) {
-            (ExportPlan::Imported(expected), CapBacking::Imported(owner)) if Rc::ptr_eq(&expected, owner) && !owner.borrow().released
-                    && dma.imports.borrow().iter().any(|entry| Rc::ptr_eq(entry, owner)) => {
-                let ticket = ImportedReturn { owner: Rc::clone(owner) };
+            (ExportPlan::Imported(expected), CapBacking::Imported(owner))
+                if Rc::ptr_eq(&expected, owner)
+                    && !owner.borrow().released
+                    && dma
+                        .imports
+                        .borrow()
+                        .iter()
+                        .any(|entry| Rc::ptr_eq(entry, owner)) =>
+            {
+                let ticket = ImportedReturn {
+                    owner: Rc::clone(owner),
+                };
                 let mut allocation = owner.borrow_mut();
                 allocation.return_requested = true;
                 allocation.released = true;
                 Ok(BufferReturn::Imported(ticket))
             }
-            (ExportPlan::Pool { grant, root, frames, first_frame, bytes }, CapBacking::Pool { frames: actual, first_frame: actual_first })
-                if Rc::ptr_eq(&frames, actual) && first_frame == *actual_first && bytes == buffer.len
-                    && dma.regions.borrow().iter().any(|region| Rc::ptr_eq(&region.frames, actual)) => {
+            (
+                ExportPlan::Pool {
+                    grant,
+                    root,
+                    frames,
+                    first_frame,
+                    bytes,
+                },
+                CapBacking::Pool {
+                    frames: actual,
+                    first_frame: actual_first,
+                },
+            ) if Rc::ptr_eq(&frames, actual)
+                && first_frame == *actual_first
+                && bytes == buffer.len
+                && dma
+                    .regions
+                    .borrow()
+                    .iter()
+                    .any(|region| Rc::ptr_eq(&region.frames, actual)) =>
+            {
                 let mut loans = dma.loans.borrow_mut();
-                if loans.len() == loans.capacity() { return Err(buffer); }
-                loans.push(PoolLoan { buffer, root: Some(root) });
-                Ok(BufferReturn::Scoped(kore_rt::cap::StashedMemory::Route(grant)))
+                if loans.len() == loans.capacity() {
+                    return Err(buffer);
+                }
+                loans.push(PoolLoan {
+                    buffer,
+                    root: Some(root),
+                });
+                Ok(BufferReturn::Scoped(kore_rt::cap::StashedMemory::Route(
+                    grant,
+                )))
             }
             _ => Err(buffer),
         }
@@ -1936,7 +2103,11 @@ impl DeviceResources<DmaActive> {
         }
         dma.extensions.iter().find_map(|(window, _)| {
             covers(window)
-                .then(|| window.fabric_registration().map(|reg| (reg, iova - window.iova())))
+                .then(|| {
+                    window
+                        .fabric_registration()
+                        .map(|reg| (reg, iova - window.iova()))
+                })
                 .flatten()
         })
     }
@@ -1962,7 +2133,11 @@ impl DeviceResources<DmaActive> {
             .max()
             .ok_or(IntakeError::DmaUnavailable)?;
         let end = dma.imports.borrow().iter().fold(end, |end, owner| {
-            owner.borrow().window.as_ref().map_or(end, |window| end.max(window.iova() + window.len()))
+            owner
+                .borrow()
+                .window
+                .as_ref()
+                .map_or(end, |window| end.max(window.iova() + window.len()))
         });
         let iova = end
             .checked_add((2 << 20) - 1)
@@ -2000,38 +2175,76 @@ impl DeviceResources<DmaActive> {
     /// grow_dma, this preserves its bytes and never adds allocator capacity.
     /// `device_write` is the consumer's admitted access, not the CPU lease's
     /// mapping rights. Any publication failure requires device-epoch containment.
-    pub fn import_dma(&mut self, supply: DmaImport, device_write: bool) -> Result<CapBuf, IntakeError> {
-        if matches!(&supply, DmaImport::Lease(lease) if !lease.is_returned()) { return Err(IntakeError::DmaUnavailable); }
+    pub fn import_dma(
+        &mut self,
+        supply: DmaImport,
+        device_write: bool,
+    ) -> Result<CapBuf, IntakeError> {
+        if matches!(&supply, DmaImport::Lease(lease) if !lease.is_returned()) {
+            return Err(IntakeError::DmaUnavailable);
+        }
         let dma = self.dma.as_mut().ok_or(IntakeError::DmaUnavailable)?;
         let device = dma.device.as_ref().ok_or(IntakeError::DmaUnavailable)?;
         let len = supply.len();
         let bytes = usize::try_from(len).map_err(|_| IntakeError::DmaUnavailable)?;
-        if len == 0 || len % PAGE != 0 { return Err(IntakeError::DmaUnavailable); }
+        if len == 0 || len % PAGE != 0 {
+            return Err(IntakeError::DmaUnavailable);
+        }
         let mut imports = dma.imports.borrow_mut();
-        if imports.len() >= 256 { return Err(IntakeError::DmaUnavailable); }
-        imports.try_reserve(1).map_err(|_| IntakeError::DmaUnavailable)?;
-        // Allocate the retention cell before publishing any device mapping.
-        let owner = Rc::try_new(RefCell::new(ImportedAllocation { released: false, return_requested: false, returned: None, window: None }))
+        if imports.len() >= 256 {
+            return Err(IntakeError::DmaUnavailable);
+        }
+        imports
+            .try_reserve(1)
             .map_err(|_| IntakeError::DmaUnavailable)?;
-        let mut end = dma.window.iter().chain(dma.extensions.iter().map(|entry| &entry.0))
-            .map(|window| window.iova() + window.len()).max().ok_or(IntakeError::DmaUnavailable)?;
+        // Allocate the retention cell before publishing any device mapping.
+        let owner = Rc::try_new(RefCell::new(ImportedAllocation {
+            released: false,
+            return_requested: false,
+            returned: None,
+            window: None,
+        }))
+        .map_err(|_| IntakeError::DmaUnavailable)?;
+        let mut end = dma
+            .window
+            .iter()
+            .chain(dma.extensions.iter().map(|entry| &entry.0))
+            .map(|window| window.iova() + window.len())
+            .max()
+            .ok_or(IntakeError::DmaUnavailable)?;
         for imported in imports.iter() {
             if let Some(window) = imported.borrow().window.as_ref() {
-                end = end.max(window.iova().checked_add(window.len()).ok_or(IntakeError::DmaUnavailable)?);
+                end = end.max(
+                    window
+                        .iova()
+                        .checked_add(window.len())
+                        .ok_or(IntakeError::DmaUnavailable)?,
+                );
             }
         }
-        let iova = end.checked_add((2 << 20) - 1).ok_or(IntakeError::DmaUnavailable)? & !((2 << 20) - 1);
+        let iova = end
+            .checked_add((2 << 20) - 1)
+            .ok_or(IntakeError::DmaUnavailable)?
+            & !((2 << 20) - 1);
         iova.checked_add(len).ok_or(IntakeError::DmaUnavailable)?;
-        let window = device.import_window(supply, iova, device_write)
+        let window = device
+            .import_window(supply, iova, device_write)
             .map_err(|fault| IntakeError::DmaMap { code: fault.code() })?;
         let cpu = window.cpu();
         owner.borrow_mut().window = Some(window);
         imports.push(Rc::clone(&owner));
         {
             let retained = owner.borrow();
-            if !device.activate_window(retained.window.as_ref().unwrap()) { return Err(IntakeError::DmaUnavailable); }
+            if !device.activate_window(retained.window.as_ref().unwrap()) {
+                return Err(IntakeError::DmaUnavailable);
+            }
         }
-        Ok(CapBuf { cpu, iova: IovaAddr(iova), len: bytes, backing: CapBacking::Imported(owner) })
+        Ok(CapBuf {
+            cpu,
+            iova: IovaAddr(iova),
+            len: bytes,
+            backing: CapBacking::Imported(owner),
+        })
     }
 
     /// Ask the kernel to prove this device quiet at the fabric (#809 §L).
@@ -2914,13 +3127,25 @@ mod tests {
         let mut loans = Vec::new_in(&arena);
         loans.extend([(1, false), (2, true), (3, false)]);
         let mut released = Vec::new_in(&arena);
-        assert!(retire_completed_loans(&mut loans, |loan| Ok(loan.1), |loan| released.push(loan.0)));
+        assert!(retire_completed_loans(
+            &mut loans,
+            |loan| Ok(loan.1),
+            |loan| released.push(loan.0)
+        ));
         assert_eq!(released, [2]);
         assert_eq!(loans, [(1, false), (3, false)]);
-        assert!(!retire_completed_loans(&mut loans, |_| Err(()), |_| panic!("indeterminate custody must not release")));
+        assert!(!retire_completed_loans(
+            &mut loans,
+            |_| Err(()),
+            |_| panic!("indeterminate custody must not release")
+        ));
         assert_eq!(loans.len(), 2);
         loans[0].1 = true;
-        assert!(retire_completed_loans(&mut loans, |loan| Ok(loan.1), |loan| released.push(loan.0)));
+        assert!(retire_completed_loans(
+            &mut loans,
+            |loan| Ok(loan.1),
+            |loan| released.push(loan.0)
+        ));
         assert_eq!(released, [2, 1]);
         assert_eq!(loans, [(3, false)]);
     }
@@ -2939,14 +3164,26 @@ mod tests {
         let mut loans = Vec::new_in(&arena);
         loans.push(loan);
         assert!(pool.alloc(4096).is_none());
-        assert!(retire_completed_loans(&mut loans, |_| Ok(false), |_| panic!("busy loan")));
+        assert!(retire_completed_loans(
+            &mut loans,
+            |_| Ok(false),
+            |_| panic!("busy loan")
+        ));
         assert!(pool.alloc(4096).is_none());
-        assert!(!retire_completed_loans(&mut loans, |_| Err(()), |_| panic!("quarantined loan")));
+        assert!(!retire_completed_loans(
+            &mut loans,
+            |_| Err(()),
+            |_| panic!("quarantined loan")
+        ));
         assert!(pool.alloc(4096).is_none());
-        assert!(retire_completed_loans(&mut loans, |_| Ok(true), |buffer| {
-            // Host-only retirement model: no hardware or external pointer exists.
-            assert!(unsafe { pool.release_quiesced(buffer) }.is_ok());
-        }));
+        assert!(retire_completed_loans(
+            &mut loans,
+            |_| Ok(true),
+            |buffer| {
+                // Host-only retirement model: no hardware or external pointer exists.
+                assert!(unsafe { pool.release_quiesced(buffer) }.is_ok());
+            }
+        ));
         let replacement = pool.alloc(4096).unwrap();
         assert_eq!(replacement.iova(), address);
         assert_ne!(replacement.iova(), sibling.iova());
@@ -2960,22 +3197,62 @@ mod tests {
         let mut owners = Vec::new_in(&arena);
         owners.extend([false, true, true]);
         let retired = core::cell::Cell::new(0);
-        assert!(super::retire_imports_and_resume(&mut owners, false, |released| *released,
+        assert!(super::retire_imports_and_resume(
+            &mut owners,
+            false,
+            |released| *released,
             |_| panic!("unrelated device work excludes outer retirement"),
-            || panic!("deferred retirement must not touch activation")));
-        assert_eq!(owners, [false, true, true], "deferred backing remains in native custody");
-        assert!(super::retire_imports_and_resume(&mut owners, true, |released| *released,
-            |_| { retired.set(retired.get() + 1); true },
-            || { assert_eq!(retired.get(), 2); true }));
+            || panic!("deferred retirement must not touch activation")
+        ));
+        assert_eq!(
+            owners,
+            [false, true, true],
+            "deferred backing remains in native custody"
+        );
+        assert!(super::retire_imports_and_resume(
+            &mut owners,
+            true,
+            |released| *released,
+            |_| {
+                retired.set(retired.get() + 1);
+                true
+            },
+            || {
+                assert_eq!(retired.get(), 2);
+                true
+            }
+        ));
         assert_eq!(owners, [false], "live imports retain their mapping owners");
-        assert!(super::retire_imports_and_resume(&mut owners, true, |released| *released,
-            |_| panic!("live import must not retire"), || panic!("no retirement means no activation")));
+        assert!(super::retire_imports_and_resume(
+            &mut owners,
+            true,
+            |released| *released,
+            |_| panic!("live import must not retire"),
+            || panic!("no retirement means no activation")
+        ));
         owners.push(true);
-        assert!(!super::retire_imports_and_resume(&mut owners, true, |released| *released,
-            |_| false, || panic!("refused retirement requires containment")));
-        assert_eq!(owners, [false, true], "refused retirement preserves the exact owner");
-        assert!(!super::retire_imports_and_resume(&mut owners, true, |released| *released,
-            |_| true, || false), "failed activation cannot acknowledge success");
+        assert!(!super::retire_imports_and_resume(
+            &mut owners,
+            true,
+            |released| *released,
+            |_| false,
+            || panic!("refused retirement requires containment")
+        ));
+        assert_eq!(
+            owners,
+            [false, true],
+            "refused retirement preserves the exact owner"
+        );
+        assert!(
+            !super::retire_imports_and_resume(
+                &mut owners,
+                true,
+                |released| *released,
+                |_| true,
+                || false
+            ),
+            "failed activation cannot acknowledge success"
+        );
         assert_eq!(owners, [false]);
     }
 
@@ -3290,7 +3567,9 @@ mod tests {
         );
         // A different allocator must not accept this pool's buffer identity.
         let other = CapPool::new(cpu, DMA_IOVA_BASE, layout.size() as u64, &ARENA).unwrap();
-        let DmaReleaseFailure::Refused(reused) = unsafe { other.release_quiesced(reused) }.unwrap_err() else {
+        let DmaReleaseFailure::Refused(reused) =
+            unsafe { other.release_quiesced(reused) }.unwrap_err()
+        else {
             panic!("foreign allocation must refuse, not claim unsupported recycling");
         };
         assert!(pool.alloc(4096).is_none());

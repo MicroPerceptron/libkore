@@ -70,7 +70,9 @@ impl<T, A: Allocator + ?Sized + 'static> AtomicSlotVec<T, A> {
             states.push(AtomicU64::new(1));
         }
         let mut readers = Vec::new_in(alloc);
-        readers.try_reserve_exact(capacity).map_err(|_| AllocError)?;
+        readers
+            .try_reserve_exact(capacity)
+            .map_err(|_| AllocError)?;
         for _ in 0..capacity {
             readers.push(AtomicU32::new(0));
         }
@@ -330,7 +332,9 @@ impl<T, A: Allocator + ?Sized + 'static> Deref for SlotVecRead<'_, T, A> {
     }
 }
 
-impl<T: core::fmt::Debug, A: Allocator + ?Sized + 'static> core::fmt::Debug for SlotVecRead<'_, T, A> {
+impl<T: core::fmt::Debug, A: Allocator + ?Sized + 'static> core::fmt::Debug
+    for SlotVecRead<'_, T, A>
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SlotVecRead")
             .field("id", &self.id)
@@ -380,7 +384,9 @@ impl<T, A: Allocator + ?Sized + 'static> DerefMut for SlotVecWrite<'_, T, A> {
     }
 }
 
-impl<T: core::fmt::Debug, A: Allocator + ?Sized + 'static> core::fmt::Debug for SlotVecWrite<'_, T, A> {
+impl<T: core::fmt::Debug, A: Allocator + ?Sized + 'static> core::fmt::Debug
+    for SlotVecWrite<'_, T, A>
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SlotVecWrite")
             .field("id", &self.id)
@@ -552,8 +558,8 @@ mod tests {
         // The fs service holds one arena type regardless of whether the
         // allocator is a test arena or the service heap: `dyn Allocator`.
         let alloc: &'static dyn core::alloc::Allocator = &ARENA;
-        let slots = AtomicSlotVec::<u32, dyn core::alloc::Allocator>::try_new_in(128, alloc)
-            .unwrap();
+        let slots =
+            AtomicSlotVec::<u32, dyn core::alloc::Allocator>::try_new_in(128, alloc).unwrap();
         let id = slots.insert(42).unwrap();
         assert_eq!(slots.capacity(), 128);
         assert_eq!(slots.read(id, |v| *v), Ok(42));

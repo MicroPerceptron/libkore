@@ -189,9 +189,13 @@ pub fn stats() -> Stats {
     let mut s = Stats::default();
     for shard in &STATS {
         s.rings = s.rings.wrapping_add(shard.rings.load(Ordering::Relaxed));
-        s.skipped = s.skipped.wrapping_add(shard.skipped.load(Ordering::Relaxed));
+        s.skipped = s
+            .skipped
+            .wrapping_add(shard.skipped.load(Ordering::Relaxed));
         s.armed = s.armed.wrapping_add(shard.armed.load(Ordering::Relaxed));
-        s.resolved = s.resolved.wrapping_add(shard.resolved.load(Ordering::Relaxed));
+        s.resolved = s
+            .resolved
+            .wrapping_add(shard.resolved.load(Ordering::Relaxed));
     }
     s
 }

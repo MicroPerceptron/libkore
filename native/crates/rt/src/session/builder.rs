@@ -78,6 +78,8 @@ pub enum BuildError {
     /// The bounded standing-post wait is malformed: an alternate post lacks
     /// its primary, aliases the same channel, or accompanies invocations.
     BadParkShape,
+    /// TASK_EXIT requires the typed [`SessionBuilder::exit`] entry point.
+    UntypedExit,
 }
 
 /// A staged invocation's **result** — the typed SSA reference (`Move D`:
@@ -311,10 +313,14 @@ impl SessionBuilder {
     /// `Derive × Task × TASK_EXIT` — **end the calling task** with
     /// `status`, presenting its own `role::SELF` handle (`MODIFY`).  The
     /// commit does not return.
-    pub fn exit(&mut self, self_handle: SlotRef, status: i32) -> Result<(), BuildError> {
+    pub fn exit(
+        &mut self,
+        self_handle: SlotRef,
+        status: crate::exit::ExitCode,
+    ) -> Result<(), BuildError> {
         let mut req = [0u8; 8];
-        req[0..4].copy_from_slice(&status.to_le_bytes());
-        self.derive_raw(
+        req[0..4].copy_from_slice(&status.get().to_le_bytes());
+        self.derive_inner(
             self_handle,
             Rights::empty(),
             kore_abi::session::DERIVE_KIND_TASK_EXIT,
@@ -481,10 +487,25 @@ impl SessionBuilder {
         Ok(off as u32)
     }
 
-    /// Stage a raw derive — the core every typed verb lowers onto:
+    /// Stage a raw derive:
     /// `Derive(subject, requested, kind) → result`, with an optional
-    /// op-specific payload already serialized.
+    /// op-specific payload already serialized. TASK_EXIT is refused: use
+    /// [`exit`](Self::exit) with a typed code instead.
     pub fn derive_raw(
+        &mut self,
+        subject: SlotRef,
+        requested: Rights,
+        kind: u8,
+        result: SlotRef,
+        arg: Option<&[u8]>,
+    ) -> Result<Staged, BuildError> {
+        if kind == kore_abi::session::DERIVE_KIND_TASK_EXIT {
+            return Err(BuildError::UntypedExit);
+        }
+        self.derive_inner(subject, requested, kind, result, arg)
+    }
+
+    fn derive_inner(
         &mut self,
         subject: SlotRef,
         requested: Rights,
@@ -833,18 +854,33 @@ impl SessionBuilder {
     /// Map a whole lease at the kernel-selected VA, retaining a named CPU
     /// view for exact unshare. Observe its geometry with `cpu_view_geometry`.
     pub fn map_owned_named(
-        &mut self, lease: impl Into<SlotRef>, rights: Rights, result: SlotRef,
+        &mut self,
+        lease: impl Into<SlotRef>,
+        rights: Rights,
+        result: SlotRef,
     ) -> Result<Staged, BuildError> {
-        self.derive_raw(lease.into(), rights,
-            kore_abi::session::DERIVE_KIND_OWNED_MAP, result, None)
+        self.derive_raw(
+            lease.into(),
+            rights,
+            kore_abi::session::DERIVE_KIND_OWNED_MAP,
+            result,
+            None,
+        )
     }
 
     /// Read an installed CPU view's geometry without installing another map.
     pub fn cpu_view_geometry(
-        &mut self, view: impl Into<SlotRef>, result: SlotRef,
+        &mut self,
+        view: impl Into<SlotRef>,
+        result: SlotRef,
     ) -> Result<Staged, BuildError> {
-        self.derive_raw(view.into(), Rights::empty(),
-            kore_abi::session::DERIVE_KIND_CPU_VIEW_OBSERVE, result, None)
+        self.derive_raw(
+            view.into(),
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_CPU_VIEW_OBSERVE,
+            result,
+            None,
+        )
     }
 
     /// Exercise a detached view in a receiver-owned, founder-stamped window.
@@ -1665,8 +1701,13 @@ impl SessionBuilder {
         rights: Rights,
         result: SlotRef,
     ) -> Result<Staged, BuildError> {
-        self.derive_raw(registration.into(), rights,
-            ResourceKind::MemoryFabricRoute as u8, result, Some(&request.encode()))
+        self.derive_raw(
+            registration.into(),
+            rights,
+            ResourceKind::MemoryFabricRoute as u8,
+            result,
+            Some(&request.encode()),
+        )
     }
 
     /// Delegate a relative range from a held or staged route.
@@ -1677,8 +1718,13 @@ impl SessionBuilder {
         rights: Rights,
         result: SlotRef,
     ) -> Result<Staged, BuildError> {
-        self.derive_raw(route.into(), rights,
-            kore_abi::session::DERIVE_KIND_FABRIC_SCOPE, result, Some(&request.encode()))
+        self.derive_raw(
+            route.into(),
+            rights,
+            kore_abi::session::DERIVE_KIND_FABRIC_SCOPE,
+            result,
+            Some(&request.encode()),
+        )
     }
 
     /// Attempt to close a held route's admission. Run alone and unflagged;
@@ -1688,8 +1734,13 @@ impl SessionBuilder {
         route: SlotRef,
         result: SlotRef,
     ) -> Result<Staged, BuildError> {
-        self.derive_raw(route, Rights::empty(),
-            kore_abi::session::DERIVE_KIND_FABRIC_CLOSE, result, None)
+        self.derive_raw(
+            route,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_FABRIC_CLOSE,
+            result,
+            None,
+        )
     }
 
     /// Observe a held or staged registration without deriving authority.
@@ -1779,47 +1830,86 @@ impl SessionBuilder {
     /// Observe the committed PCI claim beneath this inventory root. The
     /// result is bind-inert correlation; it conveys no retirement authority.
     pub fn read_device_claim(
-        &mut self, root: SlotRef, index: u32, result: SlotRef,
+        &mut self,
+        root: SlotRef,
+        index: u32,
+        result: SlotRef,
     ) -> Result<Staged, BuildError> {
         let mut req = [0u8; InventoryReq::WIRE];
         req[0..4].copy_from_slice(&index.to_le_bytes());
         req[4] = kore_abi::session::INVENTORY_QUERY_DEVICE_CLAIM;
-        self.derive_raw(root, Rights::empty(), DERIVE_KIND_DEVICE_RECORD, result, Some(&req))
+        self.derive_raw(
+            root,
+            Rights::empty(),
+            DERIVE_KIND_DEVICE_RECORD,
+            result,
+            Some(&req),
+        )
     }
 
     /// Close only this exact committed grant's admission. Use a singular,
     /// unflagged session; the report never authorizes physical device reuse.
-    pub fn close_device_claim(&mut self, root: SlotRef, index: u32,
-        identity: kore_abi::session::DeviceClaimReport, result: SlotRef,
+    pub fn close_device_claim(
+        &mut self,
+        root: SlotRef,
+        index: u32,
+        identity: kore_abi::session::DeviceClaimReport,
+        result: SlotRef,
     ) -> Result<Staged, BuildError> {
         let mut req = [0u8; kore_abi::session::DeviceClaimCloseReq::WIRE];
         req[0..4].copy_from_slice(&index.to_le_bytes());
         req[8..16].copy_from_slice(&identity.generation.to_le_bytes());
         req[16..24].copy_from_slice(&identity.grant.0.to_le_bytes());
-        self.derive_raw(root, Rights::empty(), kore_abi::session::DERIVE_KIND_DEVICE_CLAIM_CLOSE, result, Some(&req))
+        self.derive_raw(
+            root,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_DEVICE_CLAIM_CLOSE,
+            result,
+            Some(&req),
+        )
     }
 
     /// Contain this exact already-closed and drained grant. Use a singular,
     /// unflagged session; the report never authorizes physical device reuse.
-    pub fn quiesce_device_claim(&mut self, root: SlotRef, index: u32,
-        identity: kore_abi::session::DeviceClaimReport, result: SlotRef,
+    pub fn quiesce_device_claim(
+        &mut self,
+        root: SlotRef,
+        index: u32,
+        identity: kore_abi::session::DeviceClaimReport,
+        result: SlotRef,
     ) -> Result<Staged, BuildError> {
         let mut req = [0u8; kore_abi::session::DeviceClaimCloseReq::WIRE];
         req[0..4].copy_from_slice(&index.to_le_bytes());
         req[8..16].copy_from_slice(&identity.generation.to_le_bytes());
         req[16..24].copy_from_slice(&identity.grant.0.to_le_bytes());
-        self.derive_raw(root, Rights::empty(), kore_abi::session::DERIVE_KIND_DEVICE_CLAIM_QUIESCE, result, Some(&req))
+        self.derive_raw(
+            root,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_DEVICE_CLAIM_QUIESCE,
+            result,
+            Some(&req),
+        )
     }
 
     /// Retire registered DMA under the original closed/drained claim issuer.
-    pub fn retire_device_claim_dma(&mut self, root: SlotRef, index: u32,
-        identity: kore_abi::session::DeviceClaimReport, result: SlotRef,
+    pub fn retire_device_claim_dma(
+        &mut self,
+        root: SlotRef,
+        index: u32,
+        identity: kore_abi::session::DeviceClaimReport,
+        result: SlotRef,
     ) -> Result<Staged, BuildError> {
         let mut req = [0u8; kore_abi::session::DeviceClaimCloseReq::WIRE];
         req[0..4].copy_from_slice(&index.to_le_bytes());
         req[8..16].copy_from_slice(&identity.generation.to_le_bytes());
         req[16..24].copy_from_slice(&identity.grant.0.to_le_bytes());
-        self.derive_raw(root, Rights::empty(), kore_abi::session::DERIVE_KIND_DEVICE_CLAIM_DMA_RETIRE, result, Some(&req))
+        self.derive_raw(
+            root,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_DEVICE_CLAIM_DMA_RETIRE,
+            result,
+            Some(&req),
+        )
     }
 
     /// Read one inert admission page under an already-held inventory root.

@@ -309,7 +309,9 @@ pub trait Dma {
     /// Whether the native owner can recover independent allocation custody
     /// after quiescent detachment. This fact neither authorizes nor performs
     /// a return; ordinary pool slices keep the conservative default.
-    fn can_return_to_owner(&self) -> bool { false }
+    fn can_return_to_owner(&self) -> bool {
+        false
+    }
 
     /// Whether the buffer is empty (the clippy convention pair).
     fn is_empty(&self) -> bool {
@@ -695,7 +697,9 @@ pub trait DmaPool {
     /// lifetime. Import adoption must authenticate provenance before mapping
     /// it; an address falling inside a window is insufficient. Pools that do
     /// not expose adoption conservatively refuse this projection.
-    fn owns(&self, _buffer: &Self::Buf) -> bool { false }
+    fn owns(&self, _buffer: &Self::Buf) -> bool {
+        false
+    }
 
     /// Return an allocation after all device references and translations have
     /// been quiesced. Pools without reclamation return `NotReclaimed` with the
@@ -707,7 +711,10 @@ pub trait DmaPool {
     /// The caller must prove no device can access this allocation, including
     /// through stale translations or an outstanding command. The allocation
     /// must not be reused after successful release.
-    unsafe fn release_quiesced(&self, buffer: Self::Buf) -> Result<(), DmaReleaseFailure<Self::Buf>> {
+    unsafe fn release_quiesced(
+        &self,
+        buffer: Self::Buf,
+    ) -> Result<(), DmaReleaseFailure<Self::Buf>> {
         Err(DmaReleaseFailure::NotReclaimed(buffer))
     }
 

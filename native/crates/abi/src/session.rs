@@ -639,12 +639,23 @@ impl ExitReport {
         rec
     }
 
-    /// Decode from the caller's result slot (client side).  `None` for
-    /// anything that is not a deliberate exit report.
+    /// Decode only the exact bind-inert exit encoding, including canonical
+    /// sign extension of its i32 payload. Malformed high bits must not become
+    /// another status (in particular success) through a narrowing cast.
     pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
-        is_inert_report(rec, EXIT_REPORT_KIND, EXIT_REPORT_MAGIC).then_some(Self {
-            status: rec.scope_rid as i64 as i32,
-        })
+        if !is_inert_report(rec, EXIT_REPORT_KIND, EXIT_REPORT_MAGIC) {
+            return None;
+        }
+        let status = i32::try_from(rec.scope_rid as i64).ok()?;
+        let report = Self { status };
+        let canonical = report.encode();
+        (rec.holder == canonical.holder
+            && rec.rights == canonical.rights
+            && rec.epoch == canonical.epoch
+            && rec.chain_len == canonical.chain_len
+            && rec.chain == canonical.chain
+            && rec.mac == canonical.mac)
+            .then_some(report)
     }
 }
 
@@ -2540,13 +2551,27 @@ pub struct LidSnapshot {
 
 impl LidSnapshot {
     pub const fn to_observation(self) -> (u64, u64) {
-        (match self.closed { None => 0, Some(false) => 1, Some(true) => 2 }, self.generation as u64)
+        (
+            match self.closed {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            },
+            self.generation as u64,
+        )
     }
 
     pub fn from_observation(value: u64, aux: u64) -> Option<Self> {
-        let closed = match value { 0 => None, 1 => Some(false), 2 => Some(true), _ => return None };
+        let closed = match value {
+            0 => None,
+            1 => Some(false),
+            2 => Some(true),
+            _ => return None,
+        };
         let generation = u32::try_from(aux).ok()?;
-        if closed.is_none() && generation != 0 { return None; }
+        if closed.is_none() && generation != 0 {
+            return None;
+        }
         Some(Self { closed, generation })
     }
 }
@@ -5191,7 +5216,19 @@ mod tests {
     /// so the sign is part of the payload, not a bit pattern to lose.
     #[test]
     fn exit_report_round_trips_bind_inert() {
-        for status in [0i32, 1, 255, i32::MAX, -1, -42, i32::MIN] {
+        for status in [
+            0i32,
+            1,
+            255,
+            256,
+            257,
+            65536,
+            i32::MAX,
+            -1,
+            -256,
+            -42,
+            i32::MIN,
+        ] {
             let rec = ExitReport { status }.encode();
             assert_eq!(rec.cid, crate::cap::Cid::NULL, "a report binds to nothing");
             assert_eq!(ExitReport::decode(&rec), Some(ExitReport { status }));
@@ -5202,6 +5239,32 @@ mod tests {
         assert_eq!(ExitReport::decode(&geom), None);
         assert_eq!(GeomReport::decode(&ExitReport { status: 0 }.encode()), None);
         assert_eq!(ExitReport::decode(&crate::cap::CapRecord::vacant()), None);
+    }
+
+    #[test]
+    fn exit_report_rejects_high_bit_aliases_and_capability_residue() {
+        for bits in [
+            1u64 << 32,
+            0xffff_ffff,
+            0x8000_0000,
+            0x1_0000_0100,
+            0xffff_fffe_0000_0000,
+        ] {
+            let mut rec = ExitReport { status: 0 }.encode();
+            rec.scope_rid = bits;
+            assert_eq!(ExitReport::decode(&rec), None, "{bits:#x}");
+        }
+        let pristine = ExitReport { status: 256 }.encode();
+        let mut variants = [pristine; 6];
+        variants[0].holder = crate::cap::Cid(1);
+        variants[1].rights = crate::cap::Rights::ACCESS;
+        variants[2].epoch = 1;
+        variants[3].chain_len = 1;
+        variants[4].chain[0] = 1;
+        variants[5].mac[0] = 1;
+        for rec in variants {
+            assert_eq!(ExitReport::decode(&rec), None);
+        }
     }
 
     /// The [`DeviceReport`] round-trips every field at its widest value —

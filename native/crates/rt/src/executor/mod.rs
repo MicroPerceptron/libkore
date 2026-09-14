@@ -67,9 +67,9 @@ use crate::wake;
 
 pub use task::{SpawnRefused, SpawnToken, TaskStorage};
 pub use time::{
-    quiesce_asked, quiesce_deadline, take_quiesce_ask,
     WakeReason, clock_ns, enable_irq_parks, next_wake, next_wake_for, next_wake_on,
-    next_wake_on_for, next_wake_until, retire_irq_parks, sleep_for, sleep_until,
+    next_wake_on_for, next_wake_until, quiesce_asked, quiesce_deadline, retire_irq_parks,
+    sleep_for, sleep_until, take_quiesce_ask,
 };
 
 use task::{TaskHeader, poll_task, waker_for};
@@ -946,7 +946,6 @@ mod tests {
             "MAX_TIMERS must cover MAX_TASKS admitted tasks plus the root"
         );
     }
-
 
     #[test]
     fn cooperative_yield_has_one_pending_poll_and_no_clock_dependency() {

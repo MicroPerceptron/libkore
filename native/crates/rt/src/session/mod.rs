@@ -43,5 +43,7 @@ pub mod slots;
 #[cfg(test)]
 mod tests;
 
-pub use builder::{BuildError, DESCRIPTOR_MAX, Deliver, MAX_SESSION_FOUNDS, SessionBuilder, Staged};
+pub use builder::{
+    BuildError, DESCRIPTOR_MAX, Deliver, MAX_SESSION_FOUNDS, SessionBuilder, Staged,
+};
 pub use slots::SlotAlloc;

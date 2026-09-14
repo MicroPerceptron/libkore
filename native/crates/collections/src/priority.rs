@@ -169,7 +169,10 @@ impl<A: Allocator + ?Sized + 'static> PriorityIndex<A> {
         index: usize,
     ) -> Result<(), PriorityError> {
         let word = Self::index_word(index)?;
-        let position = nodes.get(index).ok_or(PriorityError::Inconsistent)?.heap_index() as usize;
+        let position = nodes
+            .get(index)
+            .ok_or(PriorityError::Inconsistent)?
+            .heap_index() as usize;
         if position >= self.heap.len() || self.heap[position] != word {
             return Err(PriorityError::Inconsistent);
         }
@@ -318,7 +321,10 @@ mod tests {
         }
     }
 
-    fn drain_top(index: &mut PriorityIndex<TestArena<{ 1 << 16 }>>, nodes: &mut [Ranked]) -> std::vec::Vec<u64> {
+    fn drain_top(
+        index: &mut PriorityIndex<TestArena<{ 1 << 16 }>>,
+        nodes: &mut [Ranked],
+    ) -> std::vec::Vec<u64> {
         let mut order = std::vec::Vec::new();
         while let Some(top) = index.peek() {
             order.push(nodes[top as usize].weight);
@@ -363,7 +369,10 @@ mod tests {
                 assert_ne!(node.heap_index, UNINDEXED);
             }
         }
-        assert_eq!(drain_top(&mut index, &mut nodes), [40, 33, 21, 17, 12, 5, 3, 2]);
+        assert_eq!(
+            drain_top(&mut index, &mut nodes),
+            [40, 33, 21, 17, 12, 5, 3, 2]
+        );
     }
 
     #[test]
@@ -378,15 +387,27 @@ mod tests {
         let mut index = PriorityIndex::try_new_in(4, &ARENA).unwrap();
         nodes[0].heap_index = UNINDEXED;
         index.insert(&mut nodes, 0).unwrap();
-        assert_eq!(index.insert(&mut nodes, 0), Err(PriorityError::Inconsistent));
+        assert_eq!(
+            index.insert(&mut nodes, 0),
+            Err(PriorityError::Inconsistent)
+        );
         // Removing a node that is not indexed.
-        assert_eq!(index.remove(&mut nodes, 1), Err(PriorityError::Inconsistent));
+        assert_eq!(
+            index.remove(&mut nodes, 1),
+            Err(PriorityError::Inconsistent)
+        );
         // Out-of-slice node index.
-        assert_eq!(index.remove(&mut nodes, 99), Err(PriorityError::Inconsistent));
+        assert_eq!(
+            index.remove(&mut nodes, 99),
+            Err(PriorityError::Inconsistent)
+        );
         // A back-pointer that lies about its position refuses instead of
         // unhooking whichever node really sits there.
         nodes[1].heap_index = 0;
-        assert_eq!(index.remove(&mut nodes, 1), Err(PriorityError::Inconsistent));
+        assert_eq!(
+            index.remove(&mut nodes, 1),
+            Err(PriorityError::Inconsistent)
+        );
         nodes[1].heap_index = UNINDEXED;
         assert_eq!(index.peek(), Some(0));
         assert_eq!(index.len(), 1);
@@ -394,6 +415,9 @@ mod tests {
 
     #[test]
     fn capacity_that_collides_with_the_sentinel_is_refused() {
-        assert!(PriorityIndex::<TestArena<{ 1 << 16 }>>::try_new_in(UNINDEXED as usize, &ARENA).is_err());
+        assert!(
+            PriorityIndex::<TestArena<{ 1 << 16 }>>::try_new_in(UNINDEXED as usize, &ARENA)
+                .is_err()
+        );
     }
 }
