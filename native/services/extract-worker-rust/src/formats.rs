@@ -433,10 +433,12 @@ pub fn parse_bmp(input: InputIdentity, bytes: &[u8]) -> Result<NormalizedResult,
 
 pub fn parse_ttf(input: InputIdentity, bytes: &[u8]) -> Result<NormalizedResult, AdapterError> {
     check_input(input, bytes, TTF)?;
-    let glyphs = crate::sfnt::glyph_count(bytes, declaration(TTF).limits.max_members)
-        .map_err(|error| match error {
-            crate::sfnt::Error::Malformed => AdapterError::Malformed,
-            crate::sfnt::Error::MemberLimit => AdapterError::MemberLimit,
+    let glyphs =
+        crate::sfnt::glyph_count(bytes, declaration(TTF).limits.max_members).map_err(|error| {
+            match error {
+                crate::sfnt::Error::Malformed => AdapterError::Malformed,
+                crate::sfnt::Error::MemberLimit => AdapterError::MemberLimit,
+            }
         })?;
     let mut builder = start(input, TTF);
     media(&mut builder, "font/ttf")?;

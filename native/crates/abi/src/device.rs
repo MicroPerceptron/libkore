@@ -19,10 +19,10 @@
 //! device domain), [`IrqReq`](crate::session::IrqReq) (an MSI/MSI-X
 //! route) — and teardown is an ordinary `Revoke` of the leaf.
 
-mod i2c_admission;
 mod census;
-pub use i2c_admission::*;
+mod i2c_admission;
 pub use census::*;
+pub use i2c_admission::*;
 
 /// An I/O virtual address — a device-domain address translated by the
 /// IOMMU. **Never** a physical address: userland holds only this, so it can

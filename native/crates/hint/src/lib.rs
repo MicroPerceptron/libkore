@@ -480,7 +480,9 @@ mod tests {
     /// [`reset`] restores the world regardless of how the loser died.
     fn serialize() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
         guard
     }
@@ -614,7 +616,11 @@ mod tests {
         AVAILABLE.store(0, Ordering::SeqCst);
         let word = AtomicU32::new(7);
         assert_eq!(wait_on_with::<Mock>(&word, 7, CAP, HZ), WaitEnd::Spun);
-        assert_eq!(DISARMED.load(Ordering::SeqCst), 0, "retired an unarmed core");
+        assert_eq!(
+            DISARMED.load(Ordering::SeqCst),
+            0,
+            "retired an unarmed core"
+        );
     }
 
     #[test]

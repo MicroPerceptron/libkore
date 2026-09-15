@@ -11,8 +11,7 @@ use kore_svc_extract::ParserId;
 use crate::{
     DirEntry, Fs, FsError, FsRequest, FsResponse, Name, ObjectKind, ObjectSubtype, Refusal,
     Revision, SearchCursor, SearchHit, SearchQuery, View, WALK_MUTATE, WALK_READ, path,
-    read_dir_entry,
-    read_search_hit,
+    read_dir_entry, read_search_hit,
 };
 
 impl<'w, 't> Fs<'w, 't> {

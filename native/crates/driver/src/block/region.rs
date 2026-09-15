@@ -257,7 +257,10 @@ mod tests {
         let id = channel.submit_flush().unwrap();
         assert_eq!(channel.poll().unwrap().request, id);
         let books = channel.stats().latency;
-        assert_eq!((books.samples, books.sum_ns, books.max_ns), (1, 2_000, 2_000));
+        assert_eq!(
+            (books.samples, books.sum_ns, books.max_ns),
+            (1, 2_000, 2_000)
+        );
         assert!(books.snapshot(channel.stats().max_outstanding).measured());
     }
 

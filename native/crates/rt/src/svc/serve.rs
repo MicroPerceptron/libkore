@@ -1022,7 +1022,7 @@ impl<'w, S: SystemService> ServePair<'w, S> {
                     if let Some(reply) = out.reply_mut() {
                         svc.grants_committed(reply, granted, self.endpoint);
                     }
-                },
+                }
                 Err(derived) => {
                     // The §5.5 violation path: drop (bounded revoke of
                     // anything derived) + flag, never block.  Then let
@@ -1285,7 +1285,7 @@ impl<'w, S: SystemService> MintedPair<'w, S> {
                     if let Some(reply) = out.reply_mut() {
                         svc.grants_committed(reply, granted, self.endpoint);
                     }
-                },
+                }
                 Err(derived) => {
                     self.stats.grants_dropped += 1;
                     drop_derived(transport, &derived).await;
@@ -2424,7 +2424,11 @@ mod tests {
             assert_eq!(*response, Reply::Granted);
             assert_eq!(emitted, 1);
             assert!(self.reserved && !self.repaired);
-            assert_eq!(self.committed.replace(via), None, "one success notification");
+            assert_eq!(
+                self.committed.replace(via),
+                None,
+                "one success notification"
+            );
         }
 
         fn grants_dropped(&mut self, response: &mut Reply, emitted: usize) {
@@ -2824,29 +2828,43 @@ mod tests {
     #[test]
     fn committed_grants_notify_both_serving_paths_with_the_structural_owner() {
         for minted in [false, true] {
-            let (mut client, rings) = split_window::<DropAware>(window(), REQ_CAP, REP_CAP).unwrap();
+            let (mut client, rings) =
+                split_window::<DropAware>(window(), REQ_CAP, REP_CAP).unwrap();
             let mut grant_tx = [None; MAX_GRANTS];
             grant_tx[0] = Some(SlotRef::from_wire(61));
             let transport = OkTransport::new();
             let mut service = DropAware::bind(NoCaps);
             if minted {
                 let mut pair = MintedPair {
-                    rings, grant_tx, scratch: [None; MAX_GRANTS], kick: None,
-                    endpoint: 19, admission: None, admitted: false, stats: ServeStats::default(),
+                    rings,
+                    grant_tx,
+                    scratch: [None; MAX_GRANTS],
+                    kick: None,
+                    endpoint: 19,
+                    admission: None,
+                    admitted: false,
+                    stats: ServeStats::default(),
                 };
                 drive(pair.serve_one(&mut service, &transport, &1));
                 assert_eq!(service.committed, Some(19));
                 assert!(service.reserved && !service.repaired);
             } else {
-                let endpoints = ServeEndpoints { kick: SlotRef::from_wire(60), grant_tx,
-                    scratch: [None; MAX_GRANTS], return_post: None };
+                let endpoints = ServeEndpoints {
+                    kick: SlotRef::from_wire(60),
+                    grant_tx,
+                    scratch: [None; MAX_GRANTS],
+                    return_post: None,
+                };
                 let mut host = ServeHost::new(service, &transport, rings, endpoints);
                 client.req.push(1).unwrap();
                 assert!(drive(host.serve_next()));
                 assert_eq!(host.service().committed, Some(0));
                 assert!(host.service().reserved && !host.service().repaired);
             }
-            assert_eq!(DropAware::decode_rep(&client.rep.pop().unwrap()), Some((Reply::Granted, 1)));
+            assert_eq!(
+                DropAware::decode_rep(&client.rep.pop().unwrap()),
+                Some((Reply::Granted, 1))
+            );
         }
     }
 

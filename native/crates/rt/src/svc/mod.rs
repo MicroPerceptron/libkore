@@ -331,21 +331,37 @@ pub const ACCEL_CAPTURE_MAX_WORDS: u64 = ACCEL_OVERLAP_WORDS;
 
 /// Versioned capture framing on the existing founded parent channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AccelCaptureKind { Regions, Overlap }
+pub enum AccelCaptureKind {
+    Regions,
+    Overlap,
+}
 impl AccelCaptureKind {
     pub const fn words(self) -> u64 {
-        match self { Self::Regions => ACCEL_CAPTURE_WORDS, Self::Overlap => ACCEL_OVERLAP_WORDS }
+        match self {
+            Self::Regions => ACCEL_CAPTURE_WORDS,
+            Self::Overlap => ACCEL_OVERLAP_WORDS,
+        }
     }
     pub const fn prefix(self) -> &'static str {
-        match self { Self::Regions => "ivpu-capture: V2", Self::Overlap => "ivpu-overlap: V1" }
+        match self {
+            Self::Regions => "ivpu-capture: V2",
+            Self::Overlap => "ivpu-overlap: V1",
+        }
     }
     /// Upper 16 bits select framing; lower 48 preserve PCI vendor/device.
     pub const fn begin(self, vendor: u16, device: u32) -> u64 {
-        let tag = match self { Self::Regions => 0, Self::Overlap => 1 };
+        let tag = match self {
+            Self::Regions => 0,
+            Self::Overlap => 1,
+        };
         (tag << 48) | ((vendor as u64) << 32) | device as u64
     }
     pub const fn decode_begin(payload: u64) -> Option<(Self, u64)> {
-        let kind = match payload >> 48 { 0 => Self::Regions, 1 => Self::Overlap, _ => return None };
+        let kind = match payload >> 48 {
+            0 => Self::Regions,
+            1 => Self::Overlap,
+            _ => return None,
+        };
         Some((kind, payload & 0x0000_ffff_ffff_ffff))
     }
 }
@@ -569,10 +585,10 @@ pub const SHELL_CONFIG_STAGE_DERIVED: u8 = 5;
 /// No transport status exists because the userland trap could not commit.
 pub const SHELL_CONFIG_ERROR_TRANSPORT: u8 = 0xfe;
 
-/// The terminal renderer's own program-band exit vocabulary. These codes
-/// cross the ordinary task-exit and shell witness paths; the renderer needs
-/// no service beacon or extra diagnostic capability to name its failing phase.
-/// Keep discriminants stable so a photographed boot remains decodable.
+/// The terminal renderer's closed failure phases. `exit_code()` assigns each
+/// phase an application-reserved slot on the ordinary task-exit path; the
+/// enum discriminants are phase identities, not the wire exit numbers. The
+/// shared decoder keeps photographed failures attributable to their phase.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalRendererFailure {
@@ -589,20 +605,30 @@ pub enum TerminalRendererFailure {
 
 impl TerminalRendererFailure {
     pub const fn exit_code(self) -> crate::exit::ExitCode {
-        crate::exit::ExitCode::app(self as u8)
+        match self {
+            Self::Bootstrap => crate::ExitCode::APPLICATION_0,
+            Self::SurfaceRequest => crate::ExitCode::APPLICATION_1,
+            Self::SurfaceMap => crate::ExitCode::APPLICATION_2,
+            Self::Application => crate::ExitCode::APPLICATION_3,
+            Self::Scratch => crate::ExitCode::APPLICATION_4,
+            Self::WorkerAdmission => crate::ExitCode::APPLICATION_5,
+            Self::Render => crate::ExitCode::APPLICATION_6,
+            Self::Commit => crate::ExitCode::APPLICATION_7,
+            Self::TargetGeometry => crate::ExitCode::APPLICATION_8,
+        }
     }
 
     pub const fn from_exit_code(code: i32) -> Option<Self> {
         match code {
-            x if x == Self::Bootstrap as i32 => Some(Self::Bootstrap),
-            x if x == Self::SurfaceRequest as i32 => Some(Self::SurfaceRequest),
-            x if x == Self::SurfaceMap as i32 => Some(Self::SurfaceMap),
-            x if x == Self::Application as i32 => Some(Self::Application),
-            x if x == Self::Scratch as i32 => Some(Self::Scratch),
-            x if x == Self::WorkerAdmission as i32 => Some(Self::WorkerAdmission),
-            x if x == Self::Render as i32 => Some(Self::Render),
-            x if x == Self::Commit as i32 => Some(Self::Commit),
-            x if x == Self::TargetGeometry as i32 => Some(Self::TargetGeometry),
+            x if x == Self::Bootstrap.exit_code().get() => Some(Self::Bootstrap),
+            x if x == Self::SurfaceRequest.exit_code().get() => Some(Self::SurfaceRequest),
+            x if x == Self::SurfaceMap.exit_code().get() => Some(Self::SurfaceMap),
+            x if x == Self::Application.exit_code().get() => Some(Self::Application),
+            x if x == Self::Scratch.exit_code().get() => Some(Self::Scratch),
+            x if x == Self::WorkerAdmission.exit_code().get() => Some(Self::WorkerAdmission),
+            x if x == Self::Render.exit_code().get() => Some(Self::Render),
+            x if x == Self::Commit.exit_code().get() => Some(Self::Commit),
+            x if x == Self::TargetGeometry.exit_code().get() => Some(Self::TargetGeometry),
             _ => None,
         }
     }
@@ -759,25 +785,25 @@ mod shell_failure_tests {
     #[test]
     fn renderer_failure_codes_are_stable_program_exits() {
         for (phase, code, name) in [
-            (TerminalRendererFailure::Bootstrap, 16, "bootstrap"),
+            (TerminalRendererFailure::Bootstrap, 256, "bootstrap"),
             (
                 TerminalRendererFailure::SurfaceRequest,
-                17,
+                257,
                 "surface-request",
             ),
-            (TerminalRendererFailure::SurfaceMap, 18, "surface-map"),
-            (TerminalRendererFailure::Application, 19, "application"),
-            (TerminalRendererFailure::Scratch, 20, "scratch"),
+            (TerminalRendererFailure::SurfaceMap, 258, "surface-map"),
+            (TerminalRendererFailure::Application, 259, "application"),
+            (TerminalRendererFailure::Scratch, 260, "scratch"),
             (
                 TerminalRendererFailure::WorkerAdmission,
-                21,
+                261,
                 "worker-admission",
             ),
-            (TerminalRendererFailure::Render, 22, "render"),
-            (TerminalRendererFailure::Commit, 23, "commit"),
+            (TerminalRendererFailure::Render, 262, "render"),
+            (TerminalRendererFailure::Commit, 263, "commit"),
             (
                 TerminalRendererFailure::TargetGeometry,
-                24,
+                264,
                 "target-geometry",
             ),
         ] {
@@ -872,11 +898,9 @@ pub const COOKIE_STORE: u64 = 0x6B72_5F73_746F_7265; // "kr_store"
 /// (the one `kore-rt/validate` build) through the ordinary
 /// generation-bound spawn path and forwards the verdict.  Payload 0 is
 /// the clean run; 900 no row/capability; 1000+s is a nonzero witness
-/// exit s, where s = failing-stage×10 + typed-fault code (stages
-/// 1 spmd / 2 room / 3 lane / 4 rotate, faults numbered in each
-/// enum's declaration order from 1 — `1032` reads "lane stage,
-/// fault 2 = Escape"; stages 1 spmd / 2 room / 3 lane / 4 rotate /
-/// 5 dispatch); anything else is the launch's spawn rung.  Like [`COOKIE_STORE`], every failure beneath the
+/// exit s. Application slots 256..261 identify spmd / room / lane / rotate /
+/// dispatch / resident respectively; the terminal output retains each typed
+/// fault. Anything else is the launch's spawn rung. Like [`COOKIE_STORE`], the
 /// summary is deliberately non-fatal: the validate ladder must never
 /// cost a machine that already booted, so this cookie is the ONLY
 /// place a dead SPMD tier and a working one differ at boot — the
@@ -1070,10 +1094,16 @@ pub fn split_window<S: SvcProtocol>(
 fn accelerator_capture_kind_preserves_identity_and_rejects_unknown_versions() {
     for kind in [AccelCaptureKind::Regions, AccelCaptureKind::Overlap] {
         let payload = kind.begin(0x8086, 0x643e);
-        assert_eq!(AccelCaptureKind::decode_begin(payload), Some((kind, 0x8086_0000_643e)));
+        assert_eq!(
+            AccelCaptureKind::decode_begin(payload),
+            Some((kind, 0x8086_0000_643e))
+        );
         assert!(kind.words() <= ACCEL_CAPTURE_MAX_WORDS);
     }
-    assert_eq!(AccelCaptureKind::Regions.begin(0x8086, 0x643e), 0x8086_0000_643e);
+    assert_eq!(
+        AccelCaptureKind::Regions.begin(0x8086, 0x643e),
+        0x8086_0000_643e
+    );
     assert_eq!(AccelCaptureKind::decode_begin(2 << 48), None);
     assert_eq!(AccelCaptureKind::decode_begin(u64::MAX), None);
 }

@@ -195,9 +195,13 @@ mod tests {
                 then_seen = Some(inner.active());
                 // Nested divergence must restore THIS arm's mask.
                 let sub = LaneMask::splat(false);
-                inner.branch(sub, |_| unreachable!("empty arm ran"), |i| {
-                    assert_eq!(i.active(), parent & cond, "else-of-empty = the arm");
-                });
+                inner.branch(
+                    sub,
+                    |_| unreachable!("empty arm ran"),
+                    |i| {
+                        assert_eq!(i.active(), parent & cond, "else-of-empty = the arm");
+                    },
+                );
                 assert_eq!(inner.active(), parent & cond, "nested reconvergence");
             },
             |inner| {
@@ -232,9 +236,7 @@ mod tests {
     fn refine_trips_per_lane_and_terminates() {
         let mut ls = Lockstep::full();
         // Lane i wants i trips (lane 0: zero — never live inside).
-        let want = LaneU32::from_slice(
-            &core::array::from_fn::<u32, W, _>(|i| i as u32),
-        );
+        let want = LaneU32::from_slice(&core::array::from_fn::<u32, W, _>(|i| i as u32));
         let done = core::cell::Cell::new(LaneU32::splat(0));
         let mut body_runs = 0usize;
         ls.refine(
@@ -242,7 +244,11 @@ mod tests {
             |inner| {
                 body_runs += 1;
                 assert!(body_runs <= W, "refine failed to tighten");
-                done.set(inner.active().select(done.get() + LaneU32::splat(1), done.get()));
+                done.set(
+                    inner
+                        .active()
+                        .select(done.get() + LaneU32::splat(1), done.get()),
+                );
             },
         );
         let done = done.get();

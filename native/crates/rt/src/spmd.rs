@@ -1756,7 +1756,10 @@ mod tests {
         // law, which must resolve before an executor or wait is needed.
         let mut region = ResidentRegion {
             region: Spmd::<NoWorker, 1> {
-                workers: [None], ctx: &CTX, join_scratch: (), star: None,
+                workers: [None],
+                ctx: &CTX,
+                join_scratch: (),
+                star: None,
             },
             tickets: ResidentTickets::new(&CTX),
         };
@@ -1764,17 +1767,23 @@ mod tests {
         CTX.complete_word().store(generation, Ordering::Release);
         let mut cx = Context::from_waker(Waker::noop());
         assert_eq!(
-            core::pin::pin!(region.wait_async(ticket)).as_mut().poll(&mut cx),
+            core::pin::pin!(region.wait_async(ticket))
+                .as_mut()
+                .poll(&mut cx),
             Poll::Ready(Ok(())),
         );
         let foreign = ResidentTicket::new(&OTHER, 1).unwrap();
         assert_eq!(
-            core::pin::pin!(region.wait_async(foreign)).as_mut().poll(&mut cx),
+            core::pin::pin!(region.wait_async(foreign))
+                .as_mut()
+                .poll(&mut cx),
             Poll::Ready(Err(ResidentTicketError::ForeignRegion)),
         );
         let ahead = ResidentTicket::new(&CTX, ticket.sequence.get() + 1).unwrap();
         assert_eq!(
-            core::pin::pin!(region.wait_async(ahead)).as_mut().poll(&mut cx),
+            core::pin::pin!(region.wait_async(ahead))
+                .as_mut()
+                .poll(&mut cx),
             Poll::Ready(Err(ResidentTicketError::NotIssued)),
         );
     }

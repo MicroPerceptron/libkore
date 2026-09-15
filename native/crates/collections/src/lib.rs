@@ -108,6 +108,4 @@ pub use slotmap::{
     AtomicSlotMap, SlotAccess, SlotId, SlotIter, SlotRead, SlotWrite, SlotWriteIter,
 };
 #[cfg(feature = "alloc")]
-pub use slotvec::{
-    AtomicSlotVec, SlotVecIter, SlotVecRead, SlotVecWrite, SlotVecWriteIter,
-};
+pub use slotvec::{AtomicSlotVec, SlotVecIter, SlotVecRead, SlotVecWrite, SlotVecWriteIter};

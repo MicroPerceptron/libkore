@@ -75,9 +75,9 @@ pub use error::{FsError, FsResult, ProviderError};
 pub use face::FilesystemFace;
 #[cfg(feature = "runtime")]
 pub use fs::{Fs, PEAK_HANDLES};
+pub use ids::{AuthorityQuota, GrantId, Handle, Rights, SessionId, VersionLease};
 #[cfg(feature = "runtime")]
 pub use io::SaveOutcome;
-pub use ids::{AuthorityQuota, GrantId, Handle, Rights, SessionId, VersionLease};
 pub use name::Name;
 pub use object::{ANY_REVISION, ObjectId, ObjectKind, ObjectSubtype, Revision, StableObjectId};
 #[cfg(feature = "runtime")]
@@ -89,7 +89,9 @@ pub use search::{
     SearchContent, SearchCursor, SearchHit, SearchPlane, SearchQuery, SearchScore, SearchTerm,
 };
 #[cfg(feature = "runtime")]
-pub use walk::{CloseFailure, View, WALK_MUTATE, WALK_READ, WALK_WRITE, rights_label, rights_parse};
+pub use walk::{
+    CloseFailure, View, WALK_MUTATE, WALK_READ, WALK_WRITE, rights_label, rights_parse,
+};
 
 #[cfg(feature = "runtime")]
 /// Drive a future to completion by polling it on the current thread.

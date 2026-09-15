@@ -1417,7 +1417,9 @@ impl<R> Outcome<R> {
     /// Complete only after the whole grant transaction commits successfully.
     pub(crate) fn release_transferred_grants(&mut self) {
         for owner in &mut self.retained_grants {
-            if let Some(owner) = owner.take() { owner.release_after_proven_move(); }
+            if let Some(owner) = owner.take() {
+                owner.release_after_proven_move();
+            }
         }
     }
 
@@ -1553,9 +1555,16 @@ impl<R> Serve<'_, R> {
     /// Retain one affine delivery through the exact reply-grant transaction.
     /// The host settles its local reservation only after a proven move; a
     /// failed grant keeps the owner in the outcome's bounded cleanup path.
-    pub fn grant_returned(&mut self, owner: crate::cap::ReturnedCapability) -> Result<(), crate::cap::ReturnedCapability> {
-        let Some(subject) = owner.slot() else { return Err(owner); };
-        if self.out.granted >= MAX_GRANTS { return Err(owner); }
+    pub fn grant_returned(
+        &mut self,
+        owner: crate::cap::ReturnedCapability,
+    ) -> Result<(), crate::cap::ReturnedCapability> {
+        let Some(subject) = owner.slot() else {
+            return Err(owner);
+        };
+        if self.out.granted >= MAX_GRANTS {
+            return Err(owner);
+        }
         let index = self.out.granted;
         self.grant(subject, Rights::empty(), GrantArg::Exact);
         self.out.retained_grants[index] = Some(owner);

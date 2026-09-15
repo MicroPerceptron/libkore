@@ -128,7 +128,9 @@ impl PackageMember {
 
 /// The manifest record.  Frozen; `size_of` pinned below.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct PackageManifest {
     /// [`PACKAGE_ABI`].
     pub abi: U16<LittleEndian>,
@@ -190,7 +192,8 @@ impl PackageManifest {
         if count >= MAX_PACKAGE_MEMBERS {
             return Err(());
         }
-        if self.members()
+        if self
+            .members()
             .iter()
             .any(|live| live.kind == member.kind && live.name() == member.name())
         {

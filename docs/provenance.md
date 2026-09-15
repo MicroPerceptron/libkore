@@ -159,7 +159,7 @@ this merged tree. No physical-hardware acceptance is inferred from these runs.
 
 ## Native TLS and independent thread lifecycle
 
-The current export records Kore `2a45f8bce5db65e7713f11c89d7eb5d2d9a04d3f`
+The TLS lifecycle export recorded Kore `2a45f8bce5db65e7713f11c89d7eb5d2d9a04d3f`
 from PR #962: 14 native packages and 223 exact source files. It adds native TLS
 provisioning, owner-checked native tickets and a process-lifetime controller for
 cross-worker create/join/detach. Loader publication and the founded guest witness
@@ -188,3 +188,27 @@ state. The checked-in guest harness exercises the actual adapter in founded
 `hello`, with C-ABI Rust callbacks; separate C/Zig consumers verify generated
 language bindings. It does not claim a C/Zig CRT, automatic stack unwinding,
 initial-process exit hooks, asynchronous cancellation or physical acceptance.
+
+
+## Closed native exit vocabulary
+
+The current export records Kore `b4113c30a8f2ae95a02e511664798eb85505a7c6`:
+14 native packages and 223 exact source files. It includes the intervening #962
+owner updates and the closed exit vocabulary. Public integer constructors are
+removed; the session builder requires the same `ExitCode` as the thread API.
+The ABI layout remains signed 32-bit, with canonical report validation shared by
+all consumers. The facade also re-exports the typed alias macro as `exit_codes!`.
+
+That Kore revision passed host tests, all three architecture checks, user and
+service verification, fresh boot/test builds, kernel and production QEMU gates,
+20 repeated shell launches plus exact 256/257/271/-1 probes, and a screen-decoded
+store launch returning 256. Digests and boot manifests verified. These are
+emulator results, not physical-hardware acceptance. The known lifetime
+capability-tag budget is unchanged.
+
+For this export, `make fmt test check docs owners cross miri bindings-check`
+passed, including the renamed-consumer exit alias and C/Zig declarations and ABI
+assertions on all three Kore architectures. The complete local-owner override
+passed its type-identity checks and duplicate-owner negative control. Both
+workspace dependency locks remain unchanged and pass locked resolution; the
+exporter verifies byte equality against the recorded Kore commit.

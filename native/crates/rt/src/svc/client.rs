@@ -527,15 +527,24 @@ mod return_capability_sealed {
     }
 
     impl Sealed for crate::cap::FabricRouteToken {
-        fn return_slot(&self) -> Option<SlotRef> { Some(self.slot()) }
-        fn return_rights(&self) -> Option<Rights> {
-            super::verbs::capability_rights(self.slot(), kore_abi::cap::ResourceKind::MemoryFabricRoute)
+        fn return_slot(&self) -> Option<SlotRef> {
+            Some(self.slot())
         }
-        fn on_proven_moved(self) { self.release_after_proven_move(); }
+        fn return_rights(&self) -> Option<Rights> {
+            super::verbs::capability_rights(
+                self.slot(),
+                kore_abi::cap::ResourceKind::MemoryFabricRoute,
+            )
+        }
+        fn on_proven_moved(self) {
+            self.release_after_proven_move();
+        }
     }
 
     impl Sealed for crate::cap::StashedMemory {
-        fn return_slot(&self) -> Option<SlotRef> { self.slot() }
+        fn return_slot(&self) -> Option<SlotRef> {
+            self.slot()
+        }
         fn return_rights(&self) -> Option<Rights> {
             match self {
                 Self::Lease(lease) => Sealed::return_rights(lease),

@@ -53,6 +53,11 @@ The driver feature does not turn arbitrary register sequences into safe hardware
 experiments. Device-specific lifecycle, register semantics and DMA completion
 ownership still belong to the driver.
 
+`kore::ExitCode` supplies closed standard outcomes and 16 application-reserved
+slots. `kore::exit_codes!` names those slots without accepting arbitrary integers;
+native exit/join preserves the full signed 32-bit status. See
+[native exit outcomes](docs/runtime.md#native-exit-outcomes).
+
 See [C and Zig allocation](docs/allocators.md), [hash collections](docs/collections.md), [time and concurrency](docs/runtime.md)
 and [random values](docs/random.md) for API examples, admission and failure contracts.
 

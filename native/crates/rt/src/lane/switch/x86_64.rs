@@ -80,12 +80,12 @@ impl FiberSwitch for X64Switch {
         // SAFETY: the contract — exclusively owned writable stack with
         // room below `stack_top`.  Layout mirrors `switch`'s pops.
         unsafe {
-            frame.write(0);                                  // r15 slot (popped first)
-            frame.add(1).write(0);                           // r14
-            frame.add(2).write(arg as u64);                  // r13 → the thunk's arg
-            frame.add(3).write(entry as usize as u64);       // r12 → the thunk's entry
-            frame.add(4).write(0);                           // rbp
-            frame.add(5).write(0);                           // rbx
+            frame.write(0); // r15 slot (popped first)
+            frame.add(1).write(0); // r14
+            frame.add(2).write(arg as u64); // r13 → the thunk's arg
+            frame.add(3).write(entry as usize as u64); // r12 → the thunk's entry
+            frame.add(4).write(0); // rbp
+            frame.add(5).write(0); // rbx
             frame.add(6).write(fiber_entry_thunk as usize as u64); // return address
         }
         sp

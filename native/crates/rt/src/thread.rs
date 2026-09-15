@@ -1662,9 +1662,8 @@ extern "C" fn thread_start(page: *const u8, start: *const ThreadStart) -> ! {
 /// **End the calling thread** with `code` — the kernel exit verb, over
 /// the thread's own `role::SELF` handle.
 ///
-/// The status is an [`ExitCode`], not a bare `i32`: the band it belongs to
-/// and the meaning it carries are named at the callsite, and a program's own
-/// codes are declared once through [`exit_codes!`](crate::exit_codes).
+/// The status must be a standard [`ExitCode`] or a named application-reserved
+/// slot. There is no conversion from an arbitrary integer.
 ///
 /// Does not return, and no code of this thread runs after the commit: the
 /// kernel marks the exit, wakes every joiner, and parks the task with
@@ -1714,7 +1713,7 @@ pub fn exit(code: ExitCode) -> ! {
         // now-monotone retired set. Rebuild even this one-op descriptor so
         // that the retry boundary is the complete prepare+commit attempt.
         let mut b = SessionBuilder::new();
-        if b.exit(slot, code.get()).is_err() {
+        if b.exit(slot, code).is_err() {
             crate::entry::refuse();
         }
         let Ok(committed) = transport.commit_now(&b) else {
@@ -2142,35 +2141,15 @@ fn validate_task_completion(
     }
 }
 
-/// Decode only the canonical bind-inert exit-report record.
-///
-/// [`kore_abi::session::ExitReport::decode`] identifies the report family;
-/// this stronger boundary check additionally proves that every field which
-/// the canonical encoder leaves vacant is still vacant.  A stale capability
-/// or partially overwritten report therefore cannot be accepted as a process
-/// status.
+/// Preserve the full status after the shared ABI decoder validates the
+/// canonical report. Every lifecycle consumer uses that same decoder.
 #[cfg(any(target_os = "none", test))]
 fn decode_task_exit_report(
     rec: &kore_abi::cap::CapRecord,
 ) -> Result<i32, crate::cap::TaskWaitError> {
-    let report = kore_abi::session::ExitReport::decode(rec)
-        .ok_or(crate::cap::TaskWaitError::MalformedReport)?;
-    let canonical = report.encode();
-    let exact = rec.cid == canonical.cid
-        && rec.parent == canonical.parent
-        && rec.holder == canonical.holder
-        && rec.scope_rid == canonical.scope_rid
-        && rec.rights == canonical.rights
-        && rec.kind == canonical.kind
-        && rec.epoch == canonical.epoch
-        && rec.chain_len == canonical.chain_len
-        && rec.chain == canonical.chain
-        && rec.mac == canonical.mac;
-    if exact {
-        Ok(report.status)
-    } else {
-        Err(crate::cap::TaskWaitError::MalformedReport)
-    }
+    kore_abi::session::ExitReport::decode(rec)
+        .map(|report| report.status)
+        .ok_or(crate::cap::TaskWaitError::MalformedReport)
 }
 
 /// One decoded step of the blocking wait loop.  Kept pure so every status in
@@ -2363,6 +2342,24 @@ mod tests {
     }
 
     #[test]
+    fn task_join_and_poll_preserve_all_exit_status_bits() {
+        use kore_abi::session::{ExitReport, Status};
+        for status in [0, 255, 256, 257, 65536, -1, -256, i32::MIN, i32::MAX] {
+            let report = ExitReport { status }.encode();
+            assert_eq!(
+                classify_task_wait(Status::Exited, Some(&report)),
+                Ok(TaskWaitStep::Complete(crate::cap::TaskWaitOutcome::Exited(
+                    status
+                )))
+            );
+            assert_eq!(
+                classify_task_poll(Status::Exited, Some(&report)),
+                Ok(crate::cap::TaskPollOutcome::Exited(status))
+            );
+        }
+    }
+
+    #[test]
     fn task_exit_report_requires_the_exact_bind_inert_encoding() {
         let canonical = kore_abi::session::ExitReport { status: -37 }.encode();
         assert_eq!(decode_task_exit_report(&canonical), Ok(-37));
@@ -2372,9 +2369,8 @@ mod tests {
             Err(crate::cap::TaskWaitError::MalformedReport)
         );
 
-        // The ABI family decoder deliberately keys only the report markers.
-        // The lifecycle boundary is stronger: a stale capability-shaped field
-        // must not be accepted merely because those markers happen to match.
+        // A stale capability-shaped field must not be accepted merely because
+        // the report markers happen to match.
         let mut noncanonical = canonical;
         noncanonical.rights = kore_abi::cap::Rights::ACCESS;
         assert_eq!(

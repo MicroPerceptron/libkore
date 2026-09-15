@@ -94,11 +94,7 @@ impl AddressMonitor for WrsMonitor {
     /// A status row reading `none` is the honest description of a hart whose
     /// Zawrs the kernel has not vouched for.
     fn name() -> &'static str {
-        if ZAWRS_AVAILABLE {
-            "wrs"
-        } else {
-            "none"
-        }
+        if ZAWRS_AVAILABLE { "wrs" } else { "none" }
     }
 
     /// Whether this hart can wait on a reservation — a detected fact, parked

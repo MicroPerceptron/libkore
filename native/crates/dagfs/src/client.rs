@@ -328,7 +328,10 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
     /// This is the lifecycle-safe counterpart of [`resume`](Self::resume): a
     /// cleanup row visited out of order gets [`CallError::Outstanding`]
     /// without kicking the service or consuming another row's late reply.
-    pub(crate) async fn call_exact(&mut self, request: &FsRequest) -> Result<FsResponse, CallError> {
+    pub(crate) async fn call_exact(
+        &mut self,
+        request: &FsRequest,
+    ) -> Result<FsResponse, CallError> {
         let reply = if self.pair.is_idle() {
             self.pair.call(request).await?
         } else {
@@ -1992,17 +1995,30 @@ mod exact_attach_tests {
     fn close_retry_cannot_consume_another_handles_late_reply() {
         let transport = RecordingTransport::refusing();
         let (mut fs, mut serve) = ring_fs(&transport, SlotRef::from_wire(0x41));
-        let close = FsRequest::Close { handle: crate::Handle::from_bits(7) };
-        assert_eq!(crate::block_on(fs.call_exact(&close)), Err(CallError::Transport));
+        let close = FsRequest::Close {
+            handle: crate::Handle::from_bits(7),
+        };
+        assert_eq!(
+            crate::block_on(fs.call_exact(&close)),
+            Err(CallError::Transport)
+        );
         assert_eq!(take_request(&mut serve), close);
         publish_done(&mut serve);
-        let other = FsRequest::Close { handle: crate::Handle::from_bits(8) };
-        assert_eq!(crate::block_on(fs.call_exact(&other)), Err(CallError::Outstanding));
+        let other = FsRequest::Close {
+            handle: crate::Handle::from_bits(8),
+        };
+        assert_eq!(
+            crate::block_on(fs.call_exact(&other)),
+            Err(CallError::Outstanding)
+        );
         assert_eq!(transport.commits.get(), 1);
         transport.succeed.set(true);
         assert_eq!(crate::block_on(fs.call_exact(&close)), Ok(FsResponse::Done));
         assert!(fs.is_idle());
-        assert!(serve.req.pop().is_none(), "retry must not publish another Close");
+        assert!(
+            serve.req.pop().is_none(),
+            "retry must not publish another Close"
+        );
     }
 
     #[test]

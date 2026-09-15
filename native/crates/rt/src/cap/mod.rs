@@ -883,7 +883,10 @@ impl SupplyToken {
     /// Recover the original retained delivery before publishing any mappings.
     /// A founder-held supply cannot be converted into a returned owner.
     pub fn into_returned_capability(mut self) -> Result<ReturnedCapability, Self> {
-        match self._returned.take() { Some(owner) => Ok(owner), None => Err(self) }
+        match self._returned.take() {
+            Some(owner) => Ok(owner),
+            None => Err(self),
+        }
     }
 
     /// Whether this supply arrived through a retained service grant.
@@ -1299,19 +1302,24 @@ impl FabricRouteToken {
     }
 
     /// The possessed route may parent the existing CPU and IOVA mapping verbs.
-    pub fn slot(&self) -> SlotRef { self.owned.slot() }
+    pub fn slot(&self) -> SlotRef {
+        self.owned.slot()
+    }
 
     /// Lend a bounded range with its own mapping/close lifecycle. The parent
     /// remains busy until the child retires. This does not pin allocator runs;
     /// a buffer provider must retain its allocation for the entire loan.
-    pub fn scope(&self, request: &kore_abi::session::FabricRouteScopeReq)
-        -> Result<Self, verbs::FabricRouteFault>
-    {
+    pub fn scope(
+        &self,
+        request: &kore_abi::session::FabricRouteScopeReq,
+    ) -> Result<Self, verbs::FabricRouteFault> {
         verbs::scope_fabric_route(self.owned.slot(), request)
     }
 
     /// Observe immutable mapping geometry before attempting publication.
-    pub fn describe(&self) -> Result<kore_abi::session::FabricRouteInfo, verbs::FabricRegistrationFault> {
+    pub fn describe(
+        &self,
+    ) -> Result<kore_abi::session::FabricRouteInfo, verbs::FabricRegistrationFault> {
         verbs::describe_fabric_route(self.slot())
     }
 
@@ -1333,9 +1341,15 @@ impl FabricRouteToken {
     /// refusal the complete token is returned so the owner can contain or retry.
     pub fn try_retire(self) -> Result<RetireOutcome, Self> {
         let mut this = self;
-        if this.try_close().is_err() { return Err(this); }
+        if this.try_close().is_err() {
+            return Err(this);
+        }
         let outcome = this.owned.retire_inner();
-        if outcome.is_closed() { Ok(outcome) } else { Err(this) }
+        if outcome.is_closed() {
+            Ok(outcome)
+        } else {
+            Err(this)
+        }
     }
 }
 
@@ -2547,8 +2561,13 @@ impl ReturnedCapability {
     /// Authenticate a received mapping route without converting it into a
     /// physical allocation lease or changing its ancestry.
     pub fn try_into_fabric_route(self, required: Rights) -> Result<FabricRouteToken, Self> {
-        if !self.slot().and_then(|slot| verbs::capability_rights(slot,
-            kore_abi::cap::ResourceKind::MemoryFabricRoute)).is_some_and(|rights| rights.contains(required)) {
+        if !self
+            .slot()
+            .and_then(|slot| {
+                verbs::capability_rights(slot, kore_abi::cap::ResourceKind::MemoryFabricRoute)
+            })
+            .is_some_and(|rights| rights.contains(required))
+        {
             return Err(self);
         }
         Ok(FabricRouteToken { owned: self.owned })
@@ -2558,7 +2577,9 @@ impl ReturnedCapability {
     pub fn try_into_memory(self, required: Rights) -> Result<StashedMemory, Self> {
         match self.try_into_stashed_lease(required) {
             Ok(lease) => Ok(StashedMemory::Lease(lease)),
-            Err(owner) => owner.try_into_fabric_route(required).map(StashedMemory::Route),
+            Err(owner) => owner
+                .try_into_fabric_route(required)
+                .map(StashedMemory::Route),
         }
     }
 
@@ -2750,7 +2771,9 @@ pub enum StashedMemory {
 }
 
 impl From<StashedLease> for StashedMemory {
-    fn from(lease: StashedLease) -> Self { Self::Lease(lease) }
+    fn from(lease: StashedLease) -> Self {
+        Self::Lease(lease)
+    }
 }
 
 impl StashedMemory {
@@ -2772,7 +2795,9 @@ impl StashedMemory {
         match self {
             Self::Lease(lease) => lease.try_retire_outcome(),
             Self::Route(route) => {
-                if route.try_close().is_err() { return RetireOutcome::Retryable; }
+                if route.try_close().is_err() {
+                    return RetireOutcome::Retryable;
+                }
                 route.owned.retire_inner()
             }
         }
@@ -2906,7 +2931,9 @@ impl MappedLeaseView {
     }
 
     /// Exact mapped extent, without borrowing the underlying memory.
-    pub const fn len(&self) -> usize { self.len }
+    pub const fn len(&self) -> usize {
+        self.len
+    }
 
     /// Borrow the live read-only mapping for validation.
     ///
@@ -3715,9 +3742,16 @@ impl DmaWindow {
 
     #[cfg(target_os = "none")]
     pub(crate) fn from_route(cpu: *mut u8, iova: u64, len: u64, route: FabricRouteToken) -> Self {
-        Self { cpu, iova, len, device_leaf: DmaDeviceLeaf::Anonymous,
-            cpu_view: None, fabric_route: None, fabric_registration: None,
-            _owned: StashedMemory::Route(route) }
+        Self {
+            cpu,
+            iova,
+            len,
+            device_leaf: DmaDeviceLeaf::Anonymous,
+            cpu_view: None,
+            fabric_route: None,
+            fabric_registration: None,
+            _owned: StashedMemory::Route(route),
+        }
     }
 
     #[cfg(any(test, target_os = "none"))]
@@ -3734,8 +3768,11 @@ impl DmaWindow {
     }
 
     #[cfg(any(test, target_os = "none"))]
-    pub(crate) fn with_fabric_route(mut self, registration: FabricRegistrationToken,
-        route: FabricRouteToken) -> Self {
+    pub(crate) fn with_fabric_route(
+        mut self,
+        registration: FabricRegistrationToken,
+        route: FabricRouteToken,
+    ) -> Self {
         self.fabric_registration = Some(registration);
         self.fabric_route = Some(route);
         self
@@ -3751,13 +3788,17 @@ impl DmaWindow {
     /// custody. The provider must separately retain any lent allocator run.
     pub fn fabric_route(&self) -> Option<&FabricRouteToken> {
         self.fabric_route.as_ref().or_else(|| match &self._owned {
-            StashedMemory::Route(route) => Some(route), _ => None,
+            StashedMemory::Route(route) => Some(route),
+            _ => None,
         })
     }
 
     /// Actual parent of the published mappings, distinct from allocation custody.
     fn dma_mapping_slot(&self) -> SlotRef {
-        self.fabric_route.as_ref().map_or_else(|| self._owned.slot().expect("live DMA custody"), FabricRouteToken::slot)
+        self.fabric_route.as_ref().map_or_else(
+            || self._owned.slot().expect("live DMA custody"),
+            FabricRouteToken::slot,
+        )
     }
 
     fn try_retire_fabric(&mut self) -> RetireOutcome {
@@ -3783,14 +3824,21 @@ impl DmaWindow {
         self.retire_cpu_via(crate::cap::verbs::retire_owned_view)
     }
 
-    fn retire_cpu_via(&mut self, retire: impl FnOnce(SlotRef, SlotRef) -> RetireOutcome) -> RetireOutcome {
+    fn retire_cpu_via(
+        &mut self,
+        retire: impl FnOnce(SlotRef, SlotRef) -> RetireOutcome,
+    ) -> RetireOutcome {
         if !matches!(self.device_leaf, DmaDeviceLeaf::Retired) {
             return RetireOutcome::Retryable;
         }
-        let Some(view) = self.cpu_view.as_mut() else { return RetireOutcome::Retryable; };
+        let Some(view) = self.cpu_view.as_mut() else {
+            return RetireOutcome::Retryable;
+        };
         let parent = view.lease;
         let outcome = view.owned.retire_via(|slot| retire(slot, parent));
-        if outcome.is_closed() { self.cpu = core::ptr::null_mut(); }
+        if outcome.is_closed() {
+            self.cpu = core::ptr::null_mut();
+        }
         outcome
     }
 
@@ -3804,7 +3852,8 @@ impl DmaWindow {
     }
 
     fn retire_device_via(
-        &mut self, retire: impl FnOnce(SlotRef, SlotRef) -> RetireOutcome,
+        &mut self,
+        retire: impl FnOnce(SlotRef, SlotRef) -> RetireOutcome,
     ) -> RetireOutcome {
         let parent = self.dma_mapping_slot();
         let outcome = match &mut self.device_leaf {
@@ -3812,7 +3861,9 @@ impl DmaWindow {
             DmaDeviceLeaf::Retired => return RetireOutcome::AlreadyDead,
             DmaDeviceLeaf::Named(owned) => owned.retire_via(|view| retire(view, parent)),
         };
-        if outcome.is_closed() { self.device_leaf = DmaDeviceLeaf::Retired; }
+        if outcome.is_closed() {
+            self.device_leaf = DmaDeviceLeaf::Retired;
+        }
         outcome
     }
 
@@ -3843,7 +3894,9 @@ impl DmaWindow {
     /// retained route and registration retire before the lease can transfer.
     /// Anonymous pool windows cannot be detached from their parent this way.
     pub fn try_into_lease(self) -> Result<StashedLease, Self> {
-        if !matches!(self._owned, StashedMemory::Lease(_)) { return Err(self); }
+        if !matches!(self._owned, StashedMemory::Lease(_)) {
+            return Err(self);
+        }
         match self.try_into_memory()? {
             StashedMemory::Lease(lease) => Ok(lease),
             StashedMemory::Route(_) => unreachable!("checked allocation species"),
@@ -3856,7 +3909,9 @@ impl DmaWindow {
         if !self.try_retire_device().is_closed() || !self.try_retire_cpu().is_closed() {
             return Err(self);
         }
-        if !self.try_retire_fabric().is_closed() { return Err(self); }
+        if !self.try_retire_fabric().is_closed() {
+            return Err(self);
+        }
         Ok(self._owned)
     }
 
@@ -3879,9 +3934,15 @@ impl DmaWindow {
         if self.cpu_view.is_some() && !self.try_retire_cpu().is_closed() {
             return Err(self);
         }
-        if !self.try_retire_fabric().is_closed() { return Err(self); }
+        if !self.try_retire_fabric().is_closed() {
+            return Err(self);
+        }
         let outcome = self._owned.try_retire_outcome();
-        if outcome.is_closed() { Ok(outcome) } else { Err(self) }
+        if outcome.is_closed() {
+            Ok(outcome)
+        } else {
+            Err(self)
+        }
     }
 }
 
@@ -4108,37 +4169,72 @@ mod retirement_tests {
     fn named_dma_child_retirement_preserves_parent_and_retry_authority() {
         let mut window = DmaWindow::new(core::ptr::null_mut(), 0x4000, 0x1000, live_slot(44))
             .with_device_leaf(live_slot(45));
-        assert_eq!(window.retire_device_via(|view, parent| {
-            assert_eq!(view, SlotRef::from_wire(45));
-            assert_eq!(parent, SlotRef::from_wire(44));
+        assert_eq!(
+            window.retire_device_via(|view, parent| {
+                assert_eq!(view, SlotRef::from_wire(45));
+                assert_eq!(parent, SlotRef::from_wire(44));
+                RetireOutcome::Retryable
+            }),
             RetireOutcome::Retryable
-        }), RetireOutcome::Retryable);
+        );
         assert!(window._owned.slot().is_some());
         assert!(matches!(&window.device_leaf, DmaDeviceLeaf::Named(owner) if owner.is_live()));
-        assert_eq!(window.retire_device_via(|_, _| RetireOutcome::Retired), RetireOutcome::Retired);
-        assert!(window._owned.slot().is_some(), "device retirement must retain allocation custody");
-        assert_eq!(window.retire_device_via(|_, _| panic!("already retired")), RetireOutcome::AlreadyDead);
-        window._owned.into_returned_capability().owned.release_reservation();
+        assert_eq!(
+            window.retire_device_via(|_, _| RetireOutcome::Retired),
+            RetireOutcome::Retired
+        );
+        assert!(
+            window._owned.slot().is_some(),
+            "device retirement must retain allocation custody"
+        );
+        assert_eq!(
+            window.retire_device_via(|_, _| panic!("already retired")),
+            RetireOutcome::AlreadyDead
+        );
+        window
+            ._owned
+            .into_returned_capability()
+            .owned
+            .release_reservation();
         let mut anonymous = DmaWindow::new(core::ptr::null_mut(), 0x5000, 0x1000, live_slot(46));
         assert_eq!(anonymous.try_retire_device(), RetireOutcome::Retryable);
         assert!(anonymous._owned.slot().is_some());
-        anonymous._owned.into_returned_capability().owned.release_reservation();
+        anonymous
+            ._owned
+            .into_returned_capability()
+            .owned
+            .release_reservation();
     }
 
     #[test]
     fn routed_dma_retirement_uses_route_parent_and_keeps_allocation_on_refusal() {
-        let route = FabricRouteToken { owned: live_slot(47) };
-        let registration = FabricRegistrationToken { owned: live_slot(48) };
+        let route = FabricRouteToken {
+            owned: live_slot(47),
+        };
+        let registration = FabricRegistrationToken {
+            owned: live_slot(48),
+        };
         let mut window = DmaWindow::new(core::ptr::null_mut(), 0x4000, 0x1000, live_slot(44))
-            .with_device_leaf(live_slot(45)).with_fabric_route(registration, route);
-        assert_eq!(window.retire_device_via(|view, parent| {
-            assert_eq!(view, SlotRef::from_wire(45));
-            assert_eq!(parent, SlotRef::from_wire(47), "the allocation is not the IOVA parent");
+            .with_device_leaf(live_slot(45))
+            .with_fabric_route(registration, route);
+        assert_eq!(
+            window.retire_device_via(|view, parent| {
+                assert_eq!(view, SlotRef::from_wire(45));
+                assert_eq!(
+                    parent,
+                    SlotRef::from_wire(47),
+                    "the allocation is not the IOVA parent"
+                );
+                RetireOutcome::Retryable
+            }),
             RetireOutcome::Retryable
-        }), RetireOutcome::Retryable);
+        );
         assert!(window._owned.slot().is_some());
-        assert_eq!(window.try_retire_fabric(), RetireOutcome::Retryable,
-            "host transport cannot prove route closure");
+        assert_eq!(
+            window.try_retire_fabric(),
+            RetireOutcome::Retryable,
+            "host transport cannot prove route closure"
+        );
         assert!(window.fabric_route.as_ref().unwrap().owned.is_live());
         assert!(window.fabric_registration.as_ref().unwrap().owned.is_live());
         core::mem::forget(window);
@@ -4150,21 +4246,42 @@ mod retirement_tests {
         let mut view = mapped_test_view(&mut bytes);
         view.owned = core::mem::ManuallyDrop::new(live_slot(42));
         let mut window = DmaWindow::new(bytes.as_mut_ptr(), 0x4000, 8, live_slot(43))
-            .with_device_leaf(live_slot(45)).with_cpu_view(view);
-        assert_eq!(window.retire_cpu_via(|_, _| panic!("device still live")), RetireOutcome::Retryable);
-        assert_eq!(window.retire_device_via(|_, _| RetireOutcome::Retired), RetireOutcome::Retired);
-        assert_eq!(window.retire_cpu_via(|cpu, parent| {
-            assert_eq!(cpu, SlotRef::from_wire(42));
-            assert_eq!(parent, SlotRef::from_wire(43));
+            .with_device_leaf(live_slot(45))
+            .with_cpu_view(view);
+        assert_eq!(
+            window.retire_cpu_via(|_, _| panic!("device still live")),
             RetireOutcome::Retryable
-        }), RetireOutcome::Retryable);
+        );
+        assert_eq!(
+            window.retire_device_via(|_, _| RetireOutcome::Retired),
+            RetireOutcome::Retired
+        );
+        assert_eq!(
+            window.retire_cpu_via(|cpu, parent| {
+                assert_eq!(cpu, SlotRef::from_wire(42));
+                assert_eq!(parent, SlotRef::from_wire(43));
+                RetireOutcome::Retryable
+            }),
+            RetireOutcome::Retryable
+        );
         assert_eq!(window.cpu(), bytes.as_mut_ptr());
         assert!(window._owned.slot().is_some());
-        assert_eq!(window.retire_cpu_via(|_, _| RetireOutcome::Retired), RetireOutcome::Retired);
+        assert_eq!(
+            window.retire_cpu_via(|_, _| RetireOutcome::Retired),
+            RetireOutcome::Retired
+        );
         assert!(window.cpu().is_null());
-        assert!(window._owned.slot().is_some(), "allocation remains available for hand-back");
-        assert_eq!(window.retire_cpu_via(|_, _| panic!("already retired")), RetireOutcome::AlreadyDead);
-        let mut lease = window.try_into_lease().expect("both named children are closed");
+        assert!(
+            window._owned.slot().is_some(),
+            "allocation remains available for hand-back"
+        );
+        assert_eq!(
+            window.retire_cpu_via(|_, _| panic!("already retired")),
+            RetireOutcome::AlreadyDead
+        );
+        let mut lease = window
+            .try_into_lease()
+            .expect("both named children are closed");
         assert_eq!(lease.slot(), Some(SlotRef::from_wire(43)));
         assert!(lease.is_live());
         lease.owned.release_reservation();

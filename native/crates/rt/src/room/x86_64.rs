@@ -72,14 +72,30 @@ fn store_mm(slot: u8, value: u64) {
     // fixed-register `movq` touches state nothing else observes.
     unsafe {
         match slot {
-            0 => asm!("movq mm0, {v}", v = in(reg) value, out("mm0") _, options(nomem, nostack, preserves_flags)),
-            1 => asm!("movq mm1, {v}", v = in(reg) value, out("mm1") _, options(nomem, nostack, preserves_flags)),
-            2 => asm!("movq mm2, {v}", v = in(reg) value, out("mm2") _, options(nomem, nostack, preserves_flags)),
-            3 => asm!("movq mm3, {v}", v = in(reg) value, out("mm3") _, options(nomem, nostack, preserves_flags)),
-            4 => asm!("movq mm4, {v}", v = in(reg) value, out("mm4") _, options(nomem, nostack, preserves_flags)),
-            5 => asm!("movq mm5, {v}", v = in(reg) value, out("mm5") _, options(nomem, nostack, preserves_flags)),
-            6 => asm!("movq mm6, {v}", v = in(reg) value, out("mm6") _, options(nomem, nostack, preserves_flags)),
-            _ => asm!("movq mm7, {v}", v = in(reg) value, out("mm7") _, options(nomem, nostack, preserves_flags)),
+            0 => {
+                asm!("movq mm0, {v}", v = in(reg) value, out("mm0") _, options(nomem, nostack, preserves_flags))
+            }
+            1 => {
+                asm!("movq mm1, {v}", v = in(reg) value, out("mm1") _, options(nomem, nostack, preserves_flags))
+            }
+            2 => {
+                asm!("movq mm2, {v}", v = in(reg) value, out("mm2") _, options(nomem, nostack, preserves_flags))
+            }
+            3 => {
+                asm!("movq mm3, {v}", v = in(reg) value, out("mm3") _, options(nomem, nostack, preserves_flags))
+            }
+            4 => {
+                asm!("movq mm4, {v}", v = in(reg) value, out("mm4") _, options(nomem, nostack, preserves_flags))
+            }
+            5 => {
+                asm!("movq mm5, {v}", v = in(reg) value, out("mm5") _, options(nomem, nostack, preserves_flags))
+            }
+            6 => {
+                asm!("movq mm6, {v}", v = in(reg) value, out("mm6") _, options(nomem, nostack, preserves_flags))
+            }
+            _ => {
+                asm!("movq mm7, {v}", v = in(reg) value, out("mm7") _, options(nomem, nostack, preserves_flags))
+            }
         }
     }
 }
@@ -91,14 +107,30 @@ fn load_mm(slot: u8) -> u64 {
     // SAFETY (each arm): as `store_mm`; a read clobbers no `mmN` state.
     unsafe {
         match slot {
-            0 => asm!("movq {v}, mm0", v = out(reg) value, options(nomem, nostack, preserves_flags)),
-            1 => asm!("movq {v}, mm1", v = out(reg) value, options(nomem, nostack, preserves_flags)),
-            2 => asm!("movq {v}, mm2", v = out(reg) value, options(nomem, nostack, preserves_flags)),
-            3 => asm!("movq {v}, mm3", v = out(reg) value, options(nomem, nostack, preserves_flags)),
-            4 => asm!("movq {v}, mm4", v = out(reg) value, options(nomem, nostack, preserves_flags)),
-            5 => asm!("movq {v}, mm5", v = out(reg) value, options(nomem, nostack, preserves_flags)),
-            6 => asm!("movq {v}, mm6", v = out(reg) value, options(nomem, nostack, preserves_flags)),
-            _ => asm!("movq {v}, mm7", v = out(reg) value, options(nomem, nostack, preserves_flags)),
+            0 => {
+                asm!("movq {v}, mm0", v = out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            1 => {
+                asm!("movq {v}, mm1", v = out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            2 => {
+                asm!("movq {v}, mm2", v = out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            3 => {
+                asm!("movq {v}, mm3", v = out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            4 => {
+                asm!("movq {v}, mm4", v = out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            5 => {
+                asm!("movq {v}, mm5", v = out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            6 => {
+                asm!("movq {v}, mm6", v = out(reg) value, options(nomem, nostack, preserves_flags))
+            }
+            _ => {
+                asm!("movq {v}, mm7", v = out(reg) value, options(nomem, nostack, preserves_flags))
+            }
         }
     }
     value
