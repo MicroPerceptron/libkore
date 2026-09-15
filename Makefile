@@ -36,6 +36,7 @@ cross:
 	    -Z build-std-features=compiler-builtins-mem; \
 	done
 	python3 tools/check-alloc-symbols.py
+	python3 tools/check-heapless.py
 
 miri:
 	cargo miri test --locked --workspace --all-features

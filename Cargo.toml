@@ -12,15 +12,16 @@ members = ["tests/consumer", "crates/ffi"]
 exclude = ["native"]
 
 [features]
-default = ["fs"]
+default = ["fs", "collections"]
 fs = ["dep:kore-dagfs", "kore-dagfs/runtime"]
+collections = ["dep:hashbrown"]
 heap = ["kore-rt/heap"]
 crt0 = ["kore-rt/crt0"]
 driver = ["dep:kore-driver", "kore-driver/service"]
 
 # Byte-exact native export; source revision and hashes live in native/provenance.json.
 [dependencies]
-hashbrown = { version = "0.17.1", default-features = false, features = ["nightly", "default-hasher"] }
+hashbrown = { version = "0.17.1", default-features = false, features = ["nightly", "default-hasher"], optional = true }
 chacha20 = { version = "0.10.2", default-features = false, features = ["rng", "zeroize"] }
 zeroize = { version = "1.8.1", default-features = false }
 kore-abi = { path = "native/crates/abi" }

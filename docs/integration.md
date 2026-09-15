@@ -69,6 +69,14 @@ for either distribution lock.
 
 ## Bootstrap and future ownership
 
+Allocation-free executables can use `default-features = false` for the native
+clock, process, task and random surfaces without linking hash collections.
+The `collections` feature enables hashbrown and is on by default. It requires
+the application's real allocator; enabling it never installs one. Filesystem
+consumers can select `features = ["fs"]` independently. Verify these modes in
+an actual `no_std` executable: checking a library alone does not detect an
+unwanted global-allocator requirement at the final executable boundary.
+
 The export includes Kore #962, its runtime task-provenance repair and bounded
 SFNT metadata owner, resynchronized with current mainline. The exact source
 commit is in `native/provenance.json`. #962 is still open and

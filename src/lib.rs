@@ -17,6 +17,7 @@ pub use kore_rt as runtime;
 pub use kore_rt::futex;
 pub use kore_rt::process;
 pub use kore_rt::{Bundle, ExitCode, main, spmd, task};
+#[cfg(feature = "collections")]
 pub mod collections;
 pub mod random;
 pub use kore_rt::executor as task;
@@ -54,6 +55,7 @@ pub mod fs;
 
 /// Common application types. Raw slots and kernel verbs stay explicitly named.
 pub mod prelude {
+    #[cfg(feature = "collections")]
     pub use crate::collections::{HashMap, HashSet, HashTable};
     #[cfg(feature = "fs")]
     pub use crate::fs::{Fs, View};
