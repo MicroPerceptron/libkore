@@ -2153,3 +2153,103 @@ mod tests {
         assert_eq!(g.window_of(geom::MAP), None);
     }
 }
+
+/// Opaque, per-boot task identity. An identifier is never authority.
+#[repr(transparent)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct TaskId([u8; 16]);
+impl TaskId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+    pub const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+impl core::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+impl core::fmt::Debug for TaskId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
+}
+/// Provenance, not a promise that the platform's seed was trustworthy.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskIdQuality {
+    Unverified = 0,
+    HardwareOrFirmware = 1,
+    TimingJitter = 2,
+    Degenerate = 3,
+}
+impl TaskIdQuality {
+    pub const fn decode(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unverified),
+            1 => Some(Self::HardwareOrFirmware),
+            2 => Some(Self::TimingJitter),
+            3 => Some(Self::Degenerate),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskIdentity {
+    pub id: TaskId,
+    pub quality: TaskIdQuality,
+}
+
+/// Owned diagnostic label. Empty means unspecified; labels convey no authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskName {
+    bytes: [u8; 63],
+    len: u8,
+}
+impl TaskName {
+    pub const EMPTY: Self = Self {
+        bytes: [0; 63],
+        len: 0,
+    };
+    pub const CAPACITY: usize = 63;
+    /// Reject oversized names instead of silently making distinct labels equal.
+    pub fn new(name: &str) -> Option<Self> {
+        if name.len() > Self::CAPACITY {
+            return None;
+        }
+        let mut value = Self::EMPTY;
+        value.bytes[..name.len()].copy_from_slice(name.as_bytes());
+        value.len = name.len() as u8;
+        Some(value)
+    }
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len as usize]).expect("validated task name")
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_name_tests {
+    use super::TaskName;
+    #[test]
+    fn names_are_owned_utf8_and_bounded_in_bytes() {
+        let mut source = *b"hello/worker-2";
+        let name = TaskName::new(core::str::from_utf8(&source).unwrap()).unwrap();
+        source.fill(0);
+        assert_eq!(name.as_str(), "hello/worker-2");
+        let ascii = [b'x'; 64];
+        let text = core::str::from_utf8(&ascii).unwrap();
+        assert!(TaskName::new(&text[..63]).is_some());
+        assert!(TaskName::new(text).is_none());
+        let utf8: [u8; 64] = core::array::from_fn(|i| if i % 2 == 0 { 0xc3 } else { 0xa9 });
+        let text = core::str::from_utf8(&utf8).unwrap();
+        assert!(TaskName::new(&text[..62]).is_some());
+        assert!(TaskName::new(text).is_none());
+    }
+}

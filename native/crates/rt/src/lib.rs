@@ -88,6 +88,7 @@ pub mod cap;
 pub mod chan;
 pub mod clock;
 pub mod core_id;
+pub mod crash;
 pub mod entry;
 pub mod event;
 pub mod executor;

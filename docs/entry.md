@@ -3,7 +3,8 @@
 `kore-entry` composes the Kore library with the native compiler entry adapter.
 It belongs only in the final executable. Reusable libraries keep depending on
 `kore-std`, and resident services keep their existing service entry points.
-The adapter requires the matching Kore process-drain session support; updating
+The adapter requires matching Kore process-drain and crash-report session support
+(Kore #1004, including #1002); updating
 only libkore on an older kernel is insufficient.
 
 Name the executable dependency `std` so rustc selects this facade and its
@@ -31,7 +32,8 @@ through `std::runtime::entry::thread_context()` and `std::process::map`.
 Build with the pinned Kore nightly, its architecture-specific user target,
 `-Z build-std=core,alloc,compiler_builtins`, and
 `-Z build-std-features=compiler-builtins-mem`. The existing loader/PIE and
-initial-exec TLS requirements remain. Renaming the dependency is a manifest
+initial-exec TLS requirements remain. The distributed target files retain frame
+pointers for bounded crash-stack capture. Renaming the dependency is a manifest
 choice; it does not replace the installed Rust sysroot or affect other projects.
 
 The executable adapter installs the native process heap. Allocation still draws
@@ -64,10 +66,12 @@ and stack unwinding are not promised on hard termination. Explicitly join
 workers whose orderly cleanup is required. An idle controller is still a live
 task and therefore makes this initial implementation take the forced path.
 
-Panic uses the typed PANIC outcome without unwinding. A main-thread panic skips
-finalizers; a worker panic retains Kore's thread-exit semantics and must be
-handled by its joiner. The launcher's root reaper uses the same process barrier
-before shared mappings are reclaimed.
+A fatal Rust panic reports the typed PANIC outcome without unwinding and
+terminates the entire process, including a panic in a worker. Fatal paths skip
+user finalizers and TLS destructors. The parent can collect bounded crash
+evidence before reaping; the launcher's root reaper enforces the physical
+worker-stop barrier before shared mappings are reclaimed. See [crash reports](crash.md)
+for the parent-owned buffer and persistence contracts.
 Reentrant finalization cannot invoke the finalizer list twice. Refused or deferred
 physical teardown never authorizes reuse of the process's shared storage.
 Such failures remain pending; this is not a bounded recovery guarantee for a

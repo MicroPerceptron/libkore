@@ -117,3 +117,11 @@ ownership contract and the remaining POSIX boundaries.
 Atomic-word synchronization is available through `kore::futex` (including Rust
 async waits), `kore_futex_*` in C, and `kore.futex.*` in Zig. Foreign waits block
 native threads; see [runtime contracts](docs/runtime.md#atomic-word-waits).
+
+### Fatal process diagnostics
+
+The matching Kore #1004 kernel contains fatal application faults and Rust panics
+within their process. `kore::crash` exposes bounded evidence collection, text
+rendering, and explicit parent-side persistence. Reports carry a bounded task
+name and opaque 128-bit public identity; IDs convey no authority. See
+[crash reports](docs/crash.md) for lifecycle ordering and validation limits.

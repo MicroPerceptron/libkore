@@ -1889,7 +1889,7 @@ pub fn refuse_with(rt: &Rt, rung: u64) -> ! {
 pub const RUNG_PANIC: u64 = 0x7f;
 
 #[cfg(not(target_os = "none"))]
-fn begin_panic() -> bool {
+pub(crate) fn begin_panic() -> bool {
     use core::sync::atomic::{AtomicBool, Ordering};
 
     // Host builds have no TP-anchored ThreadBlock. `panic_refuse` is a
@@ -1900,7 +1900,7 @@ fn begin_panic() -> bool {
 }
 
 #[cfg(target_os = "none")]
-fn begin_panic() -> bool {
+pub(crate) fn begin_panic() -> bool {
     geometry::begin_panic()
 }
 
@@ -1934,6 +1934,7 @@ pub fn panic_refuse(info: &core::panic::PanicInfo<'_>) -> ! {
     if !begin_panic() {
         refuse();
     }
+    crate::crash::report_panic_info(info);
     let payload = info
         .location()
         .map_or(RUNG_PANIC, |at| panic_payload(at.file(), at.line()));

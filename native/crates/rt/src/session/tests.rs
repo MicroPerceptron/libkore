@@ -2189,3 +2189,99 @@ fn process_drain_is_a_standalone_authenticated_self_operation() {
         DERIVE_KIND_PROCESS_DRAIN
     ));
 }
+
+#[test]
+fn crash_read_and_panic_are_standalone_and_preserve_their_payloads() {
+    use kore_abi::session::{DERIVE_KIND_CRASH_READ, DERIVE_KIND_PANIC_REPORT};
+    let task = SlotRef::from_wire(3);
+    let report = SlotRef::from_wire(5);
+    let mut b = SessionBuilder::new();
+    b.read_crash(task, report, 63).unwrap();
+    assert!(b.start(task).is_err());
+    let mut bytes = [0; DESCRIPTOR_MAX];
+    let length = b.finish(&mut bytes).unwrap();
+    let (_, invocations, args) = parse(&bytes[..length]);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].kind, DERIVE_KIND_CRASH_READ);
+    assert_eq!(invocations[0].subject.get(), 3);
+    assert_eq!(invocations[0].result.get(), 5);
+    assert_eq!(args, &[63, 0, 0, 0, 0, 0, 0, 0]);
+
+    let mut b = SessionBuilder::new();
+    b.report_panic(task, "panic \u{20ac}").unwrap();
+    assert!(b.read_crash(task, report, 0).is_err());
+    let length = b.finish(&mut bytes).unwrap();
+    let (_, invocations, args) = parse(&bytes[..length]);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].kind, DERIVE_KIND_PANIC_REPORT);
+    assert_eq!(invocations[0].subject.get(), 3);
+    assert_eq!(u32::from_le_bytes(args[..4].try_into().unwrap()), 9);
+    assert_eq!(&args[4..8], &[0; 4]);
+    assert_eq!(&args[8..], "panic \u{20ac}".as_bytes());
+    let mut b = SessionBuilder::new();
+    b.start(task).unwrap();
+    assert!(b.report_panic(task, "too late").is_err());
+}
+
+#[test]
+fn crash_binding_is_standalone_and_uses_held_memory_coordinates() {
+    let task = SlotRef::from_wire(3);
+    let lease = SlotRef::from_wire(7);
+    let mut b = SessionBuilder::new();
+    b.bind_crash(task, lease, 8192, 4096).unwrap();
+    assert!(b.start(task).is_err());
+    let mut bytes = [0; DESCRIPTOR_MAX];
+    let length = b.finish(&mut bytes).unwrap();
+    let (_, invocations, args) = parse(&bytes[..length]);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(
+        invocations[0].kind,
+        kore_abi::session::DERIVE_KIND_CRASH_BIND
+    );
+    assert_eq!(args.len(), 24);
+    assert_eq!(u32::from_le_bytes(args[..4].try_into().unwrap()), 7);
+    assert_eq!(&args[4..8], &[0; 4]);
+    assert_eq!(u64::from_le_bytes(args[8..16].try_into().unwrap()), 8192);
+    assert_eq!(u64::from_le_bytes(args[16..24].try_into().unwrap()), 4096);
+}
+
+#[test]
+fn task_name_is_bounded_copied_and_standalone() {
+    let mut b = SessionBuilder::new();
+    let name = kore_abi::task::TaskName::new("hello/worker-2").unwrap();
+    b.name_task(SlotRef::from_wire(7), name).unwrap();
+    assert_eq!(
+        b.name_task(SlotRef::from_wire(8), name),
+        Err(BuildError::EffectMustStandAlone)
+    );
+    let mut bytes = [0; DESCRIPTOR_MAX];
+    let n = b.finish(&mut bytes).unwrap();
+    let (_, invs, args) = parse(&bytes[..n]);
+    assert_eq!(invs.len(), 1);
+    assert_eq!(invs[0].kind, kore_abi::session::DERIVE_KIND_TASK_NAME);
+    let payload = &args[invs[0].arg.get() as usize..];
+    assert_eq!(payload[0] as usize, name.as_str().len());
+    assert_eq!(
+        &payload[1..1 + payload[0] as usize],
+        name.as_str().as_bytes()
+    );
+}
+
+#[test]
+fn task_identity_query_is_standalone_and_has_no_arguments() {
+    let mut b = SessionBuilder::new();
+    let task = SlotRef::from_wire(7);
+    let result = SlotRef::from_wire(8);
+    b.task_identity(task, result).unwrap();
+    assert_eq!(
+        b.task_identity(task, result),
+        Err(BuildError::EffectMustStandAlone)
+    );
+    let mut bytes = [0; DESCRIPTOR_MAX];
+    let n = b.finish(&mut bytes).unwrap();
+    let (_, invs, args) = parse(&bytes[..n]);
+    assert_eq!(invs.len(), 1);
+    assert_eq!(invs[0].kind, kore_abi::session::DERIVE_KIND_TASK_IDENTITY);
+    assert_eq!(invs[0].arg.get(), u32::MAX);
+    assert!(args.is_empty());
+}

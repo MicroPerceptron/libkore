@@ -332,6 +332,124 @@ impl SessionBuilder {
         .map(|_| ())
     }
 
+    /// Report the caller's fatal panic with a bounded UTF-8 message.
+    pub fn report_panic(&mut self, task: SlotRef, message: &str) -> Result<(), BuildError> {
+        self.report_panic_with_truncation(task, message, false)
+    }
+
+    pub(crate) fn report_panic_with_truncation(
+        &mut self,
+        task: SlotRef,
+        message: &str,
+        truncated: bool,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        let mut bytes = [0u8; 8 + kore_abi::crash::MESSAGE_BYTES];
+        let mut len = message.len().min(kore_abi::crash::MESSAGE_BYTES);
+        while !message.is_char_boundary(len) {
+            len -= 1;
+        }
+        bytes[..4].copy_from_slice(&(len as u32).to_le_bytes());
+        bytes[4] = u8::from(truncated || len != message.len());
+        bytes[8..8 + len].copy_from_slice(&message.as_bytes()[..len]);
+        self.derive_raw(
+            task,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_PANIC_REPORT,
+            task,
+            Some(&bytes[..8 + len]),
+        )
+        .map(|_| ())
+    }
+
+    /// Read a task's opaque public identity through an ACCESS handle.
+    pub fn task_identity(&mut self, task: SlotRef, result: SlotRef) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        self.derive_raw(
+            task,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_TASK_IDENTITY,
+            result,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// Name a dormant task once. Names are copied into kernel-owned storage.
+    pub fn name_task(
+        &mut self,
+        task: SlotRef,
+        name: kore_abi::task::TaskName,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        let mut bytes = [0u8; 64];
+        let text = name.as_str().as_bytes();
+        bytes[0] = text.len() as u8;
+        bytes[1..1 + text.len()].copy_from_slice(text);
+        self.derive_raw(
+            task,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_TASK_NAME,
+            task,
+            Some(&bytes[..1 + text.len()]),
+        )
+        .map(|_| ())
+    }
+
+    /// Bind an unmapped parent lease before START. Custody remains with parent;
+    /// the kernel reserves the range exclusively until process reaping.
+    pub fn bind_crash(
+        &mut self,
+        task: SlotRef,
+        lease: SlotRef,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        let mut arg = [0u8; 24];
+        arg[..4].copy_from_slice(&lease.index().to_le_bytes());
+        arg[8..16].copy_from_slice(&offset.to_le_bytes());
+        arg[16..24].copy_from_slice(&length.to_le_bytes());
+        self.derive_raw(
+            task,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_CRASH_BIND,
+            task,
+            Some(&arg),
+        )
+        .map(|_| ())
+    }
+
+    /// Read one evidence chunk before revoking the owning process handle.
+    pub fn read_crash(
+        &mut self,
+        task: SlotRef,
+        report: SlotRef,
+        index: u32,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        let mut arg = [0u8; 8];
+        arg[..4].copy_from_slice(&index.to_le_bytes());
+        self.derive_raw(
+            task,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_CRASH_READ,
+            report,
+            Some(&arg),
+        )
+        .map(|_| ())
+    }
+
     /// End worker admission and drain the calling process owner's peers.
     pub fn drain_process(
         &mut self,
@@ -486,6 +604,11 @@ impl SessionBuilder {
         }
         let is_effect = inv.op == OpCode::Derive as u16
             && (inv.kind == kore_abi::session::DERIVE_KIND_PROCESS_DRAIN
+                || inv.kind == kore_abi::session::DERIVE_KIND_TASK_IDENTITY
+                || inv.kind == kore_abi::session::DERIVE_KIND_TASK_NAME
+                || inv.kind == kore_abi::session::DERIVE_KIND_CRASH_BIND
+                || inv.kind == kore_abi::session::DERIVE_KIND_PANIC_REPORT
+                || inv.kind == kore_abi::session::DERIVE_KIND_CRASH_READ
                 || inv.kind == kore_abi::session::DERIVE_KIND_TASK_START
                 || inv.kind == kore_abi::session::DERIVE_KIND_ARENA_EXTEND
                 || inv.kind == kore_abi::session::DERIVE_KIND_DEVICE_ACTIVATE

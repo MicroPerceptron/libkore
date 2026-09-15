@@ -46,6 +46,12 @@ class DistributionContract(unittest.TestCase):
             self.assertEqual(record["packages"][path], name)
         self.assertTrue(all(not Path(path).is_absolute() for path in paths.values()))
 
+    def test_user_targets_preserve_frames_for_crash_capture(self):
+        for arch in ('x86_64', 'aarch64', 'riscv64gc'):
+            target = json.loads((ROOT / f'targets/{arch}-unknown-kore-user.json').read_text())
+            self.assertEqual(target['frame-pointer'], 'always', arch)
+            self.assertEqual(target['panic-strategy'], 'abort', arch)
+
     def test_native_drift_is_detected(self):
         spec = importlib.util.spec_from_file_location("native", ROOT / "tools/check-native.py")
         native = importlib.util.module_from_spec(spec)

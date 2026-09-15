@@ -63,6 +63,8 @@ def check(tree: Path):
         (work / "Cargo.toml").write_text(manifest)
         (work / "Cargo.lock").write_bytes((ROOT / "Cargo.lock").read_bytes())
         (work / "src/lib.rs").write_text('''
+pub fn crash_identity(record: kore_abi::crash::CrashRecord) -> sdk::crash::CrashRecord { record }
+pub fn task_identity(id: kore_abi::task::TaskIdentity) -> sdk::abi::task::TaskIdentity { id }
 pub fn abi_identity(slot: kore_abi::session::SlotRef) -> sdk::abi::session::SlotRef { slot }
 pub fn runtime_identity(rt: kore_rt::entry::Rt) -> sdk::runtime::entry::Rt { rt }
 pub fn entry_runtime_identity(rt: kore_rt::entry::Rt) -> entry::runtime::entry::Rt { rt }

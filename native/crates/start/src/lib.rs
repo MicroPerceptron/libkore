@@ -49,9 +49,9 @@ mod native {
     }
 
     #[panic_handler]
-    fn panic(_: &core::panic::PanicInfo) -> ! {
+    fn panic(info: &core::panic::PanicInfo) -> ! {
         // Abort: no unwinding or user callbacks after a panic. The launcher
         // reaps the process through the same kernel worker barrier.
-        kore_rt::thread::exit(ExitCode::PANIC)
+        kore_rt::crash::panic(info)
     }
 }

@@ -12,6 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 ARCHES = ("x86_64", "aarch64", "riscv64gc")
 
 GOOD = {
+    "crash_report": """
+fn main() {
+    use std::abi::crash::{Architecture, FaultKind};
+    let record = std::crash::CrashRecord::new(Architecture::X86_64, FaultKind::Panic, 0, 0, 0);
+    let mut text = String::new();
+    std::crash::render(&record, &mut text, false).unwrap();
+    assert!(text.contains("Rust panic"));
+}
+""",
     "unit": "fn main() {}",
     "typed": "fn main() -> std::ExitCode { std::ExitCode::APPLICATION_15 }",
     "result": "fn main() -> Result<(), std::ExitCode> { Err(std::ExitCode::LINK_FAILED) }",

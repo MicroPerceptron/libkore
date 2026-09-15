@@ -387,6 +387,84 @@ pub const DERIVE_KIND_TASK_EXIT: u8 = 0xfc;
 /// and may be retried after a concurrent physical reaper completes.
 pub const DERIVE_KIND_PROCESS_DRAIN: u8 = 0xe2;
 
+/// Read one immutable crash-evidence chunk through an owning task handle.
+/// ACCESS + REVOKE, sole invocation. The argument is a little-endian u32
+/// chunk index followed by four zero bytes. No record returns Exited;
+/// live subjects return WouldBlock. Lifecycle observers cannot read stacks.
+pub const DERIVE_KIND_CRASH_READ: u8 = 0xe1;
+/// Report a fatal software panic on SELF. The payload is UTF-8 with a u32
+/// length, four reserved zero bytes, and exactly that many message bytes.
+/// MODIFY, standalone. Never grants the caller authority over another process.
+/// Panic arguments: UTF-8 length u32, truncated u8 (0/1), zero[3], message bytes.
+pub const DERIVE_KIND_PANIC_REPORT: u8 = 0xe0;
+/// Bind a parent-owned, unmapped RAM lease before TASK_START. Arguments are
+/// lease slot u32, reserved-zero u32, page-aligned offset u64 and length u64.
+/// Task MODIFY|REVOKE and lease MODIFY are required. Standalone, no result.
+pub const DERIVE_KIND_CRASH_BIND: u8 = 0xdf;
+/// Assign a bounded UTF-8 task label once before START (Task MODIFY).
+/// Arguments: byte length u8 followed by that many UTF-8 bytes, at most 63.
+pub const DERIVE_KIND_TASK_NAME: u8 = 0xde;
+/// Task ACCESS; standalone, no arguments. Returns an inert TaskIdentity report.
+pub const DERIVE_KIND_TASK_IDENTITY: u8 = 0xdd;
+pub const TASK_IDENTITY_KIND: u16 = 0xFF16;
+pub const TASK_IDENTITY_MAGIC: u64 = 0x6b6f_7265_5449_4431;
+impl crate::task::TaskIdentity {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(TASK_IDENTITY_KIND, TASK_IDENTITY_MAGIC);
+        rec.mac = self.id.bytes();
+        rec.scope_rid = self.quality as u64;
+        rec
+    }
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        if !is_inert_report(rec, TASK_IDENTITY_KIND, TASK_IDENTITY_MAGIC)
+            || rec.holder != crate::cap::Cid::NULL
+            || !rec.rights.is_empty()
+            || rec.epoch != 0
+            || rec.chain_len != 0
+            || rec.chain != [0; crate::cap::MAX_DEPTH]
+            || rec.scope_rid > u8::MAX as u64
+        {
+            return None;
+        }
+        Some(Self {
+            id: crate::task::TaskId::from_bytes(rec.mac),
+            quality: crate::task::TaskIdQuality::decode(rec.scope_rid as u8)?,
+        })
+    }
+}
+pub const CRASH_CHUNK_BYTES: usize = 16;
+pub const CRASH_CHUNK_KIND: u16 = 0xFF15;
+pub const CRASH_CHUNK_MAGIC: u64 = 0x6b6f_7265_4352_5348;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CrashChunk {
+    pub index: u32,
+    pub bytes: [u8; CRASH_CHUNK_BYTES],
+}
+impl CrashChunk {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(CRASH_CHUNK_KIND, CRASH_CHUNK_MAGIC);
+        rec.scope_rid = u64::from(self.index);
+        rec.mac = self.bytes;
+        rec
+    }
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        if !is_inert_report(rec, CRASH_CHUNK_KIND, CRASH_CHUNK_MAGIC)
+            || rec.scope_rid >= (crate::crash::MIN_BUFFER_BYTES / CRASH_CHUNK_BYTES) as u64
+            || rec.holder != crate::cap::Cid::NULL
+            || !rec.rights.is_empty()
+            || rec.epoch != 0
+            || rec.chain_len != 0
+            || rec.chain != [0; crate::cap::MAX_DEPTH]
+        {
+            return None;
+        }
+        Some(Self {
+            index: rec.scope_rid as u32,
+            bytes: rec.mac,
+        })
+    }
+}
+
 /// Successful terminal worker barrier. Forced shutdown skips user finalizers:
 /// arbitrary interrupted user code may have left shared state inconsistent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1243,8 +1321,13 @@ const _: () = {
 /// Their authenticated subject kinds disambiguate both pairs. This table is a
 /// vocabulary, not a uniqueness proof; the pairwise same-subject assertions
 /// above carry the distinctness that matters.
-const DERIVE_FLAVORS: [u8; 30] = [
+const DERIVE_FLAVORS: [u8; 35] = [
+    DERIVE_KIND_TASK_IDENTITY,
+    DERIVE_KIND_TASK_NAME,
     DERIVE_KIND_PROCESS_DRAIN,
+    DERIVE_KIND_CRASH_READ,
+    DERIVE_KIND_PANIC_REPORT,
+    DERIVE_KIND_CRASH_BIND,
     DERIVE_KIND_IOVA_ANON,
     DERIVE_KIND_SET_TP,
     DERIVE_KIND_PROTECT,
@@ -1314,7 +1397,10 @@ const _: () = {
 /// both `0xFF05` for ~80 commits because nothing owned the proof.  A new
 /// member joins by adding its row; forgetting to is caught by the arity
 /// assert any time the member count moves.
-const REPORT_KINDS: [u16; 17] = [
+const REPORT_KINDS: [u16; 20] = [
+    TASK_IDENTITY_KIND,
+    PROCESS_DRAIN_REPORT_KIND,
+    CRASH_CHUNK_KIND,
     NOTICE_KIND,
     GEOM_REPORT_KIND,
     DISPLAY_REPORT_KIND,
@@ -4147,6 +4233,40 @@ impl SupplyReleaseReport {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn task_identity_reports_validate_quality_and_never_carry_authority() {
+        use crate::task::{TaskId, TaskIdQuality, TaskIdentity};
+        for quality in [
+            TaskIdQuality::Unverified,
+            TaskIdQuality::HardwareOrFirmware,
+            TaskIdQuality::TimingJitter,
+            TaskIdQuality::Degenerate,
+        ] {
+            let identity = TaskIdentity {
+                id: TaskId::from_bytes([0xa5; 16]),
+                quality,
+            };
+            let rec = identity.encode();
+            assert_eq!(TaskIdentity::decode(&rec), Some(identity));
+            assert_eq!(rec.cid, crate::cap::Cid::NULL);
+            for field in 0..9 {
+                let mut bad = rec;
+                match field {
+                    0 => bad.cid = crate::cap::Cid(1),
+                    1 => bad.holder = crate::cap::Cid(1),
+                    2 => bad.parent = crate::cap::Cid(0),
+                    3 => bad.rights = Rights::ACCESS,
+                    4 => bad.epoch = 1,
+                    5 => bad.chain_len = 1,
+                    6 => bad.chain[0] = 1,
+                    7 => bad.scope_rid = 4,
+                    _ => bad.scope_rid = 256,
+                }
+                assert_eq!(TaskIdentity::decode(&bad), None, "field {field}");
+            }
+        }
+    }
 
     #[test]
     fn claim_dma_report_is_canonical_and_bind_inert() {

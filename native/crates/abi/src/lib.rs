@@ -52,6 +52,7 @@
 pub mod cap;
 pub mod clock;
 pub mod command;
+pub mod crash;
 pub mod device;
 pub mod execution;
 pub mod founding;
