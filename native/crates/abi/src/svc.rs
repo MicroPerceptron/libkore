@@ -1458,9 +1458,9 @@ impl TaskReqWire {
     /// `Spawn` asks for the returned lifecycle owner to retain `DERIVE`, so
     /// its caller may attenuate an observer into a sibling worker. This bit
     /// is meaningful only with [`SPAWN_RETURN_HANDLE`](Self::SPAWN_RETURN_HANDLE);
-    /// the service must additionally authorize the authenticated launch
-    /// profile, and ordinary exec clients continue to receive a non-delegable
-    /// owner.
+    /// it is available for any otherwise authorized spawn and changes only
+    /// the parent's returned handle, not the child's authority. Ordinary exec
+    /// clients continue to receive a non-delegable owner.
     pub const SPAWN_DELEGABLE_HANDLE: u8 = 1 << 2;
     /// `Invoke` asks exec to return a second affine result at grant lane 1:
     /// an attenuated send descendant of the provisioned service response channel that

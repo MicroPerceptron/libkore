@@ -110,6 +110,8 @@ pub mod stack_arena;
 mod star;
 pub mod startup;
 pub mod svc;
+#[cfg(feature = "heap")]
+pub mod task_watch;
 pub mod termination;
 pub mod thread;
 pub mod thread_controller;

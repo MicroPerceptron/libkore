@@ -1,6 +1,6 @@
 # Fatal process diagnostics
 
-This snapshot matches Kore commit `8c093d61b0d2714bfc9f3df139549e73f864ee91`
+This snapshot matches Kore commit `7a0005c928a2eb905455d3297f260137bc6e0c9e`
 ([Kore #1004](https://github.com/MicroPerceptron/kore/pull/1004)). Updating the
 library alone does not add the required kernel session effects.
 
