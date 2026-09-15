@@ -4188,7 +4188,12 @@ impl FsReqWire {
     /// `kind` is 1 while verification/copy is active, 0 once complete.
     pub const OP_SET_SYSTEM_SEED: u8 = 42;
     /// The highest defined verb — the codec's range check.
-    pub const OP_MAX: u8 = Self::OP_SET_SYSTEM_SEED;
+    /// Session-owned atomic file replacement (no wire layout change).
+    pub const OP_BEGIN_REPLACE: u8 = 43;
+    pub const OP_WRITE_REPLACEMENT: u8 = 44;
+    pub const OP_COMMIT_REPLACE: u8 = 45;
+    pub const OP_ABORT_REPLACE: u8 = 46;
+    pub const OP_MAX: u8 = Self::OP_ABORT_REPLACE;
 
     /// [`kind`](Self::kind): a file.
     pub const KIND_FILE: u8 = 1;
