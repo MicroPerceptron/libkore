@@ -1,0 +1,10 @@
+[package]
+name = "kore-entry"
+version = "0.1.0-alpha.1"
+edition = "2024"
+publish = false
+description = "Returning Rust executable entry over the Kore standard library"
+
+[dependencies]
+kore = { package = "kore-std", path = "../..", features = ["heap"] }
+kore-start = { path = "../../native/crates/start" }

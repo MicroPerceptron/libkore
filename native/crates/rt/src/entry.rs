@@ -582,6 +582,11 @@ pub(crate) mod geometry {
         tls_template_align: AtomicUsize,
         thread_owner_next: AtomicUsize,
         thread_owner_id: AtomicUsize,
+        // Extend the runtime block at its tail: existing owner-field offsets
+        // remain intact for libraries using the preceding runtime prefix.
+        finalizer_state: AtomicUsize,
+        finalizers: [AtomicUsize; 32],
+        exit_started: AtomicUsize,
     }
 
     // The block must fit the founder's one-page window.
@@ -824,6 +829,54 @@ pub(crate) mod geometry {
         root.tls_template_base
             .store(template.base as usize, Ordering::Release);
         true
+    }
+
+    /// Loader-published pointers, already admitted against executable mappings.
+    pub(crate) unsafe fn publish_finalizers(functions: &[u64]) -> bool {
+        let Some(root) = process_root_block() else {
+            return false;
+        };
+        if functions.len() > root.finalizers.len()
+            || functions.iter().any(|f| *f == 0)
+            || root
+                .finalizer_state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        for (slot, address) in root.finalizers.iter().zip(functions) {
+            slot.store(*address as usize, Ordering::Relaxed);
+        }
+        root.finalizer_state
+            .store(functions.len() + 2, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn begin_process_exit() -> bool {
+        process_root_block().is_some_and(|root| root.exit_started.swap(1, Ordering::AcqRel) == 0)
+    }
+
+    pub(crate) fn run_finalizers() {
+        let Some(root) = process_root_block() else {
+            return;
+        };
+        let state = root.finalizer_state.swap(usize::MAX, Ordering::AcqRel);
+        if !(2..=root.finalizers.len() + 2).contains(&state) {
+            return;
+        }
+        // Snapshot before any callback. The loader already supplied finalization
+        // order (reverse dependency order and reverse per-module array order).
+        let mut functions = [0; 32];
+        for (out, slot) in functions.iter_mut().zip(&root.finalizers) {
+            *out = slot.load(Ordering::Relaxed);
+        }
+        for address in functions.into_iter().take(state - 2) {
+            // SAFETY: unsafe publication requires live executable C callbacks;
+            // the terminal worker barrier keeps their modules mapped here.
+            let call: extern "C" fn() = unsafe { core::mem::transmute(address) };
+            call();
+        }
     }
 
     /// The geometry-stamped process-lifetime runtime block.
@@ -2949,4 +3002,20 @@ pub(crate) fn install_child_tls(page: &'static [u8]) -> bool {
     // On success the copied block is now active and owns this reservation.
     geometry::release_cap_slot(slot);
     installed
+}
+
+/// Retain the startup linker's admitted finalizers for normal process return.
+/// # Safety
+/// Every pointer must name a no-argument C function in a module that stays
+/// mapped until process teardown. Call once, after all constructors complete.
+pub unsafe fn publish_finalizers(functions: &[u64]) -> bool {
+    #[cfg(target_os = "none")]
+    {
+        unsafe { geometry::publish_finalizers(functions) }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = functions;
+        false
+    }
 }

@@ -234,6 +234,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-entry"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "kore-start",
+ "kore-std",
+]
+
+[[package]]
 name = "kore-ffi"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -277,6 +285,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "kore-start"
+version = "0.1.0"
+dependencies = [
+ "kore-rt",
 ]
 
 [[package]]

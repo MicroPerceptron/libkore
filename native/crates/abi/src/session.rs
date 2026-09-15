@@ -380,6 +380,47 @@ pub const DERIVE_KIND_PROTECT: u8 = 0xfa;
 /// read.  The reap is still the handle's `Revoke`.
 pub const DERIVE_KIND_TASK_EXIT: u8 = 0xfc;
 
+/// Close the calling process owner's worker admission and physically drain
+/// every peer in that exact address space. SELF + MODIFY, sole invocation,
+/// no arguments. Workers and peer handles cannot request this operation.
+/// The result is a bind-inert `ProcessDrainReport`; WouldBlock reports no proof
+/// and may be retried after a concurrent physical reaper completes.
+pub const DERIVE_KIND_PROCESS_DRAIN: u8 = 0xe2;
+
+/// Successful terminal worker barrier. Forced shutdown skips user finalizers:
+/// arbitrary interrupted user code may have left shared state inconsistent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessDrainReport {
+    pub forced: bool,
+}
+pub const PROCESS_DRAIN_REPORT_KIND: u16 = 0xFF14;
+pub const PROCESS_DRAIN_REPORT_MAGIC: u64 = 0x6b6f_7265_4452_414e;
+impl ProcessDrainReport {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(PROCESS_DRAIN_REPORT_KIND, PROCESS_DRAIN_REPORT_MAGIC);
+        rec.scope_rid = u64::from(self.forced);
+        rec
+    }
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        if !is_inert_report(rec, PROCESS_DRAIN_REPORT_KIND, PROCESS_DRAIN_REPORT_MAGIC)
+            || rec.scope_rid > 1
+        {
+            return None;
+        }
+        let result = Self {
+            forced: rec.scope_rid != 0,
+        };
+        let canonical = result.encode();
+        (rec.holder == canonical.holder
+            && rec.rights == canonical.rights
+            && rec.epoch == canonical.epoch
+            && rec.chain_len == canonical.chain_len
+            && rec.chain == canonical.chain
+            && rec.mac == canonical.mac)
+            .then_some(result)
+    }
+}
+
 /// `Derive × Task` that **joins** the subject task: the result slot
 /// receives a bind-inert [`ExitReport`] once it has exited.  `ACCESS` on
 /// the handle authorizes it — observing a task's end is the observer's
@@ -1202,7 +1243,8 @@ const _: () = {
 /// Their authenticated subject kinds disambiguate both pairs. This table is a
 /// vocabulary, not a uniqueness proof; the pairwise same-subject assertions
 /// above carry the distinctness that matters.
-const DERIVE_FLAVORS: [u8; 29] = [
+const DERIVE_FLAVORS: [u8; 30] = [
+    DERIVE_KIND_PROCESS_DRAIN,
     DERIVE_KIND_IOVA_ANON,
     DERIVE_KIND_SET_TP,
     DERIVE_KIND_PROTECT,
@@ -5429,3 +5471,29 @@ const DEVICE_FLAG_PROBE: u8 = crate::device::DeviceRecord::HAS_BINDING
     | crate::device::DeviceRecord::HAS_BAR0
     | crate::device::DeviceRecord::DRIVER_ENDPOINT
     | crate::device::DeviceRecord::HAS_REMAPPED_MSIX;
+
+#[cfg(test)]
+mod process_drain_tests {
+    use super::*;
+    #[test]
+    fn drain_report_is_canonical_data_not_authority() {
+        for forced in [false, true] {
+            let report = ProcessDrainReport { forced };
+            let record = report.encode();
+            assert_eq!(ProcessDrainReport::decode(&record), Some(report));
+            let mut bad = record;
+            bad.scope_rid = 2;
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            let mut bad = record;
+            bad.cid = crate::cap::Cid(1);
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            let mut bad = record;
+            bad.chain_len = 1;
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            let mut bad = record;
+            bad.mac[0] = 1;
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            assert!(derive_kind_known(DERIVE_KIND_PROCESS_DRAIN));
+        }
+    }
+}

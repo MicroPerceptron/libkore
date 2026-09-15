@@ -332,6 +332,25 @@ impl SessionBuilder {
         .map(|_| ())
     }
 
+    /// End worker admission and drain the calling process owner's peers.
+    pub fn drain_process(
+        &mut self,
+        self_handle: SlotRef,
+        report: SlotRef,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        self.derive_raw(
+            self_handle,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_PROCESS_DRAIN,
+            report,
+            None,
+        )
+        .map(|_| ())
+    }
+
     /// `Derive × Task × TASK_JOIN` — **wait for `handle`'s task to end**,
     /// its [`ExitReport`](kore_abi::session::ExitReport) landing in
     /// `report`.  Pair with [`wait_task`](Self::wait_task) to block;
@@ -466,7 +485,8 @@ impl SessionBuilder {
             return Err(BuildError::TooManyInvocations);
         }
         let is_effect = inv.op == OpCode::Derive as u16
-            && (inv.kind == kore_abi::session::DERIVE_KIND_TASK_START
+            && (inv.kind == kore_abi::session::DERIVE_KIND_PROCESS_DRAIN
+                || inv.kind == kore_abi::session::DERIVE_KIND_TASK_START
                 || inv.kind == kore_abi::session::DERIVE_KIND_ARENA_EXTEND
                 || inv.kind == kore_abi::session::DERIVE_KIND_DEVICE_ACTIVATE
                 || inv.kind == kore_abi::session::DERIVE_KIND_DEVICE_QUIESCE);

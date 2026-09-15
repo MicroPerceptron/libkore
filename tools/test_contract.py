@@ -24,16 +24,25 @@ def graph(*rows):
 class DistributionContract(unittest.TestCase):
     def test_export_and_patch_roots_cannot_drift(self):
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
-        dependencies = manifest["dependencies"]
         paths = manifest["package"]["metadata"]["kore"]["owner-paths"]
-        native_roots = {name for name, dep in dependencies.items()
-                        if name.startswith("kore-") or
-                        (isinstance(dep, dict) and dep.get("path", "").startswith("native/"))}
-        self.assertEqual(native_roots, set(paths))
+        # Executable-only owners live in the entry facade, not in reusable
+        # kore-std (which must not acquire lang items or a panic handler).
+        native_roots = {}
+        for relative in [".", *manifest["workspace"]["members"]]:
+            package_dir = (ROOT / relative).resolve()
+            package = tomllib.loads((package_dir / "Cargo.toml").read_text())
+            for name, dep in package.get("dependencies", {}).items():
+                if not isinstance(dep, dict) or "path" not in dep:
+                    continue
+                dependency = (package_dir / dep["path"]).resolve()
+                if dependency.is_relative_to(ROOT / "native"):
+                    name = dep.get("package", name)
+                    path = str(dependency.relative_to(ROOT / "native"))
+                    self.assertEqual(native_roots.setdefault(name, path), path)
+        self.assertEqual(native_roots, paths)
         record = json.loads((ROOT / "native/provenance.json").read_text())
         self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", record["revision"]))
         for name, path in paths.items():
-            self.assertEqual(dependencies[name]["path"], "native/" + path)
             self.assertEqual(record["packages"][path], name)
         self.assertTrue(all(not Path(path).is_absolute() for path in paths.values()))
 

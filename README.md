@@ -46,6 +46,10 @@ DagFS; graph/revision/grant facilities remain under `kore::fs::dag`. See
 | `crt0` | Native process entry stub on Kore targets |
 | `driver` | Existing native device host, register/DMA and ring APIs |
 
+Returning executables can use ordinary Rust `fn main()` through the executable-only
+[`kore-entry` adapter](docs/entry.md), with typed return codes, the native heap,
+and a kernel-backed worker shutdown barrier.
+
 `use kore::prelude::*` brings common types into scope. `#[kore::main]`,
 `#[kore::task]`, `#[kore::spmd]` and `#[derive(kore::Bundle)]` work even when the
 dependency is renamed; no hidden direct runtime/ABI dependency is required.

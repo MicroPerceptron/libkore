@@ -2935,6 +2935,46 @@ impl MappedLeaseView {
         self.len
     }
 
+    /// Permanently remove write access from a page-aligned part of this view.
+    /// The current thread's held address-space capability authorizes the
+    /// existing clear-only protection verb. A refusal leaves the range intact.
+    /// Raw pointers previously obtained from this view must honor the new access.
+    pub fn seal_read_only(&mut self, offset: usize, len: usize) -> bool {
+        if len == 0
+            || offset % 4096 != 0
+            || len % 4096 != 0
+            || offset.checked_add(len).is_none_or(|end| end > self.len)
+        {
+            return false;
+        }
+        let Some(va) = (self.base.as_ptr() as usize).checked_add(offset) else {
+            return false;
+        };
+        #[cfg(target_os = "none")]
+        {
+            let Some(space) = crate::entry::geometry::self_space_slot() else {
+                return false;
+            };
+            let Some(scratch) = OwnedSlot::reserve() else {
+                return false;
+            };
+            // PROTECT mints no record: dropping the reserved name returns it
+            // to this thread's allocator after the synchronous session.
+            verbs::seal_range(
+                space,
+                va as u64,
+                len as u64,
+                kore_abi::session::SHARE_ACCESS_R,
+                scratch.slot(),
+            )
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = va;
+            false
+        }
+    }
+
     /// Borrow the live read-only mapping for validation.
     ///
     /// # Safety
@@ -2950,14 +2990,14 @@ impl MappedLeaseView {
     }
 
     /// Borrow the live mapping mutably — lawful only for a view minted
-    /// writable ([`map_owned_lease_at_rw`](verbs::map_owned_lease_at_rw);
-    /// the kernel refused `W` otherwise, so a read-only view never
-    /// constructs and this cannot alias an immutable page).
+    /// writable ([`map_owned_lease_at_rw`](verbs::map_owned_lease_at_rw))
+    /// which has not subsequently been sealed read-only.
     ///
     /// # Safety
     ///
     /// As [`as_ref`](Self::as_ref), plus: the caller must be the mapping's
-    /// sole toucher for the borrow's duration — met by the stamp shape,
+    /// sole toucher for the borrow's duration, and the entire mapping must
+    /// still be writable — met by the stamp shape,
     /// where the view is private to one control flow and retired before
     /// the lease is conveyed anywhere.
     pub unsafe fn as_mut(&mut self) -> &mut [u8] {

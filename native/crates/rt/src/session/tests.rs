@@ -2159,3 +2159,33 @@ fn typed_exit_serializes_every_status_bit_and_raw_exit_cannot_bypass_it() {
     );
     assert_eq!(args.len(), ExitReq::WIRE, "nor consume argument storage");
 }
+
+#[test]
+fn process_drain_is_a_standalone_authenticated_self_operation() {
+    use kore_abi::session::DERIVE_KIND_PROCESS_DRAIN;
+    let mut b = SessionBuilder::new();
+    b.drain_process(SlotRef::from_wire(3), SlotRef::from_wire(5))
+        .unwrap();
+    let mut bytes = [0u8; DESCRIPTOR_MAX];
+    let length = b.finish(&mut bytes).unwrap();
+    let (header, invocations, args) = parse(&bytes[..length]);
+    assert_eq!(header.flags.get(), 0);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].op.get(), OpCode::Derive as u16);
+    assert_eq!(invocations[0].kind, DERIVE_KIND_PROCESS_DRAIN);
+    assert_eq!(invocations[0].subject.get(), 3);
+    assert_eq!(invocations[0].result.get(), 5);
+    assert_eq!(invocations[0].requested, 0);
+    assert_eq!(invocations[0].arg.get(), Invocation::NO_ARG);
+    assert!(args.is_empty());
+    assert!(b.start(SlotRef::from_wire(3)).is_err());
+    let mut b = SessionBuilder::new();
+    b.start(SlotRef::from_wire(3)).unwrap();
+    assert!(
+        b.drain_process(SlotRef::from_wire(3), SlotRef::from_wire(5))
+            .is_err()
+    );
+    assert!(kore_abi::session::derive_kind_known(
+        DERIVE_KIND_PROCESS_DRAIN
+    ));
+}

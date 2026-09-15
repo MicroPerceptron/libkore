@@ -54,7 +54,9 @@ jobs:
             ~/.cargo/git
             target
           key: alpha-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - run: cargo check --locked -p kore-std -p kore-ffi --all-features --target targets/${{ matrix.arch }}-unknown-kore-user.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+      - run: cargo check --locked -p kore-std -p kore-ffi -p kore-entry --all-features --target targets/${{ matrix.arch }}-unknown-kore-user.json -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem
+      - name: Link returning Rust programs and reject integer return types
+        run: python3 tools/check-entry.py --arch ${{ matrix.arch }}
       - name: Verify freestanding C allocation symbols
         run: |
           sudo apt-get update -qq
