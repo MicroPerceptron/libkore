@@ -292,6 +292,10 @@ impl PowerReqWire {
     pub const OP_DISPLAY_DIAGNOSTIC: u8 = 13;
     /// Read the cached lid level and runtime close generation; no side effects.
     pub const OP_LID_STATUS: u8 = 14;
+    /// Fixed display owner publishes one immutable evidence word: index, u32 LE, zeros.
+    pub const OP_DISPLAY_EVIDENCE_REPORT: u8 = 15;
+    /// Read one evidence word: index, then zeros. Missing words refuse Unavailable.
+    pub const OP_DISPLAY_EVIDENCE: u8 = 16;
 }
 
 /// The power reply wire form.  A power service mints no authority, so
@@ -322,6 +326,8 @@ impl PowerRepWire {
     pub const TAG_DISPLAY_DIAGNOSTIC: u8 = 7;
     /// Level (0 unknown, 1 open, 2 closed), followed by a little-endian u32 generation.
     pub const TAG_LID_STATUS: u8 = 8;
+    /// Echoed evidence index and its u32 LE value.
+    pub const TAG_DISPLAY_EVIDENCE: u8 = 9;
 
     /// The session refused the transition.  Authority (`MODIFY` absent) and
     /// feasibility (no firmware backend realizes it) are **not separable

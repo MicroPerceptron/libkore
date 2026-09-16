@@ -761,7 +761,11 @@ mod metal {
     /// queue write happens-before this notice, so a receiver that
     /// consumed a post is awake and will drain every source after it
     /// re-posts.
+    // This frame must end before panic/refusal proceeds to TASK_EXIT. Under
+    // LTO its full-batch builder otherwise stays live in panic_terminate,
+    // stacking roughly 10 KiB of notification storage under the exit path.
     #[cfg(target_os = "none")]
+    #[inline(never)]
     pub fn post_notice(send: SlotRef, cookie: u64, payload: u64) -> bool {
         use crate::session::SessionBuilder;
         use crate::transport::{Transport, TrapTransport};
@@ -842,10 +846,10 @@ mod metal {
         None
     }
 
-    /// Establish the firmware-correlated GPIO-ready route for one initialized
+    /// Establish the firmware-correlated child-ready route for one initialized
     /// HID child behind this exact controller capability.
     #[cfg(target_os = "none")]
-    pub fn establish_i2c_hid_gpio<C: crate::cap::I2cHidSubject>(
+    pub fn establish_i2c_hid_ready<C: crate::cap::I2cHidSubject>(
         dev: &C,
         child: u32,
     ) -> Option<RouteToken> {
@@ -854,7 +858,7 @@ mod metal {
 
         let owned = crate::cap::OwnedSlot::reserve()?;
         let mut b = SessionBuilder::new();
-        b.derive_i2c_hid_gpio_route(
+        b.derive_i2c_hid_ready_route(
             dev.i2c_subject_slot(),
             DEVICE_CHILD_RIGHTS,
             child,
@@ -869,7 +873,7 @@ mod metal {
     }
 
     #[cfg(not(target_os = "none"))]
-    pub fn establish_i2c_hid_gpio<C: crate::cap::I2cHidSubject>(
+    pub fn establish_i2c_hid_ready<C: crate::cap::I2cHidSubject>(
         _dev: &C,
         _child: u32,
     ) -> Option<RouteToken> {

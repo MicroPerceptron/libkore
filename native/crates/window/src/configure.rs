@@ -1,6 +1,7 @@
 //! Portable layout requests. These describe a window, never grant authority.
 
-/// A content rectangle in physical display pixels, excluding future chrome.
+/// A content rectangle in native display pixels, excluding chrome. UI density
+/// is carried separately in the window state; clients rasterize at this extent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bounds {
     pub x: u16,

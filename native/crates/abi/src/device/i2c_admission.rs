@@ -15,14 +15,21 @@ pub const I2C_ADMISSION_NO_GSI: u32 = u32::MAX;
 pub const I2C_ADMISSION_CLAIMED: u8 = 1 << 7;
 
 impl super::DeviceRecord {
-    /// The current native driver profile is Intel LNL LPSS DesignWare. This
+    /// The native driver profile is Intel LNL / PTL-P LPSS DesignWare. This
     /// identifies candidates only; correlation, BAR and line checks still
     /// belong to Claim. Inspection must remain possible when those fail.
     pub fn is_native_i2c_hid_candidate(&self) -> bool {
         self.species == super::DeviceSpecies::Pci
             && (self.class, self.subclass, self.progif) == (0x0c, 0x80, 0)
             && self.vendor == 0x8086
-            && matches!(self.device, 0xa850 | 0xa851 | 0xa878..=0xa87b)
+            // Linux intel-lpss-pci.c maps these LNL-M and PTL-P I2C
+            // functions to ehl_i2c_info (100 MHz). Adjacent UART/SPI
+            // functions must not receive DesignWare/LPSS I2C resets.
+            // https://github.com/torvalds/linux/blob/master/drivers/mfd/intel-lpss-pci.c
+            && matches!(
+                self.device,
+                0xa850 | 0xa851 | 0xa878..=0xa87b | 0xe450 | 0xe451 | 0xe478..=0xe47b
+            )
     }
 }
 

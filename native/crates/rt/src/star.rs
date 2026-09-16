@@ -90,6 +90,11 @@ struct Wires {
     parent_sends: [Option<crate::cap::ChanSendToken>; crate::thread::MAX_THREADS as usize],
     hub_root: crate::cap::ChannelRoot,
     hub_send: crate::cap::ChanSendToken,
+    // The hub and a resident submitter are mutually exclusive consumers.
+    hub_recv: Option<crate::cap::ChanRecvToken>,
+    completion: Option<
+        core::cell::RefCell<crate::chan::NoticeRx<'static, crate::transport::TrapTransport>>,
+    >,
     workers: usize,
 }
 
@@ -150,7 +155,7 @@ pub(crate) fn provision(workers: usize) -> Option<StarPlan> {
         minted(&mut roots, &mut parent_sends);
         return None;
     };
-    let _ = hub_pair.recv.try_retire();
+
     Some(StarPlan {
         wires: Wires {
             _space: space,
@@ -158,6 +163,8 @@ pub(crate) fn provision(workers: usize) -> Option<StarPlan> {
             parent_sends,
             hub_root: hub_pair.root,
             hub_send: hub_pair.send,
+            hub_recv: Some(hub_pair.recv),
+            completion: None,
             workers,
         },
     })
@@ -279,10 +286,20 @@ impl StarPlan {
     /// Seal the plan into the region's star, with (or, on the ruled
     /// degrade, without) its hub ticket.
     pub(crate) fn into_star(
-        self,
+        mut self,
         hub: Option<crate::thread::Thread>,
         join_report: kore_abi::session::SlotRef,
     ) -> Star {
+        if hub.is_some() {
+            if let Some(recv) = self.wires.hub_recv.take() {
+                let _ = recv.try_retire();
+            }
+        } else if let Some(recv) = self.wires.hub_recv.as_ref() {
+            self.wires.completion = Some(core::cell::RefCell::new(crate::chan::NoticeRx::new(
+                crate::entry::transport(),
+                recv.slot(),
+            )));
+        }
         Star {
             hub,
             join_report,
@@ -293,6 +310,17 @@ impl StarPlan {
 
 #[cfg(target_os = "none")]
 impl Star {
+    /// One observer owns the alternate post across its wait. Concurrent
+    /// observers fall back to the bounded futex wait; cancellation leaves the
+    /// standing landing with this region, never donated to another channel.
+    pub(crate) fn completion_receiver(
+        &self,
+    ) -> Option<
+        core::cell::RefMut<'_, crate::chan::NoticeRx<'static, crate::transport::TrapTransport>>,
+    > {
+        self.wires.completion.as_ref()?.try_borrow_mut().ok()
+    }
+
     /// Kick every worker (and the hub) directly over the parent-held
     /// sends — the gate release, which must never depend on the hub it
     /// just launched.
@@ -305,10 +333,8 @@ impl Star {
             );
         }
         // The hub post reaches a consumer only when a hub thread was spawned
-        // (it holds the sole recv). A hubless star — the resident region, and
-        // the degraded hub-founding path — retired that recv at provision, so
-        // the post would `WouldBlock` against a receiverless channel every
-        // submit for nothing; skip it.
+        // (it holds the sole recv). A hubless resident retains that recv for
+        // reverse completion; kicking the submitter on its own submit is wasteful.
         if self.hub.is_some() {
             let _ = crate::cap::verbs::post_notice(
                 self.wires.hub_send.slot(),
@@ -334,8 +360,8 @@ impl Star {
     /// the same explicit retry contract as a worker join.
     pub(crate) fn finish(mut self) -> Result<(), (Self, crate::cap::TaskWaitError)> {
         // Wake the hub off its park so its loop can see the gate and exit —
-        // only if one was spawned; a hubless star has no consumer for this
-        // send (its recv was retired at provision).
+        // only if one was spawned; the resident's receiver belongs to its
+        // submitter and requires no retirement wake.
         if self.hub.is_some() {
             let _ = crate::cap::verbs::post_notice(
                 self.wires.hub_send.slot(),
@@ -361,6 +387,8 @@ impl Star {
             mut parent_sends,
             hub_root,
             hub_send,
+            hub_recv,
+            completion,
             workers: _,
         } = wires;
         for s in parent_sends.iter_mut() {
@@ -374,13 +402,30 @@ impl Star {
                 let _ = r.try_retire();
             }
         }
-        let _ = hub_root.try_retire();
+        if let Some(recv) = hub_recv {
+            let _ = recv.try_retire();
+        }
+        if hub_root.try_retire().is_ok() {
+            if let Some(rx) = completion {
+                rx.into_inner().close_after_root_revoked();
+            }
+        }
+        // An unproven root close leaves any armed landing quarantined by
+        // NoticeRx/ReturnedCapability, just like the existing channel owners.
         Ok(())
     }
 }
 
 #[cfg(not(target_os = "none"))]
 impl Star {
+    pub(crate) fn completion_receiver(
+        &self,
+    ) -> Option<
+        core::cell::RefMut<'_, crate::chan::NoticeRx<'static, crate::transport::TrapTransport>>,
+    > {
+        None
+    }
+
     /// Off metal nothing was provisioned, so the teardown is nothing too
     /// — kept so the join path reads identically on every target.
     pub(crate) fn finish(self) -> Result<(), (Self, crate::cap::TaskWaitError)> {

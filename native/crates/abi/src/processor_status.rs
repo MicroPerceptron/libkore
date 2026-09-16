@@ -100,7 +100,7 @@ impl<const N: usize> ProcessorSnapshot<N> {
                 return *row == ProcessorRow::default();
             }
             row.cpu.get() as usize == self.first.get() as usize + i
-                && row.class <= 2
+                && row.class <= 3
                 && matches!(row.vector_bytes, 0 | 16 | 32 | 64)
                 && row.feedback.get() & !0x1ffff == 0
                 && (row.feedback.get() & 0x10000 != 0 || row.feedback.get() == 0)

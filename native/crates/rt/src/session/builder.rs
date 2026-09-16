@@ -2217,8 +2217,8 @@ impl SessionBuilder {
     }
 
     /// Establish one initialized HID-over-I2C child's firmware-correlated
-    /// GPIO-ready route beneath an authenticated PCI or platform controller.
-    pub fn derive_i2c_hid_gpio_route(
+    /// Child-ready route beneath an authenticated PCI or platform controller.
+    pub fn derive_i2c_hid_ready_route(
         &mut self,
         device: SlotRef,
         rights: Rights,
@@ -2230,7 +2230,7 @@ impl SessionBuilder {
         self.derive_raw(
             device,
             rights,
-            kore_abi::session::DERIVE_KIND_I2C_HID_GPIO_ROUTE,
+            kore_abi::session::DERIVE_KIND_I2C_HID_READY_ROUTE,
             result,
             Some(&req),
         )

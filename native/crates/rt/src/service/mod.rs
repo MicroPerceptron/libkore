@@ -792,9 +792,9 @@ pub enum DeviceSelector {
         /// GPIO data-ready route is a separate capability lane (#408).
         irq: bool,
     },
-    /// An Intel Lunar Lake LPSS I2C controller with initialized firmware-
+    /// An Intel Lunar Lake / Panther Lake-P LPSS I2C controller with initialized firmware-
     /// correlated HID children and a user-mappable BAR0. This initial profile
-    /// admits Intel a850/a851/a878–a87b; another vendor or wrapper requires an
+    /// admits Intel a850/a851/a878–a87b and e450/e451/e478–e47b; another wrapper requires an
     /// explicit profile extension before the driver may apply LPSS resets.
     /// No DMA authority is required.
     PciI2cHid {
@@ -941,9 +941,32 @@ impl PciIdentitySelector {
         Self(packed)
     }
 
+    /// Match every function of one vendor that satisfies the class and
+    /// resource requirements — the shape a driver whose admission table is
+    /// its own (`XeDeviceProfile::for_pci`, the ivpu identity rows) claims
+    /// with, so the claim names *who may be admitted* and the driver names
+    /// *who is*. Encoded as the vendor with device `0xFFFF`: no PCI function
+    /// lawfully enumerates with an all-ones device id, so an old peer that
+    /// reads this word as an exact pair matches nothing rather than
+    /// misinterpreting it.
+    pub const fn vendor(vendor: u16) -> Self {
+        assert!(vendor != 0 && vendor != 0xFFFF, "not a lawful PCI vendor id");
+        Self(vendor as u32 | (VENDOR_ONLY_DEVICE << 16))
+    }
+
     /// Lift the complete 32-bit request-word vocabulary.
     pub const fn from_packed(packed: u32) -> Self {
         Self(packed)
+    }
+
+    /// The vendor a vendor-scoped selector admits, or `None` for [`ANY`](Self::ANY)
+    /// and exact pairs.
+    pub const fn vendor_only(self) -> Option<u16> {
+        if self.0 != 0 && (self.0 >> 16) == VENDOR_ONLY_DEVICE {
+            Some(self.0 as u16)
+        } else {
+            None
+        }
     }
 
     /// Lower into the stable request-word representation.
@@ -951,9 +974,10 @@ impl PciIdentitySelector {
         self.0
     }
 
-    /// The exact pair, or `None` for [`ANY`](Self::ANY).
+    /// The exact pair, or `None` for [`ANY`](Self::ANY) and vendor-scoped
+    /// selectors.
     pub const fn exact_pair(self) -> Option<(u16, u16)> {
-        if self.0 == 0 {
+        if self.0 == 0 || (self.0 >> 16) == VENDOR_ONLY_DEVICE {
             None
         } else {
             Some((self.0 as u16, (self.0 >> 16) as u16))
@@ -962,14 +986,21 @@ impl PciIdentitySelector {
 
     /// Whether one enumerated identity satisfies this constraint.
     pub const fn matches(self, vendor: u16, device: u16) -> bool {
+        if let Some(required_vendor) = self.vendor_only() {
+            return vendor == required_vendor;
+        }
         match self.exact_pair() {
             Some((required_vendor, required_device)) => {
-                vendor == required_vendor && device == required_device
+                vendor == required_vendor && required_device == device
             }
             None => true,
         }
     }
 }
+
+/// The device half of a vendor-scoped [`PciIdentitySelector`]: the all-ones
+/// id no function lawfully enumerates with.
+const VENDOR_ONLY_DEVICE: u32 = 0xFFFF;
 
 /// Exact user-mappable PCI BARs a device claimant requires.
 ///
@@ -1905,6 +1936,18 @@ mod tests {
         assert!(dg2.matches(0x8086, 0x56a0));
         assert!(!dg2.matches(0x8086, 0x56a1));
         assert!(!dg2.matches(0x10de, 0x56a0));
+
+        let intel = PciIdentitySelector::vendor(0x8086);
+        assert_eq!(intel.packed(), 0xFFFF_8086);
+        assert_eq!(intel.exact_pair(), None);
+        assert_eq!(intel.vendor_only(), Some(0x8086));
+        assert!(intel.matches(0x8086, 0x64a0));
+        assert!(intel.matches(0x8086, 0xb080));
+        assert!(!intel.matches(0x10de, 0x64a0));
+        // Round trip through the wire word keeps the vendor scope.
+        assert_eq!(PciIdentitySelector::from_packed(intel.packed()), intel);
+        assert_eq!(dg2.vendor_only(), None);
+        assert_eq!(PciIdentitySelector::ANY.vendor_only(), None);
     }
 
     #[test]
