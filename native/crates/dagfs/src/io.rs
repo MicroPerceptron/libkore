@@ -197,18 +197,61 @@ impl<'w, 't> Fs<'w, 't> {
         result
     }
 
-    /// Replace `file`'s contents with `bytes`: written chunk by chunk from
-    /// offset zero, then resized to exactly `bytes.len()`. Unconditional
-    /// (`ANY_REVISION`): the caller holds the route, and a concurrent writer
-    /// is the service's `Conflict` to report, not this client's to guess.
+    /// Atomically replace an existing file's contents. Private chunks become
+    /// visible together only if the revision captured at begin is unchanged.
+    /// A lost commit reply is ambiguous; do not retry publication blindly.
     pub async fn write_bytes(&mut self, file: &View, bytes: &[u8]) -> Result<(), Refusal> {
+        let handle = file.handle();
+        match self
+            .checked(&FsRequest::BeginReplace {
+                handle,
+                length: bytes.len() as u64,
+                expected: ANY_REVISION,
+            })
+            .await?
+        {
+            FsResponse::Done => {}
+            _ => return Err(Refusal::Pair),
+        }
+        let result = self.write_replacement_chunks(handle, bytes).await;
+        if result.is_err() && self.client.is_idle() {
+            // Never touch the window or issue cleanup past an outstanding
+            // request. Peer teardown owns cleanup after a transport failure.
+            let _ = self.checked(&FsRequest::AbortReplace { handle }).await;
+        }
+        result
+    }
+
+    async fn write_replacement_chunks(
+        &mut self,
+        handle: crate::Handle,
+        bytes: &[u8],
+    ) -> Result<(), Refusal> {
         let mut offset = 0usize;
         while offset < bytes.len() {
-            let count = self.write_at(file, offset as u64, &bytes[offset..]).await?;
+            let count = transfer_len(offset as u64, bytes.len() - offset, self.chunk())?;
+            if !self.client.is_idle() {
+                return Err(Refusal::Pair);
+            }
+            self.window[..count].copy_from_slice(&bytes[offset..offset + count]);
+            match self
+                .checked(&FsRequest::WriteReplacement {
+                    handle,
+                    offset: offset as u64,
+                    window_offset: 0,
+                    length: count as u32,
+                })
+                .await?
+            {
+                FsResponse::Done => {}
+                _ => return Err(Refusal::Pair),
+            }
             offset += count;
         }
-        self.resize(file, bytes.len() as u64).await?;
-        Ok(())
+        match self.checked(&FsRequest::CommitReplace { handle }).await? {
+            FsResponse::Committed { .. } => Ok(()),
+            _ => Err(Refusal::Pair),
+        }
     }
 
     /// Append `bytes` to `file` in one bounded transfer; yields the offset
@@ -242,8 +285,8 @@ impl<'w, 't> Fs<'w, 't> {
     }
 
     /// Replace a complete text file, creating its final edge when absent
-    /// — the editor's save. Streams `bytes` through the bounded window,
-    /// truncates the old tail, then publishes the same plain-text index
+    /// — the editor's save. Stages `bytes` through the bounded window and atomically replaces
+    /// the complete contents, then publishes the same plain-text index
     /// batch the `write` verb does; every view is closed on both paths.
     #[cfg(feature = "index")]
     pub async fn replace_file(

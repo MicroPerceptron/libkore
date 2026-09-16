@@ -254,11 +254,11 @@ pub const DERIVE_KIND_VIEW_MAP: u8 = 0xf1;
 pub const DERIVE_KIND_IRQ_ROUTE_LINE: u8 = 0xf0;
 
 /// `Derive × PciDevice/PlatformDevice → IrqRoute` for one initialized
-/// HID-over-I2C child's firmware-correlated GPIO-ready pad. The argument is an
+/// HID-over-I2C child's firmware-correlated readiness source. The argument is an
 /// [`I2cHidReq`] record query whose index is interpreted beneath the already
 /// authenticated controller capability; no GPIO community, pin, GSI or
 /// polarity is caller-selectable.
-pub const DERIVE_KIND_I2C_HID_GPIO_ROUTE: u8 = 0xef;
+pub const DERIVE_KIND_I2C_HID_READY_ROUTE: u8 = 0xef;
 
 /// `Derive × MmioRegion → LeasedIova` for an exact, sponsored peer aperture.
 ///
@@ -271,7 +271,7 @@ pub const DERIVE_KIND_I2C_HID_GPIO_ROUTE: u8 = 0xef;
 /// `bytes` select the exact BAR subrange; neither a whole-BAR inference nor an
 /// ambient PCI-class whitelist exists.
 ///
-/// `0xec` is the next unused selector below [`DERIVE_KIND_I2C_HID_GPIO_ROUTE`]
+/// `0xec` is the next unused selector below [`DERIVE_KIND_I2C_HID_READY_ROUTE`]
 /// once `0xee` (the terminal device quiesce, #847) and `0xed` (its
 /// next-flavor probe) are set aside — the two arcs must compose in either
 /// landing order.
@@ -379,6 +379,125 @@ pub const DERIVE_KIND_PROTECT: u8 = 0xfa;
 /// status has to outlive it for a joiner ([`DERIVE_KIND_TASK_JOIN`]) to
 /// read.  The reap is still the handle's `Revoke`.
 pub const DERIVE_KIND_TASK_EXIT: u8 = 0xfc;
+
+/// Close the calling process owner's worker admission and physically drain
+/// every peer in that exact address space. SELF + MODIFY, sole invocation,
+/// no arguments. Workers and peer handles cannot request this operation.
+/// The result is a bind-inert `ProcessDrainReport`; WouldBlock reports no proof
+/// and may be retried after a concurrent physical reaper completes.
+pub const DERIVE_KIND_PROCESS_DRAIN: u8 = 0xe2;
+
+/// Read one immutable crash-evidence chunk through an owning task handle.
+/// ACCESS + REVOKE, sole invocation. The argument is a little-endian u32
+/// chunk index followed by four zero bytes. No record returns Exited;
+/// live subjects return WouldBlock. Lifecycle observers cannot read stacks.
+pub const DERIVE_KIND_CRASH_READ: u8 = 0xe1;
+/// Report a fatal software panic on SELF. The payload is UTF-8 with a u32
+/// length, four reserved zero bytes, and exactly that many message bytes.
+/// MODIFY, standalone. Never grants the caller authority over another process.
+/// Panic arguments: UTF-8 length u32, truncated u8 (0/1), zero[3], message bytes.
+pub const DERIVE_KIND_PANIC_REPORT: u8 = 0xe0;
+/// Bind a parent-owned, unmapped RAM lease before TASK_START. Arguments are
+/// lease slot u32, reserved-zero u32, page-aligned offset u64 and length u64.
+/// Task MODIFY|REVOKE and lease MODIFY are required. Standalone, no result.
+pub const DERIVE_KIND_CRASH_BIND: u8 = 0xdf;
+/// Assign a bounded UTF-8 task label once before START (Task MODIFY).
+/// Arguments: byte length u8 followed by that many UTF-8 bytes, at most 63.
+pub const DERIVE_KIND_TASK_NAME: u8 = 0xde;
+/// Task ACCESS; standalone, no arguments. Returns an inert TaskIdentity report.
+pub const DERIVE_KIND_TASK_IDENTITY: u8 = 0xdd;
+pub const TASK_IDENTITY_KIND: u16 = 0xFF16;
+pub const TASK_IDENTITY_MAGIC: u64 = 0x6b6f_7265_5449_4431;
+impl crate::task::TaskIdentity {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(TASK_IDENTITY_KIND, TASK_IDENTITY_MAGIC);
+        rec.mac = self.id.bytes();
+        rec.scope_rid = self.quality as u64;
+        rec
+    }
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        if !is_inert_report(rec, TASK_IDENTITY_KIND, TASK_IDENTITY_MAGIC)
+            || rec.holder != crate::cap::Cid::NULL
+            || !rec.rights.is_empty()
+            || rec.epoch != 0
+            || rec.chain_len != 0
+            || rec.chain != [0; crate::cap::MAX_DEPTH]
+            || rec.scope_rid > u8::MAX as u64
+        {
+            return None;
+        }
+        Some(Self {
+            id: crate::task::TaskId::from_bytes(rec.mac),
+            quality: crate::task::TaskIdQuality::decode(rec.scope_rid as u8)?,
+        })
+    }
+}
+pub const CRASH_CHUNK_BYTES: usize = 16;
+pub const CRASH_CHUNK_KIND: u16 = 0xFF15;
+pub const CRASH_CHUNK_MAGIC: u64 = 0x6b6f_7265_4352_5348;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CrashChunk {
+    pub index: u32,
+    pub bytes: [u8; CRASH_CHUNK_BYTES],
+}
+impl CrashChunk {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(CRASH_CHUNK_KIND, CRASH_CHUNK_MAGIC);
+        rec.scope_rid = u64::from(self.index);
+        rec.mac = self.bytes;
+        rec
+    }
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        if !is_inert_report(rec, CRASH_CHUNK_KIND, CRASH_CHUNK_MAGIC)
+            || rec.scope_rid >= (crate::crash::MIN_BUFFER_BYTES / CRASH_CHUNK_BYTES) as u64
+            || rec.holder != crate::cap::Cid::NULL
+            || !rec.rights.is_empty()
+            || rec.epoch != 0
+            || rec.chain_len != 0
+            || rec.chain != [0; crate::cap::MAX_DEPTH]
+        {
+            return None;
+        }
+        Some(Self {
+            index: rec.scope_rid as u32,
+            bytes: rec.mac,
+        })
+    }
+}
+
+/// Successful terminal worker barrier. Forced shutdown skips user finalizers:
+/// arbitrary interrupted user code may have left shared state inconsistent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessDrainReport {
+    pub forced: bool,
+}
+pub const PROCESS_DRAIN_REPORT_KIND: u16 = 0xFF14;
+pub const PROCESS_DRAIN_REPORT_MAGIC: u64 = 0x6b6f_7265_4452_414e;
+impl ProcessDrainReport {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(PROCESS_DRAIN_REPORT_KIND, PROCESS_DRAIN_REPORT_MAGIC);
+        rec.scope_rid = u64::from(self.forced);
+        rec
+    }
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        if !is_inert_report(rec, PROCESS_DRAIN_REPORT_KIND, PROCESS_DRAIN_REPORT_MAGIC)
+            || rec.scope_rid > 1
+        {
+            return None;
+        }
+        let result = Self {
+            forced: rec.scope_rid != 0,
+        };
+        let canonical = result.encode();
+        (rec.holder == canonical.holder
+            && rec.rights == canonical.rights
+            && rec.epoch == canonical.epoch
+            && rec.chain_len == canonical.chain_len
+            && rec.chain == canonical.chain
+            && rec.mac == canonical.mac)
+            .then_some(result)
+    }
+}
 
 /// `Derive × Task` that **joins** the subject task: the result slot
 /// receives a bind-inert [`ExitReport`] once it has exited.  `ACCESS` on
@@ -493,7 +612,7 @@ pub const DERIVE_KIND_DEVICE_ACTIVATE: u8 = 0xf6;
 /// it stopped, the kernel proves what the fabric saw.
 ///
 /// `0xee` is the next unused selector below
-/// [`DERIVE_KIND_I2C_HID_GPIO_ROUTE`].
+/// [`DERIVE_KIND_I2C_HID_READY_ROUTE`].
 pub const DERIVE_KIND_DEVICE_QUIESCE: u8 = 0xee;
 
 /// `Derive × GuestSpace` terminal founding flavor: create one schedulable
@@ -1169,9 +1288,11 @@ const _: () = {
     assert!((crate::cap::ResourceKind::PlatformBus as u16) < DERIVE_KIND_I2C_HID_RECORD as u16);
     assert!(DERIVE_KIND_I2C_HID_RECORD != DERIVE_KIND_DEVICE_ACTIVATE);
     assert!(DERIVE_KIND_I2C_HID_RECORD != DERIVE_KIND_IRQ_ROUTE_MSIX);
-    assert!((crate::cap::ResourceKind::PlatformBus as u16) < DERIVE_KIND_I2C_HID_GPIO_ROUTE as u16);
-    assert!(DERIVE_KIND_I2C_HID_GPIO_ROUTE != DERIVE_KIND_IRQ_ROUTE_LINE);
-    assert!(DERIVE_KIND_I2C_HID_GPIO_ROUTE != DERIVE_KIND_I2C_HID_RECORD);
+    assert!(
+        (crate::cap::ResourceKind::PlatformBus as u16) < DERIVE_KIND_I2C_HID_READY_ROUTE as u16
+    );
+    assert!(DERIVE_KIND_I2C_HID_READY_ROUTE != DERIVE_KIND_IRQ_ROUTE_LINE);
+    assert!(DERIVE_KIND_I2C_HID_READY_ROUTE != DERIVE_KIND_I2C_HID_RECORD);
     assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_PEER_IOVA as u16);
     assert!(DERIVE_KIND_PEER_IOVA != DERIVE_KIND_IRQ_ROUTE_MSIX);
     assert!(DERIVE_KIND_PEER_IOVA != DERIVE_KIND_DEVICE_ACTIVATE);
@@ -1202,7 +1323,13 @@ const _: () = {
 /// Their authenticated subject kinds disambiguate both pairs. This table is a
 /// vocabulary, not a uniqueness proof; the pairwise same-subject assertions
 /// above carry the distinctness that matters.
-const DERIVE_FLAVORS: [u8; 29] = [
+const DERIVE_FLAVORS: [u8; 35] = [
+    DERIVE_KIND_TASK_IDENTITY,
+    DERIVE_KIND_TASK_NAME,
+    DERIVE_KIND_PROCESS_DRAIN,
+    DERIVE_KIND_CRASH_READ,
+    DERIVE_KIND_PANIC_REPORT,
+    DERIVE_KIND_CRASH_BIND,
     DERIVE_KIND_IOVA_ANON,
     DERIVE_KIND_SET_TP,
     DERIVE_KIND_PROTECT,
@@ -1219,7 +1346,7 @@ const DERIVE_FLAVORS: [u8; 29] = [
     DERIVE_KIND_SUPPLY_RELEASE,
     DERIVE_KIND_VIEW_MAP,
     DERIVE_KIND_IRQ_ROUTE_LINE,
-    DERIVE_KIND_I2C_HID_GPIO_ROUTE,
+    DERIVE_KIND_I2C_HID_READY_ROUTE,
     DERIVE_KIND_GUEST_FOUND,
     DERIVE_KIND_DEVICE_QUIESCE,
     DERIVE_KIND_PEER_IOVA,
@@ -1272,7 +1399,10 @@ const _: () = {
 /// both `0xFF05` for ~80 commits because nothing owned the proof.  A new
 /// member joins by adding its row; forgetting to is caught by the arity
 /// assert any time the member count moves.
-const REPORT_KINDS: [u16; 17] = [
+const REPORT_KINDS: [u16; 20] = [
+    TASK_IDENTITY_KIND,
+    PROCESS_DRAIN_REPORT_KIND,
+    CRASH_CHUNK_KIND,
     NOTICE_KIND,
     GEOM_REPORT_KIND,
     DISPLAY_REPORT_KIND,
@@ -3742,7 +3872,7 @@ impl I2cGpioPolarity {
     }
 }
 
-/// Kernel-side readiness of one firmware-described I2C-HID GPIO route.
+/// Kernel-side readiness of one firmware-described I2C-HID child route.
 ///
 /// This is configuration evidence, not authority: it explains whether the
 /// immutable boot-time GPIO inventory admitted the pad. The caller must still
@@ -3750,8 +3880,8 @@ impl I2cGpioPolarity {
 /// refuse.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum I2cGpioRouteState {
-    /// Firmware did not describe a GPIO interrupt for this child.
+pub enum I2cReadyRouteState {
+    /// Firmware did not describe a readiness interrupt for this child.
     #[default]
     NotDescribed = 0,
     /// The `GpioInt` source path did not resolve to a discovered community.
@@ -3772,7 +3902,8 @@ pub enum I2cGpioRouteState {
     QuiesceRefused = 8,
     /// The parent GSI could not be installed in the interrupt fabric.
     ParentRouteRefused = 9,
-    /// The parent route and pad geometry are ready for capability derivation.
+    /// The source is described and ready for capability derivation. Line
+    /// admission still occurs in the pin fabric when deriving the capability.
     Ready = 10,
     /// GPIO setup did not publish a diagnostic for this described child.
     SetupUnavailable = 11,
@@ -3784,7 +3915,7 @@ pub enum I2cGpioRouteState {
     PadAliasRefused = 13,
 }
 
-impl I2cGpioRouteState {
+impl I2cReadyRouteState {
     pub const fn from_bits(bits: u32) -> Option<Self> {
         match bits {
             0 => Some(Self::NotDescribed),
@@ -3821,10 +3952,21 @@ pub struct I2cHidReport {
     pub fast_timing: Option<I2cTimingReport>,
     /// Controller input clock established by firmware integration data.
     pub input_clock_hz: Option<u32>,
-    pub gpio_interrupt: Option<I2cGpioInterruptReport>,
-    pub gpio_route_state: I2cGpioRouteState,
+    pub ready_interrupt: Option<I2cReadyInterruptReport>,
+    pub ready_route_state: I2cReadyRouteState,
     pub no_irq: bool,
     pub no_power_after_reset: bool,
+}
+
+/// Data only: deriving this source still requires the exact controller cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum I2cReadyInterruptReport {
+    Gpio(I2cGpioInterruptReport),
+    Line {
+        gsi: u32,
+        edge: bool,
+        active_high: bool,
+    },
 }
 
 /// One HID child's data-ready GPIO description.
@@ -3847,13 +3989,15 @@ const I2C_GPIO_EDGE: u8 = 1 << 3;
 const I2C_QUIRK_NO_IRQ: u8 = 1 << 4;
 const I2C_QUIRK_NO_POWER_AFTER_RESET: u8 = 1 << 5;
 const I2C_INPUT_CLOCK: u8 = 1 << 6;
+const I2C_LINE_INTERRUPT: u8 = 1 << 7;
 const I2C_REPORT_FLAGS: u8 = I2C_STD_TIMING
     | I2C_FAST_TIMING
     | I2C_GPIO_INTERRUPT
     | I2C_GPIO_EDGE
     | I2C_QUIRK_NO_IRQ
     | I2C_QUIRK_NO_POWER_AFTER_RESET
-    | I2C_INPUT_CLOCK;
+    | I2C_INPUT_CLOCK
+    | I2C_LINE_INTERRUPT;
 
 impl I2cHidReport {
     /// Encode as bind-inert data. Zero is the absence sentinel for timing
@@ -3884,13 +4028,28 @@ impl I2cHidReport {
         if self.fast_timing.is_some() {
             flags |= I2C_FAST_TIMING;
         }
-        if let Some(gpio) = self.gpio_interrupt {
-            flags |= I2C_GPIO_INTERRUPT;
-            if gpio.edge {
+        if let Some(interrupt) = self.ready_interrupt {
+            let edge = match interrupt {
+                I2cReadyInterruptReport::Gpio(gpio) => {
+                    flags |= I2C_GPIO_INTERRUPT;
+                    rec.epoch = u32::from(gpio.pin);
+                    rec.chain[0] = gpio.polarity as u32;
+                    gpio.edge
+                }
+                I2cReadyInterruptReport::Line {
+                    gsi,
+                    edge,
+                    active_high,
+                } => {
+                    flags |= I2C_LINE_INTERRUPT;
+                    rec.epoch = gsi;
+                    rec.chain[0] = u32::from(active_high);
+                    edge
+                }
+            };
+            if edge {
                 flags |= I2C_GPIO_EDGE;
             }
-            rec.epoch = u32::from(gpio.pin);
-            rec.chain[0] = gpio.polarity as u32;
         }
         if self.no_irq {
             flags |= I2C_QUIRK_NO_IRQ;
@@ -3902,7 +4061,7 @@ impl I2cHidReport {
             flags |= I2C_INPUT_CLOCK;
             rec.chain[1] = hz;
         }
-        rec.chain[2] = self.gpio_route_state as u32;
+        rec.chain[2] = self.ready_route_state as u32;
         rec.rights = crate::cap::Rights::from_bits_retain(flags);
         rec
     }
@@ -3951,20 +4110,34 @@ impl I2cHidReport {
             None
         };
 
-        let gpio_interrupt = if flags & I2C_GPIO_INTERRUPT != 0 {
-            if rec.epoch > u32::from(u16::MAX) {
-                return None;
+        let ready_interrupt = match flags & (I2C_GPIO_INTERRUPT | I2C_LINE_INTERRUPT) {
+            I2C_GPIO_INTERRUPT => {
+                if rec.epoch > u32::from(u16::MAX) {
+                    return None;
+                }
+                Some(I2cReadyInterruptReport::Gpio(I2cGpioInterruptReport {
+                    pin: rec.epoch as u16,
+                    edge: flags & I2C_GPIO_EDGE != 0,
+                    polarity: I2cGpioPolarity::from_bits(rec.chain[0])?,
+                }))
             }
-            Some(I2cGpioInterruptReport {
-                pin: rec.epoch as u16,
-                edge: flags & I2C_GPIO_EDGE != 0,
-                polarity: I2cGpioPolarity::from_bits(rec.chain[0])?,
-            })
-        } else {
-            if flags & I2C_GPIO_EDGE != 0 || rec.epoch != 0 || rec.chain[0] != 0 {
-                return None;
+            I2C_LINE_INTERRUPT => {
+                if rec.chain[0] > 1 {
+                    return None;
+                }
+                Some(I2cReadyInterruptReport::Line {
+                    gsi: rec.epoch,
+                    edge: flags & I2C_GPIO_EDGE != 0,
+                    active_high: rec.chain[0] != 0,
+                })
             }
-            None
+            0 => {
+                if flags & I2C_GPIO_EDGE != 0 || rec.epoch != 0 || rec.chain[0] != 0 {
+                    return None;
+                }
+                None
+            }
+            _ => return None, // A child cannot name two different source kinds.
         };
         let input_clock_hz = if flags & I2C_INPUT_CLOCK != 0 {
             Some((rec.chain[1] != 0).then_some(rec.chain[1])?)
@@ -3974,8 +4147,8 @@ impl I2cHidReport {
             }
             None
         };
-        let gpio_route_state = I2cGpioRouteState::from_bits(rec.chain[2])?;
-        if gpio_interrupt.is_some() == (gpio_route_state == I2cGpioRouteState::NotDescribed) {
+        let ready_route_state = I2cReadyRouteState::from_bits(rec.chain[2])?;
+        if ready_interrupt.is_some() == (ready_route_state == I2cReadyRouteState::NotDescribed) {
             return None;
         }
         if rec.chain[3..].iter().any(|&word| word != 0) {
@@ -3989,8 +4162,8 @@ impl I2cHidReport {
             standard_timing,
             fast_timing,
             input_clock_hz,
-            gpio_interrupt,
-            gpio_route_state,
+            ready_interrupt,
+            ready_route_state,
             no_irq: flags & I2C_QUIRK_NO_IRQ != 0,
             no_power_after_reset: flags & I2C_QUIRK_NO_POWER_AFTER_RESET != 0,
         })
@@ -4105,6 +4278,40 @@ impl SupplyReleaseReport {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn task_identity_reports_validate_quality_and_never_carry_authority() {
+        use crate::task::{TaskId, TaskIdQuality, TaskIdentity};
+        for quality in [
+            TaskIdQuality::Unverified,
+            TaskIdQuality::HardwareOrFirmware,
+            TaskIdQuality::TimingJitter,
+            TaskIdQuality::Degenerate,
+        ] {
+            let identity = TaskIdentity {
+                id: TaskId::from_bytes([0xa5; 16]),
+                quality,
+            };
+            let rec = identity.encode();
+            assert_eq!(TaskIdentity::decode(&rec), Some(identity));
+            assert_eq!(rec.cid, crate::cap::Cid::NULL);
+            for field in 0..9 {
+                let mut bad = rec;
+                match field {
+                    0 => bad.cid = crate::cap::Cid(1),
+                    1 => bad.holder = crate::cap::Cid(1),
+                    2 => bad.parent = crate::cap::Cid(0),
+                    3 => bad.rights = Rights::ACCESS,
+                    4 => bad.epoch = 1,
+                    5 => bad.chain_len = 1,
+                    6 => bad.chain[0] = 1,
+                    7 => bad.scope_rid = 4,
+                    _ => bad.scope_rid = 256,
+                }
+                assert_eq!(TaskIdentity::decode(&bad), None, "field {field}");
+            }
+        }
+    }
 
     #[test]
     fn claim_dma_report_is_canonical_and_bind_inert() {
@@ -4255,14 +4462,14 @@ mod tests {
     #[test]
     fn line_and_i2c_gpio_flavors_are_known_without_aliasing() {
         assert!(derive_kind_known(DERIVE_KIND_IRQ_ROUTE_LINE));
-        assert!(derive_kind_known(DERIVE_KIND_I2C_HID_GPIO_ROUTE));
+        assert!(derive_kind_known(DERIVE_KIND_I2C_HID_READY_ROUTE));
         assert_ne!(DERIVE_KIND_IRQ_ROUTE_LINE, DERIVE_KIND_IRQ_ROUTE_MSIX);
         assert_ne!(DERIVE_KIND_IRQ_ROUTE_LINE, DERIVE_KIND_I2C_HID_RECORD);
-        assert_ne!(DERIVE_KIND_IRQ_ROUTE_LINE, DERIVE_KIND_I2C_HID_GPIO_ROUTE);
+        assert_ne!(DERIVE_KIND_IRQ_ROUTE_LINE, DERIVE_KIND_I2C_HID_READY_ROUTE);
         // The byte below the GPIO route is the terminal device-quiesce flavor
         // (#809 §L); the one below *that* is the next free selector.
         assert_eq!(
-            DERIVE_KIND_I2C_HID_GPIO_ROUTE - 1,
+            DERIVE_KIND_I2C_HID_READY_ROUTE - 1,
             DERIVE_KIND_DEVICE_QUIESCE
         );
         assert!(derive_kind_known(DERIVE_KIND_DEVICE_QUIESCE));
@@ -4839,8 +5046,8 @@ mod tests {
                     standard_timing: None,
                     fast_timing: None,
                     input_clock_hz: None,
-                    gpio_interrupt: None,
-                    gpio_route_state: I2cGpioRouteState::NotDescribed,
+                    ready_interrupt: None,
+                    ready_route_state: I2cReadyRouteState::NotDescribed,
                     no_irq: false,
                     no_power_after_reset: false,
                 }
@@ -4965,12 +5172,12 @@ mod tests {
                 lcnt: 0xa0,
             }),
             input_clock_hz: Some(19_200_000),
-            gpio_interrupt: Some(I2cGpioInterruptReport {
+            ready_interrupt: Some(I2cReadyInterruptReport::Gpio(I2cGpioInterruptReport {
                 pin: 37,
                 edge: false,
                 polarity: I2cGpioPolarity::Low,
-            }),
-            gpio_route_state: I2cGpioRouteState::Ready,
+            })),
+            ready_route_state: I2cReadyRouteState::Ready,
             no_irq: true,
             no_power_after_reset: true,
         };
@@ -4986,12 +5193,50 @@ mod tests {
             standard_timing: None,
             fast_timing: None,
             input_clock_hz: None,
-            gpio_interrupt: None,
-            gpio_route_state: I2cGpioRouteState::NotDescribed,
+            ready_interrupt: None,
+            ready_route_state: I2cReadyRouteState::NotDescribed,
             no_irq: false,
             no_power_after_reset: false,
         };
         assert_eq!(I2cHidReport::decode(&minimal.encode()), Some(minimal));
+    }
+
+    #[test]
+    fn i2c_child_line_retains_full_gsi_and_electrical_mode_and_refuses_ambiguous_sources() {
+        for gsi in [0, 84, 108, u32::MAX] {
+            for (edge, active_high) in [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let report = I2cHidReport {
+                    slave_addr: 0x16,
+                    descriptor_register: 1,
+                    speed_hz: 400_000,
+                    standard_timing: None,
+                    fast_timing: None,
+                    input_clock_hz: None,
+                    ready_interrupt: Some(I2cReadyInterruptReport::Line {
+                        gsi,
+                        edge,
+                        active_high,
+                    }),
+                    ready_route_state: I2cReadyRouteState::Ready,
+                    no_irq: false,
+                    no_power_after_reset: false,
+                };
+                let encoded = report.encode();
+                assert_eq!(I2cHidReport::decode(&encoded), Some(report));
+                let mut ambiguous = encoded;
+                ambiguous.rights = crate::cap::Rights::from_bits_retain(
+                    ambiguous.rights.bits() | I2C_GPIO_INTERRUPT,
+                );
+                assert!(I2cHidReport::decode(&ambiguous).is_none());
+                let mut invalid_polarity = encoded;
+                invalid_polarity.chain[0] = 2;
+                assert!(I2cHidReport::decode(&invalid_polarity).is_none());
+                let mut absent = encoded;
+                absent.chain[2] = I2cReadyRouteState::NotDescribed as u32;
+                assert!(I2cHidReport::decode(&absent).is_none());
+            }
+        }
     }
 
     #[test]
@@ -5004,8 +5249,8 @@ mod tests {
                 standard_timing: None,
                 fast_timing: None,
                 input_clock_hz: None,
-                gpio_interrupt: None,
-                gpio_route_state: I2cGpioRouteState::NotDescribed,
+                ready_interrupt: None,
+                ready_route_state: I2cReadyRouteState::NotDescribed,
                 no_irq: false,
                 no_power_after_reset: false,
             };
@@ -5022,8 +5267,8 @@ mod tests {
             standard_timing: None,
             fast_timing: None,
             input_clock_hz: None,
-            gpio_interrupt: None,
-            gpio_route_state: I2cGpioRouteState::NotDescribed,
+            ready_interrupt: None,
+            ready_route_state: I2cReadyRouteState::NotDescribed,
             no_irq: false,
             no_power_after_reset: false,
         };
@@ -5037,7 +5282,7 @@ mod tests {
         assert_eq!(I2cHidReport::decode(&stale_gpio), None);
 
         let mut route_without_gpio = base.encode();
-        route_without_gpio.chain[2] = I2cGpioRouteState::Ready as u32;
+        route_without_gpio.chain[2] = I2cReadyRouteState::Ready as u32;
         assert_eq!(I2cHidReport::decode(&route_without_gpio), None);
 
         let mut unknown_route_state = base.encode();
@@ -5045,16 +5290,16 @@ mod tests {
         assert_eq!(I2cHidReport::decode(&unknown_route_state), None);
 
         let mut missing_route_state = I2cHidReport {
-            gpio_interrupt: Some(I2cGpioInterruptReport {
+            ready_interrupt: Some(I2cReadyInterruptReport::Gpio(I2cGpioInterruptReport {
                 pin: 18,
                 edge: false,
                 polarity: I2cGpioPolarity::Low,
-            }),
-            gpio_route_state: I2cGpioRouteState::Ready,
+            })),
+            ready_route_state: I2cReadyRouteState::Ready,
             ..base
         }
         .encode();
-        missing_route_state.chain[2] = I2cGpioRouteState::NotDescribed as u32;
+        missing_route_state.chain[2] = I2cReadyRouteState::NotDescribed as u32;
         assert_eq!(I2cHidReport::decode(&missing_route_state), None);
 
         let mut stale_clock = base.encode();
@@ -5429,3 +5674,29 @@ const DEVICE_FLAG_PROBE: u8 = crate::device::DeviceRecord::HAS_BINDING
     | crate::device::DeviceRecord::HAS_BAR0
     | crate::device::DeviceRecord::DRIVER_ENDPOINT
     | crate::device::DeviceRecord::HAS_REMAPPED_MSIX;
+
+#[cfg(test)]
+mod process_drain_tests {
+    use super::*;
+    #[test]
+    fn drain_report_is_canonical_data_not_authority() {
+        for forced in [false, true] {
+            let report = ProcessDrainReport { forced };
+            let record = report.encode();
+            assert_eq!(ProcessDrainReport::decode(&record), Some(report));
+            let mut bad = record;
+            bad.scope_rid = 2;
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            let mut bad = record;
+            bad.cid = crate::cap::Cid(1);
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            let mut bad = record;
+            bad.chain_len = 1;
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            let mut bad = record;
+            bad.mac[0] = 1;
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            assert!(derive_kind_known(DERIVE_KIND_PROCESS_DRAIN));
+        }
+    }
+}

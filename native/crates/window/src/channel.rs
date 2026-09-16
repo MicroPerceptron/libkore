@@ -82,6 +82,31 @@ impl WindowState {
         }
     }
 
+    /// Legacy two-pixels-per-unit flag, used when no quarter-step code is present.
+    pub const DOUBLE_DENSITY: u32 = 1 << 3;
+
+    // Four unused flag bits carry exact quarter steps without changing the
+    // mapped state layout. Old peers retain the native/double fallback.
+    const DENSITY_SHIFT: u32 = 4;
+    const DENSITY_MASK: u32 = 0xf << Self::DENSITY_SHIFT;
+    pub fn density(&self) -> crate::appearance::Density {
+        crate::appearance::Density::from_quarters(
+            ((self.flags & Self::DENSITY_MASK) >> Self::DENSITY_SHIFT) as u8,
+        )
+        .unwrap_or(if self.flags & Self::DOUBLE_DENSITY != 0 {
+            crate::appearance::Density::Double
+        } else {
+            crate::appearance::Density::Native
+        })
+    }
+    pub fn set_density(&mut self, density: crate::appearance::Density) {
+        self.flags = (self.flags & !(Self::DENSITY_MASK | Self::DOUBLE_DENSITY))
+            | (u32::from(density.quarters()) << Self::DENSITY_SHIFT);
+        if density == crate::appearance::Density::Double {
+            self.flags |= Self::DOUBLE_DENSITY;
+        }
+    }
+
     /// The state's [`Configure`] view, `None` before the first publish
     /// (serial 0 is never a valid configuration).
     pub fn configure(&self) -> Option<Configure> {
@@ -171,6 +196,29 @@ mod tests {
             WindowState::VISIBLE,
             "focus clears without disturbing visibility"
         );
+    }
+
+    #[test]
+    fn quarter_density_flags_preserve_other_state_and_legacy_values() {
+        use crate::appearance::Density;
+        let other = WindowState::FOCUSED | WindowState::VISIBLE | WindowState::LIGHT | (1 << 30);
+        let mut state = WindowState {
+            flags: other,
+            ..WindowState::default()
+        };
+        assert_eq!(state.density(), Density::Native);
+        state.flags |= WindowState::DOUBLE_DENSITY;
+        assert_eq!(state.density(), Density::Double);
+        for density in Density::ALL {
+            state.set_density(density);
+            assert_eq!(state.density(), density);
+            assert_eq!(
+                state.flags & !(WindowState::DENSITY_MASK | WindowState::DOUBLE_DENSITY),
+                other
+            );
+        }
+        state.flags = other | WindowState::DENSITY_MASK;
+        assert_eq!(state.density(), Density::Native);
     }
 
     /// The whole pair — request/reply rings, commit plane, terminal

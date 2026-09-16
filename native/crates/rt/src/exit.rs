@@ -52,8 +52,6 @@
 //! SessionBuilder::new().exit(SlotRef::from_wire(1), 256).unwrap();
 //! ```
 
-use crate::entry::RUNG_PANIC;
-
 /// A named native task outcome. Its representation is private so safe callers
 /// cannot turn an integer into an exit code. Default means success.
 #[repr(transparent)]
@@ -123,7 +121,10 @@ impl ExitCode {
     pub const TLS_FAILED: Self = Self(-2);
 
     /// The Rust panic handler ended the task.
-    pub const PANIC: Self = Self(i32::MIN + RUNG_PANIC as i32);
+    pub const PANIC: Self = Self(kore_abi::crash::PANIC_EXIT_STATUS);
+
+    /// An unrecoverable user CPU exception terminated the process.
+    pub const FAULT: Self = Self(kore_abi::crash::FAULT_EXIT_STATUS);
 
     /// Application-reserved slot 0 (256); its meaning belongs to the executable.
     pub const APPLICATION_0: Self = Self(256);

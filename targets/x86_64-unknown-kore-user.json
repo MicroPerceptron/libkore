@@ -8,6 +8,7 @@
   "dynamic-linking": true,
   "features": "+sse,+sse2,-mmx",
   "has-thread-local": true,
+  "frame-pointer": "always",
   "linker": "rust-lld",
   "linker-flavor": "gnu-lld",
   "llvm-target": "x86_64-unknown-none-elf",

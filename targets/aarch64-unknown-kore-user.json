@@ -8,6 +8,7 @@
   "dynamic-linking": true,
   "features": "+v8a,+strict-align,+neon",
   "has-thread-local": true,
+  "frame-pointer": "always",
   "linker": "rust-lld",
   "linker-flavor": "gnu-lld",
   "llvm-target": "aarch64-unknown-none",

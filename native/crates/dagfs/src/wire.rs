@@ -282,6 +282,36 @@ pub fn encode_req(req: &FsRequest) -> FsReqWire {
             w.length = U32::new(length);
             w.expected_revision = U64::new(expected);
         }
+        FsRequest::BeginReplace {
+            handle,
+            length,
+            expected,
+        } => {
+            w.op = FsReqWire::OP_BEGIN_REPLACE;
+            w.handle = U64::new(handle.to_bits());
+            w.offset = U64::new(length);
+            w.expected_revision = U64::new(expected);
+        }
+        FsRequest::WriteReplacement {
+            handle,
+            offset,
+            window_offset,
+            length,
+        } => {
+            w.op = FsReqWire::OP_WRITE_REPLACEMENT;
+            w.handle = U64::new(handle.to_bits());
+            w.offset = U64::new(offset);
+            w.window_offset = U32::new(window_offset);
+            w.length = U32::new(length);
+        }
+        FsRequest::CommitReplace { handle } | FsRequest::AbortReplace { handle } => {
+            w.op = if matches!(req, FsRequest::CommitReplace { .. }) {
+                FsReqWire::OP_COMMIT_REPLACE
+            } else {
+                FsReqWire::OP_ABORT_REPLACE
+            };
+            w.handle = U64::new(handle.to_bits());
+        }
         FsRequest::Append {
             handle,
             window_offset,
@@ -663,6 +693,19 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
             length: w.length.get(),
             expected: w.expected_revision.get(),
         },
+        FsReqWire::OP_BEGIN_REPLACE => FsRequest::BeginReplace {
+            handle,
+            length: w.offset.get(),
+            expected: w.expected_revision.get(),
+        },
+        FsReqWire::OP_WRITE_REPLACEMENT => FsRequest::WriteReplacement {
+            handle,
+            offset: w.offset.get(),
+            window_offset: w.window_offset.get(),
+            length: w.length.get(),
+        },
+        FsReqWire::OP_COMMIT_REPLACE => FsRequest::CommitReplace { handle },
+        FsReqWire::OP_ABORT_REPLACE => FsRequest::AbortReplace { handle },
         FsReqWire::OP_APPEND => FsRequest::Append {
             handle,
             window_offset: w.window_offset.get(),
@@ -1276,9 +1319,11 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         FsRequest::Read { .. } | FsRequest::ReadVersion { .. } => FsResponse::Transferred {
             count: w.count.get(),
         },
-        FsRequest::WriteAt { .. } | FsRequest::Resize { .. } => FsResponse::Committed {
-            revision: w.revision.get(),
-        },
+        FsRequest::WriteAt { .. } | FsRequest::Resize { .. } | FsRequest::CommitReplace { .. } => {
+            FsResponse::Committed {
+                revision: w.revision.get(),
+            }
+        }
         FsRequest::Append { .. } => FsResponse::Appended {
             offset: w.len.get(),
             revision: w.revision.get(),
@@ -1354,6 +1399,9 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         | FsRequest::DetachEdge { .. }
         | FsRequest::Revoke { .. }
         | FsRequest::Sync { .. }
+        | FsRequest::BeginReplace { .. }
+        | FsRequest::WriteReplacement { .. }
+        | FsRequest::AbortReplace { .. }
         | FsRequest::DeferCommits { .. }
         | FsRequest::SetSystemSeed { .. }
         | FsRequest::ReleaseVersion { .. }
@@ -1451,7 +1499,9 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
                 FsResponse::Transferred { .. }
             )
             | (
-                FsRequest::WriteAt { .. } | FsRequest::Resize { .. },
+                FsRequest::WriteAt { .. }
+                    | FsRequest::Resize { .. }
+                    | FsRequest::CommitReplace { .. },
                 FsResponse::Committed { .. }
             )
             | (FsRequest::Append { .. }, FsResponse::Appended { .. })
@@ -1493,6 +1543,9 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
                     | FsRequest::DetachEdge { .. }
                     | FsRequest::Revoke { .. }
                     | FsRequest::Sync { .. }
+                    | FsRequest::BeginReplace { .. }
+                    | FsRequest::WriteReplacement { .. }
+                    | FsRequest::AbortReplace { .. }
                     | FsRequest::DeferCommits { .. }
                     | FsRequest::SetSystemSeed { .. }
                     | FsRequest::ReleaseVersion { .. }
@@ -1520,6 +1573,37 @@ mod tests {
     /// cannot tell from a service that simply never answers.
     /// `Create` is the one request whose reserved byte carries data, and
     /// only there: every other verb still refuses a non-zero byte.
+    #[test]
+    fn atomic_replacement_wire_round_trips() {
+        let handle = Handle::from_bits(0x1234);
+        for req in [
+            FsRequest::BeginReplace {
+                handle,
+                length: u64::from(u32::MAX) + 1,
+                expected: 9,
+            },
+            FsRequest::WriteReplacement {
+                handle,
+                offset: 5,
+                window_offset: 7,
+                length: 3,
+            },
+            FsRequest::CommitReplace { handle },
+            FsRequest::AbortReplace { handle },
+        ] {
+            assert_eq!(decode_req(&encode_req(&req)), Some(req));
+            let reply = if matches!(req, FsRequest::CommitReplace { .. }) {
+                FsResponse::Committed { revision: 10 }
+            } else {
+                FsResponse::Done
+            };
+            assert_eq!(
+                decode_rep_for(&req, &encode_rep(&reply, 0)),
+                Some((reply, 0))
+            );
+        }
+    }
+
     #[test]
     fn create_carries_a_subtype_and_every_other_verb_keeps_reserved0_zero() {
         let stamped = FsRequest::Create {

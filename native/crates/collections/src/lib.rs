@@ -37,6 +37,9 @@
 //!   generations, guarded reads, and affine mutation claims that can span an
 //!   async operation without excluding unrelated slots.
 //!
+//! - [`PageStore`] — sparse publication and guarded reclamation of caller-defined
+//!   pages, with permanent retirement and transposed pin-counter shards.
+//!
 //! Plain (single-owner, `&mut self` — wrap in the caller's own lock if
 //! shared; the point is that they impose no locking policy):
 //! - [`BitSet`] / [`BitVec`] — the non-atomic siblings.
@@ -82,6 +85,8 @@ mod bitset;
 mod bitvec;
 mod genid;
 #[cfg(feature = "alloc")]
+mod pages;
+#[cfg(feature = "alloc")]
 mod priority;
 #[cfg(feature = "alloc")]
 mod slotarena;
@@ -109,3 +114,6 @@ pub use slotmap::{
 };
 #[cfg(feature = "alloc")]
 pub use slotvec::{AtomicSlotVec, SlotVecIter, SlotVecRead, SlotVecWrite, SlotVecWriteIter};
+
+#[cfg(feature = "alloc")]
+pub use pages::{PageError, PageGuard, PagePresence, PageStore};

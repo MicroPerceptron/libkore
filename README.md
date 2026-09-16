@@ -46,6 +46,10 @@ DagFS; graph/revision/grant facilities remain under `kore::fs::dag`. See
 | `crt0` | Native process entry stub on Kore targets |
 | `driver` | Existing native device host, register/DMA and ring APIs |
 
+Returning executables can use ordinary Rust `fn main()` through the executable-only
+[`kore-entry` adapter](docs/entry.md), with typed return codes, the native heap,
+and a kernel-backed worker shutdown barrier.
+
 `use kore::prelude::*` brings common types into scope. `#[kore::main]`,
 `#[kore::task]`, `#[kore::spmd]` and `#[derive(kore::Bundle)]` work even when the
 dependency is renamed; no hidden direct runtime/ABI dependency is required.
@@ -113,3 +117,11 @@ ownership contract and the remaining POSIX boundaries.
 Atomic-word synchronization is available through `kore::futex` (including Rust
 async waits), `kore_futex_*` in C, and `kore.futex.*` in Zig. Foreign waits block
 native threads; see [runtime contracts](docs/runtime.md#atomic-word-waits).
+
+### Fatal process diagnostics
+
+The matching Kore #1004 kernel contains fatal application faults and Rust panics
+within their process. `kore::crash` exposes bounded evidence collection, text
+rendering, and explicit parent-side persistence. Reports carry a bounded task
+name and opaque 128-bit public identity; IDs convey no authority. See
+[crash reports](docs/crash.md) for lifecycle ordering and validation limits.

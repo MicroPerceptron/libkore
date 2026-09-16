@@ -292,6 +292,10 @@ impl PowerReqWire {
     pub const OP_DISPLAY_DIAGNOSTIC: u8 = 13;
     /// Read the cached lid level and runtime close generation; no side effects.
     pub const OP_LID_STATUS: u8 = 14;
+    /// Fixed display owner publishes one immutable evidence word: index, u32 LE, zeros.
+    pub const OP_DISPLAY_EVIDENCE_REPORT: u8 = 15;
+    /// Read one evidence word: index, then zeros. Missing words refuse Unavailable.
+    pub const OP_DISPLAY_EVIDENCE: u8 = 16;
 }
 
 /// The power reply wire form.  A power service mints no authority, so
@@ -322,6 +326,8 @@ impl PowerRepWire {
     pub const TAG_DISPLAY_DIAGNOSTIC: u8 = 7;
     /// Level (0 unknown, 1 open, 2 closed), followed by a little-endian u32 generation.
     pub const TAG_LID_STATUS: u8 = 8;
+    /// Echoed evidence index and its u32 LE value.
+    pub const TAG_DISPLAY_EVIDENCE: u8 = 9;
 
     /// The session refused the transition.  Authority (`MODIFY` absent) and
     /// feasibility (no firmware backend realizes it) are **not separable
@@ -1458,9 +1464,9 @@ impl TaskReqWire {
     /// `Spawn` asks for the returned lifecycle owner to retain `DERIVE`, so
     /// its caller may attenuate an observer into a sibling worker. This bit
     /// is meaningful only with [`SPAWN_RETURN_HANDLE`](Self::SPAWN_RETURN_HANDLE);
-    /// the service must additionally authorize the authenticated launch
-    /// profile, and ordinary exec clients continue to receive a non-delegable
-    /// owner.
+    /// it is available for any otherwise authorized spawn and changes only
+    /// the parent's returned handle, not the child's authority. Ordinary exec
+    /// clients continue to receive a non-delegable owner.
     pub const SPAWN_DELEGABLE_HANDLE: u8 = 1 << 2;
     /// `Invoke` asks exec to return a second affine result at grant lane 1:
     /// an attenuated send descendant of the provisioned service response channel that
@@ -4188,7 +4194,12 @@ impl FsReqWire {
     /// `kind` is 1 while verification/copy is active, 0 once complete.
     pub const OP_SET_SYSTEM_SEED: u8 = 42;
     /// The highest defined verb — the codec's range check.
-    pub const OP_MAX: u8 = Self::OP_SET_SYSTEM_SEED;
+    /// Session-owned atomic file replacement (no wire layout change).
+    pub const OP_BEGIN_REPLACE: u8 = 43;
+    pub const OP_WRITE_REPLACEMENT: u8 = 44;
+    pub const OP_COMMIT_REPLACE: u8 = 45;
+    pub const OP_ABORT_REPLACE: u8 = 46;
+    pub const OP_MAX: u8 = Self::OP_ABORT_REPLACE;
 
     /// [`kind`](Self::kind): a file.
     pub const KIND_FILE: u8 = 1;

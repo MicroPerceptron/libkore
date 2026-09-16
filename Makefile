@@ -14,7 +14,7 @@ check:
 	python3 tools/check-native.py
 
 fmt:
-	cargo fmt -p kore-std -p libkore-consumer -p kore-ffi --check
+	cargo fmt -p kore-std -p libkore-consumer -p kore-ffi -p kore-entry --check
 	$(ZIG) fmt --check build.zig build.zig.zon crates/ffi/tests/consumer.zig extern/zig/src/root.zig extern/zig/src/allocator.zig
 
 docs:
@@ -30,12 +30,13 @@ owners:
 # x86_64-unknown-none check alone cannot certify this interface.
 cross:
 	@set -eu; for arch in x86_64 aarch64 riscv64gc; do \
-	  cargo check --locked -p kore-std -p kore-ffi --all-features \
+	  cargo check --locked -p kore-std -p kore-ffi -p kore-entry --all-features \
 	    --target "targets/$$arch-unknown-kore-user.json" \
 	    -Z build-std=core,alloc,compiler_builtins \
 	    -Z build-std-features=compiler-builtins-mem; \
 	done
 	python3 tools/check-alloc-symbols.py
+	python3 tools/check-entry.py
 
 miri:
 	cargo miri test --locked --workspace --all-features

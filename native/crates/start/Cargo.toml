@@ -1,0 +1,7 @@
+[package]
+name = "kore-start"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[dependencies]
+kore-rt = { path = "../rt", default-features = false, features = ["crt0"] }

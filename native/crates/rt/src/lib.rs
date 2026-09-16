@@ -69,6 +69,7 @@
 
 #![no_std]
 #![feature(allocator_api)]
+#![feature(never_type)]
 #![feature(portable_simd)]
 #![allow(async_fn_in_trait)]
 
@@ -87,6 +88,7 @@ pub mod cap;
 pub mod chan;
 pub mod clock;
 pub mod core_id;
+pub mod crash;
 pub mod entry;
 pub mod event;
 pub mod executor;
@@ -106,7 +108,11 @@ pub mod session;
 pub mod spmd;
 pub mod stack_arena;
 mod star;
+pub mod startup;
 pub mod svc;
+#[cfg(feature = "heap")]
+pub mod task_watch;
+pub mod termination;
 pub mod thread;
 pub mod thread_controller;
 pub mod transport;
@@ -129,6 +135,7 @@ pub use heap::Heap;
 pub use service::SystemService;
 pub use session::SessionBuilder;
 pub use spmd::{Spmd, SpmdCtx, SpmdEntry, spawn_spmd};
+pub use termination::Termination;
 pub use transport::{Committed, Transport};
 
 // The runtime attributes and authority-bundle derive

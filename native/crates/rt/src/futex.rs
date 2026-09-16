@@ -600,22 +600,89 @@ const BARRIER_SPIN: SpinBudget = SpinBudget {
 /// the waker's own store is what ends it, so the common case costs neither a
 /// syscall nor a busy core. On hardware without a monitor
 /// ([`hint::wait_on`](crate::hint::wait_on) reports `Spun`) the turns degrade
-/// to ordinary spin hints, which is a few microseconds before a park that was
-/// going to happen anyway.
+/// to ordinary spin hints bounded by the same calibrated clock. Without a
+/// readable clock only the finite probe count is available.
 ///
 /// It also **does not need the waker to reach us**. A doorbell wake requires a
 /// send end the waker holds; a store to the futex word requires nothing. So on
 /// a machine with a monitor, short contention resolves between threads the
 /// peer mesh cannot yet connect — which is most of them.
 fn spin_briefly(word: &AtomicU32, expected: u32, budget: SpinBudget) -> Option<WaitOutcome> {
-    for _ in 0..budget.turns {
+    spin_briefly_with(
+        word,
+        expected,
+        budget,
+        || crate::clock::uptime().ok().map(|time| time.as_nanos()),
+        |cap| {
+            crate::hint::wait_on(word, expected, cap);
+        },
+    )
+}
+
+/// Spend a wall-clock jitter window even when the ISA has no bounded monitor.
+/// Spurious monitor returns do not consume the entire budget in a few hints.
+/// Without a published clock use the existing finite probe bound; if a live
+/// clock disappears, stop rather than silently turning the deadline into a spin.
+fn spin_briefly_with(
+    word: &AtomicU32,
+    expected: u32,
+    budget: SpinBudget,
+    mut now: impl FnMut() -> Option<u64>,
+    mut pause: impl FnMut(Duration),
+) -> Option<WaitOutcome> {
+    let cap_ns = nanos_of(budget.cap);
+    let deadline =
+        now().map(|start| start.saturating_add(cap_ns.saturating_mul(u64::from(budget.turns))));
+    let mut probes = budget.turns;
+    loop {
         if word.load(Ordering::SeqCst) != expected {
             return Some(WaitOutcome::Retry);
         }
-        crate::hint::wait_on(word, expected, budget.cap);
+        let cap = if let Some(deadline) = deadline {
+            let current = now()?;
+            if current >= deadline {
+                return None;
+            }
+            Duration::from_nanos(cap_ns.min(deadline - current))
+        } else {
+            if probes == 0 {
+                return None;
+            }
+            probes -= 1;
+            budget.cap
+        };
+        pause(cap);
     }
-    // One last look: the final turn's wake is as good as any other's.
-    (word.load(Ordering::SeqCst) != expected).then_some(WaitOutcome::Retry)
+}
+
+/// A completion handoff uses the short lock budget before paying for a post.
+pub(crate) fn spin_completion(word: &AtomicU32, expected: u32) {
+    let _ = spin_briefly(word, expected, LOCK_SPIN);
+}
+
+/// Block on a caller-owned standing post without consuming its landing or
+/// the executor's doorbell. The owner rechecks its shared word before this
+/// call and drains/reposts its NoticeRx afterwards. Never called by a future.
+pub(crate) fn wait_standing(post: crate::transport::ParkPost, timeout: Duration) -> WaitOutcome {
+    STAT_PARKS.fetch_add(1, Ordering::Relaxed);
+    let outcome = imp::park_post(post, Some(timeout));
+    match outcome {
+        WaitOutcome::Woken => {
+            STAT_WOKEN.fetch_add(1, Ordering::Relaxed);
+        }
+        WaitOutcome::TimedOut => {
+            STAT_RODE.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    outcome
+}
+
+/// The star's relay endpoint is also the hubless resident's reverse
+/// completion channel. The publisher must store the completion word first;
+/// a refused/coalesced notice is only a hint and never completion evidence.
+pub(crate) fn notify_resident_completion() -> bool {
+    imp::relay()
 }
 
 /// Wake **one** thread waiting on `word`; `true` if a kick was delivered.
@@ -823,30 +890,15 @@ mod imp {
         let Some(db) = doorbell() else {
             return WaitOutcome::Unsupported;
         };
-        let deadline = match timeout {
-            Some(d) => match crate::clock::uptime() {
-                Ok(now) => Some((now + d).as_nanos()),
-                Err(_) => return WaitOutcome::Unsupported,
-            },
-            None => None,
-        };
-
-        let mut p = SessionBuilder::new();
-        p.park_standing(db.chan, db.land.index() as u16, db.recv_tag);
-        if let Some(at) = deadline {
-            p.wait_sleep(at);
-        }
-        let spec = ParkSpec {
+        let standing = crate::transport::ParkPost {
             chan: db.chan,
             land: db.land,
-            alternate: None,
-            deadline_ns: deadline,
-            irq: false,
+            recv_tag: db.recv_tag,
         };
-        let Ok(committed) = TrapTransport::new().commit_and_park(&p, &spec) else {
+        let Some(status) = park_status(standing, timeout) else {
             return WaitOutcome::Unsupported;
         };
-        match committed.status() {
+        match status {
             // A notice landed. Consume it and re-stand the post *before*
             // returning: `take_notice` deliberately does not clear the
             // landing slot — the next `post_recv` scrubs it kernel-side — so
@@ -868,6 +920,44 @@ mod imp {
             Status::WouldBlock => WaitOutcome::Woken,
             // The recv end was reaped — this thread's wake edge is gone and
             // no future wait can succeed.
+            _ => WaitOutcome::Unsupported,
+        }
+    }
+
+    /// Shared parking transport for the fixed thread doorbell and an affine
+    /// alternate receiver. Only the caller owning the landing may consume it.
+    fn park_status(post: crate::transport::ParkPost, timeout: Option<Duration>) -> Option<Status> {
+        let deadline = match timeout {
+            Some(d) => Some((crate::clock::uptime().ok()? + d).as_nanos()),
+            None => None,
+        };
+        let mut p = SessionBuilder::new();
+        p.park_standing(post.chan, post.land.index() as u16, post.recv_tag);
+        if let Some(at) = deadline {
+            p.wait_sleep(at);
+        }
+        let spec = ParkSpec {
+            chan: post.chan,
+            land: post.land,
+            alternate: None,
+            deadline_ns: deadline,
+            irq: false,
+        };
+        Some(
+            TrapTransport::new()
+                .commit_and_park(&p, &spec)
+                .ok()?
+                .status(),
+        )
+    }
+
+    pub(super) fn park_post(
+        post: crate::transport::ParkPost,
+        timeout: Option<Duration>,
+    ) -> WaitOutcome {
+        match park_status(post, timeout) {
+            Some(Status::Ok | Status::WouldBlock) => WaitOutcome::Woken,
+            Some(Status::Deadline) => WaitOutcome::TimedOut,
             _ => WaitOutcome::Unsupported,
         }
     }
@@ -937,6 +1027,13 @@ mod imp {
         super::WaitOutcome::Unsupported
     }
 
+    pub(super) fn park_post(
+        _post: crate::transport::ParkPost,
+        _timeout: Option<core::time::Duration>,
+    ) -> super::WaitOutcome {
+        super::WaitOutcome::Unsupported
+    }
+
     pub(super) fn kick(_index: usize) -> bool {
         false
     }
@@ -957,6 +1054,57 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn jitter_window_is_time_bounded_without_a_monitor() {
+        use core::cell::Cell;
+        let time = Cell::new(0u64);
+        let pauses = Cell::new(0u32);
+        let word = AtomicU32::new(1);
+        let out = spin_briefly_with(
+            &word,
+            1,
+            BARRIER_SPIN,
+            || Some(time.get()),
+            |_| {
+                time.set(time.get() + 1_000);
+                pauses.set(pauses.get() + 1);
+                if pauses.get() == 16 {
+                    word.store(2, Ordering::SeqCst);
+                }
+            },
+        );
+        assert_eq!(out, Some(WaitOutcome::Retry));
+        assert_eq!(pauses.get(), 16); // beyond the former eight-hint fallback
+        let word = AtomicU32::new(1);
+        time.set(0);
+        let out = spin_briefly_with(
+            &word,
+            1,
+            LOCK_SPIN,
+            || Some(time.get()),
+            |cap| {
+                assert!(cap <= LOCK_SPIN.cap);
+                time.set(time.get() + 1_000);
+            },
+        );
+        assert_eq!(out, None);
+        assert_eq!(time.get(), 4_000);
+        let reads = Cell::new(0);
+        assert_eq!(
+            spin_briefly_with(
+                &word,
+                1,
+                LOCK_SPIN,
+                || {
+                    reads.set(reads.get() + 1);
+                    (reads.get() == 1).then_some(0)
+                },
+                |_| panic!("lost clock must end the wait")
+            ),
+            None
+        );
+    }
+
     use super::*;
 
     /// Clear **one thread's** row.

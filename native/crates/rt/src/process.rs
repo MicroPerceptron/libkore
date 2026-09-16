@@ -408,6 +408,17 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
         self.peer.begin_drain()
     }
 
+    /// Arm a stream whose child output kick was wired to the owner's shared
+    /// executor doorbell. The owner must drain every such stream on each wake.
+    /// False requests another drain before parking; the sequence/flag fence
+    /// covers publication racing this registration. No alternate post is used.
+    pub fn arm_shared_doorbell(&self, drain: ProcessStdioDrain) -> bool {
+        assert!(core::ptr::eq(drain.source, self.peer.observed));
+        self.peer.waiting.store(1, Ordering::SeqCst);
+        self.peer.observed.load(Ordering::SeqCst) == drain.sequence
+            && self.output.outstanding() == 0
+    }
+
     /// Enqueue one canonical-input record and notify the child. [`Full`]
     /// alone means nothing was published.
     pub async fn try_send_stdin(
@@ -1054,6 +1065,37 @@ mod tests {
             init_stdio(&mut oversized.0[1..]),
             Err(RingError::Misaligned)
         ));
+    }
+
+    #[test]
+    fn shared_doorbell_covers_both_sides_of_registration_and_coalesces() {
+        let transport = OkTransport::new();
+        let mut page = Page::zeroed();
+        let (mut parent, mut child) = split_stdio(&mut page.0, &transport, &transport).unwrap();
+        let before_publish = parent.begin_drain();
+        drive(child.try_send_output(ProcessOutputEvent::stdout(b"a").unwrap())).unwrap();
+        assert!(!parent.arm_shared_doorbell(before_publish));
+        drive(parent.try_recv_output()).unwrap();
+        assert!(parent.arm_shared_doorbell(parent.begin_drain()));
+        assert_eq!(
+            drive(child.try_send_output(ProcessOutputEvent::stdout(b"b").unwrap())).unwrap(),
+            ProcessStdioWake::Delivered
+        );
+        assert_eq!(
+            drive(child.try_send_output(ProcessOutputEvent::stdout(b"c").unwrap())).unwrap(),
+            ProcessStdioWake::PeerNotWaiting
+        );
+        let drain = parent.begin_drain();
+        assert!(!parent.arm_shared_doorbell(drain));
+        assert_eq!(
+            drive(parent.try_recv_output()).unwrap().0.bytes().unwrap(),
+            b"b"
+        );
+        assert_eq!(
+            drive(parent.try_recv_output()).unwrap().0.bytes().unwrap(),
+            b"c"
+        );
+        assert!(parent.arm_shared_doorbell(parent.begin_drain()));
     }
 
     #[test]

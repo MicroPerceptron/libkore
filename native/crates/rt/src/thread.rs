@@ -1659,23 +1659,6 @@ extern "C" fn thread_start(page: *const u8, start: *const ThreadStart) -> ! {
     exit(ExitCode::OK)
 }
 
-/// **End the calling thread** with `code` — the kernel exit verb, over
-/// the thread's own `role::SELF` handle.
-///
-/// The status must be a standard [`ExitCode`] or a named application-reserved
-/// slot. There is no conversion from an arbitrary integer.
-///
-/// Does not return, and no code of this thread runs after the commit: the
-/// kernel marks the exit, wakes every joiner, and parks the task with
-/// nothing that can ever re-admit it.  The thread's memory stays mapped
-/// until someone [`join`]s it (or revokes its handle) — that is what lets
-/// a joiner arriving afterwards still read the status.
-///
-/// A thread that cannot present a SELF handle — thread 0, whose founding
-/// is the founder's rather than [`spawn`]'s — [`refuse`]s instead: an
-/// honest wedge rather than a silent fall-through.
-///
-/// [`refuse`]: crate::entry::refuse
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExitCommitAction {
     Retry,
@@ -1696,42 +1679,69 @@ fn exit_commit_action(committed: kore_abi::session::Committed) -> ExitCommitActi
     }
 }
 
+/// Commit one exit attempt in its own frame. The ordinary builder is sized
+/// for a full batch; keeping it out of the retry loop releases that storage
+/// before a WouldBlock sleep builds another session. Inlining both builders
+/// into `exit` consumed 18 KiB in the installed PTL input service.
+#[cfg(target_os = "none")]
+#[inline(never)]
+fn exit_attempt(
+    slot: kore_abi::session::SlotRef,
+    code: ExitCode,
+) -> Result<kore_abi::session::Committed, crate::transport::TrapUnavailable> {
+    let mut b = SessionBuilder::new();
+    b.exit(slot, code)
+        .map_err(|_| crate::transport::TrapUnavailable)?;
+    TrapTransport::new().commit_now(&b)
+}
+
+/// Keep the sleep descriptor out of both the terminal caller and the exit
+/// attempt. Its frame is reused after the unsuccessful exit commit returned.
+#[cfg(target_os = "none")]
+#[inline(never)]
+fn exit_backoff() {
+    if let Some(word) = crate::cap::verbs::sleep_until(1) {
+        let now_ms = word >> 32;
+        let _ = crate::cap::verbs::sleep_until((now_ms + 1) * 1_000_000);
+    }
+}
+
+/// **End the calling thread** with `code` — the kernel exit verb, over
+/// the thread's own `role::SELF` handle.
+///
+/// The status must be a standard [`ExitCode`] or a named application-reserved
+/// slot declared through [`exit_codes!`](crate::exit_codes). There is no
+/// conversion from an arbitrary integer.
+///
+/// Does not return, and no code of this thread runs after the commit: the
+/// kernel marks the exit, wakes every joiner, and parks the task with
+/// nothing that can ever re-admit it.  The thread's memory stays mapped
+/// until someone [`join`]s it (or revokes its handle) — that is what lets
+/// a joiner arriving afterwards still read the status.
+///
+/// A context that cannot present its own SELF handle [`refuse`]s instead;
+/// a fully founded task, including thread zero, receives that authority.
+///
+/// [`refuse`]: crate::entry::refuse
 #[cfg(target_os = "none")]
 pub fn exit(code: ExitCode) -> ! {
-    use crate::session::SessionBuilder;
-    use crate::transport::{Transport, TrapTransport};
-
     let Some(rt) = crate::entry::thread_context() else {
         crate::entry::refuse();
     };
     let Some(slot) = rt.bootstrap().handle(role::SELF, 0) else {
         crate::entry::refuse();
     };
-    let transport = TrapTransport::new();
     loop {
-        // A `Conflict` applied nothing and must re-run prepare against the
-        // now-monotone retired set. Rebuild even this one-op descriptor so
-        // that the retry boundary is the complete prepare+commit attempt.
-        let mut b = SessionBuilder::new();
-        if b.exit(slot, code).is_err() {
-            crate::entry::refuse();
-        }
-        let Ok(committed) = transport.commit_now(&b) else {
+        // Each OCC retry rebuilds a complete descriptor. The previous
+        // attempt's builder no longer occupies this worker's stack.
+        let Ok(committed) = exit_attempt(slot, code) else {
             crate::entry::refuse();
         };
-        // The commit does not return on success. `Conflict` is the session
-        // engine's explicit OCC retry and cannot safely detour through a
-        // second session first. `WouldBlock` is the task-boundary transient
-        // and retains its paced retry. Every other refusal is terminal, and a
-        // thread that could not end must not fall off its entry frame.
+        // Success never returns. Conflict retries immediately; WouldBlock
+        // retains the existing paced retry. Other outcomes stay terminal.
         match exit_commit_action(committed) {
             ExitCommitAction::Retry => continue,
-            ExitCommitAction::Backoff => {
-                if let Some(word) = crate::cap::verbs::sleep_until(1) {
-                    let now_ms = word >> 32;
-                    let _ = crate::cap::verbs::sleep_until((now_ms + 1) * 1_000_000);
-                }
-            }
+            ExitCommitAction::Backoff => exit_backoff(),
             ExitCommitAction::Refuse => crate::entry::refuse(),
         }
     }

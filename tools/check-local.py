@@ -33,7 +33,7 @@ def check(tree: Path):
         files = subprocess.check_output(
             ["git", "ls-files", "-c", "-o", "--exclude-standard", "-z", "--",
              "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md", "LICENSE",
-             ".cargo", "src", "docs", "tests/consumer", "native", "crates/ffi", "extern"], cwd=ROOT,
+             ".cargo", "src", "docs", "tests/consumer", "native", "crates/ffi", "crates/entry", "extern"], cwd=ROOT,
         ).decode().split("\0")
         for name in sorted(set(files)):
             if not name or not (ROOT / name).is_file():
@@ -51,6 +51,7 @@ def check(tree: Path):
         dependencies = {
             "sdk": {"package": "kore-std", "git": source, "rev": revision},
             "ffi": {"package": "kore-ffi", "git": source, "rev": revision},
+            "entry": {"package": "kore-entry", "git": source, "rev": revision},
             "kore-abi": {"path": str(tree / "crates/abi")},
             "kore-rt": {"path": str(tree / "crates/rt"), "default-features": False},
             "kore-dagfs": {"path": str(tree / "crates/dagfs"), "features": ["runtime"]},
@@ -62,8 +63,12 @@ def check(tree: Path):
         (work / "Cargo.toml").write_text(manifest)
         (work / "Cargo.lock").write_bytes((ROOT / "Cargo.lock").read_bytes())
         (work / "src/lib.rs").write_text('''
+pub fn crash_identity(record: kore_abi::crash::CrashRecord) -> sdk::crash::CrashRecord { record }
+pub fn task_identity(id: kore_abi::task::TaskIdentity) -> sdk::abi::task::TaskIdentity { id }
 pub fn abi_identity(slot: kore_abi::session::SlotRef) -> sdk::abi::session::SlotRef { slot }
 pub fn runtime_identity(rt: kore_rt::entry::Rt) -> sdk::runtime::entry::Rt { rt }
+pub fn entry_runtime_identity(rt: kore_rt::entry::Rt) -> entry::runtime::entry::Rt { rt }
+pub fn entry_exit_identity(code: kore_rt::ExitCode) -> entry::startup::ExitCode { code }
 pub fn fs_identity<'w, 't>(fs: kore_dagfs::Fs<'w, 't>) -> sdk::fs::Fs<'w, 't> { fs }
 pub fn view_identity(view: kore_dagfs::View) -> sdk::fs::View { view }
 pub fn foreign_task_tokens(batch: &mut ffi::KoreTaskBatch, slot: usize) -> Option<kore_rt::executor::SpawnToken> { batch.take(slot) }

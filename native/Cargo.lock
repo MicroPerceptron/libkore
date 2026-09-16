@@ -305,6 +305,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-start"
+version = "0.1.0"
+dependencies = [
+ "kore-rt",
+]
+
+[[package]]
 name = "kore-svc-extract"
 version = "0.0.1"
 dependencies = [
