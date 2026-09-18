@@ -426,13 +426,14 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
     DESKTOP_BOOTSTRAP_WINDOW_SLOTS + 2 * DESKTOP_CONTROLLER_CAPACITY;
 
 /// Live immutable image-generation peers the boot catalogue can hold at once:
-/// the 33-row bootstrap catalogue — the desktop's `editor` and `power-ui`
-/// beside the two native filesystem verbs `append` and `sync` — plus the
-/// shell, the graphical terminal, and three extraction parsers.  Named
+/// the 34-row bootstrap catalogue — the desktop's `editor` and `power-ui`
+/// beside the two native filesystem verbs `append` and `sync`, and
+/// `wasm-witness` — plus the shell, the graphical terminal, and three
+/// extraction parsers.  Named
 /// separately from the interactive reservation below because the two grow for
 /// unrelated reasons: this one when a row joins the catalogue, that one when
 /// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 38;
+pub const BOOTSTRAP_IMAGE_PEERS: usize = 39;
 
 /// Bootstrap face-supply sizing. Image and runtime grow their face tables and
 /// rings on demand; this reserves enough initial memory for the boot catalogue
@@ -539,6 +540,17 @@ pub mod geom {
     /// spawned threads, where a BAR map then refuses fail-closed.  Fills the
     /// entry the v4 [`SURFACES`](Self::SURFACES) widening left spare (GEOM_ABI v5).
     pub const DEVICE: u16 = 9;
+    /// The task's **heap window** (GEOM_ABI v7) — where the process heap maps
+    /// the granules it carves off its own `role::HEAP` supply, at addresses it
+    /// places itself. The [`DEVICE`](Self::DEVICE) lesson for the heap: growth
+    /// on the receiver-map cursor spent the one 16 MiB stride every view on
+    /// that thread shares, so no heap could map more than 16 MiB however large
+    /// its supply (window launches refused larger heaps outright). Address
+    /// space, not authority — a reservation with no backing, mapped only by
+    /// leases the task already holds; task-level and stamped for founded
+    /// tasks, absent for spawned threads, whose growth stays on their stride
+    /// because their holdings die with them.
+    pub const HEAP: u16 = 10;
 }
 
 /// One startup handle: a delegated capability tagged by [`role`] (+ an instance
@@ -743,20 +755,22 @@ impl Default for BootBlock {
 /// pool window (#578 slice 3) — stamped only for a row endowing
 /// [`role::SURFACE_POOL`].  v5 names the tenth (previously spare) entry: the
 /// task-level [`geom::DEVICE`] BAR window — stamped only for a row that claims
-/// a PCI function with a large BAR (the NPU's 16 MiB BAR0).
-pub const GEOM_ABI: u16 = 6;
+/// a PCI function with a large BAR (the NPU's 16 MiB BAR0).  v7 widens the
+/// table (10 → 12) and adds the task-level [`geom::HEAP`] window, leaving one
+/// entry spare as v4 did.
+pub const GEOM_ABI: u16 = 7;
 
 /// Window capacity of a [`GeomBlock`] — design-bounded like the handle table.
 /// A task learns at most a handful of founder-mapped windows (scratch, slots,
 /// map cursor, heap, ring); the v4 widening added a tenth entry, now named by
-/// [`geom::DEVICE`] (v5) — the table is full.
-pub const MAX_GEOM_WINDOWS: usize = 10;
-// Ten founder entries are now stampable (SCRATCH, SLOTS, MAP, LINK,
+/// [`geom::DEVICE`] (v5), and v7 widened to twelve for [`geom::HEAP`].
+pub const MAX_GEOM_WINDOWS: usize = 12;
+// Eleven founder entries are now stampable (SCRATCH, SLOTS, MAP, LINK,
 // THREAD_BLOCK, APERTURE, TRANSIENT, SLOTS_EXT, SURFACES — display row only —
-// and DEVICE — device-claiming rows only); the table is full.  An eleventh
-// window needs a `MAX_GEOM_WINDOWS` bump (a wire change, the GEOM_ABI v4/v5
-// precedent).
-const _: () = assert!(10 <= MAX_GEOM_WINDOWS);
+// DEVICE — device-claiming rows only — and HEAP); one entry is spare.  A
+// thirteenth window needs a `MAX_GEOM_WINDOWS` bump (a wire change, the
+// GEOM_ABI v4/v7 precedent).
+const _: () = assert!(11 <= MAX_GEOM_WINDOWS);
 
 /// One geometry window: a `(va, len)` the founder mapped, tagged by [`geom`]
 /// role (+ an `index` so a task could hold several of one kind).  24 bytes,
@@ -1574,7 +1588,7 @@ const _: () = {
     assert!(crate::session::MAX_FOUND_DELIVERIES <= u16::MAX as usize);
     assert!(size_of::<SpawnReq>() == 24);
     assert!(size_of::<GeomEntry>() == 24);
-    assert!(size_of::<GeomBlock>() == 8 + 24 * MAX_GEOM_WINDOWS); // 200
+    assert!(size_of::<GeomBlock>() == 8 + 24 * MAX_GEOM_WINDOWS); // 296
 };
 
 #[cfg(test)]

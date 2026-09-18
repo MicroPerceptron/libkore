@@ -1321,6 +1321,32 @@ impl FabricRegistrationToken {
         verbs::open_fabric_route(self.owned.slot(), request)
     }
 
+    /// The common route in one call: describe this registration, build the
+    /// self-route over its first `bytes`, and open it.  Every native DMA
+    /// window and the init witness used to spell this as describe + a
+    /// twelve-field literal + open; the order is now the type's.
+    pub fn open_self_route(
+        &self,
+        bytes: u64,
+        op: kore_abi::session::FabricOp,
+        access: kore_abi::session::FabricAccess,
+        sync: kore_abi::session::FabricSync,
+    ) -> Result<FabricRouteToken, verbs::FabricRouteFault> {
+        let facts = self.describe().map_err(|fault| match fault {
+            verbs::FabricRegistrationFault::Slot => verbs::FabricRouteFault::Slot,
+            verbs::FabricRegistrationFault::Build => verbs::FabricRouteFault::Build,
+            verbs::FabricRegistrationFault::Commit(status) => {
+                verbs::FabricRouteFault::Commit(status)
+            }
+            verbs::FabricRegistrationFault::MalformedReport => {
+                verbs::FabricRouteFault::MalformedReport
+            }
+        })?;
+        let request =
+            kore_abi::session::FabricRouteReq::self_route(&facts, bytes, op, access, sync);
+        self.open_route(&request)
+    }
+
     /// Explicitly retire registration before its owning DMA window.
     /// A refusal returns the token for containment instead of discarding it.
     pub fn try_retire(self) -> Result<RetireOutcome, Self> {

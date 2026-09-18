@@ -93,6 +93,7 @@ pub mod entry;
 pub mod event;
 pub mod executor;
 pub mod exit;
+pub mod fiber_stack;
 pub mod futex;
 #[cfg(feature = "heap")]
 pub mod heap;
@@ -100,6 +101,7 @@ pub mod hint;
 pub mod lane;
 pub mod mem_source;
 pub mod pace;
+pub mod pinned;
 pub mod process;
 pub mod random;
 pub mod room;
@@ -132,6 +134,7 @@ pub use executor::{
 pub use exit::ExitCode;
 #[cfg(feature = "heap")]
 pub use heap::Heap;
+pub use pinned::Pinned;
 pub use service::SystemService;
 pub use session::SessionBuilder;
 pub use spmd::{Spmd, SpmdCtx, SpmdEntry, spawn_spmd};

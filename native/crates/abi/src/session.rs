@@ -1890,10 +1890,16 @@ impl ShareReq {
 /// mapping: the task must hold the view and the founder must stamp the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMapWindow {
-    /// Ordinary small views and heap growth, bounded to this thread's stride.
+    /// Ordinary small views, bounded to this thread's stride — and heap
+    /// growth on a thread without a [`Heap`](Self::Heap) window.
     Map,
     /// Large compositor-owned surfaces, separate from that heap stride.
     Surfaces,
+    /// The task's heap window (`geom::HEAP`, GEOM_ABI v7): where the process
+    /// heap maps the carves it takes off its own supply, a monotone cursor
+    /// like [`Map`](Self::Map)'s but task-level and off the per-thread stride
+    /// every view shares. Stamped for founded tasks only.
+    Heap,
 }
 
 /// One of the two fixed, reusable halves of a task's `SURFACES` window.
@@ -1926,6 +1932,7 @@ impl ViewMapWindow {
         match self {
             Self::Map => crate::task::geom::MAP,
             Self::Surfaces => crate::task::geom::SURFACES,
+            Self::Heap => crate::task::geom::HEAP,
         }
     }
 }
@@ -1952,6 +1959,7 @@ impl ViewMapReq {
         }
         match self.window.get() {
             crate::task::geom::MAP if self.lane == 0 => Some(ViewMapWindow::Map),
+            crate::task::geom::HEAP if self.lane == 0 => Some(ViewMapWindow::Heap),
             crate::task::geom::SURFACES if SurfaceMapLane::from_wire(self.lane).is_some() => {
                 Some(ViewMapWindow::Surfaces)
             }
@@ -2682,6 +2690,128 @@ pub enum SystemMetric {
     /// deadline-shaped stalls acquits the timer; a growing one convicts it.
     /// Architectures without a counted arm report zeros.
     TimerArms = 19,
+    /// One physical frame-size class of the boot partition
+    /// (`res/ACCEL_MEMORY_SCALE.md` §1): the operand is the class
+    /// (0 = 4 KiB base, 1 = 2 MiB, 2 = 1 GiB), and the pair is
+    /// [`MemoryClassCensus::to_observation`] — bytes carved into the class,
+    /// bytes still free in it, and requests the class could not serve from
+    /// its own ledger.  An operand past 2 refuses.
+    MemoryClass = 20,
+    /// The boot-time DRAM stream measurement (`res/RESIDENCY.md` §8 row
+    /// 1), three views by operand range: `0..MEMORY_STREAM_CLASS_BASE` one
+    /// node per index in measurement order (0 is the first node measured,
+    /// which on a UMA machine is the only one; `slot` = node slot, HMAT
+    /// beside it); `MEMORY_STREAM_CLASS_BASE + class` one CPU of that core
+    /// class alone (`slot` = the CPU that ran it); `MEMORY_STREAM_AGGREGATE`
+    /// every CPU at once (`slot` = how many).
+    /// [`MemoryStreamSample::to_observation`].  An operand with no sample
+    /// answers all-zero rather than refusing, so a reader can walk a range.
+    MemoryStream = 21,
+}
+
+/// The three physical frame-size classes, as the census operand names them.
+pub const MEMORY_CLASS_COUNT: u16 = 3;
+/// [`SystemMetric::MemoryStream`] operands at and above this name a core
+/// class (`CoreClass` discriminant 0..=3) measured alone.
+pub const MEMORY_STREAM_CLASS_BASE: u16 = 64;
+/// Core classes the stream metric distinguishes.
+pub const MEMORY_STREAM_CLASSES: u16 = 4;
+/// The [`SystemMetric::MemoryStream`] operand of the all-CPUs measurement.
+pub const MEMORY_STREAM_AGGREGATE: u16 = MEMORY_STREAM_CLASS_BASE + MEMORY_STREAM_CLASSES;
+
+/// Authority-free record of one node's boot DRAM stream measurement
+/// ([`SystemMetric::MemoryStream`]).  A measured rate, never a link ceiling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryStreamSample {
+    /// The Manifold node slot the run was lent from (node view), the CPU
+    /// that ran it (class view), or the CPU count (aggregate view).
+    pub slot: u8,
+    /// One agent's fill rate, bytes per second.
+    pub write_bps: u64,
+    /// One agent's copy rate, bytes copied per second.
+    pub copy_bps: u64,
+    /// HMAT's self-access bandwidth for the node, bytes per second, or `0`.
+    pub hmat_bps: u64,
+}
+
+impl MemoryStreamSample {
+    /// `value` = write rate in `[55:0]` (72 PB/s) with the slot in `[63:56]`;
+    /// `aux` = copy rate in `[39:0]` (1.1 TB/s) and HMAT in MB/s in `[63:40]`.
+    pub const fn to_observation(self) -> (u64, u64) {
+        const RATE: u64 = (1 << 56) - 1;
+        const COPY: u64 = (1 << 40) - 1;
+        let write = if self.write_bps > RATE {
+            RATE
+        } else {
+            self.write_bps
+        };
+        let copy = if self.copy_bps > COPY {
+            COPY
+        } else {
+            self.copy_bps
+        };
+        let hmat = self.hmat_bps / 1_000_000;
+        let hmat = if hmat > (1 << 24) - 1 {
+            (1 << 24) - 1
+        } else {
+            hmat
+        };
+        (write | (self.slot as u64) << 56, copy | hmat << 40)
+    }
+
+    pub const fn from_observation(value: u64, aux: u64) -> Self {
+        Self {
+            slot: (value >> 56) as u8,
+            write_bps: value & ((1 << 56) - 1),
+            copy_bps: aux & ((1 << 40) - 1),
+            hmat_bps: (aux >> 40) * 1_000_000,
+        }
+    }
+
+    /// Whether a measurement is present at all.
+    pub const fn measured(self) -> bool {
+        self.write_bps != 0
+    }
+}
+
+/// Authority-free census of one frame-size class
+/// ([`SystemMetric::MemoryClass`]).  Capacity facts only; it grants nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryClassCensus {
+    /// Bytes carved into the class at boot (free or not).
+    pub carved: u64,
+    /// Bytes free in the class now.
+    pub free: u64,
+    /// Requests of this class served from a finer ledger because the class
+    /// was exhausted — the reservation-miss count the 40/30/30 ruling is
+    /// judged by.
+    pub misses: u64,
+}
+
+impl MemoryClassCensus {
+    /// `value` = carved bytes; `aux` = free bytes in `[47:0]` (256 TiB) and
+    /// misses saturated to 16 bits in `[63:48]`.
+    pub const fn to_observation(self) -> (u64, u64) {
+        let free = if self.free > (1 << 48) - 1 {
+            (1 << 48) - 1
+        } else {
+            self.free
+        };
+        let misses = if self.misses > u16::MAX as u64 {
+            u16::MAX as u64
+        } else {
+            self.misses
+        };
+        (self.carved, free | misses << 48)
+    }
+
+    pub const fn from_observation(value: u64, aux: u64) -> Self {
+        Self {
+            carved: value,
+            free: aux & ((1 << 48) - 1),
+            misses: aux >> 48,
+        }
+    }
 }
 
 /// Authority-free aggregate returned by [`SystemMetric::Fabric`].
@@ -2886,6 +3016,8 @@ impl SystemObserveReq {
                 | SystemMetric::ProcessorTopology
                 | SystemMetric::ProcessorCache
                 | SystemMetric::ProcessorRuntime
+                | SystemMetric::MemoryClass
+                | SystemMetric::MemoryStream
         )
     }
 
@@ -3223,7 +3355,81 @@ pub struct FabricRouteReq {
     pub reserved: [u8; 5],
 }
 
+bitflags! {
+    /// Route access on the wire (`FabricRouteReq::access`,
+    /// `FabricRouteScopeReq::access`): the three bits the kernel's
+    /// `runtime::fabric::FabricAccess` decodes.  At least one data direction
+    /// is required; `EXCLUSIVE` bars every independently admitted alias.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FabricAccess: u8 {
+        const READ      = 1 << 0;
+        const WRITE     = 1 << 1;
+        const EXCLUSIVE = 1 << 2;
+    }
+}
+
+/// The mapping operation a route admits (`FabricRouteReq::operation`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FabricOp {
+    /// A CPU mapping child (`LeasedRegion`).
+    CpuMap = 0,
+    /// A device mapping child (`LeasedIova`); also admits CPU children.
+    IommuMap = 1,
+}
+
+/// The caller's declared visibility state (`FabricRouteReq::synchronization`).
+/// A declaration, never hardware attestation of a producer fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FabricSync {
+    Unfenced = 0,
+    Fenced = 1,
+}
+
 impl FabricRouteReq {
+    /// A route between two described domains over `offset..offset+bytes`
+    /// of the source, carrying both endpoints' captured generations.  The
+    /// twelve-field literal every call site used to spell by hand.
+    pub fn between(
+        src: &FabricDomainReport,
+        dst: &FabricDomainReport,
+        offset: u64,
+        bytes: u64,
+        op: FabricOp,
+        access: FabricAccess,
+        sync: FabricSync,
+    ) -> Self {
+        Self {
+            destination: dst.domain.into(),
+            offset: offset.into(),
+            bytes: bytes.into(),
+            source_reset: src.reset.into(),
+            source_power: src.power.into(),
+            source_allocation: src.allocation.into(),
+            destination_reset: dst.reset.into(),
+            destination_power: dst.power.into(),
+            destination_allocation: dst.allocation.into(),
+            access: access.bits(),
+            operation: op as u8,
+            synchronization: sync as u8,
+            reserved: [0; 5],
+        }
+    }
+
+    /// The common case: a route whose source and destination are the same
+    /// registered domain (host DRAM mapped into a CPU space or a device
+    /// domain), over the first `bytes` of the registration.
+    pub fn self_route(
+        facts: &FabricDomainReport,
+        bytes: u64,
+        op: FabricOp,
+        access: FabricAccess,
+        sync: FabricSync,
+    ) -> Self {
+        Self::between(facts, facts, 0, bytes, op, access, sync)
+    }
+
     pub fn encode(&self) -> [u8; Self::WIRE] {
         let mut bytes = [0u8; Self::WIRE];
         for (i, value) in [self.destination, self.offset, self.bytes]
@@ -3276,6 +3482,16 @@ pub struct FabricRouteScopeReq {
 }
 
 impl FabricRouteScopeReq {
+    /// A page-granular relative range with attenuated access.
+    pub const fn new(offset: u64, bytes: u64, access: FabricAccess) -> Self {
+        Self {
+            offset: U64::new(offset),
+            bytes: U64::new(bytes),
+            access: access.bits(),
+            reserved: [0; 7],
+        }
+    }
+
     pub const WIRE: usize = 24;
     pub fn valid(&self) -> bool {
         self.bytes.get() != 0
@@ -4859,7 +5075,7 @@ mod tests {
 
     #[test]
     fn view_map_request_is_a_closed_window_selector() {
-        for window in [ViewMapWindow::Map, ViewMapWindow::Surfaces] {
+        for window in [ViewMapWindow::Map, ViewMapWindow::Surfaces, ViewMapWindow::Heap] {
             let mut bytes = [0u8; ViewMapReq::WIRE];
             bytes[..2].copy_from_slice(&window.role().to_le_bytes());
             let (req, rest) = ViewMapReq::try_ref_from_prefix(&bytes).unwrap();
@@ -4925,6 +5141,55 @@ mod tests {
     }
 
     #[test]
+    fn memory_class_census_round_trips_and_saturates() {
+        let census = MemoryClassCensus {
+            carved: 6 << 30,
+            free: 5 << 30,
+            misses: 3,
+        };
+        let (value, aux) = census.to_observation();
+        assert_eq!(MemoryClassCensus::from_observation(value, aux), census);
+        let big = MemoryClassCensus {
+            carved: u64::MAX,
+            free: u64::MAX,
+            misses: u64::MAX,
+        };
+        let (value, aux) = big.to_observation();
+        let back = MemoryClassCensus::from_observation(value, aux);
+        assert_eq!(back.carved, u64::MAX);
+        assert_eq!(back.free, (1 << 48) - 1);
+        assert_eq!(back.misses, u64::from(u16::MAX));
+        assert!(SystemObserveReq::takes_operand(SystemMetric::MemoryClass));
+    }
+
+    #[test]
+    fn memory_stream_sample_round_trips_and_saturates() {
+        let sample = MemoryStreamSample {
+            slot: 64,
+            write_bps: 31_400_000_000,
+            copy_bps: 12_900_000_000,
+            hmat_bps: 136_500_000_000,
+        };
+        let (value, aux) = sample.to_observation();
+        assert_eq!(MemoryStreamSample::from_observation(value, aux), sample);
+        assert!(sample.measured());
+        assert!(!MemoryStreamSample::default().measured());
+        let big = MemoryStreamSample {
+            slot: 255,
+            write_bps: u64::MAX,
+            copy_bps: u64::MAX,
+            hmat_bps: u64::MAX,
+        };
+        let (value, aux) = big.to_observation();
+        let back = MemoryStreamSample::from_observation(value, aux);
+        assert_eq!(back.slot, 255);
+        assert_eq!(back.write_bps, (1 << 56) - 1);
+        assert_eq!(back.copy_bps, (1 << 40) - 1);
+        assert_eq!(back.hmat_bps, ((1u64 << 24) - 1) * 1_000_000);
+        assert!(SystemObserveReq::takes_operand(SystemMetric::MemoryStream));
+    }
+
+    #[test]
     fn fabric_route_request_layout_and_refusals() {
         assert_eq!(core::mem::size_of::<FabricRouteReq>(), FabricRouteReq::WIRE);
         let mut bytes = [0u8; FabricRouteReq::WIRE];
@@ -4959,6 +5224,93 @@ mod tests {
         empty = req;
         empty.destination = 0.into();
         assert!(!empty.valid());
+    }
+
+    /// The typed constructors spell exactly the literal the wire expects,
+    /// and every constructor product is valid.
+    #[test]
+    fn fabric_request_constructors_match_the_wire_literal() {
+        let facts = FabricDomainReport {
+            domain: 7,
+            bytes: 1 << 20,
+            owner: 9,
+            reset: 1,
+            power: 2,
+            allocation: 3,
+            cache: 0,
+            coherent: true,
+            needs_fence: false,
+        };
+        let req = FabricRouteReq::self_route(
+            &facts,
+            8192,
+            FabricOp::IommuMap,
+            FabricAccess::all(),
+            FabricSync::Fenced,
+        );
+        assert!(req.valid());
+        let literal = FabricRouteReq {
+            destination: 7.into(),
+            offset: 0.into(),
+            bytes: 8192.into(),
+            source_reset: 1.into(),
+            source_power: 2.into(),
+            source_allocation: 3.into(),
+            destination_reset: 1.into(),
+            destination_power: 2.into(),
+            destination_allocation: 3.into(),
+            access: 7,
+            operation: 1,
+            synchronization: 1,
+            reserved: [0; 5],
+        };
+        assert_eq!(req.encode(), literal.encode());
+        let other = FabricDomainReport {
+            domain: 11,
+            reset: 4,
+            power: 5,
+            allocation: 6,
+            ..facts
+        };
+        let between = FabricRouteReq::between(
+            &facts,
+            &other,
+            4096,
+            4096,
+            FabricOp::CpuMap,
+            FabricAccess::READ,
+            FabricSync::Unfenced,
+        );
+        assert!(between.valid());
+        assert_eq!(between.destination.get(), 11);
+        assert_eq!(between.destination_allocation.get(), 6);
+        assert_eq!(between.source_allocation.get(), 3);
+        assert_eq!(
+            (between.access, between.operation, between.synchronization),
+            (1, 0, 0)
+        );
+        // An exclusive-only access is not a route: the kernel refuses it and
+        // so does `valid`, so a constructor cannot smuggle it in silently.
+        let bad = FabricRouteReq::self_route(
+            &facts,
+            4096,
+            FabricOp::CpuMap,
+            FabricAccess::EXCLUSIVE,
+            FabricSync::Fenced,
+        );
+        assert!(!bad.valid());
+        let scope = FabricRouteScopeReq::new(4096, 8192, FabricAccess::all());
+        assert!(scope.valid());
+        assert_eq!(
+            scope.encode(),
+            FabricRouteScopeReq {
+                offset: 4096.into(),
+                bytes: 8192.into(),
+                access: 7,
+                reserved: [0; 7],
+            }
+            .encode()
+        );
     }
 
     #[test]

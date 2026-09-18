@@ -129,6 +129,17 @@ pub const PROFILE_SYSTEM_POWER: u32 = 1 << 8;
 /// service's pair, issues the two read-only verbs, and stamps the answers
 /// before the child starts — the filesystem snapshot's shape exactly.
 pub const PROFILE_NETWORK: u32 = 1 << 9;
+/// The program hosts an **execution engine** — an interpreter or a loaded
+/// native image — whose working set exceeds the ordinary launch arena.
+///
+/// This names a *class*, not a size: the launcher owns the numbers
+/// (`kore_svc_exec::founder::LaunchPlan`), exactly as it already decides
+/// whether to charge a launch for the trailing heap interval at all from
+/// [`PROFILE_HEAP`]. A bit rather than a per-row byte count because the
+/// profile word already crosses exec's wire, authenticated with the image,
+/// while a new size field would widen the reply record. Meaningful only
+/// beside [`PROFILE_HEAP`]: an engine with no heap has nowhere to run.
+pub const PROFILE_ENGINE: u32 = 1 << 11;
 /// Launch profile: exec provisions one private recyclable accelerator face.
 ///
 /// The bit grants no device authority by itself. Exec admits a fresh service
@@ -148,7 +159,8 @@ pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_WINDOW_CONTROL
     | PROFILE_SYSTEM_POWER
     | PROFILE_NETWORK
-    | PROFILE_ACCELERATOR;
+    | PROFILE_ACCELERATOR
+    | PROFILE_ENGINE;
 
 /// Validate the profile vocabulary and its dependencies: both filesystem
 /// auxiliary endpoint kinds are meaningful only beside an actual FS face.
@@ -156,6 +168,7 @@ pub const fn profile_valid(profile: u32) -> bool {
     profile & !PROFILE_KNOWN == 0
         && (profile & PROFILE_FS_VIEW_BINDER == 0 || profile & PROFILE_FILESYSTEM != 0)
         && (profile & PROFILE_FS_GRANT_TARGET == 0 || profile & PROFILE_FILESYSTEM != 0)
+        && (profile & PROFILE_ENGINE == 0 || profile & PROFILE_HEAP != 0)
 }
 
 /// Segment ceiling per image — up to eight `PT_LOAD`s plus one `PT_TLS`
@@ -817,8 +830,22 @@ pub struct ModulePage {
     pub flags: U16,
     /// Live records.
     pub count: U16,
-    /// Reserved; zero.
-    pub reserved: U16,
+    /// How much of the link window the startup placement consumed, in
+    /// pages counted **down from this page's own address**; `0` means
+    /// *unrecorded* (a page stamped before this field existed, or a world
+    /// that does not report placement).
+    ///
+    /// Exists because [`high_water`](Self::high_water) covers only the
+    /// segments the records name, and the startup stub places more than
+    /// that: the static TLS block is placed into the link window but is
+    /// not a module segment. A TLS-bearing executable therefore had its
+    /// first late placement land exactly on its own TLS block. The unit is
+    /// pages below the page rather than an absolute address because that
+    /// fits the sixteen bits this word already had — the same layout, the
+    /// same [`IMAGE_ABI`], and every existing page reads as unrecorded.
+    /// A link window wider than `u16::MAX` pages refuses at link time
+    /// (`kore_ld::link`), never truncates here.
+    pub placed: U16,
     /// The module table; entries past `count` are zero.
     pub records: [ModuleRecord; MAX_MODULE_RECORDS],
 }
@@ -830,7 +857,7 @@ impl ModulePage {
             abi: U16::new(IMAGE_ABI),
             flags: U16::new(0),
             count: U16::new(0),
-            reserved: U16::new(0),
+            placed: U16::new(0),
             records: [ModuleRecord::vacant(); MAX_MODULE_RECORDS],
         }
     }
@@ -852,9 +879,30 @@ impl ModulePage {
         self.count.get() == 0
     }
 
+    /// Record the startup placement high water: `pages` pages below this
+    /// page's own address. See [`placed`](Self::placed).
+    pub fn record_placed(&mut self, pages: u16) {
+        self.placed = U16::new(pages);
+    }
+
+    /// One past the highest address the startup **placement** reached —
+    /// the TLS block included — given where this page lives
+    /// (`module_page_va`). `None` when unrecorded. A late placer takes
+    /// the larger of this and [`high_water`](Self::high_water); neither
+    /// alone is the floor.
+    pub fn placed_high_water(&self, module_page_va: u64) -> Option<u64> {
+        let pages = u64::from(self.placed.get());
+        if pages == 0 {
+            return None;
+        }
+        module_page_va.checked_sub(pages.checked_mul(MODULE_PAGE_BYTES)?)
+    }
+
     /// One past the highest address any recorded segment occupies,
     /// page-rounded — where a **late** loader (`res/IMAGE.md` §8) may start
-    /// placing: everything the startup stub mapped lies below it.  `None`
+    /// placing, *for the segments the records name*. The startup stub also
+    /// places what no record names (the static TLS block); take the larger
+    /// of this and [`placed_high_water`](Self::placed_high_water).  `None`
     /// for an empty page or on overflow (a lying record is refused, not
     /// clamped).
     pub fn high_water(&self) -> Option<u64> {
@@ -1183,6 +1231,24 @@ mod tests {
             d.segs[0].access = seg::ACCESS_R | seg::ACCESS_X;
             assert!(d.validate(), "kind {k} must validate");
         }
+    }
+
+    /// The placement high water reads back as pages below the page, and a
+    /// page that never recorded one says so rather than answering an
+    /// address a placer would then land on.
+    #[test]
+    fn placed_high_water_reads_back_and_zero_means_unrecorded() {
+        let page_va = 0x5000_0000 + 0x0800_0000 - MODULE_PAGE_BYTES;
+        let mut page = ModulePage::new();
+        assert_eq!(page.placed_high_water(page_va), None);
+        page.record_placed(3);
+        assert_eq!(
+            page.placed_high_water(page_va),
+            Some(page_va - 3 * MODULE_PAGE_BYTES)
+        );
+        // A count that would reach below address zero refuses, not wraps.
+        page.record_placed(u16::MAX);
+        assert_eq!(page.placed_high_water(2 * MODULE_PAGE_BYTES), None);
     }
 
     #[test]

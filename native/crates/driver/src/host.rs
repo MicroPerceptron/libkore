@@ -1409,15 +1409,43 @@ pub struct CapPool {
     imports: Rc<RefCell<Vec<Rc<RefCell<ImportedAllocation>>>>>,
 }
 
+/// What the caller can prove about a window's bytes when it becomes pool
+/// capacity — the proof that lets the pool scrub **once** instead of on
+/// every allocation (`res/ACCEL_MEMORY_SCALE.md` §2.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolBytes {
+    /// Every byte is zero and nothing has written the window since the
+    /// kernel's fresh-DRAM scrub: a founder-delivered DMA pool on its first
+    /// window.  Pages are handed out without a second pass and are zeroed
+    /// only after a quiescent release dirties them.
+    Scrubbed,
+    /// Anything else — a client-provisioned supply the client may have
+    /// written, a test buffer, a re-founded row over prior memory.  Every
+    /// page is zeroed on its first allocation, exactly the old behaviour.
+    Unknown,
+}
+
 struct PoolRegion {
     cpu: *mut u8,
     iova: u64,
     len: u64,
+    /// Set = free.
     frames: Rc<AtomicBitVec<dyn Allocator>>,
+    /// Set = the page may hold stale bytes and must be zeroed before it is
+    /// handed out.  Cleared by allocation (the pool just zeroed it), set by
+    /// quiescent release (the device or CPU wrote it).  Never set for a page
+    /// that is currently allocated: its bit is irrelevant until release.
+    dirty: AtomicBitVec<dyn Allocator>,
 }
 
 impl PoolRegion {
-    fn new(cpu: *mut u8, iova: u64, len: u64, allocator: &'static dyn Allocator) -> Option<Self> {
+    fn new(
+        cpu: *mut u8,
+        iova: u64,
+        len: u64,
+        bytes: PoolBytes,
+        allocator: &'static dyn Allocator,
+    ) -> Option<Self> {
         if cpu.is_null()
             || iova % PAGE != 0
             || (cpu as usize as u64) % PAGE != 0
@@ -1431,12 +1459,58 @@ impl PoolRegion {
         let pages = usize::try_from(len / PAGE).ok()?;
         let frames = AtomicBitVec::try_new_in(pages, allocator).ok()?;
         frames.release_run(0, pages);
+        let dirty = AtomicBitVec::try_new_in(pages, allocator).ok()?;
+        if bytes == PoolBytes::Unknown {
+            dirty.release_run(0, pages);
+        }
         Some(Self {
             cpu,
             iova,
             len,
             frames: Rc::try_new(frames).ok()?,
+            dirty,
         })
+    }
+
+    /// Zero every dirty page in `[first, first + pages)` — one `write_bytes`
+    /// per contiguous dirty run, nothing for a clean run — then mark the run
+    /// clean.  The allocation-time half of the scrub-once contract.
+    ///
+    /// # Safety
+    /// The run must be claimed by the caller (exclusive) and inside the window.
+    unsafe fn scrub_dirty(&self, first: usize, pages: usize) {
+        let end = first + pages;
+        let mut cursor = first;
+        while cursor < end {
+            let Some(run_start) = self.dirty.find_first_set_from(cursor) else {
+                break;
+            };
+            if run_start >= end {
+                break;
+            }
+            let run_end = self
+                .dirty
+                .find_first_clear_from(run_start)
+                .unwrap_or(end)
+                .min(end);
+            let bytes = (run_end - run_start) * PAGE as usize;
+            // SAFETY: per the caller's contract the pages are exclusively
+            // claimed and inside the live window.
+            unsafe {
+                core::ptr::write_bytes(self.cpu.add(run_start * PAGE as usize), 0, bytes);
+            }
+            for page in run_start..run_end {
+                self.dirty.clear(page);
+            }
+            cursor = run_end;
+        }
+    }
+
+    /// A quiescent release: the pages return to the free map **and** are
+    /// marked dirty, so the next allocation of any of them scrubs first.
+    fn release_dirty(&self, first: usize, pages: usize) {
+        self.dirty.release_run(first, pages);
+        self.frames.release_run(first, pages);
     }
 
     fn allocate(&self, bytes: usize, alignment: usize) -> Option<CapBuf> {
@@ -1462,10 +1536,11 @@ impl PoolRegion {
             let first_frame = usize::try_from(off / PAGE).ok()?;
             if self.frames.try_claim_run(first_frame, pages).is_ok() {
                 // SAFETY: the claimed extent is exclusive and within the live
-                // window. Reused allocations must satisfy DmaPool's zeroing
-                // contract just like their first allocation.
+                // window.  `DmaPool::alloc`'s zeroing contract holds for
+                // first and reused allocations alike: only pages that were
+                // dirtied since their last scrub are written (§2.2 scrub-once).
                 let cpu = unsafe { self.cpu.add(off as usize) };
-                unsafe { core::ptr::write_bytes(cpu, 0, size as usize) };
+                unsafe { self.scrub_dirty(first_frame, pages) };
                 return Some(CapBuf {
                     cpu,
                     iova: IovaAddr(aligned),
@@ -1482,8 +1557,14 @@ impl PoolRegion {
 }
 
 impl CapPool {
-    fn new(cpu: *mut u8, iova: u64, len: u64, allocator: &'static dyn Allocator) -> Option<Self> {
-        let region = PoolRegion::new(cpu, iova, len, allocator)?;
+    fn new(
+        cpu: *mut u8,
+        iova: u64,
+        len: u64,
+        bytes: PoolBytes,
+        allocator: &'static dyn Allocator,
+    ) -> Option<Self> {
+        let region = PoolRegion::new(cpu, iova, len, bytes, allocator)?;
         let mut regions = Vec::new();
         regions.try_reserve(1).ok()?;
         regions.push(region);
@@ -1550,9 +1631,7 @@ impl DmaPool for CapPool {
                 else {
                     return Err(DmaReleaseFailure::Refused(buffer));
                 };
-                region
-                    .frames
-                    .release_run(*first_frame, buffer.len / PAGE as usize);
+                region.release_dirty(*first_frame, buffer.len / PAGE as usize);
                 Ok(())
             }
             CapBacking::Imported(owner) => {
@@ -2157,10 +2236,13 @@ impl DeviceResources<DmaActive> {
         // remains in the containment graph, even though no allocator can use it.
         dma.extensions.push((window, parent));
         let (window, _) = dma.extensions.last_mut().unwrap();
+        // A client-provisioned supply: the client held a writable view before
+        // publishing it, so nothing proves its bytes.  Scrub on first use.
         let region = PoolRegion::new(
             window.cpu(),
             window.iova(),
             window.len(),
+            PoolBytes::Unknown,
             &alloc::alloc::Global,
         )
         .ok_or(IntakeError::DmaUnavailable)?;
@@ -3062,10 +3144,14 @@ fn realize_host_resources<B: DeviceBinding>(
     let (window, pool) = device
         .dma_window(pool, len, DMA_IOVA_BASE)
         .map_err(|fault| IntakeError::DmaMap { code: fault.code() })?;
+    // The founder-delivered pool on its first window: minted fresh for this
+    // row by the kernel (`Mem::derive_zeroed_dram`) and unwritten since — the
+    // one place the scrub-once proof holds without a second pass.
     let cap_pool = CapPool::new(
         window.cpu(),
         window.iova(),
         window.len(),
+        PoolBytes::Scrubbed,
         &alloc::alloc::Global,
     )
     .ok_or(IntakeError::DmaUnavailable)?;
@@ -3157,7 +3243,14 @@ mod tests {
         let mut backing = Backing([0; 8192]);
         static CLAIMS: test_arena::TestArena<4096> = test_arena::TestArena::new();
         let arena = test_arena::TestArena::<4096>::new();
-        let pool = CapPool::new(backing.0.as_mut_ptr(), DMA_IOVA_BASE, 8192, &CLAIMS).unwrap();
+        let pool = CapPool::new(
+            backing.0.as_mut_ptr(),
+            DMA_IOVA_BASE,
+            8192,
+            PoolBytes::Unknown,
+            &CLAIMS,
+        )
+        .unwrap();
         let loan = pool.alloc(4096).unwrap();
         let sibling = pool.alloc(4096).unwrap();
         let address = loan.iova();
@@ -3527,13 +3620,90 @@ mod tests {
         let cpu = unsafe { alloc_zeroed(layout) };
         assert!(!cpu.is_null());
         static ARENA: test_arena::TestArena<4096> = test_arena::TestArena::new();
-        let pool = CapPool::new(cpu, DMA_IOVA_BASE, layout.size() as u64, &ARENA).unwrap();
+        let pool = CapPool::new(
+            cpu,
+            DMA_IOVA_BASE,
+            layout.size() as u64,
+            PoolBytes::Unknown,
+            &ARENA,
+        )
+        .unwrap();
         let first = pool.alloc(4096).unwrap();
         let aligned = pool.alloc_aligned(4096, 8192).unwrap();
         assert_eq!(first.iova().0, DMA_IOVA_BASE);
         assert_eq!(aligned.iova().0 & 0x1fff, 0);
         assert_eq!(aligned.cpu() as usize & 0x1fff, 0);
         drop((first, aligned, pool));
+        // SAFETY: `cpu` came from this exact layout and no view is live now.
+        unsafe { dealloc(cpu, layout) };
+    }
+
+    /// Scrub-once: a `Scrubbed` window is handed out without a second pass
+    /// (the caller's proof is the contract — the pattern survives), a page
+    /// released quiescent is dirty and is zeroed on its next allocation, and
+    /// an `Unknown` window over the same pattern is zeroed on first use.
+    #[test]
+    fn cap_pool_scrubs_once_per_dirtying_not_per_allocation() {
+        use alloc::alloc::{Layout, alloc, dealloc};
+        static ARENA: test_arena::TestArena<4096> = test_arena::TestArena::new();
+        let layout = Layout::from_size_align(4 * 4096, 4096).unwrap();
+        // SAFETY: the window is retained until all test views are dead.
+        let cpu = unsafe { alloc(layout) };
+        assert!(!cpu.is_null());
+        // SAFETY: exclusively ours; the pattern stands in for "prior bytes".
+        unsafe { core::ptr::write_bytes(cpu, 0xa5, layout.size()) };
+
+        let pool = CapPool::new(
+            cpu,
+            DMA_IOVA_BASE,
+            layout.size() as u64,
+            PoolBytes::Scrubbed,
+            &ARENA,
+        )
+        .unwrap();
+        let a = pool.alloc(8192).unwrap();
+        // SAFETY: a live, exclusively held pool view.
+        let seen = unsafe { core::slice::from_raw_parts(a.cpu(), a.len()) };
+        assert!(
+            seen.iter().all(|&b| b == 0xa5),
+            "a Scrubbed window takes no second pass"
+        );
+        let first = a.iova();
+        // SAFETY: nothing but this test names the buffer; release dirties it.
+        assert!(unsafe { pool.release_quiesced(a) }.is_ok());
+        let b = pool.alloc(8192).unwrap();
+        assert_eq!(b.iova(), first, "same pages come back");
+        // SAFETY: as above.
+        let seen = unsafe { core::slice::from_raw_parts(b.cpu(), b.len()) };
+        assert!(
+            seen.iter().all(|&x| x == 0),
+            "released pages are scrubbed on reuse"
+        );
+        // The untouched tail is still pristine and still not rewritten.
+        let c = pool.alloc(4096).unwrap();
+        // SAFETY: as above.
+        let seen = unsafe { core::slice::from_raw_parts(c.cpu(), c.len()) };
+        assert!(seen.iter().all(|&x| x == 0xa5));
+        drop((b, c, pool));
+
+        // SAFETY: re-pattern the window for the Unknown half.
+        unsafe { core::ptr::write_bytes(cpu, 0xa5, layout.size()) };
+        let pool = CapPool::new(
+            cpu,
+            DMA_IOVA_BASE,
+            layout.size() as u64,
+            PoolBytes::Unknown,
+            &ARENA,
+        )
+        .unwrap();
+        let d = pool.alloc(4 * 4096).unwrap();
+        // SAFETY: as above.
+        let seen = unsafe { core::slice::from_raw_parts(d.cpu(), d.len()) };
+        assert!(
+            seen.iter().all(|&x| x == 0),
+            "Unknown bytes are zeroed on first use"
+        );
+        drop((d, pool));
         // SAFETY: `cpu` came from this exact layout and no view is live now.
         unsafe { dealloc(cpu, layout) };
     }
@@ -3546,7 +3716,14 @@ mod tests {
         // SAFETY: the window is retained until all test views are dead.
         let cpu = unsafe { alloc_zeroed(layout) };
         assert!(!cpu.is_null());
-        let pool = CapPool::new(cpu, DMA_IOVA_BASE, layout.size() as u64, &ARENA).unwrap();
+        let pool = CapPool::new(
+            cpu,
+            DMA_IOVA_BASE,
+            layout.size() as u64,
+            PoolBytes::Unknown,
+            &ARENA,
+        )
+        .unwrap();
         let a = pool.alloc(4096).unwrap();
         let b = pool.alloc(4096).unwrap();
         let c = pool.alloc(8192).unwrap();
@@ -3566,7 +3743,14 @@ mod tests {
                 .all(|byte| *byte == 0)
         );
         // A different allocator must not accept this pool's buffer identity.
-        let other = CapPool::new(cpu, DMA_IOVA_BASE, layout.size() as u64, &ARENA).unwrap();
+        let other = CapPool::new(
+            cpu,
+            DMA_IOVA_BASE,
+            layout.size() as u64,
+            PoolBytes::Unknown,
+            &ARENA,
+        )
+        .unwrap();
         let DmaReleaseFailure::Refused(reused) =
             unsafe { other.release_quiesced(reused) }.unwrap_err()
         else {
@@ -3585,7 +3769,7 @@ mod tests {
         let layout = Layout::from_size_align(4 * 4096, 4096).unwrap();
         let cpu = unsafe { alloc_zeroed(layout) };
         assert!(!cpu.is_null());
-        let pool = CapPool::new(cpu, DMA_IOVA_BASE, 8192, &ARENA).unwrap();
+        let pool = CapPool::new(cpu, DMA_IOVA_BASE, 8192, PoolBytes::Unknown, &ARENA).unwrap();
         let original = pool.alloc(8192).unwrap();
         assert!(pool.alloc(4096).is_none());
         // Model the owner's publication of a second disjoint retained window.
@@ -3593,6 +3777,7 @@ mod tests {
             unsafe { cpu.add(8192) },
             DMA_IOVA_BASE + (2 << 20),
             8192,
+            PoolBytes::Unknown,
             &ARENA,
         )
         .unwrap();
@@ -3621,7 +3806,14 @@ mod tests {
         let cpu = unsafe { alloc_zeroed(layout) };
         assert!(!cpu.is_null());
         static ARENA: test_arena::TestArena<4096> = test_arena::TestArena::new();
-        let pool = CapPool::new(cpu, DMA_IOVA_BASE + 4096, layout.size() as u64, &ARENA).unwrap();
+        let pool = CapPool::new(
+            cpu,
+            DMA_IOVA_BASE + 4096,
+            layout.size() as u64,
+            PoolBytes::Unknown,
+            &ARENA,
+        )
+        .unwrap();
         assert!(pool.alloc_aligned(4096, 8192).is_none());
         drop(pool);
         // SAFETY: `cpu` came from this exact layout and no view is live now.

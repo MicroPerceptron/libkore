@@ -41,7 +41,7 @@
 use core::simd::prelude::*;
 
 pub mod fiber;
-mod switch;
+pub mod switch;
 
 /// Lanes per worker — derived from the enabled target features, the
 /// raster `W` precedent recast for `f32`: AVX2 carries 8 single-precision

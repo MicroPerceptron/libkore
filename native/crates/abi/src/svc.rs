@@ -3187,9 +3187,11 @@ const _: () = {
     assert!(size_of::<MmReqWire>() == 32);
     assert!(size_of::<MmRepWire>() == 72);
     assert!(size_of::<MonitorReqWire>() == 104);
+    // 8-byte head ‖ 280-byte telemetry (240 + the 16-byte frame-class census
+    // + the 24-byte DRAM stream table).
     assert!(
         size_of::<MonitorRepWire>()
-            == 248
+            == 8 + 280
                 + size_of::<crate::processor_status::ProcessorPage>()
                 + size_of::<crate::device::DeviceCensusPage>()
     );
@@ -3222,7 +3224,7 @@ const _: () = {
                 + size_of::<ImageName>()
     ); // 864
     assert!(size_of::<TaskReqWire>() == 864);
-    // 16-byte head ‖ 224 telemetry ‖ 236 filesystem (with the derived
+    // 16-byte head ‖ 256 telemetry ‖ 236 filesystem (with the derived
     // completion-latency moments) ‖ the 76-byte NetSnapshot ‖ the two pages.
     assert!(
         size_of::<TaskRepWire>()

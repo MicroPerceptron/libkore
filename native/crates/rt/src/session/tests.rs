@@ -23,7 +23,7 @@ fn view_placement_requests_only_a_window_not_more_authority() {
     use kore_abi::session::{DERIVE_KIND_VIEW_MAP, ViewMapReq, ViewMapWindow};
     use zerocopy::TryFromBytes;
 
-    for window in [ViewMapWindow::Map, ViewMapWindow::Surfaces] {
+    for window in [ViewMapWindow::Map, ViewMapWindow::Surfaces, ViewMapWindow::Heap] {
         let mut builder = SessionBuilder::new();
         builder
             .map_view_in(SlotRef::from_wire(2), window, SlotRef::from_wire(3))

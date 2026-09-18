@@ -200,14 +200,36 @@ impl<'t, T: Transport> ChanTx<'t, T> {
     /// happens-before this kick, and a consumed post means the receiver
     /// is awake and will drain every source after it re-posts.
     pub async fn send(&self, notice: Notice) -> Result<(), SendError> {
-        let mut s = SessionBuilder::new();
-        s.notice(self.send, notice.cookie, notice.payload)
-            .map_err(|_| SendError::Refused(Status::Malformed))?;
+        let s = self.notice_session(notice)?;
         let committed = self
             .transport
             .commit(&s)
             .await
             .map_err(|_| SendError::Transport)?;
+        Self::notice_outcome(committed)
+    }
+
+    /// [`send`](Self::send), committed synchronously — the same one-notice
+    /// session through [`Transport::commit_now`]. For callers that cannot
+    /// await: a synchronous stream operation that must publish its ring
+    /// write before returning (the process stream's `*_now` operations).
+    pub fn send_now(&self, notice: Notice) -> Result<(), SendError> {
+        let s = self.notice_session(notice)?;
+        let committed = self
+            .transport
+            .commit_now(&s)
+            .map_err(|_| SendError::Transport)?;
+        Self::notice_outcome(committed)
+    }
+
+    fn notice_session(&self, notice: Notice) -> Result<SessionBuilder, SendError> {
+        let mut s = SessionBuilder::new();
+        s.notice(self.send, notice.cookie, notice.payload)
+            .map_err(|_| SendError::Refused(Status::Malformed))?;
+        Ok(s)
+    }
+
+    fn notice_outcome(committed: crate::transport::Committed) -> Result<(), SendError> {
         if committed.failing_index() != 0 {
             return Err(SendError::Refused(Status::Malformed));
         }

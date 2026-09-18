@@ -13,11 +13,11 @@
 //!   arena by bump.  Fully functional and host-testable **now**, and the
 //!   shape a freestanding binary uses before the kernel can map memory.
 //! - [`HeapSupplySource`] (here) — the **metal** source every founded
-//!   binary links: a miss raises the founder-window grow trap and the
-//!   kernel maps the next slice of the task's reserved backing.  An
-//!   mm-*served* source (extent growth as memory-manager grants, for
-//!   mm's peers) is the vertical-slice rung ahead — it will be built
-//!   against the resident mm's real serve loop.
+//!   binary links: a miss carves the next slice of the task's own
+//!   `role::HEAP` supply.  The task's own thread maps it in granules in the
+//!   task's heap window (`geom::HEAP`), off the per-thread receiver-map
+//!   cursor ([`window`]); a spawned thread, or a task founded without the
+//!   window, maps each extent at its map cursor in one session, as before.
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -273,6 +273,11 @@ fn supply_len(supply: kore_abi::session::SlotRef) -> Option<u64> {
 fn grow_from_supply(min_bytes: usize) -> Option<NonNull<[u8]>> {
     let want = checked_align_up(min_bytes.max(1), EXTENT_ALIGN)?;
     let want = u64::try_from(want).ok()?;
+    match window::grow(want) {
+        window::Grow::Extent(extent) => return Some(extent),
+        window::Grow::Refused => return None,
+        window::Grow::NoWindow => {}
+    }
     let supply = crate::entry::geometry::heap_supply_slot()?;
     let offset = reserve_supply(&HEAP_GROWN, want)?;
     // The reserved tail is the other cursor's; a grow that would enter it
@@ -286,6 +291,198 @@ fn grow_from_supply(min_bytes: usize) -> Option<NonNull<[u8]>> {
         return None;
     }
     carve_and_map(supply, offset, want)
+}
+
+/// **The process heap window** (`geom::HEAP`, GEOM_ABI v7): the task's heap
+/// maps what it carves off its own `role::HEAP` supply in a founder-stamped
+/// reservation of its own, instead of at the thread's receiver-map cursor.
+///
+/// That cursor's 16 MiB stride is shared by every view on the thread and never
+/// reused, so a heap could not map more than 16 MiB however large its supply
+/// (a compiler maps 234 extents, 17.7 MiB, compiling one stock Rust program).
+/// Here the supply is taken in **granules**, each one session of
+/// [`carve_and_map_in`] staged into [`ViewMapWindow::Heap`]: the same scratch
+/// slots and bind-inert report as the per-extent grow, so growth still holds
+/// no capability and reserves no arena slot — a grow may run at any moment,
+/// including between a slot index being chosen for a delivery and the
+/// delivery landing.
+///
+/// **One free interval, every thread.** `[at, end)` is packed into one atomic
+/// word as page offsets from the window base (a 1 TiB window is 2^28 pages).
+/// Any thread bumps extents off its front by compare-and-swap and holds
+/// nothing — the mapping is the task's, so a worker shares the window's memory
+/// without carving. A refill extends the interval when the kernel places the
+/// granule at its end, and replaces it otherwise.
+///
+/// **Only the task's own thread refills** (shard 0): the window is stamped
+/// for the founded task, not its threads, and the kernel's heap cursor is the
+/// task's. A worker finding the interval short takes the per-extent path on
+/// its own stride, as does a task founded without the window.
+///
+/// **Never greedy.** The same supply feeds worker growth and
+/// [`reserve_from_top`]'s code windows, so a refill takes what is missing,
+/// rounded up to at most `min(doubling, remaining / 4)` ([`GRANULE_MIN`] up to
+/// [`GRANULE_MAX`]): each refill leaves three quarters of what remains to the
+/// supply's other consumers, and a large heap still costs a handful of
+/// sessions.
+///
+/// [`ViewMapWindow::Heap`]: kore_abi::session::ViewMapWindow::Heap
+#[cfg(target_os = "none")]
+mod window {
+    use core::ptr::NonNull;
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    /// The doubling's first step: 2 MiB — the frame class the physical
+    /// allocator reserves for huge leaves (`res/ACCEL_MEMORY_SCALE.md` §1).
+    const GRANULE_MIN: u64 = 2 << 20;
+    /// Where doubling stops: five doublings reach it.
+    const GRANULE_MAX: u64 = 32 << 20;
+    /// A refill may take at most this fraction of the supply that remains.
+    const REFILL_SHARE: u64 = 4;
+    /// Interval offsets count pages of this size.
+    const PAGE: u64 = 4096;
+
+    /// The window base, published before any interval is non-empty (zero =
+    /// not learned yet).
+    static BASE: AtomicU64 = AtomicU64::new(0);
+    /// The free interval: bits 0..32 its start, bits 32..64 its end, both in
+    /// pages from [`BASE`].
+    static FREE: AtomicU64 = AtomicU64::new(0);
+    /// Granules mapped so far: the doubling's exponent.
+    static GRANULES: AtomicU32 = AtomicU32::new(0);
+
+    const fn pack(at: u64, end: u64) -> u64 {
+        (end << 32) | at
+    }
+    const fn unpack(word: u64) -> (u64, u64) {
+        (word & 0xffff_ffff, word >> 32)
+    }
+
+    pub(super) enum Grow {
+        Extent(NonNull<[u8]>),
+        /// The window exists and could not supply `want`: the heap surfaces
+        /// `AllocError`, exactly as the per-extent path would.
+        Refused,
+        /// Not from the window: this thread cannot refill it, or the task has
+        /// none. Use the per-extent path.
+        NoWindow,
+    }
+
+    pub(super) fn grow(want: u64) -> Grow {
+        if let Some(extent) = bump(want) {
+            return Grow::Extent(extent);
+        }
+        if crate::entry::geometry::shard_index() != Some(0) {
+            return Grow::NoWindow;
+        }
+        if BASE.load(Ordering::Relaxed) == 0 {
+            let Some((base, _)) = crate::entry::thread_context()
+                .and_then(|rt| rt.geom())
+                .and_then(|g| g.window(kore_abi::task::geom::HEAP))
+            else {
+                return Grow::NoWindow;
+            };
+            BASE.store(base, Ordering::Release);
+        }
+        // A worker may bump the fresh bytes away between the refill and this
+        // thread's own bump; one more refill answers that race, and a second
+        // loss is reported rather than chased.
+        for _ in 0..2 {
+            if refill(want).is_none() {
+                return Grow::Refused;
+            }
+            if let Some(extent) = bump(want) {
+                return Grow::Extent(extent);
+            }
+        }
+        Grow::Refused
+    }
+
+    /// Take `want` bytes off the front of the free interval, lock-free: the
+    /// compare-and-swap retries only when another thread changed the
+    /// interval first.
+    fn bump(want: u64) -> Option<NonNull<[u8]>> {
+        let pages = want / PAGE;
+        let mut word = FREE.load(Ordering::Acquire);
+        loop {
+            let (at, end) = unpack(word);
+            let next = at.checked_add(pages).filter(|&next| next <= end)?;
+            match FREE.compare_exchange_weak(
+                word,
+                pack(next, end),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let va = BASE.load(Ordering::Acquire).checked_add(at * PAGE)?;
+                    return Some(NonNull::slice_from_raw_parts(
+                        NonNull::new(va as *mut u8)?,
+                        usize::try_from(want).ok()?,
+                    ));
+                }
+                Err(actual) => word = actual,
+            }
+        }
+    }
+
+    /// Carve the next granule off the supply and have the kernel map it in
+    /// the heap window, then publish it as free.
+    fn refill(want: u64) -> Option<()> {
+        let supply = crate::entry::geometry::heap_supply_slot()?;
+        let total = super::supply_len(supply)?;
+        let room = total
+            .checked_sub(super::HEAP_RESERVED.load(Ordering::Acquire))?
+            .checked_sub(super::HEAP_GROWN.load(Ordering::Acquire))?;
+        let (at, end) = unpack(FREE.load(Ordering::Acquire));
+        let missing = want.saturating_sub((end - at) * PAGE);
+        let doubling = GRANULE_MIN
+            .checked_shl(GRANULES.load(Ordering::Relaxed))
+            .unwrap_or(GRANULE_MAX)
+            .min(GRANULE_MAX);
+        let share = room / REFILL_SHARE;
+        let want = missing.max(doubling.min(share));
+        // The kernel places a view of at least 2 MiB on a 2 MiB boundary (the
+        // huge-leaf alignment), so whole multiples of it land end to end and
+        // the interval extends. That rounding is taken only inside the share:
+        // on the ordinary 2 MiB supply it would otherwise swallow the whole
+        // supply on the first refill and starve `reserve_from_top` (Lua's
+        // native `require` then has no JIT arena). Page grain is the rest.
+        let size = [GRANULE_MIN, PAGE]
+            .into_iter()
+            .filter_map(|grain| Some(want.checked_add(grain - 1)? & !(grain - 1)))
+            .find(|&size| size <= room && (size <= want.max(share) || size - want < PAGE))?;
+        let offset = super::reserve_supply(&super::HEAP_GROWN, size)?;
+        if !super::grow_clears_reserved(
+            offset,
+            size,
+            total,
+            super::HEAP_RESERVED.load(Ordering::Acquire),
+        ) {
+            return None;
+        }
+        let granule = super::carve_and_map_in(
+            supply,
+            offset,
+            size,
+            Some(kore_abi::session::ViewMapWindow::Heap),
+        )?;
+        GRANULES.fetch_add(1, Ordering::Relaxed);
+        let start = (granule.as_ptr() as *mut u8 as u64)
+            .checked_sub(BASE.load(Ordering::Relaxed))?
+            / PAGE;
+        let stop = start.checked_add(size / PAGE).filter(|&stop| stop <= u32::MAX as u64)?;
+        // Extend the interval when the granule lands at its end; otherwise
+        // the new granule replaces it and the old tail is left unused.
+        let mut word = FREE.load(Ordering::Acquire);
+        loop {
+            let (at, end) = unpack(word);
+            let next = if start == end { pack(at, stop) } else { pack(start, stop) };
+            match FREE.compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(()),
+                Err(actual) => word = actual,
+            }
+        }
+    }
 }
 
 /// **Carve `[offset, offset+len)` off a held supply and map the staged
@@ -305,6 +502,20 @@ pub fn carve_and_map(
     supply: kore_abi::session::SlotRef,
     offset: u64,
     len: u64,
+) -> Option<NonNull<[u8]>> {
+    carve_and_map_in(supply, offset, len, None)
+}
+
+/// [`carve_and_map`] with the map staged into a named receiver window
+/// (`ViewMapWindow`) instead of the thread's receiver-map cursor — the same
+/// single session, the same scratch slots, the same bind-inert report: the
+/// window selects placement only, and nothing is held afterwards.
+#[cfg(target_os = "none")]
+pub fn carve_and_map_in(
+    supply: kore_abi::session::SlotRef,
+    offset: u64,
+    len: u64,
+    window: Option<kore_abi::session::ViewMapWindow>,
 ) -> Option<NonNull<[u8]>> {
     use kore_abi::cap::{CapRecord, ResourceKind, Rights};
     use kore_abi::session::{GeomReport, Status};
@@ -337,7 +548,10 @@ pub fn carve_and_map(
     )
     .ok()?;
     // ι1: the staged map — subject is ι0's result slot (Move D dataflow).
-    b.derive_raw(carve, Rights::empty(), 0, report, None).ok()?;
+    match window {
+        None => b.derive_raw(carve, Rights::empty(), 0, report, None).ok()?,
+        Some(window) => b.map_view_in(carve, window, report).ok()?,
+    };
     let committed = TrapTransport::new().commit_now(&b).ok()?;
     if committed.status() != Status::Ok {
         return None;

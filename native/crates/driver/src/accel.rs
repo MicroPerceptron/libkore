@@ -5,6 +5,61 @@
 
 pub use virtio_accel_core::*;
 
+/// One accelerator's DMA demand, stated per frame class
+/// (`res/ACCEL_MEMORY_SCALE.md` §2.2).
+///
+/// A profile is data the backend declares once, and it replaces the
+/// constants that used to sit in each service: the founder stages the
+/// `structural` and `firmware` demands as the row's DMA pool (from the
+/// kernel's 2 MiB class), and the service derives its retained-byte budgets
+/// (`virtio_accel_device::ResourcePolicy`) from `buffers` and `programs`,
+/// which arrive as client-owned leases and are never founder-staged.
+///
+/// Classes are named by the lease alignment vocabulary the kernel already
+/// routes on (`kore_abi::session::LEASE_ALIGN_*`); nothing new crosses a
+/// wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaProfile {
+    /// Rings, CTBs, MMU/GuC tables, IPC, event arenas: small, fixed,
+    /// founder-staged.
+    pub structural: ClassDemand,
+    /// Resident firmware and its runtime: founder-staged.
+    pub firmware: ClassDemand,
+    /// The client working set: grows on demand up to `ceiling`.
+    pub buffers: GrowDemand,
+    /// Resident programs: grows on demand up to `ceiling`.
+    pub programs: GrowDemand,
+}
+
+/// A fixed demand in one class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassDemand {
+    /// `kore_abi::session::LEASE_ALIGN_4K` / `_2M` / `_1G`.
+    pub align_log2: u8,
+    pub bytes: u64,
+}
+
+/// A demand that is funded incrementally by client supplies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrowDemand {
+    /// The class a funding supply should be leased in; the kernel falls to
+    /// the next finer class when it is exhausted, so this is a preference
+    /// with a measured miss, never a refusal.
+    pub align_log2: u8,
+    /// Bytes the service may keep resident across every client.
+    pub ceiling: u64,
+}
+
+impl DmaProfile {
+    /// The pool the founder must deliver for this backend to found at all:
+    /// the two fixed demands.  A backend checks its delivered pool against
+    /// this at claim time so a manifest that under-funds the row refuses by
+    /// name instead of dying at bring-up rung N with "pool exhausted".
+    pub const fn founded_bytes(&self) -> u64 {
+        self.structural.bytes.saturating_add(self.firmware.bytes)
+    }
+}
+
 /// Deployed Kore Query capability bit, confined to the native pair-ring wire.
 /// Never insert this bit into upstream `DeviceInfo::capabilities`.
 pub const EXPLICIT_WORKGROUPS: u64 = 1 << 6;
