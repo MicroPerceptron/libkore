@@ -248,6 +248,87 @@ pub fn reserve_from_top(_len: u64) -> Option<crate::cap::StashedLease> {
     None
 }
 
+/// A supply a program **adopted** into its heap ([`adopt_supply`]): a root
+/// lease it obtained itself — an mm supply minted on its own per-launch face
+/// — drawn on before the launch supply.
+#[cfg(target_os = "none")]
+struct Adopted {
+    /// The lease's slot index + 1; zero marks a vacant entry.
+    slot: core::sync::atomic::AtomicU32,
+    /// The lease's length.
+    len: core::sync::atomic::AtomicU64,
+    /// Bytes carved off it so far (a monotone cursor, like [`HEAP_GROWN`]).
+    grown: core::sync::atomic::AtomicU64,
+}
+
+/// Adopted supplies one task may hold — design-bounded: a program adopts one
+/// reservation per large synchronous job it prepares for, not per
+/// allocation.
+#[cfg(target_os = "none")]
+const MAX_ADOPTED: usize = 8;
+
+#[cfg(target_os = "none")]
+static ADOPTED: [Adopted; MAX_ADOPTED] = [const {
+    Adopted {
+        slot: core::sync::atomic::AtomicU32::new(0),
+        len: core::sync::atomic::AtomicU64::new(0),
+        grown: core::sync::atomic::AtomicU64::new(0),
+    }
+}; MAX_ADOPTED];
+
+/// **Give this task's heap more room**: adopt `lease` — a root supply the
+/// program obtained itself, typically from mm on its per-launch face — as
+/// backing for the heap window, drawn on **before** the launch supply, which
+/// stays for the code and data windows `reserve_from_top` carves.
+///
+/// This is how a program prepares for a large *synchronous* job whose
+/// allocations cannot wait on a service: the global allocator never talks to
+/// mm (`res/USERLAND.md` §2.2), so the program asks mm on its executor first,
+/// then adopts the grant. The lease is held for the task's life — its
+/// granules back live heap memory, which is never returned.
+///
+/// Refused (the lease back) off the task's own thread (only it refills the
+/// heap window), when the task has no heap window, when the lease's geometry
+/// is unreadable, or when every adoption entry is taken.
+#[cfg(target_os = "none")]
+pub fn adopt_supply(lease: crate::cap::StashedLease) -> Result<(), crate::cap::StashedLease> {
+    let has_window = crate::entry::thread_context()
+        .and_then(|rt| rt.geom())
+        .and_then(|g| g.window(kore_abi::task::geom::HEAP))
+        .is_some();
+    let len = lease
+        .slot()
+        .and_then(crate::cap::verbs::lease_geometry)
+        .map(|(_, len)| len)
+        .filter(|&len| len != 0);
+    let (Some(slot), Some(len), Some(0), true) = (
+        lease.slot(),
+        len,
+        crate::entry::geometry::shard_index(),
+        has_window,
+    ) else {
+        return Err(lease);
+    };
+    let Some(entry) = ADOPTED
+        .iter()
+        .find(|entry| entry.slot.load(Ordering::Acquire) == 0)
+    else {
+        return Err(lease);
+    };
+    entry.len.store(len, Ordering::Relaxed);
+    entry.grown.store(0, Ordering::Relaxed);
+    entry.slot.store(slot.index() + 1, Ordering::Release);
+    // Held for the task's life: its granules back live heap memory.
+    core::mem::forget(lease);
+    Ok(())
+}
+
+/// Off metal there is no heap window to back.
+#[cfg(not(target_os = "none"))]
+pub fn adopt_supply(lease: crate::cap::StashedLease) -> Result<(), crate::cap::StashedLease> {
+    Err(lease)
+}
+
 /// The supply's length, cached after one kernel query.
 #[cfg(target_os = "none")]
 fn supply_len(supply: kore_abi::session::SlotRef) -> Option<u64> {
@@ -425,41 +506,72 @@ mod window {
         }
     }
 
-    /// Carve the next granule off the supply and have the kernel map it in
-    /// the heap window, then publish it as free.
-    fn refill(want: u64) -> Option<()> {
+    /// How big the next granule is: what is missing, rounded up to
+    /// `min(doubling, share)`, in 2 MiB multiples when that stays inside the
+    /// share (see [`launch_granule`]), else in pages; never past `room`.
+    fn granule_size(missing: u64, doubling: u64, room: u64, share: u64) -> Option<u64> {
+        let want = missing.max(doubling.min(share));
+        [GRANULE_MIN, PAGE]
+            .into_iter()
+            .filter_map(|grain| Some(want.checked_add(grain - 1)? & !(grain - 1)))
+            .find(|&size| size <= room && (size <= want.max(share) || size - want < PAGE))
+    }
+
+    /// The next granule off the launch supply (`role::HEAP@0`), reserved:
+    /// `(supply, offset, size)`.
+    fn launch_granule(missing: u64, doubling: u64) -> Option<(kore_abi::session::SlotRef, u64, u64)> {
         let supply = crate::entry::geometry::heap_supply_slot()?;
         let total = super::supply_len(supply)?;
         let room = total
             .checked_sub(super::HEAP_RESERVED.load(Ordering::Acquire))?
             .checked_sub(super::HEAP_GROWN.load(Ordering::Acquire))?;
-        let (at, end) = unpack(FREE.load(Ordering::Acquire));
-        let missing = want.saturating_sub((end - at) * PAGE);
-        let doubling = GRANULE_MIN
-            .checked_shl(GRANULES.load(Ordering::Relaxed))
-            .unwrap_or(GRANULE_MAX)
-            .min(GRANULE_MAX);
-        let share = room / REFILL_SHARE;
-        let want = missing.max(doubling.min(share));
         // The kernel places a view of at least 2 MiB on a 2 MiB boundary (the
         // huge-leaf alignment), so whole multiples of it land end to end and
         // the interval extends. That rounding is taken only inside the share:
         // on the ordinary 2 MiB supply it would otherwise swallow the whole
         // supply on the first refill and starve `reserve_from_top` (Lua's
         // native `require` then has no JIT arena). Page grain is the rest.
-        let size = [GRANULE_MIN, PAGE]
-            .into_iter()
-            .filter_map(|grain| Some(want.checked_add(grain - 1)? & !(grain - 1)))
-            .find(|&size| size <= room && (size <= want.max(share) || size - want < PAGE))?;
+        let size = granule_size(missing, doubling, room, room / REFILL_SHARE)?;
         let offset = super::reserve_supply(&super::HEAP_GROWN, size)?;
-        if !super::grow_clears_reserved(
+        super::grow_clears_reserved(
             offset,
             size,
             total,
             super::HEAP_RESERVED.load(Ordering::Acquire),
-        ) {
-            return None;
-        }
+        )
+        .then_some((supply, offset, size))
+    }
+
+    /// The next granule off an adopted supply ([`super::adopt_supply`]),
+    /// reserved. Nothing else draws on an adopted lease, so its share is all
+    /// that remains of it.
+    fn adopted_granule(missing: u64, doubling: u64) -> Option<(kore_abi::session::SlotRef, u64, u64)> {
+        super::ADOPTED.iter().find_map(|entry| {
+            let slot = entry.slot.load(Ordering::Acquire).checked_sub(1)?;
+            let room = entry
+                .len
+                .load(Ordering::Relaxed)
+                .checked_sub(entry.grown.load(Ordering::Relaxed))?;
+            let size = granule_size(missing, doubling, room, room)?;
+            let offset = super::reserve_supply(&entry.grown, size)?;
+            Some((kore_abi::session::SlotRef::from_wire(slot), offset, size))
+        })
+    }
+
+    /// Carve the next granule off the supply and have the kernel map it in
+    /// the heap window, then publish it as free.
+    fn refill(want: u64) -> Option<()> {
+        let (at, end) = unpack(FREE.load(Ordering::Acquire));
+        let missing = want.saturating_sub((end - at) * PAGE);
+        let doubling = GRANULE_MIN
+            .checked_shl(GRANULES.load(Ordering::Relaxed))
+            .unwrap_or(GRANULE_MAX)
+            .min(GRANULE_MAX);
+        // Adopted supplies first: they were obtained for the heap alone,
+        // while the launch supply is shared with `reserve_from_top`'s code
+        // windows (a Wasmtime engine maps every compiled module there).
+        let (supply, offset, size) =
+            adopted_granule(missing, doubling).or_else(|| launch_granule(missing, doubling))?;
         let granule = super::carve_and_map_in(
             supply,
             offset,

@@ -3652,6 +3652,21 @@ mod metal {
     pub fn reclaim_extent(_view: SlotRef, _supply: &SupplyToken) -> Option<(u64, u64)> {
         None
     }
+
+    /// [`reclaim_extent`] for a view that arrived on a **retained** return
+    /// leg ([`ReturnMode::RetainedAny`](crate::service::ReturnMode)): the
+    /// return retires the record out of its runtime-owned landing, so the
+    /// owner's reservation is released without the revoke its drop would
+    /// otherwise attempt on the now-vacant slot. A refused return keeps
+    /// the owner, whose drop revokes the record as usual.
+    pub fn reclaim_returned_extent(
+        view: crate::cap::ReturnedCapability,
+        supply: &SupplyToken,
+    ) -> Option<(u64, u64)> {
+        let reclaimed = reclaim_extent(view.slot()?, supply)?;
+        view.release_after_proven_move();
+        Some(reclaimed)
+    }
     /// Possess a delivered **`MemLease`** — the shape an image-service
     /// `Acquire` grant arrives in, and the one [`take_view`] refuses.
     ///

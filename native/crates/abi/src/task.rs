@@ -624,7 +624,13 @@ pub const BOOTSTRAP_ABI: u16 = 4;
 /// Sixty-four accommodates the production shell's service faces plus its
 /// attenuated child-principal sources while keeping the complete block well below
 /// one 4 KiB boot page.
-pub const MAX_BOOT_HANDLES: usize = 64;
+///
+/// 80 (from 64): exec's memory-manager client gained its return leg — the
+/// pair on which exec administers per-launch mm faces (one per engine
+/// launch) — and exec's block, the fullest, held exactly 64. Its loader
+/// grant bank was the first name refused. 80 × 8 bytes keeps the whole
+/// block at 712 bytes, still well under the page.
+pub const MAX_BOOT_HANDLES: usize = 80;
 
 /// Literal startup values carried beside, but never confused with, arena
 /// handles.  Spawn records currently carry at most four; the eight-entry
@@ -635,7 +641,7 @@ pub const MAX_BOOT_DATA: usize = 8;
 /// capability endowment from (`.kore.boot` in the child image; the module
 /// docs tell the whole story).  The layout *is* the frozen ABI: 8-byte
 /// header + [`MAX_BOOT_HANDLES`] handle entries + [`MAX_BOOT_DATA`] datum
-/// entries = 584 bytes, every field
+/// entries = 712 bytes, every field
 /// little-endian and unaligned-safe, so the spawner writes it through any
 /// delegated mapping with plain `IntoBytes` and no serializer exists on
 /// either side.
@@ -1578,7 +1584,7 @@ const _: () = {
     use core::mem::size_of;
     assert!(size_of::<HandleEntry>() == 8);
     assert!(size_of::<DatumEntry>() == 8);
-    assert!(size_of::<BootBlock>() == 8 + 8 * (MAX_BOOT_HANDLES + MAX_BOOT_DATA)); // 584
+    assert!(size_of::<BootBlock>() == 8 + 8 * (MAX_BOOT_HANDLES + MAX_BOOT_DATA)); // 712
     // Publication and movement are separate bounded vocabularies.  Neither
     // count dominates the other: vacant landing names cost only a boot entry;
     // arithmetic grant-bank members cost only delivery rows.  Each wire uses

@@ -95,6 +95,24 @@ impl MmReqWire {
     /// Read the lessor's bounded, provider-owned allocator snapshot.
     /// Every argument field must remain zero.
     pub const OP_STATS: u8 = 4;
+    /// Exec's administration pair only: one component of a per-launch
+    /// client face (a recyclable peer). `contiguous` carries the part code
+    /// (`0` ring, `1` kick, `2` return receive, `0x80 | n` grant `n`),
+    /// `slot` the announced return landing; every other field is zero.
+    pub const OP_ADMIT_PEER: u8 = 5;
+    /// Exec's administration pair only: consume the verdict of the
+    /// preceding admission. Every argument field is zero.
+    pub const OP_TAKE_ADMISSION: u8 = 6;
+    /// Exec's administration pair only: retire one exact face generation.
+    /// `numa` carries its arrival; every other field is zero.
+    pub const OP_RETIRE_PEER: u8 = 7;
+    /// Exec's administration pair only: fence retirement. Accepted only
+    /// once the face is closed **and** every supply it minted has returned,
+    /// so exec reclaims the face's local backing no earlier. `numa` carries
+    /// its arrival; every other field is zero.
+    pub const OP_CONFIRM_RETIRED: u8 = 8;
+    /// A per-launch face retires itself. Every argument field is zero.
+    pub const OP_CLOSE_PEER: u8 = 9;
 }
 
 /// The memory-manager reply wire form (`MmResponse`'s crossing shape).
@@ -133,6 +151,11 @@ impl MmRepWire {
     pub const TAG_REFUSED: u8 = 3;
     /// `MmResponse::Stats` — no capability grant accompanies the sample.
     pub const TAG_STATS: u8 = 4;
+    /// `MmResponse::Accepted` — an administration step took effect.
+    pub const TAG_ACCEPTED: u8 = 5;
+    /// `MmResponse::PeerAdmitted` — `reserved[0..2]` carries the admitted
+    /// face's arrival (little-endian); the rest stays zero.
+    pub const TAG_PEER_ADMITTED: u8 = 6;
 
     /// `MmRefusal::BadProps`.
     pub const REFUSE_BAD_PROPS: u8 = 1;
@@ -147,6 +170,10 @@ impl MmRepWire {
     /// `TableFull` discipline: a loud wire refusal, never a silent
     /// clamp).
     pub const REFUSE_QUOTA: u8 = 5;
+    /// `MmRefusal::Pending` — the administration step cannot complete yet
+    /// (an admission in flight, or a retired face whose supplies have not
+    /// all returned); ask again.
+    pub const REFUSE_PENDING: u8 = 6;
 }
 
 // ─── monitor — federated telemetry assembly ───────────────────────
