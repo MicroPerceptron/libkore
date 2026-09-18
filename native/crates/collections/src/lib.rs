@@ -43,6 +43,11 @@
 //! Plain (single-owner, `&mut self` — wrap in the caller's own lock if
 //! shared; the point is that they impose no locking policy):
 //! - [`BitSet`] / [`BitVec`] — the non-atomic siblings.
+//! - [`BoundedVec`] — a fixed-capacity vector whose storage is in the arena
+//!   rather than inline: the bound stays a refusal (`push` hands the value
+//!   back, storage never grows) without the worst case landing in a stack
+//!   frame.  The shape a `heapless::Vec` has wherever `N` is large enough to
+//!   be a stack budget rather than a capacity.
 //! - [`BitMat`] — a bit *matrix* plus the row-wise set ops
 //!   ([`and_into`], [`or_into`], [`is_disjoint`], …).
 //! - [`SlotArena`] — the generational slot store for *intrusively linked*
@@ -83,6 +88,8 @@ mod bitmat;
 mod bitset;
 #[cfg(feature = "alloc")]
 mod bitvec;
+#[cfg(feature = "alloc")]
+mod boundedvec;
 mod genid;
 #[cfg(feature = "alloc")]
 mod pages;
@@ -104,6 +111,8 @@ pub use bitmat::{
 pub use bitset::{AtomicBitSet, BitSet};
 #[cfg(feature = "alloc")]
 pub use bitvec::{AtomicBitVec, BitVec};
+#[cfg(feature = "alloc")]
+pub use boundedvec::BoundedVec;
 pub use genid::{GenId, GenIdAllocator};
 #[cfg(feature = "alloc")]
 pub use priority::{PriorityError, PriorityIndex, PriorityLink, UNINDEXED};

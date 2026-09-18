@@ -727,6 +727,23 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
         Ok(())
     }
 
+    /// Ask the controller to close this window — the keyboard's ESC/Q and
+    /// an app's own close action take the path the chrome's close dot
+    /// takes. The compositor raises the same `close_requested` latch and
+    /// echoes `Event::CloseRequested` down this window's channel; the app
+    /// then leaves through its ordinary close path once it sees the echo,
+    /// after the controller has begun its own teardown. `Ok(serial)` is
+    /// the configure serial the request is held under; an already-asked
+    /// window answers again rather than refusing. A `Busy` refusal is
+    /// retryable: the window is already closing, or the event ring could
+    /// not take the echo this instant.
+    pub async fn request_close(&mut self) -> Result<u64, ClientError> {
+        match self.surface_request(SurfaceRequest::RequestClose).await? {
+            SurfaceResponse::CloseRequested { serial } => Ok(serial),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
     async fn read_configuration(&mut self) -> Result<Configure, ClientError> {
         let reply = self
             .control

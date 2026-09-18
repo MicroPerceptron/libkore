@@ -13,14 +13,14 @@
 //!
 //! | Constant | Value | Dominant cost |
 //! |---|---|---|
-//! | [`MAX_OBJECTS`] | 128 | 128 × ~48 B ≈ 6 KiB |
-//! | [`MAX_DIRECTORIES`] × [`MAX_DIR_ENTRIES`] | 16 × 128 | ≈ 96 KiB |
+//! | [`MAX_OBJECTS`] | 512 | 512 × ~48 B ≈ 24 KiB |
+//! | [`MAX_DIRECTORIES`] × [`MAX_DIR_ENTRIES`] | 64 × 128 | ≈ 328 KiB |
 //! | [`MAX_NAME_LEN`] | 32 | (per entry, inline) |
 //! | [`RAM_CHUNKS`] × [`RAM_CHUNK_BYTES`] | 64 × 256 | 16 KiB pool |
-//! | `MAX_SESSIONS` (service-side) × [`MAX_HANDLES_PER_SESSION`] | 8 × 16 | ≈ 22 KiB |
+//! | `MAX_SESSIONS` (service-side) × [`MAX_HANDLES_PER_SESSION`] | 12 × 32 | ≈ 212 KiB |
 //! | [`MAX_PLACEMENTS`] | 72 | ≈ 5 KiB RAM placement table |
-//! | [`MAX_BLOCK_PLACEMENTS`] | 256 | file (≤128) + durable-derived (≤128); block provider only |
-//! | [`MAX_BLOCK_EXTENT_NODES`] | 1539 | ≈ 68 KiB heap-backed nodes + free heap; block provider only |
+//! | [`MAX_BLOCK_PLACEMENTS`] | 1024 | file (≤512) + durable-derived (≤512); block provider only |
+//! | [`MAX_BLOCK_EXTENT_NODES`] | 6147 | ≈ 192 KiB heap-backed 32-byte nodes + free heap; block provider only |
 //! | [`MAX_AUTHORITY_EDGES`] | 64 | ≈ 4 KiB |
 //!
 //! Directory child lists live in their own arena rather than inside
@@ -28,12 +28,17 @@
 //! space: an inline `Body::Directory` would have made every object as large
 //! as the largest directory.
 //!
-//! The whole engine comes to roughly **140 KiB**.  That number is load-bearing,
-//! not incidental: an engine is moved by value on construction, and an
-//! unoptimized build does not elide those moves, so an engine of a few hundred
-//! KiB overflows a test thread's stack before a single assertion runs.  A
-//! workload that needs a bigger pool should raise [`RAM_CHUNKS`] *and* have
-//! its callers hold the engine behind a box.
+//! The volume-scaled tables are **heap reservations, not inline fields**:
+//! since `res/FILESYSTEM_SCALE.md` stage B the object, directory, placement,
+//! extent, derived and handle arenas live in the service heap, so a bound
+//! here is a heap number rather than a stack one, and at these bounds one
+//! mounted engine reserves roughly **1.75 MiB** (`services/dagfs/boot.toml`
+//! derives its heap supply from that figure, twice over for a provisioned
+//! disk). The one table still carried by value is the RAM provider's chunk
+//! pool, and an engine is moved by value on construction — an unoptimized
+//! build does not elide those moves — so a workload that needs a bigger pool
+//! should raise [`RAM_CHUNKS`] *and* have its callers hold the engine behind
+//! a box.
 //!
 //! ## Deliberately compact presentation bounds
 //!
@@ -44,25 +49,46 @@
 //! everything else combined. Thirty-two bytes covers every current native
 //! service, shell, and gate name.
 //!
-//! [`MAX_PATH_DEPTH`] is **8** for the same reason from the other direction:
-//! it is the length of the edge proof stored in *every* open handle, so it
-//! multiplies by the handle arena.  Eight levels of nesting below a client's
-//! own root covers the current bounded profile.
+//! [`MAX_PATH_DEPTH`] is **32**, raised from 8 on measurement. It is the
+//! length of the edge proof stored in *every* open handle, so it multiplies
+//! by the handle arena — session-scaled and heap-backed now — and it fixes
+//! the wire spelling of a search hit: `kore_abi::svc::FS_SEARCH_PATH_BYTES`
+//! is pinned to `MAX_PATH_DEPTH × MAX_NAME_LEN` plus separators, and the
+//! assertion beside the bound refuses to compile a depth the wire cannot
+//! spell.
 //!
 //! Neither value is assumed anywhere in the engine — both are bounds, not
-//! layouts, and raising either is a one-line change plus a footprint
-//! recalculation.
+//! layouts. Raising [`MAX_NAME_LEN`] is a one-line change plus a footprint
+//! recalculation; raising [`MAX_PATH_DEPTH`] is that plus the wire pin.
 
 /// Maximum live objects (files + directories) in the namespace.  Exhaustion
 /// refuses with [`FsError::OutOfObjects`](crate::FsError::OutOfObjects).
-pub const MAX_OBJECTS: usize = 128;
+///
+/// Raised 128 → 512 once the volume-scaled arenas left the `serve` future's
+/// stack, so this is a service-heap number rather than a stack one. The
+/// durable reservation is what caps it now: see `MAX_DURABLE_EDGES` in
+/// `persistence.rs` for the trade that paid for it.
+///
+/// Still four orders of magnitude below a general-purpose filesystem. A
+/// desktop measured for `res/FILESYSTEM_SCALE.md` carries about 2.6 million
+/// objects, and roughly one edge per object rather than the sixteen this
+/// format reserves. Closing that gap needs the paged layout, not a larger
+/// constant.
+pub const MAX_OBJECTS: usize = 512;
 
+/// Raised 16 → 64. It no longer enters the durable reservation at all, since
+/// `MAX_DURABLE_EDGES` is decoupled from the directory × entry product, so
+/// this is now purely a service-heap cost. It must also stay comfortably
+/// above [`MAX_PATH_DEPTH`]: a chain as deep as the proof allows needs one
+/// directory per level, and when the two are equal the arena refuses before
+/// the depth bound can.
+///
 /// Maximum live directory *child lists*.  Every directory object owns one,
 /// so this is the ceiling on live directories — necessarily
 /// `<= MAX_OBJECTS`.  Exhaustion refuses with
 /// [`FsError::OutOfObjects`](crate::FsError::OutOfObjects), since from
 /// a client's view the thing that could not be created is the directory.
-pub const MAX_DIRECTORIES: usize = 16;
+pub const MAX_DIRECTORIES: usize = 64;
 
 /// Maximum containment edges beneath one directory.  Exhaustion refuses with
 /// [`FsError::OutOfEdges`](crate::FsError::OutOfEdges).
@@ -76,7 +102,26 @@ pub const MAX_NAME_LEN: usize = 32;
 /// the depth of the bounded edge proof an open handle carries
 /// (the service's `EdgeProof`).  A path deeper than this refuses with
 /// [`FsError::Range`](crate::FsError::Range) rather than truncating.
-pub const MAX_PATH_DEPTH: usize = 8;
+///
+/// Raised 8 → 32 on measurement, and it was the bound that bit first: only
+/// **48%** of the directories in a real desktop tree sit at depth 8 or less,
+/// so more than half of ordinary content was literally unaddressable, while
+/// the deepest observed path was 28 (`res/FILESYSTEM_SCALE.md`). Costs
+/// nothing on disk — depth is client-side traversal, never a stored fact —
+/// and multiplies only the handle arena, which is session-scaled and now
+/// heap-backed. It does reach the wire: a search hit spells its path into
+/// `kore_abi::svc::FS_SEARCH_PATH_BYTES`, pinned below.
+pub const MAX_PATH_DEPTH: usize = 32;
+
+// A search hit spells its whole view-relative path into one fixed wire field.
+// The field is pinned in the ABI rather than derived from here so a depth
+// raise is an explicit wire decision; this assertion is what makes the pin
+// and the bound move together, and what lets the service's encoder treat a
+// path it cannot spell as unreachable rather than as an index past the field.
+const _: () = assert!(
+    kore_abi::svc::FS_SEARCH_PATH_BYTES >= MAX_PATH_DEPTH * MAX_NAME_LEN + MAX_PATH_DEPTH - 1,
+    "the search-hit wire path must spell the deepest legal path"
+);
 
 /// Stable task views retained independently of short-lived command pairs.
 /// Each view owns one private root and is selected only by an authenticated
@@ -86,7 +131,13 @@ pub const MAX_TASK_VIEWS: usize = 4;
 
 /// Maximum open handles held by one session.  Exhaustion refuses with
 /// [`FsError::OutOfHandles`](crate::FsError::OutOfHandles).
-pub const MAX_HANDLES_PER_SESSION: usize = 16;
+///
+/// Raised 16 → 32 to follow [`MAX_PATH_DEPTH`]. A client walks a path one
+/// `open_at` at a time and holds the intermediate handles, so a session that
+/// cannot hold as many handles as the deepest legal path cannot express that
+/// path at all — at depth 32 with 16 handles the walk refused `OutOfHandles`
+/// halfway down. The two bounds are related and must move together.
+pub const MAX_HANDLES_PER_SESSION: usize = 32;
 
 /// Maximum live authority edges — private roots plus direct grants — across
 /// all sessions.  Exhaustion refuses with

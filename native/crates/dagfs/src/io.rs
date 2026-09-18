@@ -284,10 +284,36 @@ impl<'w, 't> Fs<'w, 't> {
         }
     }
 
+    /// Hold this session's durable commits (`true`) or release them
+    /// (`false`, which commits everything held at once).
+    ///
+    /// The durable service commits the whole session-zero tree — a full
+    /// image encode, a metadata write and a device flush — after **every**
+    /// mutating request from a session that is not holding. A multi-request
+    /// transaction therefore pays one flush per request unless it says
+    /// otherwise, and a save of a few chunks was paying five to eight of
+    /// them, serialized on the service's loop behind everyone else's. The
+    /// hold is per session: it never delays another client's commits, and
+    /// the service drops it when this peer dies, so a held transaction can
+    /// never outlive its author.
+    pub async fn hold_commits(&mut self, hold: bool) -> Result<(), Refusal> {
+        self.checked(&FsRequest::DeferCommits { hold }).await?;
+        Ok(())
+    }
+
     /// Replace a complete text file, creating its final edge when absent
     /// — the editor's save. Stages `bytes` through the bounded window and atomically replaces
     /// the complete contents, then publishes the same plain-text index
     /// batch the `write` verb does; every view is closed on both paths.
+    ///
+    /// One transaction, one commit: the chunk writes, the truncating resize
+    /// and the index batch are held and published by the single release at
+    /// the end. Before this each of them was a whole-tree commit with its
+    /// own flush, which is what made "close the editor right after saving"
+    /// a race the shell's close grace could lose. The release runs on the
+    /// error path too: mutations already applied to the live engine cannot
+    /// be rolled back, so leaving them uncommitted would only defer their
+    /// publication to the next client's commit rather than prevent it.
     #[cfg(feature = "index")]
     pub async fn replace_file(
         &mut self,
@@ -309,13 +335,26 @@ impl<'w, 't> Fs<'w, 't> {
             }
             Err(error) => return Err(error),
         };
+        // A refused hold is not a failed save: the writes below still
+        // commit, one request at a time, exactly as they did before.
+        let held = self.hold_commits(true).await.is_ok();
         let written = self.write_bytes(&file, bytes).await;
         let outcome = match written {
             Ok(()) => crate::index::classify(crate::index::publish(self, &file, Some(bytes)).await),
             Err(error) => Err(error),
         };
+        let released = if held {
+            self.hold_commits(false).await
+        } else {
+            Ok(())
+        };
         self.close(file).await;
-        outcome.map(|indexed| match indexed {
+        let indexed = outcome?;
+        // The release IS the commit. A save whose bytes landed but whose
+        // commit was refused is not saved; say so rather than report the
+        // index verdict of an unpublished tree.
+        released?;
+        Ok(match indexed {
             crate::index::Indexed::Published => SaveOutcome::Indexed,
             crate::index::Indexed::Incomplete => SaveOutcome::IndexIncomplete,
         })

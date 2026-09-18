@@ -357,11 +357,17 @@ impl<T: Transport> ProcessStdioPeer<'_, '_, T> {
             None => crate::executor::next_wake_on(post).await,
         };
         drop(waiting);
-        let delivered = self.notice.try_recv()?;
+        let delivered = if reason == WakeReason::Delivery {
+            self.notice.settle_delivery()?
+        } else {
+            self.notice.try_recv()?
+        };
         match (reason, delivered) {
             (_, Some(notice)) if self.notice_is_valid(notice) => Ok(ProcessStdioPark::StateChanged),
             (_, Some(_)) => Err(ProcessStdioWaitError::InvalidNotice),
-            (WakeReason::Delivery, None) => Err(ProcessStdioWaitError::MissingNotice),
+            // A resolved post with no record is a spurious alternate wake:
+            // the post was re-armed, and the state re-check above is truth.
+            (WakeReason::Delivery, None) => Ok(ProcessStdioPark::Wake(reason)),
             // The primary doorbell won; the alternate post remains standing
             // and `try_recv` correctly left it armed for the next pass.
             (reason, None) => Ok(ProcessStdioPark::Wake(reason)),

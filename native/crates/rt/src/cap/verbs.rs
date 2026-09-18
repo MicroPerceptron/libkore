@@ -4055,7 +4055,7 @@ mod metal {
     /// the monotone receiver-map cursor.
     #[cfg(target_os = "none")]
     pub fn map_owned_lease_at(lease: SlotRef, va: u64, len: u64) -> Option<MappedLeaseView> {
-        map_owned_whole_lease_at(lease, va, len, kore_abi::session::SHARE_ACCESS_R)
+        try_map_owned_whole_lease_at(lease, va, len, kore_abi::session::SHARE_ACCESS_R).ok()
     }
 
     #[cfg(not(target_os = "none"))]
@@ -4069,12 +4069,7 @@ mod metal {
     /// the childless root. Σ5 still gates `W` through `MODIFY`.
     #[cfg(target_os = "none")]
     pub fn map_owned_lease_at_rw(lease: SlotRef, va: u64, len: u64) -> Option<MappedLeaseView> {
-        map_owned_whole_lease_at(
-            lease,
-            va,
-            len,
-            kore_abi::session::SHARE_ACCESS_R | kore_abi::session::SHARE_ACCESS_W,
-        )
+        try_map_owned_lease_at_rw(lease, va, len).ok()
     }
 
     /// Map one complete finalized lease R/X at a caller-selected VA. The
@@ -4082,12 +4077,13 @@ mod metal {
     /// view whose drop exact-unshares the mapping.
     #[cfg(target_os = "none")]
     pub fn map_owned_lease_at_rx(lease: SlotRef, va: u64, len: u64) -> Option<MappedLeaseView> {
-        map_owned_whole_lease_at(
+        try_map_owned_whole_lease_at(
             lease,
             va,
             len,
             kore_abi::session::SHARE_ACCESS_R | kore_abi::session::SHARE_ACCESS_X,
         )
+        .ok()
     }
 
     #[cfg(not(target_os = "none"))]
@@ -4137,8 +4133,15 @@ mod metal {
     }
 
     /// Shared whole-lease implementation for the fixed-address view helpers.
+    ///
+    /// The arena slot is reserved by the caller and handed in, so an
+    /// exhausted arena is reported as [`LeaseWindowFault::Slot`] instead of
+    /// being folded into this function's `None` alongside every policy
+    /// refusal.  On any refusal `owned` drops here and releases its
+    /// reservation, exactly as when the reserve lived inside.
     #[cfg(target_os = "none")]
-    fn map_owned_whole_lease_at(
+    fn map_owned_whole_lease_in(
+        owned: crate::cap::OwnedSlot,
         lease: SlotRef,
         va: u64,
         len: u64,
@@ -4153,7 +4156,6 @@ mod metal {
         }
         let len_usize = usize::try_from(len).ok()?;
         let base = NonNull::new(usize::try_from(va).ok()? as *mut u8)?;
-        let owned = crate::cap::OwnedSlot::reserve()?;
         let mut b = SessionBuilder::new();
         if access
             & !(kore_abi::session::SHARE_ACCESS_R
@@ -4177,6 +4179,43 @@ mod metal {
             return None;
         }
         Some(MappedLeaseView::new(owned, lease, base, len_usize))
+    }
+
+    /// Reserve the arena slot, then map — the seam that separates "no slot"
+    /// from "refused" for every whole-lease map.
+    #[cfg(target_os = "none")]
+    fn try_map_owned_whole_lease_at(
+        lease: SlotRef,
+        va: u64,
+        len: u64,
+        access: u8,
+    ) -> Result<MappedLeaseView, LeaseWindowFault> {
+        let owned = crate::cap::OwnedSlot::reserve().ok_or(LeaseWindowFault::Slot)?;
+        map_owned_whole_lease_in(owned, lease, va, len, access).ok_or(LeaseWindowFault::Refused)
+    }
+
+    /// [`map_owned_lease_at_rw`] with the refusal named.
+    #[cfg(target_os = "none")]
+    pub fn try_map_owned_lease_at_rw(
+        lease: SlotRef,
+        va: u64,
+        len: u64,
+    ) -> Result<MappedLeaseView, LeaseWindowFault> {
+        try_map_owned_whole_lease_at(
+            lease,
+            va,
+            len,
+            kore_abi::session::SHARE_ACCESS_R | kore_abi::session::SHARE_ACCESS_W,
+        )
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn try_map_owned_lease_at_rw(
+        _lease: SlotRef,
+        _va: u64,
+        _len: u64,
+    ) -> Result<MappedLeaseView, LeaseWindowFault> {
+        Err(LeaseWindowFault::Refused)
     }
 
     #[cfg(not(target_os = "none"))]
@@ -4219,22 +4258,62 @@ mod metal {
         false
     }
 
-    /// Carve one segment lease into a runtime-reserved persistent slot.
+    /// Why an owned lease window could not be produced — the `Slot` arm is
+    /// the one a bare `Option` hides.  An exhausted cap arena never reaches
+    /// the kernel at all, so collapsing it into the same `None` as a kernel
+    /// refusal leaves a caller (a refused window launch, say) unable to say
+    /// whether it ran out of slots or was denied.  Shaped like
+    /// [`BarMapFault`] and [`DeviceMmuFault`]: `Slot` first, one vocabulary
+    /// for the whole lease-window seam.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LeaseWindowFault {
+        /// The task's cap arena had no free slot and could not extend.  No
+        /// session was built and nothing was asked of the kernel.
+        Slot,
+        /// Everything else: a malformed ask, a session that failed to build
+        /// or transport, or one that committed with a non-`Ok` status.  A
+        /// supply lease that has left `LEASE_LIVE` refuses here.
+        Refused,
+    }
+
+    /// Carve one segment lease into a runtime-reserved persistent slot,
+    /// naming the refusal.
     ///
     /// This is the ownership-safe service form of [`carve_lease_window`]: the
     /// caller never chooses an arena index and receives an affine value that
     /// keeps the allocator reservation paired with the live capability.
+    #[cfg(target_os = "none")]
+    pub fn try_carve_owned_lease_window(
+        subject: SlotRef,
+        offset: u64,
+        len: u64,
+    ) -> Result<StashedLease, LeaseWindowFault> {
+        let owned = crate::cap::OwnedSlot::reserve().ok_or(LeaseWindowFault::Slot)?;
+        if !carve_lease_window(subject, offset, len, owned.slot()) {
+            return Err(LeaseWindowFault::Refused);
+        }
+        Ok(StashedLease::new(owned))
+    }
+
+    /// The lossy projection of [`try_carve_owned_lease_window`], kept for the
+    /// callers that have nothing to report.
     #[cfg(target_os = "none")]
     pub fn carve_owned_lease_window(
         subject: SlotRef,
         offset: u64,
         len: u64,
     ) -> Option<StashedLease> {
-        let owned = crate::cap::OwnedSlot::reserve()?;
-        if !carve_lease_window(subject, offset, len, owned.slot()) {
-            return None;
-        }
-        Some(StashedLease::new(owned))
+        try_carve_owned_lease_window(subject, offset, len).ok()
+    }
+
+    /// Off metal there is no session engine and therefore no owned lease.
+    #[cfg(not(target_os = "none"))]
+    pub fn try_carve_owned_lease_window(
+        _subject: SlotRef,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<StashedLease, LeaseWindowFault> {
+        Err(LeaseWindowFault::Refused)
     }
 
     /// Off metal there is no session engine and therefore no owned lease.
@@ -4886,6 +4965,21 @@ mod metal {
     #[cfg(not(target_os = "none"))]
     pub fn take_delivery(_slot: SlotRef) -> Option<crate::cap::RawDelivery> {
         None
+    }
+
+    /// Whether this thread's read-only slot alias can read `slot` at all —
+    /// the distinction [`take_delivery`]'s `None` folds away: a vacant record
+    /// in a readable slot versus a slot outside the aliased founding/extension
+    /// spans. Diagnostic only; it grants and consumes nothing.
+    #[cfg(target_os = "none")]
+    pub fn slot_readable(slot: SlotRef) -> bool {
+        crate::entry::geometry::slot_record_va(slot).is_some()
+    }
+
+    /// Off the metal userland targets — nothing is aliased.
+    #[cfg(not(target_os = "none"))]
+    pub fn slot_readable(_slot: SlotRef) -> bool {
+        false
     }
 
     /// Non-owning ingress check that a delivered slot holds a **channel

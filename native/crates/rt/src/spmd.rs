@@ -1166,7 +1166,14 @@ impl<const N: usize> ResidentRegion<N> {
                         return Ok(());
                     }
                     if let Some(post) = rx.standing_post() {
-                        crate::executor::next_wake_on_for(post, RESIDENT_WAKE_BACKSTOP_NS).await;
+                        let reason =
+                            crate::executor::next_wake_on_for(post, RESIDENT_WAKE_BACKSTOP_NS)
+                                .await;
+                        if reason == crate::executor::WakeReason::Delivery {
+                            // A spurious alternate wake re-arms; the complete
+                            // word re-read at the top of the loop is truth.
+                            let _ = rx.settle_delivery();
+                        }
                         continue;
                     }
                     // A delivered old/spurious notice consumed the landing;
