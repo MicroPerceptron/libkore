@@ -950,7 +950,10 @@ impl PciIdentitySelector {
     /// reads this word as an exact pair matches nothing rather than
     /// misinterpreting it.
     pub const fn vendor(vendor: u16) -> Self {
-        assert!(vendor != 0 && vendor != 0xFFFF, "not a lawful PCI vendor id");
+        assert!(
+            vendor != 0 && vendor != 0xFFFF,
+            "not a lawful PCI vendor id"
+        );
         Self(vendor as u32 | (VENDOR_ONLY_DEVICE << 16))
     }
 

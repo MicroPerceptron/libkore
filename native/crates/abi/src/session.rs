@@ -2622,9 +2622,12 @@ pub enum SystemMetric {
     /// refused it, and a serial-less machine's only view of it.
     IommuFaults = 6,
     /// Live memory-fabric domain registrations (res/MEMORY_FABRIC.md, #697);
-    /// auxiliary = the registry capacity. A minimally exposed health surface:
-    /// the fabric registry is up when this samples, and the count is how many
-    /// allocation domains are registered (zero until a producer registers one).
+    /// value packs domain count in the low word and registry capacity in the
+    /// high word. Auxiliary packs registered extent KiB in `[31:0]`, domains
+    /// with at least one lendable window in `[47:32]`, and domains requiring a
+    /// producer/consumer visibility fence in `[63:48]`. This remains a
+    /// data-only census: it does not attest capability liveness or an
+    /// executable device route.
     Fabric = 7,
     /// Manifold barrier exponents (MANIFOLD §6.3, §14.4): value packs
     /// `α_cpu × 10⁶` in the low word and `α_mem × 10⁶` in the high word;
@@ -2669,6 +2672,81 @@ pub enum SystemMetric {
     Sleep = 17,
     /// Last lid level and close-edge generation; see LidSnapshot.
     Lid = 18,
+    /// Scheduler-timer hardware arms since boot, summed over every CPU;
+    /// auxiliary packs `[63:32]` arms that needed a second try (a
+    /// TSC-deadline write that read back as zero before its instant and was
+    /// written again, or a one-shot count that rounded to zero and was
+    /// clamped to one tick), `[31:0]` arms refused after the second deadline
+    /// write also read zero (the CPU then wakes only on other interrupts
+    /// until an arm lands).  Zero auxiliary on a machine that shows
+    /// deadline-shaped stalls acquits the timer; a growing one convicts it.
+    /// Architectures without a counted arm report zeros.
+    TimerArms = 19,
+}
+
+/// Authority-free aggregate returned by [`SystemMetric::Fabric`].
+///
+/// This type is the single wire contract between the kernel registry census
+/// and the monitor service.  It describes registered planning facts only; it
+/// does not prove that a capability remains live or that a device route can
+/// execute.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FabricCensus {
+    pub domains: u32,
+    pub capacity: u32,
+    pub extent_bytes: u64,
+    pub lendable_domains: u32,
+    pub fence_required_domains: u32,
+}
+
+/// Number of bytes represented by one extent unit in `SystemObserve`.
+const FABRIC_EXTENT_UNIT_BYTES: u64 = 1 << 10;
+
+impl FabricCensus {
+    /// Encode into the generic observation pair used by `SystemObserve`.
+    /// Extent is represented in KiB and auxiliary domain counts saturate at
+    /// their fixed-width wire fields.
+    pub const fn to_observation(self) -> (u64, u64) {
+        let extent_kib = self.extent_bytes / FABRIC_EXTENT_UNIT_BYTES;
+        let extent_kib = if extent_kib > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            extent_kib as u32
+        };
+        let lendable = if self.lendable_domains > u16::MAX as u32 {
+            u16::MAX
+        } else {
+            self.lendable_domains as u16
+        };
+        let fences = if self.fence_required_domains > u16::MAX as u32 {
+            u16::MAX
+        } else {
+            self.fence_required_domains as u16
+        };
+        (
+            self.domains as u64 | ((self.capacity as u64) << 32),
+            extent_kib as u64 | ((lendable as u64) << 32) | ((fences as u64) << 48),
+        )
+    }
+
+    /// Decode and validate one fabric observation.
+    pub const fn from_observation(value: u64, aux: u64) -> Option<Self> {
+        let out = Self {
+            domains: value as u32,
+            capacity: (value >> 32) as u32,
+            extent_bytes: (aux as u32 as u64) * FABRIC_EXTENT_UNIT_BYTES,
+            lendable_domains: ((aux >> 32) as u16) as u32,
+            fence_required_domains: ((aux >> 48) as u16) as u32,
+        };
+        if (out.capacity != 0 && out.domains > out.capacity)
+            || out.lendable_domains > out.domains
+            || out.fence_required_domains > out.domains
+        {
+            None
+        } else {
+            Some(out)
+        }
+    }
 }
 
 /// Read-only lid mechanism data. Generation advances only on a runtime close
@@ -4648,6 +4726,49 @@ mod tests {
         assert_eq!(req.index.get(), 0x1234_5678);
         assert_eq!(req.query, INVENTORY_QUERY_COUNT);
         assert_eq!(req.reserved, [0; 3]);
+    }
+
+    #[test]
+    fn fabric_census_owns_and_validates_its_observation_layout() {
+        const TEST_EXTENT_BYTES: u64 = 96 << 20;
+        let census = FabricCensus {
+            domains: 3,
+            capacity: 128,
+            extent_bytes: TEST_EXTENT_BYTES,
+            lendable_domains: 2,
+            fence_required_domains: 1,
+        };
+        let (value, aux) = census.to_observation();
+        assert_eq!(FabricCensus::from_observation(value, aux), Some(census));
+
+        let invalid_lendable = u64::from(4_u16) << 32;
+        assert_eq!(
+            FabricCensus::from_observation(
+                value,
+                (aux & !(u64::from(u16::MAX) << 32)) | invalid_lendable,
+            ),
+            None
+        );
+        let invalid_domains = census.capacity + 1;
+        assert_eq!(
+            FabricCensus::from_observation(
+                u64::from(invalid_domains) | (u64::from(census.capacity) << 32),
+                0,
+            ),
+            None
+        );
+
+        let saturated = FabricCensus {
+            domains: 1,
+            capacity: 1,
+            extent_bytes: u64::MAX,
+            lendable_domains: u32::MAX,
+            fence_required_domains: u32::MAX,
+        }
+        .to_observation();
+        assert_eq!(saturated.1 as u32, u32::MAX);
+        assert_eq!((saturated.1 >> 32) as u16, u16::MAX);
+        assert_eq!((saturated.1 >> 48) as u16, u16::MAX);
     }
 
     /// DEVICE_ACTIVATE consumes the next registered high flavor and its

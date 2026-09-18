@@ -432,12 +432,13 @@ impl FoundingRow {
             40 => b"bring-up rung 24: golden-LRC hardware recording refused or reset-required",
             41 => b"bring-up rung 25: queue PPGTT build or witness map refused",
             42 => b"bring-up rung 26: PPGTT TLB-invalidation round trip refused",
-            43 => b"bring-up rung 27: witness storage, NOP job, or compute-LRC build refused",
+            43 => b"bring-up rung 27: witness storage, startup job, or compute-LRC build refused",
             44 => b"bring-up rung 28: memirq page or tracked control plane refused",
             45 => b"bring-up rung 29: REGISTER_CONTEXT or default policy did not complete",
             46 => b"bring-up rung 30: first submit or MODE_SET enable event did not complete",
-            47 => b"bring-up rung 31: NOP-job completion evidence did not arrive",
+            47 => b"bring-up rung 31: startup-job completion evidence did not arrive",
             48 => b"bring-up rung 32: CCS0 ring enable refused (RCU_MODE/RING_MODE/HWSP readback)",
+            49 => b"bring-up rung 33: EU transform result/input/guard mismatch (detail: word index)",
             50 => {
                 b"recording epoch alive: submission GuC READY, CT enabled; golden recording and native queue not implemented"
             }

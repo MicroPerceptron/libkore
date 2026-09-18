@@ -893,6 +893,27 @@ mod shell_failure_tests {
 /// testimony), and a seed verdict is not shell testimony.
 pub const COOKIE_STORE: u64 = 0x6B72_5F73_746F_7265; // "kr_store"
 
+/// One init phase boundary (`"kr_initP"`): `[7:0]` the phase ordinal,
+/// `[63:8]` init's committed session clock in milliseconds. Posted at
+/// every step of the bring-up ladder so a boot log attributes the
+/// welcome-to-dock interval to the phase that spent it — the kernel
+/// stamps only founding/readiness as a whole, and a serial-less machine
+/// shows nothing at all (#1003).
+pub const COOKIE_INIT_PHASE: u64 = 0x6B72_5F69_6E69_7450; // "kr_initP"
+
+/// One step of init's bring-up that is finer than a phase (`"kr_initS"`):
+/// `[7:0]` the step's index, `[15:8]` its catalogue size (kind 0 only),
+/// `[23:16]` the kind, `[63:24]` init's committed session clock in
+/// milliseconds. Kind 0 is a bootstrap store member about to be installed
+/// (index into `BOOTSTRAP_EXECUTABLES`); kind 1 is one of the named calls
+/// between the `installed` and `extraction` phase stamps (the kernel's
+/// `init_step_name` ladder). Posted before each such call because every one
+/// of them is a deadline-less exec or mm call, and a boot that stalls in one
+/// died with nothing on the glass but "installed 19779 | extraction -": the
+/// kernel keeps the latest per kind and the terminal verdict names the row
+/// or the step, so a stall is one call rather than forty.
+pub const COOKIE_INIT_STEP: u64 = 0x6B72_5F69_6E69_7453; // "kr_initS"
+
 /// Completion cookie for the boot SPMD validate run (`"kr_spmdW"`),
 /// posted by INIT after the store seed: it launches `spmd-witness`
 /// (the one `kore-rt/validate` build) through the ordinary

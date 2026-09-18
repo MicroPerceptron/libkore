@@ -9,6 +9,16 @@ pub use virtio_accel_core::*;
 /// Never insert this bit into upstream `DeviceInfo::capabilities`.
 pub const EXPLICIT_WORKGROUPS: u64 = 1 << 6;
 
+/// Kore's sealed Intel Xe native-kernel package.
+///
+/// Format 1 is the deployed VPUX ELF envelope. Format 2 deliberately carries
+/// no Vulkan/SPIR-V promise: the payload is provider-validated Xe machine code
+/// plus its execution ABI and generation identity.
+pub const FORMAT_XE_NATIVE: ArtifactFormat = match ArtifactFormat::new(2) {
+    Some(format) => format,
+    None => unreachable!(),
+};
+
 // A future upstream assignment must trigger an explicit wire-compatibility review.
 const _: () = assert!(Capabilities::all().bits() & EXPLICIT_WORKGROUPS == 0);
 
@@ -153,6 +163,24 @@ pub trait NativeAccelerator: Accelerator {
     /// Bounded, nonblocking provider-wide fault probe; never drives work.
     fn poll_health(&self) -> Result<(), BackendError> {
         Ok(())
+    }
+
+    /// The packed device-plane witness of a reported `DeviceLost` (the
+    /// provider's own layout; `0` when none was retained). A sealed epoch's
+    /// refusals may carry it so a serial-less client can name the fault
+    /// instead of only the loss. Providers with no device witness keep the
+    /// default.
+    fn loss_evidence(&self) -> u64 {
+        0
+    }
+
+    /// Copy the newest bytes of the device firmware's own log into `out`,
+    /// returning how many were written (the tail is right-aligned to what
+    /// fits). A provider without a readable firmware log keeps the default
+    /// and writes nothing.
+    fn firmware_log(&self, out: &mut [u8]) -> usize {
+        let _ = out;
+        0
     }
 
     /// Preserve the deployed scalar sentinel; reject unproved grid/group/SIMD.

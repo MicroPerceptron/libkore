@@ -12,6 +12,9 @@ use crate::process::ProcessSnapshot;
 const AVAILABLE: u32 = 1;
 const AVAILABLE_U16: u16 = 1;
 
+/// Number of bytes represented by one extent unit in the fixed monitor ABI.
+const FABRIC_EXTENT_UNIT_BYTES: u64 = 1 << 10;
+
 /// Kernel-owned system snapshot: scheduler time, physical memory and heap.
 #[repr(C)]
 #[derive(
@@ -20,10 +23,10 @@ const AVAILABLE_U16: u16 = 1;
 pub struct SystemSnapshot {
     flags: U32,
     cpu_count: U32,
-    /// Live memory-fabric domain registrations (#697) — repurposes one of the
-    /// two former reserved words as the `status fab` health surface.
+    /// Packed memory-fabric domain posture; see the accessors below.
     fabric_domains: U32,
-    reserved: U32,
+    /// Aggregate registered extent in KiB, saturating at `u32::MAX`.
+    fabric_extent_kib: U32,
     captured_ns: U64,
     cpu_busy_ns: U64,
     phys_total: U64,
@@ -36,6 +39,14 @@ pub struct SystemSnapshot {
     /// The LAST fault record, packed: `[15:0]` source-id, `[23:16]`
     /// raw reason, `[24]` write, `[63:25]` faulting-IOVA page.
     iommu_last: U64,
+    /// Scheduler-timer hardware arms since boot, every CPU summed.
+    timer_arms: U64,
+    /// `[63:32]` arms that needed a second try (a deadline write that read
+    /// back unarmed, or a one-shot count clamped up from zero), `[31:0]` arms
+    /// refused after the second deadline write also failed
+    /// (`SystemMetric::TimerArms` auxiliary).  A timer that loses arms in
+    /// steady state is otherwise invisible on a machine with no serial.
+    timer_arm_faults: U64,
 }
 
 impl SystemSnapshot {
@@ -43,7 +54,7 @@ impl SystemSnapshot {
         flags: U32::new(0),
         cpu_count: U32::new(0),
         fabric_domains: U32::new(0),
-        reserved: U32::new(0),
+        fabric_extent_kib: U32::new(0),
         captured_ns: U64::new(0),
         cpu_busy_ns: U64::new(0),
         phys_total: U64::new(0),
@@ -53,6 +64,8 @@ impl SystemSnapshot {
         heap_largest: U64::new(0),
         iommu_faults: U64::new(0),
         iommu_last: U64::new(0),
+        timer_arms: U64::new(0),
+        timer_arm_faults: U64::new(0),
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -68,12 +81,19 @@ impl SystemSnapshot {
         iommu_faults: u64,
         iommu_last: u64,
         fabric_domains: u32,
+        timer_arms: u64,
+        timer_arm_faults: u64,
     ) -> Self {
+        let fabric_domains = if fabric_domains > u8::MAX as u32 {
+            u8::MAX as u32
+        } else {
+            fabric_domains
+        };
         Self {
             flags: U32::new(AVAILABLE),
             cpu_count: U32::new(cpu_count),
             fabric_domains: U32::new(fabric_domains),
-            reserved: U32::new(0),
+            fabric_extent_kib: U32::new(0),
             captured_ns: U64::new(captured_ns),
             cpu_busy_ns: U64::new(cpu_busy_ns),
             phys_total: U64::new(phys_total),
@@ -83,6 +103,8 @@ impl SystemSnapshot {
             heap_largest: U64::new(heap_largest),
             iommu_faults: U64::new(iommu_faults),
             iommu_last: U64::new(iommu_last),
+            timer_arms: U64::new(timer_arms),
+            timer_arm_faults: U64::new(timer_arm_faults),
         }
     }
 
@@ -90,7 +112,14 @@ impl SystemSnapshot {
         self.flags.get() == AVAILABLE
     }
     pub fn validate(self) -> bool {
-        self.reserved.get() == 0 && (self.available() || self == Self::EMPTY)
+        if !self.available() {
+            return self == Self::EMPTY;
+        }
+        let domains = self.fabric_domains();
+        let capacity = self.fabric_capacity();
+        (capacity == 0 || domains <= capacity)
+            && self.fabric_lendable_domains() <= domains
+            && self.fabric_fence_required_domains() <= domains
     }
     pub fn cpu_count(self) -> u32 {
         self.cpu_count.get()
@@ -122,10 +151,81 @@ impl SystemSnapshot {
     pub fn iommu_last(self) -> u64 {
         self.iommu_last.get()
     }
+    /// Scheduler-timer hardware arms since boot, every CPU summed.
+    pub fn timer_arms(self) -> u64 {
+        self.timer_arms.get()
+    }
+    /// Arms that needed a second try: a deadline write that read back
+    /// unarmed, or a one-shot count clamped up from zero.
+    pub fn timer_arms_retried(self) -> u64 {
+        self.timer_arm_faults.get() >> 32
+    }
+    /// Arms refused after the second write also read back as unarmed.
+    pub fn timer_arms_dead(self) -> u64 {
+        self.timer_arm_faults.get() & 0xffff_ffff
+    }
     /// Live memory-fabric domain registrations (#697). Zero until a producer
     /// registers a domain — the registry health surface for `status fab`.
     pub fn fabric_domains(self) -> u32 {
-        self.fabric_domains.get()
+        self.fabric_domains.get() & 0xff
+    }
+    /// Bounded registry slots. Zero is the legacy/no-detail posture.
+    pub fn fabric_capacity(self) -> u32 {
+        (self.fabric_domains.get() >> 8) & 0xff
+    }
+    /// Domains advertising at least one lendable window.
+    pub fn fabric_lendable_domains(self) -> u32 {
+        (self.fabric_domains.get() >> 16) & 0xff
+    }
+    /// Domains whose visibility contract requires an explicit fence.
+    pub fn fabric_fence_required_domains(self) -> u32 {
+        self.fabric_domains.get() >> 24
+    }
+    /// Aggregate registered extent, rounded down to KiB and saturating at the
+    /// wire ceiling. Registration extents are page-granular in production.
+    pub fn fabric_extent_bytes(self) -> u64 {
+        u64::from(self.fabric_extent_kib.get()) * FABRIC_EXTENT_UNIT_BYTES
+    }
+
+    /// Attach the complete fabric census to a newly assembled system sample.
+    pub const fn with_fabric(
+        mut self,
+        domains: u32,
+        capacity: u32,
+        lendable_domains: u32,
+        fence_required_domains: u32,
+        extent_bytes: u64,
+    ) -> Self {
+        let domains = if domains > u8::MAX as u32 {
+            u8::MAX as u32
+        } else {
+            domains
+        };
+        let capacity = if capacity > u8::MAX as u32 {
+            u8::MAX as u32
+        } else {
+            capacity
+        };
+        let lendable = if lendable_domains > u8::MAX as u32 {
+            u8::MAX as u32
+        } else {
+            lendable_domains
+        };
+        let fences = if fence_required_domains > u8::MAX as u32 {
+            u8::MAX as u32
+        } else {
+            fence_required_domains
+        };
+        let extent_kib = extent_bytes / FABRIC_EXTENT_UNIT_BYTES;
+        let extent_kib = if extent_kib > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            extent_kib as u32
+        };
+        self.fabric_domains =
+            U32::new(domains | (capacity << 8) | (lendable << 16) | (fences << 24));
+        self.fabric_extent_kib = U32::new(extent_kib);
+        self
     }
 }
 
@@ -792,6 +892,8 @@ impl FilesystemSnapshot {
     pub const SYSTEM_VIEW: u16 = 1 << 4;
     /// The durable block channel crossed its one-way lost boundary.
     pub const CHANNEL_LOST: u16 = 1 << 5;
+    /// The controller holds a host memory buffer for its mapping tables.
+    pub const HOST_MEMORY_BUFFER: u16 = 1 << 6;
 
     pub const LIFECYCLE_UNKNOWN: u8 = crate::svc::FsSystemStatusWire::LIFECYCLE_UNKNOWN as u8;
     pub const LIFECYCLE_UNDESIGNATED: u8 =
@@ -963,6 +1065,9 @@ impl FilesystemSnapshot {
     pub fn channel_lost(self) -> bool {
         self.posture.get() & Self::CHANNEL_LOST != 0
     }
+    pub fn host_memory_buffer(self) -> bool {
+        self.posture.get() & Self::HOST_MEMORY_BUFFER != 0
+    }
     pub fn sessions(self) -> u16 {
         self.sessions.get()
     }
@@ -1026,11 +1131,14 @@ impl FilesystemSnapshot {
     pub fn spins(self) -> u64 {
         self.spins.get()
     }
-    /// Completion waits that exhausted their full provider budget.
+    /// Completion waits that ran one backend budget out empty — one per
+    /// round, so a command that was slow for several budgets counts each.
     pub fn expired_waits(self) -> u64 {
         self.expired_waits.get()
     }
-    /// Expired waits where the device still reported itself healthy.
+    /// Of those, the rounds where the device still reported itself healthy
+    /// and was therefore waited out (up to the provider's stall ceiling)
+    /// rather than condemned; `expired - slow` is the condemned count.
     pub fn slow_waits(self) -> u64 {
         self.slow_waits.get()
     }
@@ -1428,7 +1536,7 @@ impl TelemetrySnapshot {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<SystemSnapshot>() == 88);
+    assert!(core::mem::size_of::<SystemSnapshot>() == 104);
     assert!(core::mem::size_of::<MemorySnapshot>() == 64);
     assert!(core::mem::size_of::<FilesystemHealthSnapshot>() == 40);
     assert!(core::mem::size_of::<FilesystemStorageSnapshot>() == 80);
@@ -1439,7 +1547,7 @@ const _: () = {
     // 16-byte link head (2 reserved) ‖ 24-byte counters ‖ 36-byte radio block.
     assert!(core::mem::size_of::<NetSnapshot>() == 76);
     assert!(core::mem::size_of::<ManifoldSnapshot>() == 40);
-    assert!(core::mem::size_of::<TelemetrySnapshot>() == 224);
+    assert!(core::mem::size_of::<TelemetrySnapshot>() == 240);
 };
 
 #[cfg(test)]
@@ -1586,12 +1694,28 @@ mod tests {
 
     #[test]
     fn provider_snapshots_validate_only_defined_postures() {
-        let system =
-            SystemSnapshot::new(4, 1_000, 500, 16_384, 8_192, 4_096, 2_048, 1_024, 0, 0, 3);
+        let system = SystemSnapshot::new(
+            4, 1_000, 500, 16_384, 8_192, 4_096, 2_048, 1_024, 0, 0, 3, 0, 0,
+        );
         assert_eq!(
             system.fabric_domains(),
             3,
             "the fabric domain count round-trips"
+        );
+        const TEST_EXTENT_BYTES: u64 = 96 << 20;
+        let system = system.with_fabric(3, 128, 2, 1, TEST_EXTENT_BYTES);
+        assert_eq!(system.fabric_capacity(), 128);
+        assert_eq!(system.fabric_lendable_domains(), 2);
+        assert_eq!(system.fabric_fence_required_domains(), 1);
+        assert_eq!(system.fabric_extent_bytes(), TEST_EXTENT_BYTES);
+        assert!(system.validate());
+        assert!(
+            !SystemSnapshot::new(
+                4, 1_000, 500, 16_384, 8_192, 4_096, 2_048, 1_024, 0, 0, 0, 0, 0
+            )
+            .with_fabric(3, 128, 4, 1, 0)
+            .validate(),
+            "the snapshot builder must not hide an impossible fabric census"
         );
         let memory = MemorySnapshot::new(8, 3, 10, 7, 2, 0, 1, 12_288);
         let exec = ProcessSnapshot::new(32, 3, 1, 0, 9, 2, 6);

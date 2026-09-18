@@ -386,16 +386,20 @@ const _: () = {
 pub const PROCESS_IO_BYTES: usize = 4096;
 /// Maximum raw command-tail bytes.  Arguments remain opaque to the launcher;
 /// each executable owns its own parser.
-/// Argument bytes. **424, sized to what a launcher can compose**: the
+/// Argument bytes. **312, sized to what a launcher can compose**: the
 /// shell's whole command line is 256 bytes (`LINE_CAP`, asserted against
 /// this constant in the shell), the files app bounds a path word at 255, and
-/// init's launches pass short constants. The 88 bytes above that which the
-/// buffer once held carry the launcher's [`NetSnapshot`](crate::monitor::NetSnapshot)
-/// instead — 64 when the link's and the radio's facts joined the page, 24
-/// more when the device's counters did — so the frame service's facts
-/// joined the page without taking a byte from command output, which every
-/// status view already fills to within a few bytes at its maximum topology.
-pub const PROCESS_ARG_BYTES: usize = 424;
+/// init's launches pass short constants. The 200 bytes above that which the
+/// buffer once held are the page's reservoir: 64 went to the launcher's
+/// [`NetSnapshot`](crate::monitor::NetSnapshot) when the link's and the
+/// radio's facts joined the page, 24 more when the device's counters did,
+/// and 112 when the scheduler timer's arm census joined the system snapshot
+/// — 16 for the census itself and 96 so the widest bounded report could
+/// grow its `timer arms` row without giving up another. Each joined the
+/// page without taking a byte from command output, which every status view
+/// already fills to within a few bytes at its maximum topology; 56 bytes
+/// remain above the longest command line.
+pub const PROCESS_ARG_BYTES: usize = 312;
 /// Maximum immutable launcher context bytes. Context and child output reuse
 /// the payload at opposite sides of the task-lifecycle handoff; they are never
 /// simultaneously live.
@@ -417,7 +421,7 @@ const _: () = assert!(
 );
 /// Header bytes before the argument and alternating payload arrays: 8 fixed
 /// (`abi`/`flags`/`arg_len`/`output_len`) + the embedded [`TelemetrySnapshot`]
-/// (224 — the IOMMU census plus the manifold's own state) + the launcher's
+/// (240 — the IOMMU and timer censuses plus the manifold's own state) + the launcher's
 /// [`FilesystemSnapshot`] (236, including physical storage geometry, pressure,
 /// health, bounded reclamation outcomes and the derived completion-latency
 /// moments) + the launcher's [`NetSnapshot`](crate::monitor::NetSnapshot) (76:
@@ -429,13 +433,15 @@ const _: () = assert!(
 /// (and `status input i2c` 3072), so with the 540-byte header of ABI 11 the
 /// output had 33 bytes to give.  ABI 12 takes 20 of them for the filesystem's
 /// latency moments; 13 remain, and the next byte past them costs that report
-/// a row.
+/// a row.  ABI 13's timer census therefore came out of the argument buffer,
+/// not the output — and so did the 96 bytes its `status` row needs, which
+/// takes the output to 3208 with 19 bytes under the widest report.
 ///
 /// The page is a fixed [`PROCESS_IO_BYTES`], so this constant and
 /// [`PROCESS_OUTPUT_BYTES`] move together: every byte the header gains is a
 /// byte of command output given up, and `size_of::<ProcessIo>()` asserts the
 /// two stay in step.
-const HEADER_BYTES: usize = 560;
+const HEADER_BYTES: usize = 576;
 /// Maximum bytes a foreground command can return to its launcher.
 pub const PROCESS_OUTPUT_BYTES: usize = PROCESS_IO_BYTES - HEADER_BYTES - PROCESS_ARG_BYTES;
 /// Layout version.  Zeroed/uninitialized pages fail closed.
@@ -453,8 +459,10 @@ pub const PROCESS_OUTPUT_BYTES: usize = PROCESS_IO_BYTES - HEADER_BYTES - PROCES
 /// 20 bytes of the output's remaining slack — and gives the word held in
 /// reserve beside them a meaning, the read-ahead hit share: an `11` reader
 /// would take that word for zero-or-corrupt. Each change shifts an offset or
-/// a meaning and therefore burns a version.
-pub const PROCESS_IO_ABI: u16 = 12;
+/// a meaning and therefore burns a version.  13: the system snapshot's
+/// scheduler-timer arm census, paid from the argument buffer together with
+/// the output bytes its status row needs, so no report lost a row.
+pub const PROCESS_IO_ABI: u16 = 13;
 
 /// One launch-time snapshot of exec's bounded process table.
 ///
@@ -940,8 +948,12 @@ mod tests {
         // out of the argument buffer the same way, so the output stayed put.
         // 3132 -> 3112 is the filesystem snapshot's 20-byte completion-latency
         // moments, leaving 13 bytes under the widest bounded report (`status
-        // sys <first-core>` at 3099; `status input i2c` needs 3072).
-        assert_eq!(PROCESS_OUTPUT_BYTES, 3112);
+        // sys <first-core>` at 3099; `status input i2c` needs 3072). 3112 ->
+        // 3208 at ABI 13 is the argument buffer's reservoir (424 -> 312, still
+        // clearing the shell's 256-byte line and the files app's 255-byte
+        // path word) paying both the timer census's 16 header bytes and the
+        // 96 its `timer arms` row adds to that widest report, now 3189.
+        assert_eq!(PROCESS_OUTPUT_BYTES, 3208);
     }
 
     /// The two snapshots have different producers — the monitor federates

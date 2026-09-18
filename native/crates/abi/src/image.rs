@@ -129,6 +129,14 @@ pub const PROFILE_SYSTEM_POWER: u32 = 1 << 8;
 /// service's pair, issues the two read-only verbs, and stamps the answers
 /// before the child starts — the filesystem snapshot's shape exactly.
 pub const PROFILE_NETWORK: u32 = 1 << 9;
+/// Launch profile: exec provisions one private recyclable accelerator face.
+///
+/// The bit grants no device authority by itself. Exec admits a fresh service
+/// peer for this launch, and the accelerator host binds every object created
+/// through that peer to its exact recyclable generation. The face disappears
+/// with the task and cannot address another application's contexts, buffers,
+/// programs, queues, or events.
+pub const PROFILE_ACCELERATOR: u32 = 1 << 10;
 
 pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_FILESYSTEM
@@ -139,7 +147,8 @@ pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_INTERACTIVE
     | PROFILE_WINDOW_CONTROL
     | PROFILE_SYSTEM_POWER
-    | PROFILE_NETWORK;
+    | PROFILE_NETWORK
+    | PROFILE_ACCELERATOR;
 
 /// Validate the profile vocabulary and its dependencies: both filesystem
 /// auxiliary endpoint kinds are meaningful only beside an actual FS face.
@@ -1120,6 +1129,7 @@ mod tests {
         // filesystem auxiliaries do.
         assert!(profile_valid(PROFILE_SYSTEM_POWER));
         assert!(profile_valid(PROFILE_SYSTEM_POWER | PROFILE_TELEMETRY));
+        assert!(profile_valid(PROFILE_ACCELERATOR));
         assert!(profile_valid(PROFILE_HEAP | PROFILE_INTERACTIVE));
         assert!(profile_valid(
             PROFILE_FILESYSTEM | PROFILE_HEAP | PROFILE_INTERACTIVE

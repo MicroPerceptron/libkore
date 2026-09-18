@@ -1693,6 +1693,9 @@ impl TaskRepWire {
     /// `TaskRefusal::PeerMemoryUnwired` — exec had no memory-service face
     /// from which to allocate the child's private filesystem ring.
     pub const REFUSE_PEER_MEMORY_UNWIRED: u8 = 20;
+    /// `TaskRefusal::PeerGrantTransfer` — the accelerator peer's reply-grant
+    /// sender could not be transferred to the service.
+    pub const REFUSE_PEER_GRANT_TRANSFER: u8 = 21;
 }
 
 // Live task discriminants stay disjoint from the frozen retired band on
@@ -2676,6 +2679,15 @@ impl AccelReqWire {
     pub const OP_IMPORT_BUFFER: u8 = 25;
     /// Return an imported allocation after quiescent buffer detachment; subject=buffer.
     pub const OP_EXPORT_BUFFER: u8 = 26;
+    /// Administration pair: request retirement of the exact recyclable peer
+    /// whose generation-stamped arrival is in `subject`.
+    pub const OP_RETIRE_PEER: u8 = 27;
+    /// Administration pair: fence the same peer's retirement before its
+    /// launcher reclaims local backing and channel roots.
+    pub const OP_CONFIRM_RETIRED: u8 = 28;
+    /// `AccelRequest::ReadLog` — copy the tail of the provider's firmware
+    /// log into the staging window: `b` = stage offset, `c` = capacity.
+    pub const OP_READ_LOG: u8 = 29;
 }
 
 /// The accel reply wire form (`AccelResponse`'s crossing shape).  Data
@@ -2774,6 +2786,11 @@ impl AccelRepWire {
     pub const TAG_IMPORT_RETURNED: u8 = 21;
     /// One exact lease grant; id echoes the detached buffer.
     pub const TAG_BUFFER_EXPORTED: u8 = 22;
+    /// The named recyclable peer is absent from the service namespace.
+    pub const TAG_PEER_RETIRED: u8 = 23;
+    /// `AccelResponse::Log` — `id` is how many log bytes now sit at the
+    /// requested stage offset (zero when the provider keeps no log).
+    pub const TAG_LOG: u8 = 24;
 
     /// The backend cannot perform the operation (unsupported verb,
     /// domain, flag set, or cancellation without the capability).
@@ -3172,7 +3189,7 @@ const _: () = {
     assert!(size_of::<MonitorReqWire>() == 104);
     assert!(
         size_of::<MonitorRepWire>()
-            == 232
+            == 248
                 + size_of::<crate::processor_status::ProcessorPage>()
                 + size_of::<crate::device::DeviceCensusPage>()
     );
@@ -3818,7 +3835,8 @@ pub struct SurReqWire {
     /// Protocol flags; reserved-zero in v1 (frozen additive headroom).
     pub flags: U32,
     /// The verb's surface id (`DestroySurface` / `Status`); zero when
-    /// the verb names none (`Query`, `CreateSurface`, `Signal`).
+    /// the verb names none (`Query`, `CreateSurface`, `Signal`,
+    /// `RequestClose`).
     pub subject: U64,
     /// Per-verb word (see the `OP_*` docs).
     pub a: U64,
@@ -3854,6 +3872,14 @@ impl SurReqWire {
     /// channel and grant its recv end (the reply's one retained grant);
     /// `COOKIE_DISPLAY_DONE` notices ride it after each present.
     pub const OP_SIGNAL: u8 = 5;
+    /// `SurfaceRequest::RequestClose` — this window's own close, asked
+    /// through the controller's path instead of taken: the compositor
+    /// raises the same `close_requested` the chrome's close dot raises
+    /// and echoes `CloseRequested` down this pair's event channel, so the
+    /// controller observes the close before the app leaves and the app
+    /// leaves only on the echo.  No words; `subject` is zero
+    /// ([`SurRepWire::TAG_CLOSE_REQUESTED`]).
+    pub const OP_REQUEST_CLOSE: u8 = 6;
 
     /// [`OP_CREATE_SURFACE`](Self::OP_CREATE_SURFACE) `b`: CPU-reachable
     /// backing — the one v1 reach.
@@ -3888,7 +3914,8 @@ pub struct SurRepWire {
     /// Reserved; must be zero.
     pub reserved: [u8; 5],
     /// The verb's surface word: a create's fresh id, a destroy/status
-    /// echo, a refusal's echoed subject; zero for `Query`/`Signal`.
+    /// echo, a refusal's echoed subject; zero for `Query`/`Signal`/
+    /// `RequestClose`.
     pub id: U64,
     /// Per-tag word (see the `TAG_*` docs).
     pub a: U64,
@@ -3924,6 +3951,10 @@ impl SurRepWire {
     /// `SurfaceResponse::Refused` — see `refusal`; `id` echoes the
     /// subject the refusal names (zero when the verb named none).
     pub const TAG_REFUSED: u8 = 6;
+    /// `SurfaceResponse::CloseRequested` — `a` = the configure serial the
+    /// close was raised under (never zero: an unconfigured window cannot
+    /// be closing).  The echo itself rides the event channel.
+    pub const TAG_CLOSE_REQUESTED: u8 = 7;
 
     /// A v1 vocabulary gate: an unknown op, a non-XRGB8888 format, a
     /// non-CPU reach, a non-LINEAR modifier, a non-empty flag set.
@@ -4350,11 +4381,19 @@ impl FsDirEntryWire {
 
 /// Maximum bytes in one view-relative search path.
 ///
-/// The filesystem currently admits eight 32-byte components. Seven `/`
-/// separators make the complete bounded spelling 263 bytes. Keeping this
-/// number in the frozen ABI makes a later service-side bound increase an
-/// explicit additive ABI decision instead of silently truncating hits.
-pub const FS_SEARCH_PATH_BYTES: usize = 263;
+/// The filesystem admits thirty-two 32-byte components
+/// (`kore_dagfs::bounds::MAX_PATH_DEPTH` × `MAX_NAME_LEN`); thirty-one `/`
+/// separators make the complete bounded spelling 1,055 bytes. The number is
+/// pinned here rather than derived so a service-side bound increase stays an
+/// explicit wire decision instead of silently truncating hits — and the
+/// client crate asserts at compile time that this spelling covers the
+/// deepest legal path, so the two can only move together. Raised from 263
+/// (eight components) when the depth bound went 8 → 32: at 263 a hit nine
+/// components deep had nowhere to put its ninth separator. Every client and
+/// the service are sealed from one tree, so the record's width is not a
+/// compatibility surface between builds; it is a page-capacity one, and eight
+/// hits (the largest page) take 9,280 of a process's 65,536-byte data window.
+pub const FS_SEARCH_PATH_BYTES: usize = 1055;
 
 /// One authority-filtered structural search hit in the pair's data window.
 ///
@@ -4394,8 +4433,9 @@ pub struct FsSearchHitWire {
 }
 
 impl FsSearchHitWire {
-    /// Bytes one hit occupies in the data window.
-    pub const BYTES: usize = 368;
+    /// Bytes one hit occupies in the data window: the 40-byte fixed prefix,
+    /// the bounded path, the 64-byte snippet and one reserved tail byte.
+    pub const BYTES: usize = 40 + FS_SEARCH_PATH_BYTES + 64 + 1;
 }
 
 /// One authority edge as `ListGrants` lands it in the data window. 48 bytes —
@@ -4604,6 +4644,10 @@ impl FsSystemStatusWire {
     /// durable namespace; this bit says its backing channel can no longer
     /// perform I/O and must not be mistaken for the healthy mount posture.
     pub const FLAG_CHANNEL_LOST: u16 = 1 << 5;
+    /// The controller holds a host memory buffer for its mapping tables
+    /// (unset: it was offered none, or refused it — a DRAM-less part then
+    /// pages its tables from NAND on every access).
+    pub const FLAG_HOST_MEMORY_BUFFER: u16 = 1 << 6;
 
     /// No lifecycle testimony was supplied (the bare volatile harness).
     pub const LIFECYCLE_UNKNOWN: u16 = 0;

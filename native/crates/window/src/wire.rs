@@ -146,6 +146,16 @@ pub enum SurfaceRequest {
     /// diagnostics and tests; the per-frame truth is the event channel's
     /// state (`crate::channel`, `res/EVENT.md`).
     Status { surface: u64 },
+    /// This window's own close — ESC, Q, an app's close action — asked
+    /// through the controller's path rather than taken.  The compositor
+    /// raises the same `close_requested` the chrome's close dot raises and
+    /// echoes [`Event::CloseRequested`](crate::event::Event::CloseRequested)
+    /// down this window's own channel; the controller's next lifecycle
+    /// observation then drives the one teardown, and the app exits only on
+    /// the echo.  An app that exits on its own instead leaves the
+    /// controller, the compositor and the app tearing one window down in
+    /// three orders at once.
+    RequestClose,
 }
 
 /// The surface-class reply vocabulary.
@@ -180,6 +190,10 @@ pub enum SurfaceResponse {
         refused_commits: u64,
         presented_at: u64,
     },
+    /// The close request is held: `serial` is the configure serial it was
+    /// raised under (never zero).  Idempotent — a window already asked to
+    /// close answers this again rather than refusing.
+    CloseRequested { serial: u64 },
     /// The refusal, echoing the subject the verb named (zero if none).
     Refused {
         refusal: SurfaceRefusal,
@@ -339,6 +353,9 @@ pub fn encode_req(req: &SurfaceRequest) -> SurReqWire {
             w.op = SurReqWire::OP_STATUS;
             w.subject = U64::new(surface);
         }
+        SurfaceRequest::RequestClose => {
+            w.op = SurReqWire::OP_REQUEST_CLOSE;
+        }
     }
     w
 }
@@ -363,6 +380,7 @@ fn raw_decode_req(w: &SurReqWire) -> Option<SurfaceRequest> {
         SurReqWire::OP_STATUS => SurfaceRequest::Status {
             surface: w.subject.get(),
         },
+        SurReqWire::OP_REQUEST_CLOSE => SurfaceRequest::RequestClose,
         _ => return None,
     })
 }
@@ -439,6 +457,10 @@ pub fn encode_rep(rep: &SurfaceResponse, grants: u8) -> SurRepWire {
             w.c = U64::new(refused_commits);
             w.d = U64::new(presented_at);
         }
+        SurfaceResponse::CloseRequested { serial } => {
+            w.tag = SurRepWire::TAG_CLOSE_REQUESTED;
+            w.a = U64::new(serial);
+        }
         SurfaceResponse::Refused { refusal, subject } => {
             w.tag = SurRepWire::TAG_REFUSED;
             w.refusal = refusal.code();
@@ -477,6 +499,7 @@ fn raw_decode_rep(w: &SurRepWire) -> Option<SurfaceResponse> {
             refused_commits: w.c.get(),
             presented_at: w.d.get(),
         },
+        SurRepWire::TAG_CLOSE_REQUESTED => SurfaceResponse::CloseRequested { serial: w.a.get() },
         SurRepWire::TAG_REFUSED => SurfaceResponse::Refused {
             refusal: SurfaceRefusal::from_code(w.refusal)?,
             subject: w.id.get(),
@@ -572,6 +595,9 @@ pub fn reply_matches(request: &SurReqWire, response: &SurfaceResponse, grants: u
                 ..
             },
         ) => surface == got && presented <= committed,
+        // A close raised under no configure serial names a window that was
+        // never presented; the compositor refuses that instead.
+        (SurfaceRequest::RequestClose, SurfaceResponse::CloseRequested { serial }) => serial != 0,
         _ => false,
     }
 }
@@ -661,6 +687,7 @@ mod tests {
             },
             SurfaceRequest::DestroySurface { surface: 17 },
             SurfaceRequest::Status { surface: 17 },
+            SurfaceRequest::RequestClose,
         ];
         let replies = [
             SurfaceResponse::Info {
@@ -684,6 +711,7 @@ mod tests {
                 refused_commits: 0,
                 presented_at: 123,
             },
+            SurfaceResponse::CloseRequested { serial: 7 },
         ];
         for (i, request) in requests.iter().enumerate() {
             let wire = encode_req(request);
@@ -772,7 +800,7 @@ mod tests {
         }
     }
 
-    fn every_request() -> [SurfaceRequest; 5] {
+    fn every_request() -> [SurfaceRequest; 6] {
         [
             SurfaceRequest::Query,
             SurfaceRequest::CreateSurface {
@@ -791,10 +819,11 @@ mod tests {
             },
             SurfaceRequest::DestroySurface { surface: 0x11 },
             SurfaceRequest::Status { surface: 0x2002 },
+            SurfaceRequest::RequestClose,
         ]
     }
 
-    fn every_response() -> [SurfaceResponse; 6] {
+    fn every_response() -> [SurfaceResponse; 7] {
         [
             SurfaceResponse::Info {
                 width: 1920,
@@ -825,7 +854,52 @@ mod tests {
                 refusal: SurfaceRefusal::Busy,
                 subject: 0,
             },
+            SurfaceResponse::CloseRequested { serial: 0x2A },
         ]
+    }
+
+    /// A close request answers only under a live configure serial, and a
+    /// refusal of it names no subject.
+    #[test]
+    fn a_close_request_is_held_only_under_a_live_serial() {
+        let wire = encode_req(&SurfaceRequest::RequestClose);
+        assert_eq!(SurfaceWire::request_grants(&wire), 0);
+        assert!(reply_matches(
+            &wire,
+            &SurfaceResponse::CloseRequested { serial: 1 },
+            0
+        ));
+        assert!(!reply_matches(
+            &wire,
+            &SurfaceResponse::CloseRequested { serial: 0 },
+            0
+        ));
+        assert!(!reply_matches(
+            &wire,
+            &SurfaceResponse::CloseRequested { serial: 1 },
+            1
+        ));
+        assert!(reply_matches(
+            &wire,
+            &SurfaceResponse::Refused {
+                refusal: SurfaceRefusal::Busy,
+                subject: 0,
+            },
+            0
+        ));
+        assert!(!reply_matches(
+            &wire,
+            &SurfaceResponse::Refused {
+                refusal: SurfaceRefusal::Busy,
+                subject: 1,
+            },
+            0
+        ));
+        assert!(!reply_matches(
+            &wire,
+            &SurfaceResponse::Destroyed { surface: 0 },
+            0
+        ));
     }
 
     /// The codec obligation: every request round-trips byte-exactly.
