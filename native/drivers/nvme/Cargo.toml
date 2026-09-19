@@ -1,0 +1,48 @@
+[package]
+name = "kore-nvme"
+version = "0.0.0"
+edition = "2024"
+description = "kore NVMe driver core: SPDK-shaped per-core qpairs over the shared register/DMA seam; the production service composition lives in kore-svc-swap-nvme (services/swap-nvme), which claims the controller from the device broker and serves the swap protocol over this core."
+publish = false
+
+# The driver core is pure logic over the `seam` traits + the kore-abi device
+# ABI's typed addresses — [`IovaAddr`]: "no phys in userland" is a *type*,
+# and the driver speaks it end to end (raw `u64` never names an address).
+# The kernel first-light impl and production userland host each provide the
+# seam. The in-crate hardware double is `#[cfg(test)]` only and proves core
+# behavior, not production composition.
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+# The shared driver substrate: the platform seam (re-exported as
+# `kore_nvme::seam`) + the async ring mechanics kore-nvme's `Qpair` composes
+# from (`SubRing` / `CompRing` / `CookieTable` / `RingStats`).  kore-nvme is
+# its first customer.
+kore-driver = { path = "../../crates/driver" }
+# The swap-service face only (`service` feature): the SystemService trait
+# + framework and the real cap verbs the serve step uses to bind delivered
+# pages (kore-rt), and the SwapRequest vocabulary (kore-svc-swap — the
+# swap service's own crate, res/USERLAND.md §1.1).  The kernel dep uses
+# default features, so neither ever enters the kernel binary.
+kore-rt = { path = "../../crates/rt", optional = true }
+kore-svc-swap = { path = "../../services/swap", optional = true }
+
+[features]
+# Userland posture: size runtime tables (the qpair cookie table) exactly to
+# the controller's negotiated depth through the global allocator — which in
+# kore userland IS the mm-backed heap (kore-svc-mm).  Off (the kernel
+# boot-test): fixed inline ceilings, heapless.
+alloc = ["kore-driver/alloc"]
+# The disk-swap service face: NvmeSwap = SystemService<Request = SwapRequest>
+# over the driver core — the lessor loop's disk backend.
+service = ["alloc", "dep:kore-rt", "dep:kore-svc-swap"]
+
+# The self-dev-dependency turns `service` on for this crate's own test
+# builds, so the service face stays test-compiled.
+[dev-dependencies]
+kore-nvme = { path = ".", features = ["service"] }
+# GPT fixture building for the discovery tests: the same crates (and
+# versions) `kore-driver`'s parse side uses, here writing the tables the
+# mock disk serves back through the real chunked-read path.
+gpt_disk_types = { version = "0.16.1", default-features = false, features = ["bytemuck"] }
+crc = { version = "3.4.0", default-features = false }
+bytemuck = { version = "1.25.2", default-features = false }

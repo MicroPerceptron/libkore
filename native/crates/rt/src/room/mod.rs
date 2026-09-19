@@ -245,13 +245,21 @@ mod tests {
     fn mail_posts_takes_and_returns_displacement() {
         let mut room = Room::new();
         assert_eq!(room.take(QuadLane::L1), None, "vacant reads vacant");
-        assert_eq!(room.post(QuadLane::L1, msg(7)), None, "first post displaces nothing");
+        assert_eq!(
+            room.post(QuadLane::L1, msg(7)),
+            None,
+            "first post displaces nothing"
+        );
         assert_eq!(
             room.post(QuadLane::L1, msg(9)),
             Some(msg(7)),
             "the displaced message returns"
         );
-        assert_eq!(room.take(QuadLane::L1), Some(msg(9)), "the receiver reads the last write");
+        assert_eq!(
+            room.take(QuadLane::L1),
+            Some(msg(9)),
+            "the receiver reads the last write"
+        );
         assert_eq!(room.take(QuadLane::L1), None, "taking clears");
         // The neighbour's box was never touched.
         assert_eq!(room.take(QuadLane::L2), None);
@@ -280,7 +288,11 @@ mod tests {
         room.store(RoomSlot::Sched, 0xDEAD);
         let _ = room.post(QuadLane::L0, msg(1));
         room.publish(2);
-        assert_eq!(room.load(RoomSlot::Sched), 0xDEAD, "mail never clobbers a tenant");
+        assert_eq!(
+            room.load(RoomSlot::Sched),
+            0xDEAD,
+            "mail never clobbers a tenant"
+        );
     }
 
     /// The host floor names itself honestly.

@@ -389,6 +389,23 @@ pub trait NicBackend {
     /// enforces, and why this takes a [`TxFrame`] rather than an address.
     fn transmit(&mut self, frame: TxFrame<'_>) -> Result<(), Self::Error>;
 
+    /// Advance link management once per drive, after completion processing
+    /// and before the transmit pump, even with no frames or vifs.
+    ///
+    /// `None` explicitly means no calibrated monotonic clock is available;
+    /// a timed link must refuse or use its declared unclocked budget, never
+    /// invent elapsed time. This method must not block or drain the shared
+    /// completion source again. Wired backends retain the no-op default.
+    fn service(&mut self, _now_ns: Option<u64>) {}
+
+    /// Earliest absolute monotonic deadline requiring another service call.
+    /// Read after the whole sweep, since RX can change the link's deadline.
+    /// The owner parks on this deadline together with its existing IRQ/request
+    /// wake, so an idle link can time out without periodic polling.
+    fn service_deadline(&self) -> Option<u64> {
+        None
+    }
+
     /// Publish everything [`transmit`](Self::transmit) staged since the last
     /// flush — the once-per-drive doorbell.
     ///

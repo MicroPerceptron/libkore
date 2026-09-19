@@ -239,7 +239,9 @@ impl DeviceCensusPage {
 /// The assembled census.  1936 bytes; the whole process-context prefix of
 /// the executable that declares it.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct DeviceCensus {
     /// [`DEVICE_CENSUS_ABI`]; 0 = unavailable.
     pub abi: U16<LittleEndian>,
@@ -278,7 +280,11 @@ impl DeviceCensus {
             count: U16::new(count),
             total: U16::new(total),
             roots,
-            flags: if total > count { DEVICE_CENSUS_TRUNCATED } else { 0 },
+            flags: if total > count {
+                DEVICE_CENSUS_TRUNCATED
+            } else {
+                0
+            },
             reserved: [0; 8],
             rows: [DeviceCensusRow::EMPTY; MAX_DEVICE_CENSUS_ROWS],
         }

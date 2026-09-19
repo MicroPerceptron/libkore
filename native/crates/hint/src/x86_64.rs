@@ -172,10 +172,7 @@ impl AddressMonitor for X86Monitor {
             return None;
         }
         let hz = counter_hz;
-        let cycles = cap
-            .as_nanos()
-            .saturating_mul(u128::from(hz))
-            / 1_000_000_000u128;
+        let cycles = cap.as_nanos().saturating_mul(u128::from(hz)) / 1_000_000_000u128;
         Some(u64::try_from(cycles).unwrap_or(u64::MAX))
     }
 

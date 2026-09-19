@@ -28,6 +28,21 @@ pub use kore_rt::{thread, thread_controller};
 #[cfg(feature = "driver")]
 pub use kore_driver as driver;
 
+/// Capability-based executable invocation and lifecycle.
+///
+/// The one native owner, re-exported — not a second implementation. A local
+/// [`exec::CapabilityNamespace`] names the executables this task actually
+/// holds; [`exec::RingExec`] speaks the protocol over a founded face the
+/// process was given. Neither the name nor this module is authority: an
+/// invocation still needs the affine [`exec::ExecutableCapability`] the founder
+/// delivered, and the service refuses anything else.
+///
+/// Enabling this does **not** link the exec service. `kore-exec-client` is the
+/// protocol and the caller's face; the spawn engine that answers it stays in
+/// Kore, where enforcement belongs.
+#[cfg(feature = "exec")]
+pub use kore_exec_client as exec;
+
 /// Native clocks and deadlines; wall time never coerces into monotonic time.
 pub mod time {
     pub use core::time::Duration;

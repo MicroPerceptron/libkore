@@ -7,9 +7,7 @@
 //! (never below [`MAX_TRANSFER`](crate::bounds::MAX_TRANSFER)), and a reply may never
 //! claim more bytes than were asked for.
 
-use crate::{
-    ANY_REVISION, Fs, FsError, FsRequest, FsResponse, Refusal, View, WALK_READ,
-};
+use crate::{ANY_REVISION, Fs, FsError, FsRequest, FsResponse, Refusal, View, WALK_READ};
 
 #[cfg(feature = "index")]
 use crate::{ObjectKind, Rights, WALK_MUTATE, WALK_WRITE};
@@ -305,7 +303,10 @@ mod tests {
         // Durable backends advertise larger windows; the old 4 KiB floor
         // must not silently cap offset I/O after negotiation.
         assert_eq!(transfer_len(0, 128 * 1024, 64 * 1024).unwrap(), 64 * 1024);
-        assert_eq!(transfer_len(0, 64 * 1024, MAX_TRANSFER).unwrap(), MAX_TRANSFER);
+        assert_eq!(
+            transfer_len(0, 64 * 1024, MAX_TRANSFER).unwrap(),
+            MAX_TRANSFER
+        );
         assert_eq!(
             transfer_len(0, usize::MAX, usize::MAX).unwrap(),
             u32::MAX as usize

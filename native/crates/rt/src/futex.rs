@@ -469,11 +469,7 @@ pub fn stats() -> WaitStats {
 /// # Panics
 /// Polled outside the kore executor, as [`next_wake`](crate::executor::next_wake):
 /// the wake it waits on is the executor's own.
-pub async fn wait_async(
-    word: &AtomicU32,
-    expected: u32,
-    timeout: Option<Duration>,
-) -> WaitOutcome {
+pub async fn wait_async(word: &AtomicU32, expected: u32, timeout: Option<Duration>) -> WaitOutcome {
     let Some(me) = current_thread() else {
         return WaitOutcome::Unsupported;
     };
@@ -1086,7 +1082,10 @@ mod tests {
         assert_ne!(a, b, "the second waiter reused the first's slot");
 
         assert!(thread_waits_on(2, address_of(&first)), "first waiter lost");
-        assert!(thread_waits_on(2, address_of(&second)), "second waiter lost");
+        assert!(
+            thread_waits_on(2, address_of(&second)),
+            "second waiter lost"
+        );
 
         // Releasing one must not retire the other.
         release_wait(2, b);

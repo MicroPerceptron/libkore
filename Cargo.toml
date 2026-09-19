@@ -18,6 +18,10 @@ collections = ["dep:hashbrown"]
 heap = ["kore-rt/heap"]
 crt0 = ["kore-rt/crt0"]
 driver = ["dep:kore-driver", "kore-driver/service"]
+# Capability-based executable invocation and lifecycle. Off by default: an
+# application that never launches anything should not link the surface, and the
+# client pulls the filesystem and image owners for its request vocabulary.
+exec = ["dep:kore-exec-client", "fs"]
 
 # Byte-exact native export; source revision and hashes live in native/provenance.json.
 [dependencies]
@@ -29,7 +33,8 @@ kore-app = { path = "native/crates/app" }
 kore-rt = { path = "native/crates/rt", default-features = false }
 kore-dagfs = { path = "native/crates/dagfs", optional = true }
 kore-driver = { path = "native/crates/driver", optional = true }
+kore-exec-client = { path = "native/services/exec-client", optional = true }
 
 [package.metadata.kore]
 # Used by tools/local-kore.py to construct one coherent local source override.
-owner-paths = { kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver" }
+owner-paths = { kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver", kore-exec-client = "services/exec-client" }

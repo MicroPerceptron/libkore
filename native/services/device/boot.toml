@@ -1,0 +1,51 @@
+# services/device/boot.toml — this service's boot-manifest row (the design
+# lives in res/boot.toml's header).  The row rides beside the crate it
+# endows, redox-style; whether and WHEN it founds is the root manifest's
+# `services` list — founding order and chain adjacency are topology, the
+# root's to declare, never a row's.
+
+# The device broker (res/DEVICE_SERVICE.md §10) — the sole holder of the
+# machine's device inventory, and the row every driver claims its hardware
+# from.
+#
+# THE CHAIN'S ORIGIN (`chain = true`, first of the root's consecutive
+# chained run), and it must be: a client face onto a serving pair can
+# only be attenuated off a founder that already holds that pair's roots, so
+# the broker has to be founded before anything that asks it for a device.
+# Founding order IS the authority order here.
+#
+# Its endowment is ROOT_COMPLEX — the inventory, endowed here and
+# nowhere else.  Deliberately no DEVICE beside it: a task that both
+# arbitrates devices and drives one is the god-object §1 rules out, and
+# this row is where that is made unrepresentable rather than merely
+# discouraged.
+#
+# FACE_SUPPLY is the claimant band's full-span serving sub (§10's
+# minted-face transition): the kernel founder mints the band at this
+# row's round (armed by this row declaring BOTH roles), keeps the root
+# on the chain shelf, and every driver row rides a runtime-minted pair
+# whose window is one band stride — `MintFace` over the control pair,
+# driven by the founder itself.  A new driver row is a manifest row,
+# never a founder edit, and never a `SERVE_PAIRS` bump.
+[service]
+image     = "kore-svc-device"
+chain     = true                             # the chain's ORIGIN: this row's founder is
+                                             # retained through every chained row after it
+                                             # (it holds the broker's control-pair roots
+                                             # and the claimant band, then input's roots,
+                                             # then the display's, then the terminal's,
+                                             # then exec's client pair half)
+endowment = "kore_svc_device::DeviceEndowment"
+protocol  = "kore_svc_device::DeviceBroker"
+# One broker row per PCIe root complex (#572): `instances` expands this
+# fragment into MAX_ROOT_COMPLEXES consecutive manifest rows backed by ONE
+# committed ELF.  Every row endows ROOT_COMPLEX@0 = "this row's root" (the
+# founder maps row ordinal k → the k-th root in ascending (segment, bus)
+# order); rows whose root the
+# machine did not discover are SKIPPED at founding.  PLATFORM_BUS rides
+# ordinal 0 alone (non-PCI devices sit on no root); FACE_SUPPLY is each
+# row's own claimant band.
+instances = 8
+endows    = ["ROOT_COMPLEX@0", "PLATFORM_BUS@0", "FACE_SUPPLY@0"]
+digest_x86_64  = "blake3:680ccdbc48e248f91afb70eb18d6b630f5d9dbc0f1906e40f6b2409ea374841d"  # res/x86_64/; make boot-digests-x86
+digest_aarch64 = "blake3:561f0487f5139e778dd5ec2aa9d030f5c7cd2e7f7af4a04f7c23e8808aa78899"  # res/aarch64/; make boot-digests-aarch64

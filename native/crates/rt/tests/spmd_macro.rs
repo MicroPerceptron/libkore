@@ -5,7 +5,7 @@
 //! expected width).  Behavior on the host is the typed refusal, exactly
 //! as `thread::spawn`'s.
 
-use kore_rt::spmd::{SpmdCtx, SpawnedSpmd};
+use kore_rt::spmd::{SpawnedSpmd, SpmdCtx};
 
 /// 2·2·2 = 8 tiles on a MAX_THREADS = 32 plan: under the ceiling, so
 /// the grid IS the width — and this annotation is the tripwire that

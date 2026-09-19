@@ -1,0 +1,33 @@
+# services/dagfs/boot.toml — the filesystem service's boot-manifest row.
+# Founding order lives in res/boot.toml; this fragment declares only the
+# service-local image, bundle, and protocol citations.
+
+# The filesystem follows the terminal in the retained chain: it consumes a
+# client face onto block, then leaves its own service pair resident before the
+# exec and init rounds. Client multiplication belongs to the recyclable-session
+# seam, not to a fixed bank of shell-specific boot pairs.
+[service]
+image     = "kore-svc-dagfs"
+chain     = true
+endowment = "kore_svc_dagfs::FsEndowment"
+protocol  = "kore_svc_dagfs::FsProtocol"
+endows    = []
+# HostLink's importer pair is distinct from broker and agent traffic. The
+# generic declared-client role bank keeps this clear of the block client.
+clients   = [{ provider = "kore-svc-hostlink", pair = 3 }]
+# The measured archive digest is immutable startup data, not a capability.
+# The generated founder row stamps it as ARCHIVE_ERA@0..=7; FsEndowment
+# resolves all eight words before the durable policy can run.
+boot_data = "archive_digest"
+# Pair 1 is exec's authority-bearing administration face. Command processes
+# themselves arrive through the recyclable-peer seam; the fixed face count
+# therefore stays independent of the installed command set.
+exec_client = true
+# The namespace's child-list arena is boxed (MAX_DIRECTORIES x MAX_DIR_ENTRIES,
+# ~450 KiB) so it does not ride the founded service's delegated stack inside the
+# mount/format futures. That moves it onto this heap, alongside the 128 KiB
+# durable image scratch and the provider's extent bookkeeping, so the 2 MiB
+# default no longer leaves comfortable headroom. 4 MiB covers the working set.
+heap_supply_bytes = 0x0040_0000
+digest_x86_64  = "blake3:b73f7b16bf00e5966a2741ef2ab4294ffc53479254b9eb4b15a06533f9bbb5a2"
+digest_aarch64 = "blake3:28bcca53ec2993b6d408c20fd5f81515e3b1933b1db09a6df9a27967b00afc52"

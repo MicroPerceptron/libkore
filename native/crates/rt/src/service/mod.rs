@@ -514,6 +514,13 @@ pub trait SystemService: crate::svc::SvcProtocol + Sized {
         0
     }
 
+    /// Deadline work that observes another service through its held client.
+    /// The deadline host awaits this before and after draining requests. The
+    /// synchronous default preserves ordinary alarm-service behavior.
+    async fn drive_deadlines_async(&mut self, now_ns: u64) -> u16 {
+        self.drive_deadlines(now_ns)
+    }
+
     /// **Terminal device quiesce** (#809 §L) — called once by the generic
     /// host when the kernel's shutdown sweep wakes the row, before
     /// `deadline_ns` (absolute monotonic nanoseconds).  The row reaches each
@@ -1417,7 +1424,9 @@ impl<R> Outcome<R> {
     /// Complete only after the whole grant transaction commits successfully.
     pub(crate) fn release_transferred_grants(&mut self) {
         for owner in &mut self.retained_grants {
-            if let Some(owner) = owner.take() { owner.release_after_proven_move(); }
+            if let Some(owner) = owner.take() {
+                owner.release_after_proven_move();
+            }
         }
     }
 
@@ -1553,9 +1562,16 @@ impl<R> Serve<'_, R> {
     /// Retain one affine delivery through the exact reply-grant transaction.
     /// The host settles its local reservation only after a proven move; a
     /// failed grant keeps the owner in the outcome's bounded cleanup path.
-    pub fn grant_returned(&mut self, owner: crate::cap::ReturnedCapability) -> Result<(), crate::cap::ReturnedCapability> {
-        let Some(subject) = owner.slot() else { return Err(owner); };
-        if self.out.granted >= MAX_GRANTS { return Err(owner); }
+    pub fn grant_returned(
+        &mut self,
+        owner: crate::cap::ReturnedCapability,
+    ) -> Result<(), crate::cap::ReturnedCapability> {
+        let Some(subject) = owner.slot() else {
+            return Err(owner);
+        };
+        if self.out.granted >= MAX_GRANTS {
+            return Err(owner);
+        }
         let index = self.out.granted;
         self.grant(subject, Rights::empty(), GrantArg::Exact);
         self.out.retained_grants[index] = Some(owner);

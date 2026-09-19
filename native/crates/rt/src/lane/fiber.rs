@@ -358,7 +358,10 @@ impl QuadWord {
             self.set_field(lane, Self::pack_field(0, FiberStatus::Poisoned));
             return Err(());
         }
-        self.set_field(lane, Self::pack_field((off / 8) as u16, FiberStatus::Parked));
+        self.set_field(
+            lane,
+            Self::pack_field((off / 8) as u16, FiberStatus::Parked),
+        );
         Ok(())
     }
 
@@ -592,8 +595,9 @@ impl FiberDeck {
                 match session.event {
                     Event::Yielded => {
                         // THE audit (rule 3) — a bad SP poisons here.
-                        let _ =
-                            self.quad.park(lane, session.fiber_sp, self.quarter_base(lane));
+                        let _ = self
+                            .quad
+                            .park(lane, session.fiber_sp, self.quarter_base(lane));
                     }
                     Event::Finished => self.quad.set_status(lane, FiberStatus::Done),
                 }
@@ -838,10 +842,14 @@ mod tests {
         let base = 0u64;
         let q = QuadWord::new();
         for lane in 0..4 {
-            q.park(lane, base + 32 * (lane as u64 + 1), base).expect("parks");
+            q.park(lane, base + 32 * (lane as u64 + 1), base)
+                .expect("parks");
         }
         q.set_status(3, FiberStatus::Live);
-        assert!(matches!(q.try_claim_parked(), Err(StealRefused::NotAllParked)));
+        assert!(matches!(
+            q.try_claim_parked(),
+            Err(StealRefused::NotAllParked)
+        ));
         q.set_status(3, FiberStatus::Parked);
 
         let q = std::sync::Arc::new(q);
@@ -859,12 +867,19 @@ mod tests {
         for h in handles {
             h.join().expect("no panics");
         }
-        assert_eq!(winners.load(Ordering::SeqCst), 1, "exactly one claimer wins");
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "exactly one claimer wins"
+        );
         assert_eq!(
             QuadWord::field(q.load(), 0).1,
             FiberStatus::Vacant,
             "the claimed word is vacant"
         );
-        assert!(matches!(q.try_claim_parked(), Err(StealRefused::NotAllParked)));
+        assert!(matches!(
+            q.try_claim_parked(),
+            Err(StealRefused::NotAllParked)
+        ));
     }
 }

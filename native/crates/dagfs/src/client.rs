@@ -328,11 +328,29 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
     /// This is the lifecycle-safe counterpart of [`resume`](Self::resume): a
     /// cleanup row visited out of order gets [`CallError::Outstanding`]
     /// without kicking the service or consuming another row's late reply.
-    pub(crate) async fn call_exact(&mut self, request: &FsRequest) -> Result<FsResponse, CallError> {
+    pub(crate) async fn call_exact(
+        &mut self,
+        request: &FsRequest,
+    ) -> Result<FsResponse, CallError> {
         let reply = if self.pair.is_idle() {
             self.pair.call(request).await?
         } else {
             self.pair.resume_exact(request).await?
+        };
+        self.finish(reply)
+    }
+
+    /// Bounded exact observation for control-plane cleanup. Service refusals
+    /// remain responses so lifecycle callers can distinguish their fences.
+    async fn call_exact_bounded(
+        &mut self,
+        request: &FsRequest,
+        budget_ns: u64,
+    ) -> Result<FsResponse, CallError> {
+        let reply = if self.pair.is_idle() {
+            self.pair.call_bounded(request, budget_ns).await?
+        } else {
+            self.pair.resume_exact_bounded(request, budget_ns).await?
         };
         self.finish(reply)
     }
@@ -345,6 +363,283 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         match response {
             FsResponse::Refused(error) => Err(RingFsError::Refused(error)),
             response => Ok(response),
+        }
+    }
+
+    /// Bounded observation of the same exact operation. The caller must keep
+    /// its phase and any acquired owners outside the cancellable future.
+    async fn checked_bounded(
+        &mut self,
+        request: &FsRequest,
+        budget_ns: u64,
+    ) -> Result<FsResponse, RingFsError> {
+        match self
+            .call_exact_bounded(request, budget_ns)
+            .await
+            .map_err(RingFsError::Infrastructure)?
+        {
+            FsResponse::Refused(error) => Err(RingFsError::Refused(error)),
+            response => Ok(response),
+        }
+    }
+
+    /// Open or resume this exact name within a Kore-executor observation budget.
+    /// Persist the opening phase before polling so a late handle can be closed.
+    pub async fn open_at_bounded(
+        &mut self,
+        parent: Handle,
+        name: &Name,
+        rights: Rights,
+        budget_ns: u64,
+    ) -> Result<Opened, RingFsError> {
+        match self
+            .checked_bounded(
+                &FsRequest::OpenAt {
+                    parent,
+                    name: *name,
+                    rights,
+                },
+                budget_ns,
+            )
+            .await?
+        {
+            FsResponse::Opened {
+                handle,
+                stable_object,
+                kind,
+                subtype,
+                len,
+                revision,
+            } => Ok(Opened {
+                handle,
+                stable_object,
+                kind,
+                subtype,
+                len,
+                revision,
+            }),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
+    /// Create a plain object or resume exactly that creation within a bounded observation.
+    pub async fn create_bounded(
+        &mut self,
+        parent: Handle,
+        name: &Name,
+        kind: ObjectKind,
+        budget_ns: u64,
+    ) -> Result<Opened, RingFsError> {
+        self.create_typed_bounded(parent, name, kind, crate::ObjectSubtype::PLAIN, budget_ns)
+            .await
+    }
+
+    /// Create or resume the exact typed object within a bounded observation.
+    pub async fn create_typed_bounded(
+        &mut self,
+        parent: Handle,
+        name: &Name,
+        kind: ObjectKind,
+        subtype: crate::ObjectSubtype,
+        budget_ns: u64,
+    ) -> Result<Opened, RingFsError> {
+        match self
+            .checked_bounded(
+                &FsRequest::Create {
+                    parent,
+                    name: *name,
+                    kind,
+                    subtype,
+                },
+                budget_ns,
+            )
+            .await?
+        {
+            FsResponse::Opened {
+                handle,
+                stable_object,
+                kind,
+                subtype,
+                len,
+                revision,
+            } => Ok(Opened {
+                handle,
+                stable_object,
+                kind,
+                subtype,
+                len,
+                revision,
+            }),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
+    /// Close or resume this exact handle while bounding one recovery observation.
+    pub async fn close_bounded(
+        &mut self,
+        handle: Handle,
+        budget_ns: u64,
+    ) -> Result<(), RingFsError> {
+        match self
+            .checked_bounded(&FsRequest::Close { handle }, budget_ns)
+            .await?
+        {
+            FsResponse::Done => Ok(()),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
+    /// Bounded discovery on the same exact grant and rights. A caller that
+    /// abandons observation must retain this opening phase to close a late handle.
+    pub async fn open_grant_bounded(
+        &mut self,
+        grant: GrantId,
+        rights: Rights,
+        budget_ns: u64,
+    ) -> Result<Opened, RingFsError> {
+        match self
+            .checked_bounded(&FsRequest::OpenGrant { grant, rights }, budget_ns)
+            .await?
+        {
+            FsResponse::Opened {
+                handle,
+                stable_object,
+                kind,
+                subtype,
+                len,
+                revision,
+            } => Ok(Opened {
+                handle,
+                stable_object,
+                kind,
+                subtype,
+                len,
+                revision,
+            }),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
+    /// Bound one observation of the exact grant-list window operation. The
+    /// original window must remain attached until its reply is consumed.
+    pub async fn list_grants_bounded(
+        &mut self,
+        window_offset: u32,
+        budget_ns: u64,
+    ) -> Result<u32, RingFsError> {
+        match self
+            .checked_bounded(&FsRequest::ListGrants { window_offset }, budget_ns)
+            .await?
+        {
+            FsResponse::GrantsListed { entries } => Ok(entries),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
+    /// Observe an executable-version lend without losing its original handle
+    /// and window offset when recovery reaches its budget.
+    pub async fn lend_executable_bounded(
+        &mut self,
+        handle: Handle,
+        window_offset: u32,
+        budget_ns: u64,
+    ) -> Result<PendingVersion, RingFsError> {
+        match self
+            .checked_bounded(
+                &FsRequest::LendExecutable {
+                    handle,
+                    window_offset,
+                },
+                budget_ns,
+            )
+            .await?
+        {
+            FsResponse::VersionLent { lease } => Ok(PendingVersion { lease }),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
+    /// Resume only the held revision and exact range; the caller retains the
+    /// version and data window until the observation reaches a terminal reply.
+    pub async fn read_version_bounded(
+        &mut self,
+        version: &LentVersion,
+        offset: u64,
+        window_offset: u32,
+        length: u32,
+        budget_ns: u64,
+    ) -> Result<u32, RingFsError> {
+        match self
+            .checked_bounded(
+                &FsRequest::ReadVersion {
+                    lease: version.lease,
+                    offset,
+                    window_offset,
+                    length,
+                },
+                budget_ns,
+            )
+            .await?
+        {
+            FsResponse::Transferred { count } => Ok(count),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
+    /// The caller retains this affine owner across cancellation and discards
+    /// it synchronously only after Ok. No cleanup witness moves into the future.
+    pub async fn release_version_retained(
+        &mut self,
+        version: &LentVersion,
+        budget_ns: u64,
+    ) -> Result<(), RingFsError> {
+        self.release_lease_bounded(version.lease, budget_ns).await
+    }
+
+    /// Pre-identity counterpart of `release_version_retained`.
+    pub async fn release_pending_version_retained(
+        &mut self,
+        version: &PendingVersion,
+        budget_ns: u64,
+    ) -> Result<(), RingFsError> {
+        self.release_lease_bounded(version.lease, budget_ns).await
+    }
+
+    async fn release_lease_bounded(
+        &mut self,
+        lease: VersionLease,
+        budget_ns: u64,
+    ) -> Result<(), RingFsError> {
+        match self
+            .checked_bounded(&FsRequest::ReleaseVersion { lease }, budget_ns)
+            .await?
+        {
+            FsResponse::Done => Ok(()),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
         }
     }
 
@@ -388,6 +683,24 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         let reply = self
             .pair
             .resume_exact(&request)
+            .await
+            .map_err(RingFsError::Infrastructure)?;
+        self.finish_attach_window(reply)
+    }
+
+    /// Bounded continuation of the original attachment, never a new transfer.
+    pub async fn resume_attach_window_bounded(
+        &mut self,
+        bytes: u32,
+        budget_ns: u64,
+    ) -> Result<(), RingFsError> {
+        if bytes == 0 {
+            return Err(RingFsError::Refused(FsError::Range));
+        }
+        let request = attach_window_request(self.return_land, bytes);
+        let reply = self
+            .pair
+            .resume_exact_bounded(&request, budget_ns)
             .await
             .map_err(RingFsError::Infrastructure)?;
         self.finish_attach_window(reply)
@@ -467,11 +780,48 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         }
     }
 
+    /// Bounded observation of this exact operation; retain request and cleanup state across awaits.
+    pub async fn defer_commits_bounded(
+        &mut self,
+        hold: bool,
+        budget_ns: u64,
+    ) -> Result<(), RingFsError> {
+        match self
+            .checked_bounded(&FsRequest::DeferCommits { hold }, budget_ns)
+            .await?
+        {
+            FsResponse::Done => Ok(()),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
     /// Publish the measured system catalogue's bounded seed lifecycle.
     /// Only the permanent administration pair is authorized by the durable
     /// router; ordinary filesystem faces receive a refusal.
     pub async fn set_system_seed_active(&mut self, active: bool) -> Result<(), RingFsError> {
         match self.checked(&FsRequest::SetSystemSeed { active }).await? {
+            FsResponse::Done => Ok(()),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
+    /// Observe this exact lifecycle publication within a bounded interval.
+    /// The caller retains the requested posture until a successful response.
+    pub async fn set_system_seed_active_bounded(
+        &mut self,
+        active: bool,
+        budget_ns: u64,
+    ) -> Result<(), RingFsError> {
+        match self
+            .checked_bounded(&FsRequest::SetSystemSeed { active }, budget_ns)
+            .await?
+        {
             FsResponse::Done => Ok(()),
             _ => {
                 self.pair.poison();
@@ -507,6 +857,37 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         }
     }
 
+    /// Bounded observation of this exact operation; retain request and cleanup state across awaits.
+    pub async fn write_at_bounded(
+        &mut self,
+        handle: Handle,
+        offset: u64,
+        window_offset: u32,
+        length: u32,
+        expected: Revision,
+        budget_ns: u64,
+    ) -> Result<Revision, RingFsError> {
+        match self
+            .checked_bounded(
+                &FsRequest::WriteAt {
+                    handle,
+                    offset,
+                    window_offset,
+                    length,
+                    expected,
+                },
+                budget_ns,
+            )
+            .await?
+        {
+            FsResponse::Committed { revision } => Ok(revision),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
     /// Set one file's complete visible length, returning its new revision.
     pub async fn resize(
         &mut self,
@@ -520,6 +901,33 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
                 length,
                 expected,
             })
+            .await?
+        {
+            FsResponse::Committed { revision } => Ok(revision),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
+    /// Bounded observation of this exact operation; retain request and cleanup state across awaits.
+    pub async fn resize_bounded(
+        &mut self,
+        handle: Handle,
+        length: u64,
+        expected: Revision,
+        budget_ns: u64,
+    ) -> Result<Revision, RingFsError> {
+        match self
+            .checked_bounded(
+                &FsRequest::Resize {
+                    handle,
+                    length,
+                    expected,
+                },
+                budget_ns,
+            )
             .await?
         {
             FsResponse::Committed { revision } => Ok(revision),
@@ -692,6 +1100,33 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         }
     }
 
+    /// Link or resume the exact edge within a bounded recovery observation.
+    pub async fn link_bounded(
+        &mut self,
+        parent: Handle,
+        name: &Name,
+        child: Handle,
+        budget_ns: u64,
+    ) -> Result<(), RingFsError> {
+        match self
+            .checked_bounded(
+                &FsRequest::Link {
+                    parent,
+                    name: *name,
+                    child,
+                },
+                budget_ns,
+            )
+            .await?
+        {
+            FsResponse::Done => Ok(()),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
     /// Remove one exact native containment edge. Unlike compatibility
     /// `Unlink`, a populated directory is legal: the graph survives through
     /// any other containment or authority route.
@@ -701,6 +1136,31 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
                 parent,
                 name: *name,
             })
+            .await?
+        {
+            FsResponse::Done => Ok(()),
+            _ => {
+                self.pair.poison();
+                Err(RingFsError::Wire)
+            }
+        }
+    }
+
+    /// Bounded observation of this exact operation; retain request and cleanup state across awaits.
+    pub async fn detach_edge_bounded(
+        &mut self,
+        parent: Handle,
+        name: &Name,
+        budget_ns: u64,
+    ) -> Result<(), RingFsError> {
+        match self
+            .checked_bounded(
+                &FsRequest::DetachEdge {
+                    parent,
+                    name: *name,
+                },
+                budget_ns,
+            )
             .await?
         {
             FsResponse::Done => Ok(()),
@@ -919,6 +1379,20 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         self.finish(reply).map_err(StagedReturnError::AfterTransfer)
     }
 
+    /// Resume only the original component request; never derive or send a replacement.
+    pub async fn resume_admit_component_bounded(
+        &mut self,
+        part: kore_rt::svc::PeerBundlePart,
+        budget_ns: u64,
+    ) -> Result<FsResponse, CallError> {
+        let request = FsRequest::AdmitPeer {
+            part,
+            announced: self.return_land,
+        };
+        let reply = self.pair.resume_exact_bounded(&request, budget_ns).await?;
+        self.finish(reply)
+    }
+
     pub async fn register_system_view<C: ReturnCapability>(
         &mut self,
         capability: C,
@@ -992,9 +1466,33 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         fs_rights: Rights,
         capability: C,
     ) -> Result<FsResponse, ReturnCallError<C>> {
+        self.bind_view_mode(handle, fs_rights, crate::ViewBindingMode::Inherited, capability)
+            .await
+    }
+
+    /// Bind a selected root without importing other named grants from its
+    /// issuer task. The exact returned endpoint remains the authority proof.
+    pub async fn bind_isolated_view<C: ReturnCapability>(
+        &mut self,
+        handle: Handle,
+        fs_rights: Rights,
+        capability: C,
+    ) -> Result<FsResponse, ReturnCallError<C>> {
+        self.bind_view_mode(handle, fs_rights, crate::ViewBindingMode::Isolated, capability)
+            .await
+    }
+
+    pub async fn bind_view_mode<C: ReturnCapability>(
+        &mut self,
+        handle: Handle,
+        fs_rights: Rights,
+        mode: crate::ViewBindingMode,
+        capability: C,
+    ) -> Result<FsResponse, ReturnCallError<C>> {
         let request = FsRequest::BindView {
             handle,
             rights: fs_rights,
+            mode,
             announced: self.return_land,
         };
         let reply = self
@@ -1033,6 +1531,7 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         let request = FsRequest::BindView {
             handle,
             rights: fs_rights,
+            mode: crate::ViewBindingMode::Inherited,
             announced: self.return_land,
         };
         let reply = self
@@ -1084,10 +1583,54 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         self.finish(reply).map_err(StagedReturnError::AfterTransfer)
     }
 
+    /// Resume the already transferred private view for this exact peer and
+    /// rights. This cannot move another input or publish a replacement.
+    pub async fn resume_apply_view_bounded(
+        &mut self,
+        peer: kore_rt::svc::PeerId,
+        fs_rights: Rights,
+        budget_ns: u64,
+    ) -> Result<FsResponse, CallError> {
+        let request = FsRequest::ApplyView {
+            peer,
+            rights: fs_rights,
+            announced: self.return_land,
+        };
+        let reply = self.pair.resume_exact_bounded(&request, budget_ns).await?;
+        self.finish(reply)
+    }
+
     /// Consume the host completion published after the final component was
     /// accepted and mapped.
     pub async fn take_admission(&mut self) -> Result<FsResponse, CallError> {
         self.call(&FsRequest::TakeAdmission).await
+    }
+
+    /// Resume only this admission mailbox request within one observation budget.
+    pub async fn take_admission_bounded(
+        &mut self,
+        budget_ns: u64,
+    ) -> Result<FsResponse, CallError> {
+        self.call_exact_bounded(&FsRequest::TakeAdmission, budget_ns)
+            .await
+    }
+
+    pub async fn retire_peer_bounded(
+        &mut self,
+        peer: kore_rt::svc::PeerId,
+        budget_ns: u64,
+    ) -> Result<FsResponse, CallError> {
+        self.call_exact_bounded(&FsRequest::RetirePeer { peer }, budget_ns)
+            .await
+    }
+
+    pub async fn confirm_retired_bounded(
+        &mut self,
+        peer: kore_rt::svc::PeerId,
+        budget_ns: u64,
+    ) -> Result<FsResponse, CallError> {
+        self.call_exact_bounded(&FsRequest::ConfirmRetired { peer }, budget_ns)
+            .await
     }
 
     /// Ask the service host to retire one exact dynamic generation.
@@ -1913,6 +2456,7 @@ mod exact_attach_tests {
     struct RecordingTransport {
         commits: Cell<usize>,
         succeed: Cell<bool>,
+        stall: Cell<bool>,
     }
 
     impl RecordingTransport {
@@ -1920,6 +2464,7 @@ mod exact_attach_tests {
             Self {
                 commits: Cell::new(0),
                 succeed: Cell::new(false),
+                stall: Cell::new(false),
             }
         }
 
@@ -1937,6 +2482,9 @@ mod exact_attach_tests {
         type Error = ();
 
         async fn commit(&self, _session: &SessionBuilder) -> Result<Committed, Self::Error> {
+            if self.stall.get() {
+                core::future::pending::<()>().await;
+            }
             self.complete()
         }
 
@@ -1988,21 +2536,284 @@ mod exact_attach_tests {
         assert!(serve.rep.push(wire).is_ok());
     }
 
+    fn with_version_rings(
+        test: impl FnOnce(
+            &RecordingTransport,
+            &mut RingFs<'_, '_, RecordingTransport>,
+            &mut ServeRings<'_, crate::DagfsProtocol>,
+        ),
+    ) {
+        #[repr(align(64))]
+        struct Window([u8; window_bytes::<crate::DagfsProtocol>(REQ_CAP, REP_CAP)]);
+        let mut window = Window([0; window_bytes::<crate::DagfsProtocol>(REQ_CAP, REP_CAP)]);
+        let transport = RecordingTransport::refusing();
+        let (client, mut serve) =
+            split_window::<crate::DagfsProtocol>(&mut window.0, REQ_CAP, REP_CAP).unwrap();
+        let pair = SvcClient::new(
+            &transport,
+            client,
+            ClientEndpoints {
+                kick: SlotRef::from_wire(0x30),
+                grants: [None; MAX_GRANTS],
+            },
+        );
+        let mut fs = RingFs::new(pair, SlotRef::from_wire(0x31), SlotRef::from_wire(0x41));
+        test(&transport, &mut fs, &mut serve);
+    }
+
+    fn run_version<F: core::future::Future>(future: F) -> F::Output {
+        let park = kore_rt::transport::TrapTransport::new();
+        kore_rt::Executor::from_standing(&park, kore_rt::executor::Doorbell {
+            chan: 0,
+            recv: SlotRef::from_wire(101),
+            land: SlotRef::from_wire(102),
+            recv_tag: 7,
+        }).run(future)
+    }
+
+    #[test]
+    fn retained_version_release_survives_cancellation_without_republication() {
+        use core::future::Future;
+        with_version_rings(|transport, fs, serve| {
+            // Service-local protocol identities only, not native capabilities.
+            let owner = PendingVersion {
+                lease: VersionLease::from_bits(7),
+            };
+            transport.stall.set(true);
+            {
+                let future = fs.release_pending_version_retained(&owner, 5_000_000);
+                let mut future = core::pin::pin!(future);
+                let polled = run_version(core::future::poll_fn(|cx| {
+                    core::task::Poll::Ready(future.as_mut().poll(cx))
+                }));
+                assert!(polled.is_pending());
+            }
+            assert_eq!(owner.lease, VersionLease::from_bits(7));
+            assert_eq!(
+                take_request(serve),
+                FsRequest::ReleaseVersion { lease: owner.lease }
+            );
+            assert!(!fs.is_idle());
+            publish_done(serve);
+            transport.stall.set(false);
+            let other = PendingVersion {
+                lease: VersionLease::from_bits(8),
+            };
+            assert!(matches!(
+                run_version(fs.release_pending_version_retained(&other, 5_000_000)),
+                Err(RingFsError::Infrastructure(CallError::Outstanding))
+            ));
+            assert_eq!(transport.commits.get(), 0);
+            transport.succeed.set(true);
+            assert!(
+                run_version(fs.release_pending_version_retained(&owner, 5_000_000)).is_ok()
+            );
+            assert!(fs.is_idle());
+            assert!(
+                serve.req.pop().is_none(),
+                "release must resume its original request"
+            );
+        });
+    }
+
+    #[test]
+    fn retained_version_read_recovery_checks_every_coordinate_before_release() {
+        with_version_rings(|transport, fs, serve| {
+            let owner = LentVersion {
+                lease: VersionLease::from_bits(7),
+                identity: InputIdentity {
+                    source: 2,
+                    version: 3,
+                    len: 8192,
+                    digest: [0; 32],
+                },
+            };
+            assert!(matches!(
+                run_version(fs.read_version_bounded(&owner, 4096, 0, 1024, 5_000_000)),
+                Err(RingFsError::Infrastructure(CallError::Transport))
+            ));
+            assert_eq!(
+                take_request(serve),
+                FsRequest::ReadVersion {
+                    lease: owner.lease,
+                    offset: 4096,
+                    window_offset: 0,
+                    length: 1024,
+                }
+            );
+            let wire = <crate::DagfsProtocol as SvcProtocol>::encode_rep(
+                &FsResponse::Transferred { count: 1024 },
+                0,
+            );
+            assert!(serve.rep.push(wire).is_ok());
+            for (offset, window, length) in [(0, 0, 1024), (4096, 1, 1024), (4096, 0, 512)] {
+                assert!(matches!(
+                    run_version(
+                        fs.read_version_bounded(&owner, offset, window, length, 5_000_000)
+                    ),
+                    Err(RingFsError::Infrastructure(CallError::Outstanding))
+                ));
+            }
+            assert!(matches!(
+                run_version(fs.release_version_retained(&owner, 5_000_000)),
+                Err(RingFsError::Infrastructure(CallError::Outstanding))
+            ));
+            assert_eq!(transport.commits.get(), 1);
+            transport.succeed.set(true);
+            assert_eq!(
+                run_version(fs.read_version_bounded(&owner, 4096, 0, 1024, 5_000_000)).unwrap(),
+                1024
+            );
+            assert!(fs.is_idle());
+            assert!(serve.req.pop().is_none());
+        });
+    }
+
+    #[test]
+    fn discovery_open_recovery_preserves_original_grant_rights_and_late_handle() {
+        use core::future::Future;
+        with_version_rings(|transport, fs, serve| {
+            let grant = GrantId::from_bits(7);
+            transport.stall.set(true);
+            {
+                let future = fs.open_grant_bounded(grant, Rights::ALL, 5_000_000);
+                let mut future = core::pin::pin!(future);
+                let polled = run_version(core::future::poll_fn(|cx| {
+                    core::task::Poll::Ready(future.as_mut().poll(cx))
+                }));
+                assert!(polled.is_pending());
+            }
+            assert_eq!(
+                take_request(serve),
+                FsRequest::OpenGrant {
+                    grant,
+                    rights: Rights::ALL
+                }
+            );
+            let handle = Handle::from_bits(19);
+            let opened = FsResponse::Opened {
+                handle,
+                stable_object: crate::StableObjectId::new(41).unwrap(),
+                kind: ObjectKind::Directory,
+                subtype: crate::ObjectSubtype::PLAIN,
+                len: 0,
+                revision: 1,
+            };
+            assert!(
+                serve
+                    .rep
+                    .push(<crate::DagfsProtocol as SvcProtocol>::encode_rep(
+                        &opened, 0
+                    ))
+                    .is_ok()
+            );
+            transport.stall.set(false);
+            for (other_grant, rights) in
+                [(GrantId::from_bits(8), Rights::ALL), (grant, Rights::READ)]
+            {
+                assert!(matches!(
+                    run_version(fs.open_grant_bounded(other_grant, rights, 5_000_000)),
+                    Err(RingFsError::Infrastructure(CallError::Outstanding))
+                ));
+            }
+            assert!(matches!(
+                run_version(fs.list_grants_bounded(0, 5_000_000)),
+                Err(RingFsError::Infrastructure(CallError::Outstanding))
+            ));
+            assert_eq!(transport.commits.get(), 0);
+            transport.succeed.set(true);
+            let received =
+                run_version(fs.open_grant_bounded(grant, Rights::ALL, 5_000_000)).unwrap();
+            assert_eq!(received.handle, handle);
+            assert!(serve.req.pop().is_none());
+            // The cleanup caller can now close precisely that late handle.
+            transport.succeed.set(false);
+            assert!(matches!(
+                run_version(fs.close_bounded(received.handle, 5_000_000)),
+                Err(RingFsError::Infrastructure(CallError::Transport))
+            ));
+            assert_eq!(take_request(serve), FsRequest::Close { handle });
+            publish_done(serve);
+            transport.succeed.set(true);
+            assert!(run_version(fs.close_bounded(handle, 5_000_000)).is_ok());
+            assert!(fs.is_idle());
+        });
+    }
+
+    #[test]
+    fn discovery_attachment_and_listing_preserve_foreign_progress() {
+        with_version_rings(|transport, fs, serve| {
+            assert!(matches!(
+                run_version(fs.list_grants_bounded(0, 5_000_000)),
+                Err(RingFsError::Infrastructure(CallError::Transport))
+            ));
+            assert_eq!(
+                take_request(serve),
+                FsRequest::ListGrants { window_offset: 0 }
+            );
+            assert!(
+                serve
+                    .rep
+                    .push(<crate::DagfsProtocol as SvcProtocol>::encode_rep(
+                        &FsResponse::GrantsListed { entries: 3 },
+                        0
+                    ))
+                    .is_ok()
+            );
+            assert!(matches!(
+                run_version(fs.list_grants_bounded(64, 5_000_000)),
+                Err(RingFsError::Infrastructure(CallError::Outstanding))
+            ));
+            assert!(matches!(
+                run_version(fs.resume_attach_window_bounded(4096, 5_000_000)),
+                Err(RingFsError::Infrastructure(CallError::Outstanding))
+            ));
+            assert_eq!(transport.commits.get(), 1);
+            transport.succeed.set(true);
+            assert_eq!(
+                run_version(fs.list_grants_bounded(0, 5_000_000)).unwrap(),
+                3
+            );
+            assert!(fs.is_idle());
+            assert!(matches!(
+                run_version(fs.resume_attach_window_bounded(4096, 5_000_000)),
+                Err(RingFsError::Infrastructure(CallError::NoOutstanding))
+            ));
+            assert!(
+                serve.req.pop().is_none(),
+                "attachment resume cannot publish a transfer"
+            );
+        });
+    }
+
     #[test]
     fn close_retry_cannot_consume_another_handles_late_reply() {
         let transport = RecordingTransport::refusing();
         let (mut fs, mut serve) = ring_fs(&transport, SlotRef::from_wire(0x41));
-        let close = FsRequest::Close { handle: crate::Handle::from_bits(7) };
-        assert_eq!(crate::block_on(fs.call_exact(&close)), Err(CallError::Transport));
+        let close = FsRequest::Close {
+            handle: crate::Handle::from_bits(7),
+        };
+        assert_eq!(
+            crate::block_on(fs.call_exact(&close)),
+            Err(CallError::Transport)
+        );
         assert_eq!(take_request(&mut serve), close);
         publish_done(&mut serve);
-        let other = FsRequest::Close { handle: crate::Handle::from_bits(8) };
-        assert_eq!(crate::block_on(fs.call_exact(&other)), Err(CallError::Outstanding));
+        let other = FsRequest::Close {
+            handle: crate::Handle::from_bits(8),
+        };
+        assert_eq!(
+            crate::block_on(fs.call_exact(&other)),
+            Err(CallError::Outstanding)
+        );
         assert_eq!(transport.commits.get(), 1);
         transport.succeed.set(true);
         assert_eq!(crate::block_on(fs.call_exact(&close)), Ok(FsResponse::Done));
         assert!(fs.is_idle());
-        assert!(serve.req.pop().is_none(), "retry must not publish another Close");
+        assert!(
+            serve.req.pop().is_none(),
+            "retry must not publish another Close"
+        );
     }
 
     #[test]

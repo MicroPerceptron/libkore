@@ -105,9 +105,8 @@ pub use priority::{PriorityError, PriorityIndex, PriorityLink, UNINDEXED};
 #[cfg(feature = "alloc")]
 pub use slotarena::SlotArena;
 pub use slotmap::{
-    AtomicSlotMap, SlotAccess, SlotId, SlotIter, SlotRead, SlotWrite, SlotWriteIter,
+    AtomicSlotMap, SlotAccess, SlotId, SlotIter, SlotRead, SlotReservation, SlotWrite,
+    SlotWriteIter,
 };
 #[cfg(feature = "alloc")]
-pub use slotvec::{
-    AtomicSlotVec, SlotVecIter, SlotVecRead, SlotVecWrite, SlotVecWriteIter,
-};
+pub use slotvec::{AtomicSlotVec, SlotVecIter, SlotVecRead, SlotVecWrite, SlotVecWriteIter};

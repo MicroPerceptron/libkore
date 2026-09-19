@@ -1,0 +1,20 @@
+[package]
+name = "kore-svc-hostlink"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
+heapless = { version = "0.9.3", default-features = false }
+kore-abi = { path = "../../crates/abi" }
+kore-driver = { path = "../../crates/driver" }
+kore-hostlink = { path = "../../crates/hostlink" }
+kore-hostlink-shmem = { path = "../../crates/hostlink-shmem" }
+kore-rt = { path = "../../crates/rt", default-features = false }
+kore-virtio = { path = "../../drivers/virtio", features = ["service"] }
+kore-svc-device = { path = "../device" }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", default-features = false, features = ["std"] }

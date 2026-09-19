@@ -364,6 +364,9 @@ impl FoundingRow {
             55 => b"Wi-Fi bring-up: the DMA engine's pre-init did not complete (DLE, busy channel, BD-RAM bound)",
             56 => b"Wi-Fi bring-up: the firmware download did not complete (path, ring stall, or the image was rejected)",
             57 => b"Wi-Fi bring-up: the running firmware never answered the first command",
+            58 => b"Wi-Fi bring-up: normal MAC initialization did not complete (packet memory, scheduler or CAM)",
+            59 => b"Wi-Fi bring-up: PHY register configuration did not complete (RF busy or command retirement)",
+            60 => b"Wi-Fi bring-up: MAC feature command completion failed",
             _ => b"(unmapped note; see the row's note map)",
         }
     }
@@ -774,7 +777,9 @@ mod tests {
             "the first rung of each band names a different fact",
         );
         assert!(
-            serving_row(ROW_NAME_NET, 32).note_meaning().starts_with(b"(unmapped"),
+            serving_row(ROW_NAME_NET, 32)
+                .note_meaning()
+                .starts_with(b"(unmapped"),
             "the base itself is not a rung",
         );
     }

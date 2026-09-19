@@ -635,7 +635,7 @@ pub struct ChannelPair {
 
 /// Why an atomic channel-pair mint did not yield three typed owners.
 #[must_use]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ChannelMintError {
     /// An endpoint-rights request is empty or exceeds the channel endpoint
     /// vocabulary.
@@ -644,15 +644,44 @@ pub enum ChannelMintError {
     NoSlots,
     /// The fixed three-invocation session could not be staged.
     Build(crate::session::BuildError),
-    /// The trap transport could not issue the session.
-    Transport,
+    /// The native transport refused before issuing the syscall. No result
+    /// was published, so every reserved name can be released immediately.
+    NotIssued,
     /// The kernel refused a well-formed invocation and rolled the session back.
     Refused(kore_abi::session::Status),
-    /// The completion could not prove either commit or rollback. Every
-    /// reserved name remains quarantined rather than risking aliasing.
-    MalformedCompletion,
+    /// The returned completion did not prove commit or rollback. Retain all
+    /// three local result names until explicit native cleanup confirms closure.
+    Uncertain(UncertainChannel),
     /// This build has no live channel-mint transport.
     Unavailable,
+}
+
+/// Cleanup-only custody for the three results of an uncertain channel mint.
+/// Nothing was posted or transferred; no endpoint can be obtained from this
+/// owner. Each original arena name remains reserved until its native closure.
+#[must_use]
+#[derive(Debug)]
+pub struct UncertainChannel {
+    members: [UncertainLocalCapability; 3],
+}
+
+impl UncertainChannel {
+    #[cfg(any(test, target_os = "none"))]
+    pub(crate) fn new(root: OwnedSlot, send: OwnedSlot, recv: OwnedSlot) -> Self {
+        Self {
+            members: [root, send, recv].map(UncertainLocalCapability::new),
+        }
+    }
+
+    /// Retire the root and both leaves, including after a retryable member.
+    /// A closed root alone does not release either leaf's arena reservation.
+    pub fn try_retire(&mut self) -> bool {
+        let mut closed = true;
+        for member in &mut self.members {
+            closed &= member.try_retire();
+        }
+        closed
+    }
 }
 
 /// A **mapped-window accessor** — the safe byte-port over a mapped view,
@@ -883,7 +912,10 @@ impl SupplyToken {
     /// Recover the original retained delivery before publishing any mappings.
     /// A founder-held supply cannot be converted into a returned owner.
     pub fn into_returned_capability(mut self) -> Result<ReturnedCapability, Self> {
-        match self._returned.take() { Some(owner) => Ok(owner), None => Err(self) }
+        match self._returned.take() {
+            Some(owner) => Ok(owner),
+            None => Err(self),
+        }
     }
 
     /// Whether this supply arrived through a retained service grant.
@@ -1299,19 +1331,24 @@ impl FabricRouteToken {
     }
 
     /// The possessed route may parent the existing CPU and IOVA mapping verbs.
-    pub fn slot(&self) -> SlotRef { self.owned.slot() }
+    pub fn slot(&self) -> SlotRef {
+        self.owned.slot()
+    }
 
     /// Lend a bounded range with its own mapping/close lifecycle. The parent
     /// remains busy until the child retires. This does not pin allocator runs;
     /// a buffer provider must retain its allocation for the entire loan.
-    pub fn scope(&self, request: &kore_abi::session::FabricRouteScopeReq)
-        -> Result<Self, verbs::FabricRouteFault>
-    {
+    pub fn scope(
+        &self,
+        request: &kore_abi::session::FabricRouteScopeReq,
+    ) -> Result<Self, verbs::FabricRouteFault> {
         verbs::scope_fabric_route(self.owned.slot(), request)
     }
 
     /// Observe immutable mapping geometry before attempting publication.
-    pub fn describe(&self) -> Result<kore_abi::session::FabricRouteInfo, verbs::FabricRegistrationFault> {
+    pub fn describe(
+        &self,
+    ) -> Result<kore_abi::session::FabricRouteInfo, verbs::FabricRegistrationFault> {
         verbs::describe_fabric_route(self.slot())
     }
 
@@ -1333,9 +1370,15 @@ impl FabricRouteToken {
     /// refusal the complete token is returned so the owner can contain or retry.
     pub fn try_retire(self) -> Result<RetireOutcome, Self> {
         let mut this = self;
-        if this.try_close().is_err() { return Err(this); }
+        if this.try_close().is_err() {
+            return Err(this);
+        }
         let outcome = this.owned.retire_inner();
-        if outcome.is_closed() { Ok(outcome) } else { Err(this) }
+        if outcome.is_closed() {
+            Ok(outcome)
+        } else {
+            Err(this)
+        }
     }
 }
 
@@ -2193,6 +2236,15 @@ macro_rules! endpoint_owner {
                 self.owned.release_after_proven_move();
             }
 
+            /// Erase the endpoint-specific Rust view while preserving the same
+            /// affine arena owner. A protocol wrapper can return a partially
+            /// converted reply to retained cleanup without a kernel operation
+            /// or releasing the dynamic slot reservation.
+            pub fn into_returned_capability(self) -> ReturnedCapability {
+                let Self { owned, .. } = self;
+                ReturnedCapability { owned }
+            }
+
             #[cfg(test)]
             fn is_live(&self) -> bool {
                 self.owned.is_live()
@@ -2203,17 +2255,6 @@ macro_rules! endpoint_owner {
 
 endpoint_owner!(ChanSendToken, record::RecKind::ChanSend);
 endpoint_owner!(ChanRecvToken, record::RecKind::ChanRecv);
-
-impl ChanSendToken {
-    /// Erase the send-end-specific Rust view while preserving the same affine
-    /// arena owner. Protocol wrappers use this only to return a partially
-    /// converted malformed reply to the generic client's poison cleanup; no
-    /// kernel authority moves and the dynamic slot reservation stays closed.
-    pub fn into_returned_capability(self) -> ReturnedCapability {
-        let Self { owned, .. } = self;
-        ReturnedCapability { owned }
-    }
-}
 
 impl HeldChanSendToken {
     #[cfg(target_os = "none")]
@@ -2547,8 +2588,13 @@ impl ReturnedCapability {
     /// Authenticate a received mapping route without converting it into a
     /// physical allocation lease or changing its ancestry.
     pub fn try_into_fabric_route(self, required: Rights) -> Result<FabricRouteToken, Self> {
-        if !self.slot().and_then(|slot| verbs::capability_rights(slot,
-            kore_abi::cap::ResourceKind::MemoryFabricRoute)).is_some_and(|rights| rights.contains(required)) {
+        if !self
+            .slot()
+            .and_then(|slot| {
+                verbs::capability_rights(slot, kore_abi::cap::ResourceKind::MemoryFabricRoute)
+            })
+            .is_some_and(|rights| rights.contains(required))
+        {
             return Err(self);
         }
         Ok(FabricRouteToken { owned: self.owned })
@@ -2558,7 +2604,9 @@ impl ReturnedCapability {
     pub fn try_into_memory(self, required: Rights) -> Result<StashedMemory, Self> {
         match self.try_into_stashed_lease(required) {
             Ok(lease) => Ok(StashedMemory::Lease(lease)),
-            Err(owner) => owner.try_into_fabric_route(required).map(StashedMemory::Route),
+            Err(owner) => owner
+                .try_into_fabric_route(required)
+                .map(StashedMemory::Route),
         }
     }
 
@@ -2750,7 +2798,9 @@ pub enum StashedMemory {
 }
 
 impl From<StashedLease> for StashedMemory {
-    fn from(lease: StashedLease) -> Self { Self::Lease(lease) }
+    fn from(lease: StashedLease) -> Self {
+        Self::Lease(lease)
+    }
 }
 
 impl StashedMemory {
@@ -2772,7 +2822,9 @@ impl StashedMemory {
         match self {
             Self::Lease(lease) => lease.try_retire_outcome(),
             Self::Route(route) => {
-                if route.try_close().is_err() { return RetireOutcome::Retryable; }
+                if route.try_close().is_err() {
+                    return RetireOutcome::Retryable;
+                }
                 route.owned.retire_inner()
             }
         }
@@ -2811,6 +2863,100 @@ pub struct MappedLeaseView {
     lease: SlotRef,
     base: core::ptr::NonNull<u8>,
     len: usize,
+}
+
+/// Cleanup-only custody for a fresh local capability whose publication was
+/// uncertain. This owner is only used for unmapped, unposted, untransferred
+/// lease, channel or endpoint results whose teardown is plain native revoke.
+#[derive(Debug)]
+pub struct UncertainLocalCapability {
+    owned: core::mem::ManuallyDrop<OwnedSlot>,
+}
+
+impl UncertainLocalCapability {
+    #[cfg(any(test, target_os = "none"))]
+    pub(crate) fn new(mut owned: OwnedSlot) -> Self {
+        owned.quarantine_unknown_publish();
+        Self {
+            owned: core::mem::ManuallyDrop::new(owned),
+        }
+    }
+
+    /// Revoke the original local result. Its name remains reserved on an
+    /// incomplete observation; cleanup never publishes a replacement result.
+    pub fn try_retire(&mut self) -> bool {
+        if self.owned.state == OwnedSlotState::Released {
+            return true;
+        }
+        self.settle(verbs::retire_owned_slot(self.owned.slot()))
+    }
+
+    fn settle(&mut self, outcome: RetireOutcome) -> bool {
+        if outcome.is_closed() {
+            self.owned.release_reservation();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for UncertainLocalCapability {
+    fn drop(&mut self) {
+        if self.try_retire() {
+            // SAFETY: native closure transitioned this owner to Released.
+            unsafe { core::mem::ManuallyDrop::drop(&mut self.owned) };
+        }
+    }
+}
+
+/// Cleanup-only custody for a named share with an unknown completion or geometry.
+/// No pointer or slice can be obtained from this owner. Its fresh result slot
+/// never participates in an outward transfer or receive post.
+#[derive(Debug)]
+pub struct UncertainLeaseMap {
+    owned: core::mem::ManuallyDrop<OwnedSlot>,
+    lease: SlotRef,
+}
+
+impl UncertainLeaseMap {
+    #[cfg(any(test, target_os = "none"))]
+    pub(crate) fn new(mut owned: OwnedSlot, lease: SlotRef) -> Self {
+        owned.quarantine_unknown_publish();
+        Self {
+            owned: core::mem::ManuallyDrop::new(owned),
+            lease,
+        }
+    }
+
+    /// Retry exact unshare using the original parent lease and view identity.
+    /// Only an actual unshare commit proves closure here. A dead/vacant record
+    /// alone does not prove that an uncertain mapping's PTE disappeared.
+    pub fn try_retire(&mut self) -> bool {
+        if self.owned.state == OwnedSlotState::Released {
+            return true;
+        }
+        let outcome = verbs::retire_owned_view(self.owned.slot(), self.lease);
+        self.settle(outcome)
+    }
+
+    fn settle(&mut self, outcome: RetireOutcome) -> bool {
+        if outcome == RetireOutcome::Retired {
+            self.owned.release_reservation();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for UncertainLeaseMap {
+    fn drop(&mut self) {
+        if self.try_retire() {
+            // SAFETY: the owner is Released; its normal Drop is now inert.
+            unsafe { core::mem::ManuallyDrop::drop(&mut self.owned) };
+        }
+    }
 }
 
 /// One private R/W code mapping paired with the lease that authenticates it.
@@ -2906,7 +3052,9 @@ impl MappedLeaseView {
     }
 
     /// Exact mapped extent, without borrowing the underlying memory.
-    pub const fn len(&self) -> usize { self.len }
+    pub const fn len(&self) -> usize {
+        self.len
+    }
 
     /// Borrow the live read-only mapping for validation.
     ///
@@ -3306,6 +3454,35 @@ impl StashedView {
     }
 }
 
+/// Cleanup-only custody of the two fresh names in a carve-and-finalize
+/// session whose completion could not be proved. Neither name can be used as
+/// writable or executable authority. Cleanup attempts the executable result
+/// first, then the temporary writable source; both must close independently.
+#[must_use]
+#[derive(Debug)]
+pub struct UncertainExecCarve {
+    members: [UncertainLocalCapability; 2],
+}
+
+impl UncertainExecCarve {
+    #[cfg(any(test, target_os = "none"))]
+    pub(crate) fn new(writable: OwnedSlot, executable: OwnedSlot) -> Self {
+        Self {
+            members: [executable, writable].map(UncertainLocalCapability::new),
+        }
+    }
+
+    /// Attempt both original results on every pass. A refused result keeps
+    /// its own arena name; closing the other does not imply its closure.
+    pub fn try_retire(&mut self) -> bool {
+        let mut closed = true;
+        for member in &mut self.members {
+            closed &= member.try_retire();
+        }
+        closed
+    }
+}
+
 /// Executable-only physical code authority after a writable source lineage
 /// was consumed by `REVOKE_KIND_EXEC`.
 #[derive(Debug)]
@@ -3600,6 +3777,59 @@ pub struct BarWindow {
     _owned: OwnedSlot,
 }
 
+/// An affine mapped coherent shared-RAM capability.  Unlike [`BarWindow`],
+/// bytes are ordinary memory (non-volatile) and may be formatted by
+/// `kore-hostlink-shmem`; the kernel admits this type only for exact
+/// ivshmem-plain BAR2 and fixes the mapping WB/coherent.
+#[derive(Debug)]
+pub struct SharedRamWindow {
+    base: *mut u8,
+    len: usize,
+    _owned: OwnedSlot,
+}
+
+impl SharedRamWindow {
+    #[cfg(target_os = "none")]
+    pub(crate) fn new(base: *mut u8, len: usize, mut owned: OwnedSlot) -> Self {
+        owned.activate();
+        Self {
+            base,
+            len,
+            _owned: owned,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Borrow the bounded mapping for a persistent
+    /// `kore_hostlink_shmem::Endpoint`. The returned slice cannot outlive this
+    /// affine owner, and borrowing it prevents local retirement or a second
+    /// safe endpoint while the first remains live.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: construction is metal-only after a kernel-vouched nonempty
+        // geometry report; this affine owner is the only safe slice source.
+        unsafe { core::slice::from_raw_parts_mut(self.base, self.len) }
+    }
+
+    /// Borrow the bounded mapping as ordinary shared bytes.  The exclusive
+    /// borrow prevents two safe Rust formatters/endpoints from aliasing the
+    /// same guest mapping; atomics and record copies remain owned by the
+    /// `kore-hostlink-shmem` implementation layered on this slice.
+    pub fn with_bytes<R>(&mut self, use_window: impl FnOnce(&mut [u8]) -> R) -> R {
+        use_window(self.bytes_mut())
+    }
+
+    pub fn retire(self) -> bool {
+        self._owned.retire()
+    }
+}
+
 impl BarWindow {
     #[cfg(target_os = "none")]
     pub(crate) fn new(base: *mut u8, len: u64, mut owned: OwnedSlot) -> Self {
@@ -3715,9 +3945,16 @@ impl DmaWindow {
 
     #[cfg(target_os = "none")]
     pub(crate) fn from_route(cpu: *mut u8, iova: u64, len: u64, route: FabricRouteToken) -> Self {
-        Self { cpu, iova, len, device_leaf: DmaDeviceLeaf::Anonymous,
-            cpu_view: None, fabric_route: None, fabric_registration: None,
-            _owned: StashedMemory::Route(route) }
+        Self {
+            cpu,
+            iova,
+            len,
+            device_leaf: DmaDeviceLeaf::Anonymous,
+            cpu_view: None,
+            fabric_route: None,
+            fabric_registration: None,
+            _owned: StashedMemory::Route(route),
+        }
     }
 
     #[cfg(any(test, target_os = "none"))]
@@ -3734,8 +3971,11 @@ impl DmaWindow {
     }
 
     #[cfg(any(test, target_os = "none"))]
-    pub(crate) fn with_fabric_route(mut self, registration: FabricRegistrationToken,
-        route: FabricRouteToken) -> Self {
+    pub(crate) fn with_fabric_route(
+        mut self,
+        registration: FabricRegistrationToken,
+        route: FabricRouteToken,
+    ) -> Self {
         self.fabric_registration = Some(registration);
         self.fabric_route = Some(route);
         self
@@ -3751,13 +3991,17 @@ impl DmaWindow {
     /// custody. The provider must separately retain any lent allocator run.
     pub fn fabric_route(&self) -> Option<&FabricRouteToken> {
         self.fabric_route.as_ref().or_else(|| match &self._owned {
-            StashedMemory::Route(route) => Some(route), _ => None,
+            StashedMemory::Route(route) => Some(route),
+            _ => None,
         })
     }
 
     /// Actual parent of the published mappings, distinct from allocation custody.
     fn dma_mapping_slot(&self) -> SlotRef {
-        self.fabric_route.as_ref().map_or_else(|| self._owned.slot().expect("live DMA custody"), FabricRouteToken::slot)
+        self.fabric_route.as_ref().map_or_else(
+            || self._owned.slot().expect("live DMA custody"),
+            FabricRouteToken::slot,
+        )
     }
 
     fn try_retire_fabric(&mut self) -> RetireOutcome {
@@ -3783,14 +4027,21 @@ impl DmaWindow {
         self.retire_cpu_via(crate::cap::verbs::retire_owned_view)
     }
 
-    fn retire_cpu_via(&mut self, retire: impl FnOnce(SlotRef, SlotRef) -> RetireOutcome) -> RetireOutcome {
+    fn retire_cpu_via(
+        &mut self,
+        retire: impl FnOnce(SlotRef, SlotRef) -> RetireOutcome,
+    ) -> RetireOutcome {
         if !matches!(self.device_leaf, DmaDeviceLeaf::Retired) {
             return RetireOutcome::Retryable;
         }
-        let Some(view) = self.cpu_view.as_mut() else { return RetireOutcome::Retryable; };
+        let Some(view) = self.cpu_view.as_mut() else {
+            return RetireOutcome::Retryable;
+        };
         let parent = view.lease;
         let outcome = view.owned.retire_via(|slot| retire(slot, parent));
-        if outcome.is_closed() { self.cpu = core::ptr::null_mut(); }
+        if outcome.is_closed() {
+            self.cpu = core::ptr::null_mut();
+        }
         outcome
     }
 
@@ -3804,7 +4055,8 @@ impl DmaWindow {
     }
 
     fn retire_device_via(
-        &mut self, retire: impl FnOnce(SlotRef, SlotRef) -> RetireOutcome,
+        &mut self,
+        retire: impl FnOnce(SlotRef, SlotRef) -> RetireOutcome,
     ) -> RetireOutcome {
         let parent = self.dma_mapping_slot();
         let outcome = match &mut self.device_leaf {
@@ -3812,7 +4064,9 @@ impl DmaWindow {
             DmaDeviceLeaf::Retired => return RetireOutcome::AlreadyDead,
             DmaDeviceLeaf::Named(owned) => owned.retire_via(|view| retire(view, parent)),
         };
-        if outcome.is_closed() { self.device_leaf = DmaDeviceLeaf::Retired; }
+        if outcome.is_closed() {
+            self.device_leaf = DmaDeviceLeaf::Retired;
+        }
         outcome
     }
 
@@ -3843,7 +4097,9 @@ impl DmaWindow {
     /// retained route and registration retire before the lease can transfer.
     /// Anonymous pool windows cannot be detached from their parent this way.
     pub fn try_into_lease(self) -> Result<StashedLease, Self> {
-        if !matches!(self._owned, StashedMemory::Lease(_)) { return Err(self); }
+        if !matches!(self._owned, StashedMemory::Lease(_)) {
+            return Err(self);
+        }
         match self.try_into_memory()? {
             StashedMemory::Lease(lease) => Ok(lease),
             StashedMemory::Route(_) => unreachable!("checked allocation species"),
@@ -3856,7 +4112,9 @@ impl DmaWindow {
         if !self.try_retire_device().is_closed() || !self.try_retire_cpu().is_closed() {
             return Err(self);
         }
-        if !self.try_retire_fabric().is_closed() { return Err(self); }
+        if !self.try_retire_fabric().is_closed() {
+            return Err(self);
+        }
         Ok(self._owned)
     }
 
@@ -3879,9 +4137,15 @@ impl DmaWindow {
         if self.cpu_view.is_some() && !self.try_retire_cpu().is_closed() {
             return Err(self);
         }
-        if !self.try_retire_fabric().is_closed() { return Err(self); }
+        if !self.try_retire_fabric().is_closed() {
+            return Err(self);
+        }
         let outcome = self._owned.try_retire_outcome();
-        if outcome.is_closed() { Ok(outcome) } else { Err(self) }
+        if outcome.is_closed() {
+            Ok(outcome)
+        } else {
+            Err(self)
+        }
     }
 }
 
@@ -4063,6 +4327,94 @@ mod retirement_tests {
     }
 
     #[test]
+    fn uncertain_unmapped_lease_retires_without_publishing_it_for_use() {
+        for closure in [RetireOutcome::Retired, RetireOutcome::AlreadyDead] {
+            let owned = OwnedSlot {
+                slot: SlotRef::from_wire(42),
+                state: OwnedSlotState::Reserved,
+                _thread_bound: core::marker::PhantomData,
+            };
+            let mut lease = UncertainLocalCapability::new(owned);
+            assert_eq!(lease.owned.state, OwnedSlotState::Indeterminate);
+            assert!(!lease.settle(RetireOutcome::Retryable));
+            assert_eq!(lease.owned.state, OwnedSlotState::Indeterminate);
+            assert!(lease.settle(closure));
+            assert_eq!(lease.owned.state, OwnedSlotState::Released);
+            assert!(lease.try_retire());
+        }
+    }
+
+    #[test]
+    fn uncertain_exec_carve_requires_both_original_reservations_to_close() {
+        let mut carve = UncertainExecCarve::new(reserved_slot(42), reserved_slot(43));
+        assert!(!carve.try_retire());
+        for (member, slot) in carve.members.iter().zip([43, 42]) {
+            assert_eq!(member.owned.slot(), SlotRef::from_wire(slot));
+            assert_eq!(member.owned.state, OwnedSlotState::Indeterminate);
+        }
+        // A consumed/vacant writable result cannot release an uncertain
+        // executable successor, nor can its successful revoke release scratch.
+        assert!(carve.members[1].settle(RetireOutcome::AlreadyDead));
+        assert!(!carve.try_retire());
+        assert_eq!(carve.members[0].owned.state, OwnedSlotState::Indeterminate);
+        assert!(!carve.members[0].settle(RetireOutcome::Retryable));
+        assert!(carve.members[0].settle(RetireOutcome::Retired));
+        assert!(carve.try_retire());
+        assert!(
+            carve
+                .members
+                .iter()
+                .all(|member| { member.owned.state == OwnedSlotState::Released })
+        );
+    }
+
+    #[test]
+    fn uncertain_channel_requires_closure_of_all_three_original_names() {
+        let mut channel = UncertainChannel::new(
+            reserved_slot(42),
+            reserved_slot(43),
+            reserved_slot(44),
+        );
+        assert!(channel.members.iter().all(|member| {
+            member.owned.state == OwnedSlotState::Indeterminate
+        }));
+        // Off-metal retirement cannot prove closure or reopen any name.
+        assert!(!channel.try_retire());
+        for (member, slot) in channel.members.iter().zip([42, 43, 44]) {
+            assert_eq!(member.owned.slot(), SlotRef::from_wire(slot));
+            assert_eq!(member.owned.state, OwnedSlotState::Indeterminate);
+        }
+        assert!(channel.members[0].settle(RetireOutcome::Retired));
+        assert!(!channel.try_retire());
+        assert_eq!(channel.members[0].owned.state, OwnedSlotState::Released);
+        assert_eq!(channel.members[1].owned.state, OwnedSlotState::Indeterminate);
+        assert_eq!(channel.members[2].owned.state, OwnedSlotState::Indeterminate);
+        assert!(channel.members[2].settle(RetireOutcome::AlreadyDead));
+        assert!(!channel.try_retire());
+        assert!(channel.members[1].settle(RetireOutcome::Retired));
+        assert!(channel.try_retire());
+        assert!(channel.try_retire());
+    }
+
+    #[test]
+    fn uncertain_lease_map_keeps_its_name_until_an_exact_unshare_commit() {
+        let owned = OwnedSlot {
+            slot: SlotRef::from_wire(42),
+            state: OwnedSlotState::Reserved,
+            _thread_bound: core::marker::PhantomData,
+        };
+        let mut mapping = UncertainLeaseMap::new(owned, SlotRef::from_wire(43));
+        assert_eq!(mapping.owned.state, OwnedSlotState::Indeterminate);
+        for outcome in [RetireOutcome::Retryable, RetireOutcome::AlreadyDead] {
+            assert!(!mapping.settle(outcome));
+            assert_eq!(mapping.owned.state, OwnedSlotState::Indeterminate);
+        }
+        assert!(mapping.settle(RetireOutcome::Retired));
+        assert_eq!(mapping.owned.state, OwnedSlotState::Released);
+        assert!(mapping.try_retire());
+    }
+
+    #[test]
     fn guest_space_token_keeps_one_live_dynamic_name() {
         let guest = GuestSpaceToken::new(reserved_slot(49));
 
@@ -4108,37 +4460,72 @@ mod retirement_tests {
     fn named_dma_child_retirement_preserves_parent_and_retry_authority() {
         let mut window = DmaWindow::new(core::ptr::null_mut(), 0x4000, 0x1000, live_slot(44))
             .with_device_leaf(live_slot(45));
-        assert_eq!(window.retire_device_via(|view, parent| {
-            assert_eq!(view, SlotRef::from_wire(45));
-            assert_eq!(parent, SlotRef::from_wire(44));
+        assert_eq!(
+            window.retire_device_via(|view, parent| {
+                assert_eq!(view, SlotRef::from_wire(45));
+                assert_eq!(parent, SlotRef::from_wire(44));
+                RetireOutcome::Retryable
+            }),
             RetireOutcome::Retryable
-        }), RetireOutcome::Retryable);
+        );
         assert!(window._owned.slot().is_some());
         assert!(matches!(&window.device_leaf, DmaDeviceLeaf::Named(owner) if owner.is_live()));
-        assert_eq!(window.retire_device_via(|_, _| RetireOutcome::Retired), RetireOutcome::Retired);
-        assert!(window._owned.slot().is_some(), "device retirement must retain allocation custody");
-        assert_eq!(window.retire_device_via(|_, _| panic!("already retired")), RetireOutcome::AlreadyDead);
-        window._owned.into_returned_capability().owned.release_reservation();
+        assert_eq!(
+            window.retire_device_via(|_, _| RetireOutcome::Retired),
+            RetireOutcome::Retired
+        );
+        assert!(
+            window._owned.slot().is_some(),
+            "device retirement must retain allocation custody"
+        );
+        assert_eq!(
+            window.retire_device_via(|_, _| panic!("already retired")),
+            RetireOutcome::AlreadyDead
+        );
+        window
+            ._owned
+            .into_returned_capability()
+            .owned
+            .release_reservation();
         let mut anonymous = DmaWindow::new(core::ptr::null_mut(), 0x5000, 0x1000, live_slot(46));
         assert_eq!(anonymous.try_retire_device(), RetireOutcome::Retryable);
         assert!(anonymous._owned.slot().is_some());
-        anonymous._owned.into_returned_capability().owned.release_reservation();
+        anonymous
+            ._owned
+            .into_returned_capability()
+            .owned
+            .release_reservation();
     }
 
     #[test]
     fn routed_dma_retirement_uses_route_parent_and_keeps_allocation_on_refusal() {
-        let route = FabricRouteToken { owned: live_slot(47) };
-        let registration = FabricRegistrationToken { owned: live_slot(48) };
+        let route = FabricRouteToken {
+            owned: live_slot(47),
+        };
+        let registration = FabricRegistrationToken {
+            owned: live_slot(48),
+        };
         let mut window = DmaWindow::new(core::ptr::null_mut(), 0x4000, 0x1000, live_slot(44))
-            .with_device_leaf(live_slot(45)).with_fabric_route(registration, route);
-        assert_eq!(window.retire_device_via(|view, parent| {
-            assert_eq!(view, SlotRef::from_wire(45));
-            assert_eq!(parent, SlotRef::from_wire(47), "the allocation is not the IOVA parent");
+            .with_device_leaf(live_slot(45))
+            .with_fabric_route(registration, route);
+        assert_eq!(
+            window.retire_device_via(|view, parent| {
+                assert_eq!(view, SlotRef::from_wire(45));
+                assert_eq!(
+                    parent,
+                    SlotRef::from_wire(47),
+                    "the allocation is not the IOVA parent"
+                );
+                RetireOutcome::Retryable
+            }),
             RetireOutcome::Retryable
-        }), RetireOutcome::Retryable);
+        );
         assert!(window._owned.slot().is_some());
-        assert_eq!(window.try_retire_fabric(), RetireOutcome::Retryable,
-            "host transport cannot prove route closure");
+        assert_eq!(
+            window.try_retire_fabric(),
+            RetireOutcome::Retryable,
+            "host transport cannot prove route closure"
+        );
         assert!(window.fabric_route.as_ref().unwrap().owned.is_live());
         assert!(window.fabric_registration.as_ref().unwrap().owned.is_live());
         core::mem::forget(window);
@@ -4150,21 +4537,42 @@ mod retirement_tests {
         let mut view = mapped_test_view(&mut bytes);
         view.owned = core::mem::ManuallyDrop::new(live_slot(42));
         let mut window = DmaWindow::new(bytes.as_mut_ptr(), 0x4000, 8, live_slot(43))
-            .with_device_leaf(live_slot(45)).with_cpu_view(view);
-        assert_eq!(window.retire_cpu_via(|_, _| panic!("device still live")), RetireOutcome::Retryable);
-        assert_eq!(window.retire_device_via(|_, _| RetireOutcome::Retired), RetireOutcome::Retired);
-        assert_eq!(window.retire_cpu_via(|cpu, parent| {
-            assert_eq!(cpu, SlotRef::from_wire(42));
-            assert_eq!(parent, SlotRef::from_wire(43));
+            .with_device_leaf(live_slot(45))
+            .with_cpu_view(view);
+        assert_eq!(
+            window.retire_cpu_via(|_, _| panic!("device still live")),
             RetireOutcome::Retryable
-        }), RetireOutcome::Retryable);
+        );
+        assert_eq!(
+            window.retire_device_via(|_, _| RetireOutcome::Retired),
+            RetireOutcome::Retired
+        );
+        assert_eq!(
+            window.retire_cpu_via(|cpu, parent| {
+                assert_eq!(cpu, SlotRef::from_wire(42));
+                assert_eq!(parent, SlotRef::from_wire(43));
+                RetireOutcome::Retryable
+            }),
+            RetireOutcome::Retryable
+        );
         assert_eq!(window.cpu(), bytes.as_mut_ptr());
         assert!(window._owned.slot().is_some());
-        assert_eq!(window.retire_cpu_via(|_, _| RetireOutcome::Retired), RetireOutcome::Retired);
+        assert_eq!(
+            window.retire_cpu_via(|_, _| RetireOutcome::Retired),
+            RetireOutcome::Retired
+        );
         assert!(window.cpu().is_null());
-        assert!(window._owned.slot().is_some(), "allocation remains available for hand-back");
-        assert_eq!(window.retire_cpu_via(|_, _| panic!("already retired")), RetireOutcome::AlreadyDead);
-        let mut lease = window.try_into_lease().expect("both named children are closed");
+        assert!(
+            window._owned.slot().is_some(),
+            "allocation remains available for hand-back"
+        );
+        assert_eq!(
+            window.retire_cpu_via(|_, _| panic!("already retired")),
+            RetireOutcome::AlreadyDead
+        );
+        let mut lease = window
+            .try_into_lease()
+            .expect("both named children are closed");
         assert_eq!(lease.slot(), Some(SlotRef::from_wire(43)));
         assert!(lease.is_live());
         lease.owned.release_reservation();
@@ -4360,6 +4768,19 @@ mod retirement_tests {
 
         let returned = send.into_returned_capability();
         assert_eq!(returned.slot(), Some(SlotRef::from_wire(52)));
+        assert!(returned.is_live());
+        core::mem::forget(returned);
+    }
+
+    #[test]
+    fn retained_recv_erasure_preserves_the_affine_owner() {
+        // Rust owner erasure only: this reserved test slot does not claim a
+        // native channel mint, possession check or successful retirement.
+        let recv = ChanRecvToken::new_with_rights(reserved_slot(53), CHANNEL_ENDPOINT_RIGHTS);
+        assert_eq!(recv.slot(), SlotRef::from_wire(53));
+        assert_eq!(recv.rights(), CHANNEL_ENDPOINT_RIGHTS);
+        let returned = recv.into_returned_capability();
+        assert_eq!(returned.slot(), Some(SlotRef::from_wire(53)));
         assert!(returned.is_live());
         core::mem::forget(returned);
     }

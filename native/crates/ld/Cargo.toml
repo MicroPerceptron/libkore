@@ -1,0 +1,21 @@
+[package]
+name = "kore-ld"
+version = "0.1.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The kore image/loader wire contract (res/IMAGE.md; #292).
+kore-abi = { path = "../abi" }
+# The one ELF parsing substrate (res/IMAGE.md §5): no_std, zero-alloc,
+# zero-dep, zero-unsafe with default features off.  Independently
+# validated by kraph's klink and upstream elf_loader building on it.
+elf = { version = "0.8.0", default-features = false }
+heapless = { version = "0.9.2", default-features = false }
+bitflags = { version = "2.13.0", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[lib]
+name = "kore_ld"
+path = "src/lib.rs"
+crate-type = ["rlib"]

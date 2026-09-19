@@ -1,0 +1,37 @@
+[package]
+name = "kore-svc-image"
+version = "0.0.0"
+edition = "2024"
+description = "kore image service protocol and host model: ELF validation, in-place segment carves, and executable text leases."
+publish = false
+
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+# `default-features = false` + the `heap` passthrough below: the startup
+# linker links the CLIENT seam of this crate (`RingImage`) into a task
+# that has no allocator yet, and cargo feature unification must not
+# re-arm kore-rt's heap engine there.  Every other consumer keeps the
+# default and sees no change.
+kore-rt = { path = "../../crates/rt", default-features = false }
+# The Register gate (res/IMAGE.md §5): parse/check/carve live in kore-ld;
+# the service calls `check_image` and never sees ELF internals.
+kore-ld = { path = "../../crates/ld" }
+# `PAGE_BYTES` — the lessor's unit; carves and windows are page-granular.
+# Optional and heap-gated: the mm crate registers an allocator-bearing
+# host of its own, and the acquire-only client seam links into tasks that
+# have none.  The one constant it lends is used only by the host model.
+kore-svc-mm = { path = "../mm", optional = true }
+# The archive index read (ArchiveHeader/ArchiveEntry) — the house byte-reader.
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
+
+[features]
+# The status quo: every consumer that was getting kore-rt's default
+# (heap-on) build keeps it.  The startup linker alone opts out with
+# `default-features = false`.
+default = ["heap"]
+heap = ["kore-rt/heap", "dep:kore-svc-mm"]
+
+# Host tests re-read module pages through the same decode traits as the kernel.
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }

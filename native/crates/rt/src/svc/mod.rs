@@ -331,21 +331,37 @@ pub const ACCEL_CAPTURE_MAX_WORDS: u64 = ACCEL_OVERLAP_WORDS;
 
 /// Versioned capture framing on the existing founded parent channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AccelCaptureKind { Regions, Overlap }
+pub enum AccelCaptureKind {
+    Regions,
+    Overlap,
+}
 impl AccelCaptureKind {
     pub const fn words(self) -> u64 {
-        match self { Self::Regions => ACCEL_CAPTURE_WORDS, Self::Overlap => ACCEL_OVERLAP_WORDS }
+        match self {
+            Self::Regions => ACCEL_CAPTURE_WORDS,
+            Self::Overlap => ACCEL_OVERLAP_WORDS,
+        }
     }
     pub const fn prefix(self) -> &'static str {
-        match self { Self::Regions => "ivpu-capture: V2", Self::Overlap => "ivpu-overlap: V1" }
+        match self {
+            Self::Regions => "ivpu-capture: V2",
+            Self::Overlap => "ivpu-overlap: V1",
+        }
     }
     /// Upper 16 bits select framing; lower 48 preserve PCI vendor/device.
     pub const fn begin(self, vendor: u16, device: u32) -> u64 {
-        let tag = match self { Self::Regions => 0, Self::Overlap => 1 };
+        let tag = match self {
+            Self::Regions => 0,
+            Self::Overlap => 1,
+        };
         (tag << 48) | ((vendor as u64) << 32) | device as u64
     }
     pub const fn decode_begin(payload: u64) -> Option<(Self, u64)> {
-        let kind = match payload >> 48 { 0 => Self::Regions, 1 => Self::Overlap, _ => return None };
+        let kind = match payload >> 48 {
+            0 => Self::Regions,
+            1 => Self::Overlap,
+            _ => return None,
+        };
         Some((kind, payload & 0x0000_ffff_ffff_ffff))
     }
 }
@@ -1070,10 +1086,16 @@ pub fn split_window<S: SvcProtocol>(
 fn accelerator_capture_kind_preserves_identity_and_rejects_unknown_versions() {
     for kind in [AccelCaptureKind::Regions, AccelCaptureKind::Overlap] {
         let payload = kind.begin(0x8086, 0x643e);
-        assert_eq!(AccelCaptureKind::decode_begin(payload), Some((kind, 0x8086_0000_643e)));
+        assert_eq!(
+            AccelCaptureKind::decode_begin(payload),
+            Some((kind, 0x8086_0000_643e))
+        );
         assert!(kind.words() <= ACCEL_CAPTURE_MAX_WORDS);
     }
-    assert_eq!(AccelCaptureKind::Regions.begin(0x8086, 0x643e), 0x8086_0000_643e);
+    assert_eq!(
+        AccelCaptureKind::Regions.begin(0x8086, 0x643e),
+        0x8086_0000_643e
+    );
     assert_eq!(AccelCaptureKind::decode_begin(2 << 48), None);
     assert_eq!(AccelCaptureKind::decode_begin(u64::MAX), None);
 }

@@ -67,9 +67,9 @@ use crate::wake;
 
 pub use task::{SpawnRefused, SpawnToken, TaskStorage};
 pub use time::{
-    quiesce_asked, quiesce_deadline, take_quiesce_ask,
     WakeReason, clock_ns, enable_irq_parks, next_wake, next_wake_for, next_wake_on,
-    next_wake_on_for, next_wake_until, retire_irq_parks, sleep_for, sleep_until,
+    next_wake_on_for, next_wake_until, quiesce_asked, quiesce_deadline, retire_irq_parks,
+    sleep_for, sleep_until, take_quiesce_ask,
 };
 
 use task::{TaskHeader, poll_task, waker_for};
@@ -324,6 +324,25 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
         Self::with_post_state(transport, doorbell, true)
     }
 
+    /// Adopt a standing post and the caller's latest kernel clock stamp.
+    /// Temporary executors need both: an immediately-ready root performs no
+    /// park/re-post from which to recover the clock, and relative deadlines
+    /// must start from the handoff rather than from boot time zero.
+    pub fn from_standing_at(transport: &'t T, doorbell: Doorbell, clock_ms: u32) -> Self {
+        let executor = Self::from_standing(transport, doorbell);
+        executor.ctx.anchor_ms(clock_ms);
+        executor
+    }
+
+    /// Adopt a standing post with a full absolute clock anchor. Use this for
+    /// temporary-executor handoffs: converting the caller's time back to the
+    /// kernel stamp's low word would discard every elapsed wrap period.
+    pub fn from_standing_at_ns(transport: &'t T, doorbell: Doorbell, now_ns: u64) -> Self {
+        let executor = Self::from_standing(transport, doorbell);
+        executor.ctx.advance(now_ns);
+        executor
+    }
+
     fn with_post_state(transport: &'t T, doorbell: Doorbell, posted: bool) -> Self {
         Self {
             transport,
@@ -409,10 +428,33 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
     /// idle park, forever.  The future remains in the caller-owned frame;
     /// this frame holds only a pinned borrow.  On target the root never
     /// completes; under a test its output is the test's result.
-    pub fn run_pinned<F: Future + ?Sized>(
+    pub fn run_pinned<F: Future + ?Sized>(&mut self, root: core::pin::Pin<&mut F>) -> F::Output {
+        self.run_pinned_inner(root)
+    }
+
+    /// Run with a synchronous handler for ordinary primary-doorbell payloads.
+    /// The handler runs before re-posting, on both idle and inline service
+    /// parks. It must finish its work without polling this executor recursively.
+    /// This permits a resident parent to forward testimony with backpressure
+    /// while its root future awaits unrelated service replies. Alternate
+    /// deliveries remain owned by their receiving futures; power quiesce stays
+    /// owned by the runtime. The handler is removed on return or unwind.
+    pub fn run_observed<F: Future, O: Fn(u64, u64)>(&mut self, root: F, observer: O) -> F::Output {
+        let mut root = pin!(root);
+        self.run_pinned_observed(root.as_mut(), observer)
+    }
+
+    /// Caller-pinned form of [`run_observed`](Self::run_observed).
+    pub fn run_pinned_observed<F: Future + ?Sized, O: Fn(u64, u64)>(
         &mut self,
-        mut root: core::pin::Pin<&mut F>,
+        root: core::pin::Pin<&mut F>,
+        observer: O,
     ) -> F::Output {
+        self.ctx
+            .with_notice_observer(&observer, || self.run_pinned_inner(root))
+    }
+
+    fn run_pinned_inner<F: Future + ?Sized>(&self, mut root: core::pin::Pin<&mut F>) -> F::Output {
         // Establish the standing doorbell post FIRST — §3.1's premise:
         // peers may kick from their very first poll, and a kick is
         // droppable only against a doorbell that already stands (the
@@ -582,15 +624,7 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
             Status::Ok => {
                 match verbs::take_notice(self.doorbell.land) {
                     None => executor_fault(ExecFault::NoDoorbellNotice),
-                    // The kernel's terminal quiesce ask rides the ordinary
-                    // doorbell (#809 §L); its reserved cookie is refused to
-                    // userland senders, so seeing it here is the kernel.
-                    Some((cookie, budget_ns))
-                        if cookie == kore_abi::session::NOTICE_COOKIE_POWER_QUIESCE =>
-                    {
-                        self.ctx.note_quiesce_ask(budget_ns);
-                    }
-                    Some(_) => {}
+                    Some((cookie, payload)) => self.ctx.dispatch_notice(cookie, payload),
                 }
                 self.cycles.set(self.cycles.get() + 1);
                 self.ctx.note_wake(time::WakeReason::Doorbell);
@@ -615,9 +649,7 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
                 // and re-stand the level-triggered doorbell when present, but
                 // preserve Delivery as the edge-visible reason.
                 if let Some((cookie, budget_ns)) = verbs::take_notice(self.doorbell.land) {
-                    if cookie == kore_abi::session::NOTICE_COOKIE_POWER_QUIESCE {
-                        self.ctx.note_quiesce_ask(budget_ns);
-                    }
+                    self.ctx.dispatch_notice(cookie, budget_ns);
                     self.cycles.set(self.cycles.get() + 1);
                     self.posted.set(false);
                     self.repost();
@@ -860,9 +892,12 @@ pub(crate) async fn settle_inline_doorbell<T: Transport>(
     doorbell: Doorbell,
     stamp_ms: u32,
 ) -> bool {
-    if verbs::take_notice(doorbell.land).is_none() {
+    let Some((cookie, payload)) = verbs::take_notice(doorbell.land) else {
         return false;
-    }
+    };
+    // Dispatch before the first cancellation point or re-post: a load-bearing
+    // payload must be handled before another sender can replace its landing.
+    dispatch_inline_notice(cookie, payload).await;
     let Some(reposted_ms) = stand_doorbell(transport, doorbell).await else {
         return false;
     };
@@ -886,8 +921,119 @@ pub(crate) async fn settle_inline_doorbell<T: Transport>(
     true
 }
 
+/// Resolve a blocking caller's waker to the same context used by idle parks.
+async fn dispatch_inline_notice(cookie: u64, payload: u64) {
+    core::future::poll_fn(|cx| {
+        let hdr = task::header_of(cx.waker())
+            .expect("inline doorbell settlement requires the kore executor");
+        // SAFETY: the authenticated header's context is live during this poll.
+        let ctx = unsafe { hdr.as_ref() }.exec.load(Ordering::Relaxed);
+        assert!(
+            !ctx.is_null(),
+            "inline doorbell settled outside an executor pass"
+        );
+        unsafe { &*ctx }.dispatch_notice(cookie, payload);
+        Poll::Ready(())
+    })
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn absolute_standing_handoff_preserves_epoch_and_relative_deadlines() {
+        let transport = crate::transport::TrapTransport;
+        let bell = Doorbell {
+            chan: 7,
+            recv: kore_abi::session::SlotRef::from_wire(101),
+            land: kore_abi::session::SlotRef::from_wire(102),
+            recv_tag: 0x1234,
+        };
+        let birth = ((3u64 << 32) + 42) * 1_000_000 + 123;
+        let mut first = Executor::from_standing_at_ns(&transport, bell, birth);
+        assert_eq!(first.run(clock_ns()), birth);
+        let mut second = Executor::from_standing_at_ns(&transport, bell, first.now());
+        second.ctx.anchor_ms(41); // older trap, same epoch
+        assert_eq!(second.run(clock_ns()), birth);
+        second.ctx.anchor_ms(43);
+        let now = ((3u64 << 32) + 43) * 1_000_000;
+        assert_eq!(second.run(clock_ns()), now);
+        let deadline = second.run(async {
+            let mut sleep = core::pin::pin!(sleep_for(500_000));
+            core::future::poll_fn(|cx| {
+                assert!(sleep.as_mut().poll(cx).is_pending());
+                let hdr = task::header_of(cx.waker()).unwrap();
+                let ctx = unsafe { hdr.as_ref() }.exec.load(Ordering::Relaxed);
+                Poll::Ready(unsafe { &*ctx }.timers_min())
+            })
+            .await
+        });
+        assert_eq!(deadline, Some(now + 500_000));
+        assert!(second.ctx.timers_min().is_none());
+    }
+
+    #[test]
+    fn standing_handoff_preserves_clock_before_any_park_or_repost() {
+        let transport = crate::transport::TrapTransport;
+        let bell = Doorbell {
+            chan: 7,
+            recv: kore_abi::session::SlotRef::from_wire(101),
+            land: kore_abi::session::SlotRef::from_wire(102),
+            recv_tag: 0x1234,
+        };
+        let mut executor = Executor::from_standing_at(&transport, bell, 1377);
+        assert_eq!(executor.run(clock_ns()), 1_377_000_000);
+        let deadline = executor.run(async {
+            let mut sleep = core::pin::pin!(sleep_for(500_000));
+            core::future::poll_fn(|cx| {
+                assert!(sleep.as_mut().poll(cx).is_pending());
+                let hdr = task::header_of(cx.waker()).unwrap();
+                let ctx = unsafe { hdr.as_ref() }.exec.load(Ordering::Relaxed);
+                // The test runs inside the real executor's immediate poll.
+                Poll::Ready(unsafe { &*ctx }.timers_min())
+            })
+            .await
+        });
+        assert_eq!(deadline, Some(1_377_500_000));
+        assert_eq!(executor.now(), 1_377_000_000);
+        assert!(
+            executor.ctx.timers_min().is_none(),
+            "root timer retired on return"
+        );
+    }
+
+    /// Runs the actual root-waker/context route without pretending that a
+    /// host test can consume a native landing slot or perform a kernel park.
+    #[test]
+    fn observed_run_dispatches_inline_payloads_through_its_root_waker() {
+        let transport = crate::transport::TrapTransport;
+        let bell = Doorbell {
+            chan: 7,
+            recv: kore_abi::session::SlotRef::from_wire(101),
+            land: kore_abi::session::SlotRef::from_wire(102),
+            recv_tag: 0x1234,
+        };
+        let mut executor = Executor::from_standing(&transport, bell);
+        let seen = core::cell::Cell::new(None);
+        let result = executor.run_observed(
+            async {
+                dispatch_inline_notice(0x7001, u64::MAX).await;
+                17
+            },
+            |cookie, payload| seen.set(Some((cookie, payload))),
+        );
+        assert_eq!(result, 17);
+        assert_eq!(seen.get(), Some((0x7001, u64::MAX)));
+        // A subsequent ordinary run must not retain the prior borrowed hook.
+        executor.run(dispatch_inline_notice(0x7002, 3));
+        assert_eq!(seen.get(), Some((0x7001, u64::MAX)));
+        executor.run(dispatch_inline_notice(
+            kore_abi::session::NOTICE_COOKIE_POWER_QUIESCE,
+            88,
+        ));
+        assert_eq!(executor.ctx.take_quiesce_ask(), Some(88));
+    }
+
     /// Every executor fault must be told apart from a photograph: one rung
     /// each, in a band that cannot collide with a service's own ladder, with
     /// the offending status preserved rather than collapsed.
@@ -946,7 +1092,6 @@ mod tests {
             "MAX_TIMERS must cover MAX_TASKS admitted tasks plus the root"
         );
     }
-
 
     #[test]
     fn cooperative_yield_has_one_pending_poll_and_no_clock_dependency() {

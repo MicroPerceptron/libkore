@@ -428,11 +428,14 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
 /// Live immutable image-generation peers the boot catalogue can hold at once:
 /// the 33-row bootstrap catalogue — the desktop's `editor` and `power-ui`
 /// beside the two native filesystem verbs `append` and `sync` — plus the
-/// shell, the graphical terminal, and three extraction parsers.  Named
+/// shell, the graphical terminal, three extraction parsers, and the resident
+/// agent runner.  The runner sits outside the shell catalogue (init installs
+/// it for the resident broker, not for a terminal namespace) but it is a
+/// resident generation like the rest and consumes one loader face.  Named
 /// separately from the interactive reservation below because the two grow for
 /// unrelated reasons: this one when a row joins the catalogue, that one when
 /// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 38;
+pub const BOOTSTRAP_IMAGE_PEERS: usize = 39;
 
 /// Bootstrap face-supply sizing. Image and runtime grow their face tables and
 /// rings on demand; this reserves enough initial memory for the boot catalogue

@@ -515,9 +515,18 @@ pub fn encode_req(req: &FsRequest) -> FsReqWire {
         FsRequest::BindView {
             handle,
             rights,
+            mode,
             announced,
         } => {
             w.op = FsReqWire::OP_BIND_VIEW;
+            w.kind = match mode {
+                crate::ViewBindingMode::Inherited => 0,
+                crate::ViewBindingMode::Isolated => 1,
+                crate::ViewBindingMode::Resources(name) => {
+                    w.name_len = put_name(&mut w.name, &name);
+                    2
+                }
+            };
             w.handle = U64::new(handle.to_bits());
             w.rights = rights.bits();
             w.window_offset = U32::new(announced.index());
@@ -607,6 +616,7 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
             | FsReqWire::OP_SEARCH
             | FsReqWire::OP_DEFER_COMMITS
             | FsReqWire::OP_SET_SYSTEM_SEED
+            | FsReqWire::OP_BIND_VIEW
     ) && w.kind != 0
     {
         return None;
@@ -886,12 +896,24 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
             }
         }
         FsReqWire::OP_BIND_VIEW => {
-            if w.kind != 0 || !control_payload_except_handle_is_empty(w) || rights.is_empty() {
+            if rights.is_empty() {
                 return None;
             }
+            let mode = match w.kind {
+                0 | 1 if control_payload_except_handle_is_empty(w) => {
+                    if w.kind == 0 { crate::ViewBindingMode::Inherited }
+                    else { crate::ViewBindingMode::Isolated }
+                }
+                2 if w.handle2.get() == 0 && w.offset.get() == 0
+                    && w.expected_revision.get() == 0 && w.length.get() == 0
+                    && w.name2_len == 0 && w.name2.iter().all(|byte| *byte == 0) =>
+                    crate::ViewBindingMode::Resources(take_name(&w.name, w.name_len)?),
+                _ => return None,
+            };
             FsRequest::BindView {
                 handle,
                 rights,
+                mode,
                 announced: SlotRef::from_wire(w.window_offset.get()),
             }
         }
@@ -1360,7 +1382,20 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         | FsRequest::AdmitPeer { .. }
         | FsRequest::RetirePeer { .. }
         | FsRequest::ConfirmRetired { .. }
-        | FsRequest::ClosePeer => FsResponse::Done,
+        | FsRequest::ClosePeer => {
+            // These acknowledgements carry no payload. In particular, a
+            // late revision/handle reply cannot certify lifecycle completion.
+            if w.kind != 0
+                || w.count.get() != 0
+                || w.handle.get() != 0
+                || w.len.get() != 0
+                || w.revision.get() != 0
+                || w.cursor.get() != 0
+            {
+                return None;
+            }
+            FsResponse::Done
+        }
     };
     if !matches!(
         request,
@@ -1482,7 +1517,6 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
             | (
                 FsRequest::RegisterSystemView { .. }
                     | FsRequest::RegisterPrivateView { .. }
-                    | FsRequest::RegisterPrivateView { .. }
                     | FsRequest::ApplyView { .. }
                     | FsRequest::BindView { .. }
                     | FsRequest::Close { .. }
@@ -1509,6 +1543,46 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
 mod tests {
     use super::*;
     use zerocopy::IntoBytes as _;
+
+    #[test]
+    fn resource_namespace_wire_refuses_missing_names_and_reserved_payload() {
+        let request = FsRequest::BindView {
+            handle: Handle::from_bits(0x100000001), rights: Rights::READ,
+            mode: crate::ViewBindingMode::Resources(Name::new("input").unwrap()),
+            announced: SlotRef::from_wire(17),
+        };
+        let mut wire = encode_req(&request);
+        wire.name_len = 0;
+        assert!(decode_req(&wire).is_none());
+        let mut wire = encode_req(&request);
+        wire.name[5] = b'x';
+        assert!(decode_req(&wire).is_none());
+        let mut wire = encode_req(&request);
+        wire.offset = 1.into();
+        assert!(decode_req(&wire).is_none());
+        let mut wire = encode_req(&request);
+        wire.kind = 1;
+        assert!(decode_req(&wire).is_none());
+    }
+
+    #[test]
+    fn isolated_bind_view_round_trips_and_unknown_modes_refuse() {
+        for (kind, mode) in [(0, crate::ViewBindingMode::Inherited),
+            (1, crate::ViewBindingMode::Isolated),
+            (2, crate::ViewBindingMode::Resources(Name::new("selected").unwrap()))] {
+            let request = FsRequest::BindView {
+                handle: Handle::from_bits(0x100000001),
+                rights: Rights::READ,
+                mode,
+                announced: SlotRef::from_wire(17),
+            };
+            let mut wire = encode_req(&request);
+            assert_eq!(decode_req(&wire), Some(request));
+            assert_eq!(wire.kind, kind);
+            wire.kind = 3;
+            assert!(decode_req(&wire).is_none());
+        }
+    }
 
     /// The control verbs that carry no object must survive the round trip.
     ///
@@ -1618,6 +1692,39 @@ mod tests {
         };
         assert_eq!(decode_rep_for(&close, &done), Some((FsResponse::Done, 0)));
         assert_eq!(decode_rep_for(&close, &stamped), None);
+    }
+
+    #[test]
+    fn empty_acknowledgements_reject_each_payload_field() {
+        for request in [
+            FsRequest::SetSystemSeed { active: true },
+            FsRequest::SetSystemSeed { active: false },
+            FsRequest::DeferCommits { hold: true },
+            FsRequest::Close {
+                handle: crate::Handle::from_bits(2),
+            },
+            FsRequest::ClosePeer,
+        ] {
+            let done = encode_rep(&FsResponse::Done, 0);
+            assert_eq!(decode_rep_for(&request, &done), Some((FsResponse::Done, 0)));
+            for field in 0..10 {
+                let mut invalid = done;
+                match field {
+                    0 => invalid.kind = 1,
+                    1 => invalid.flags = 1,
+                    2 => invalid.count = U32::new(1),
+                    3 => invalid.handle = U64::new(1),
+                    4 => invalid.len = U64::new(1),
+                    5 => invalid.revision = U64::new(1),
+                    6 => invalid.cursor = U32::new(1),
+                    7 => invalid.reserved0 = U32::new(1),
+                    8 => invalid.reserved1 = U64::new(1),
+                    9 => invalid.grants = 1,
+                    _ => unreachable!(),
+                }
+                assert_eq!(decode_rep_for(&request, &invalid), None, "field {field}");
+            }
+        }
     }
 
     /// A refusal carries a status and nothing else — a subtype on it is not

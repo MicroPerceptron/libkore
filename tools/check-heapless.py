@@ -7,6 +7,7 @@ proves it:
   runtime   default-features = false        -> no allocator required
   fs        default-features = false + fs   -> allocator required (see below)
   full      default features                -> collections, allocator required
+  exec      default-features = false + exec -> invocation surface, allocator required
 
 The dependency is renamed (`sdk = { package = "kore-std", .. }`) on purpose: a
 consumer that reaches the library under its own chosen name cannot be relying on
@@ -44,6 +45,9 @@ MODES = {
     "runtime": ("default-features=false", False),
     "fs": ('default-features=false, features=["fs"]', True),
     "full": ("", True),
+    # libkore #18's surface. It pulls `fs` (the request vocabulary names
+    # filesystem rights), so it inherits that mode's allocator requirement.
+    "exec": ('default-features=false, features=["exec"]', True),
 }
 
 ALLOCATOR = """
@@ -62,6 +66,10 @@ BODY = {
     "runtime": "let _ = (sdk::time::uptime(), sdk::time::wall());",
     "fs": "let _ = (sdk::time::uptime(), core::mem::size_of::<sdk::fs::Fs>());",
     "full": "let _ = (sdk::time::uptime(), core::mem::size_of::<sdk::collections::HashSet<u32>>());",
+    # A real consumer names an executable it holds and asks the protocol how
+    # many grant channels it must pre-pin. Neither is authority; both are the
+    # surface libkore #18 exists to expose.
+    "exec": "let ns = sdk::exec::CapabilityNamespace::<u32, 2>::new();\n    let _ = (ns.metadata().count(), sdk::exec::EXEC_REPLY_GRANTS);",
 }
 
 
@@ -109,5 +117,5 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=sorted(MODES))
     args = parser.parse_args()
     for arch in ([args.arch] if args.arch else ["x86_64", "aarch64", "riscv64gc"]):
-        for mode in ([args.mode] if args.mode else ["runtime", "fs", "full"]):
+        for mode in ([args.mode] if args.mode else ["runtime", "fs", "full", "exec"]):
             check(arch, mode)

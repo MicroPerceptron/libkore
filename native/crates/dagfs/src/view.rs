@@ -10,7 +10,8 @@
 use kore_rt::svc::ReturnCallError;
 
 use crate::{
-    Fs, FsError, FsRequest, FsResponse, GrantEntry, Name, Refusal, Rights, read_grant_entry,
+    Fs, FsError, FsRequest, FsResponse, GrantEntry, GrantId, Name, Refusal, Rights,
+    read_grant_entry,
 };
 
 impl<'w, 't> Fs<'w, 't> {
@@ -20,16 +21,134 @@ impl<'w, 't> Fs<'w, 't> {
     /// corresponding immutable root it minted before launch.
     pub async fn bind_cwd(&mut self, path: &[u8]) -> Result<(), Refusal> {
         let rights = self.effective_rights(path).await?;
-        let view = self.open(path, rights).await?;
+        self.bind_cwd_with_rights(path, rights).await
+    }
+
+    /// Bind exactly the requested rights on a directory. Opening the route
+    /// with SHARE enforces delegation authority before the one-shot endpoint moves; a
+    /// request for rights the source does not hold refuses rather than
+    /// silently publishing a weaker or broader view.
+    pub async fn bind_cwd_with_rights(
+        &mut self,
+        path: &[u8],
+        rights: Rights,
+    ) -> Result<(), Refusal> {
+        self.bind_cwd_mode(path, rights, false).await
+    }
+
+    /// Bind a directory without exposing the issuer's other named grants.
+    pub async fn bind_cwd_isolated(&mut self, path: &[u8], rights: Rights) -> Result<(), Refusal> {
+        self.bind_cwd_mode(path, rights, true).await
+    }
+
+    /// Bind one exact non-directory object as an isolated invocation root.
+    /// The recipient opens `/` to use that object; no parent, sibling or
+    /// issuer's named grants accompany it. Object identity is pinned by the
+    /// native handle before this command exits, not re-resolved by pathname.
+    pub async fn bind_object_isolated(
+        &mut self,
+        path: &[u8],
+        rights: Rights,
+    ) -> Result<(), Refusal> {
+        if !rights.contains(Rights::READ) || rights.contains(Rights::MUTATE_NAMESPACE) {
+            return Err(Refusal::Fs(FsError::AccessDenied));
+        }
+        let view = self.open(path, rights.union(Rights::SHARE)).await?;
+        if view.is_directory() {
+            self.close(view).await;
+            return Err(Refusal::Fs(FsError::IsDirectory));
+        }
+        self.bind_selected(view, rights, true).await
+    }
+
+    /// Start a private read-only namespace containing one explicitly named
+    /// resource. Further resources require ordinary target-authenticated grants.
+    pub async fn bind_resource_view(
+        &mut self,
+        path: &[u8],
+        rights: Rights,
+        name: Name,
+    ) -> Result<(), Refusal> {
+        if !rights.contains(Rights::READ) || !rights.is_subset_of(Rights::HOME) {
+            return Err(Refusal::Fs(FsError::AccessDenied));
+        }
+        let view = self.open(path, rights.union(Rights::SHARE)).await?;
+        self.bind_selected_mode(view, rights, crate::ViewBindingMode::Resources(name))
+            .await
+    }
+
+    /// Bind only the explicitly named grant, without a same-named containment
+    /// entry taking precedence. Parent admission uses this for imported roots.
+    pub async fn bind_named_grant_isolated(
+        &mut self,
+        name: &Name,
+        rights: Rights,
+    ) -> Result<(), Refusal> {
+        if !rights.contains(Rights::READ) {
+            return Err(Refusal::Fs(FsError::AccessDenied));
+        }
+        let grant = self
+            .named_grant(name)
+            .await?
+            .ok_or(Refusal::Fs(FsError::NotFound))?;
+        let view = self.open_grant(grant, rights.union(Rights::SHARE)).await?;
+        self.bind_directory(view, rights, true).await
+    }
+
+    async fn bind_cwd_mode(
+        &mut self,
+        path: &[u8],
+        rights: Rights,
+        isolated: bool,
+    ) -> Result<(), Refusal> {
+        if !rights.contains(Rights::READ) {
+            return Err(Refusal::Fs(FsError::AccessDenied));
+        }
+        let view = self.open(path, rights.union(Rights::SHARE)).await?;
+        self.bind_directory(view, rights, isolated).await
+    }
+
+    async fn bind_directory(
+        &mut self,
+        view: crate::View,
+        rights: Rights,
+        isolated: bool,
+    ) -> Result<(), Refusal> {
         if !view.is_directory() {
             self.close(view).await;
             return Err(Refusal::Fs(FsError::NotDirectory));
         }
+        self.bind_selected(view, rights, isolated).await
+    }
+
+    async fn bind_selected(
+        &mut self,
+        view: crate::View,
+        rights: Rights,
+        isolated: bool,
+    ) -> Result<(), Refusal> {
+        let mode = if isolated {
+            crate::ViewBindingMode::Isolated
+        } else {
+            crate::ViewBindingMode::Inherited
+        };
+        self.bind_selected_mode(view, rights, mode).await
+    }
+
+    async fn bind_selected_mode(
+        &mut self,
+        view: crate::View,
+        rights: Rights,
+        mode: crate::ViewBindingMode,
+    ) -> Result<(), Refusal> {
         let Some(binding) = self.view_binding.take() else {
             self.close(view).await;
             return Err(Refusal::Fs(FsError::AccessDenied));
         };
-        let moved = self.client.bind_view(view.handle(), rights, binding).await;
+        let moved = self
+            .client
+            .bind_view_mode(view.handle(), rights, mode, binding)
+            .await;
         self.close(view).await;
         match moved {
             Ok(FsResponse::Done) => Ok(()),
@@ -53,6 +172,19 @@ impl<'w, 't> Fs<'w, 't> {
         display_name: Name,
         rights: Rights,
     ) -> Result<(), Refusal> {
+        self.share_grant(path, display_name, rights)
+            .await
+            .map(|_| ())
+    }
+
+    /// Preserve the exact edge returned by the service for native parent
+    /// bookkeeping. Receiving its ID does not confer authority over that edge.
+    pub async fn share_grant(
+        &mut self,
+        path: &[u8],
+        display_name: Name,
+        rights: Rights,
+    ) -> Result<GrantId, Refusal> {
         let view = self.open(path, rights.union(Rights::SHARE)).await?;
         let Some(target) = self.grant_target.take() else {
             self.close(view).await;
@@ -64,7 +196,7 @@ impl<'w, 't> Fs<'w, 't> {
             .await;
         self.close(view).await;
         match result {
-            Ok(FsResponse::Granted { .. }) => Ok(()),
+            Ok(FsResponse::Granted { grant }) => Ok(grant),
             Ok(FsResponse::Refused(error)) => Err(Refusal::Fs(error)),
             Ok(_) => Err(Refusal::Pair),
             Err(ReturnCallError::NotMoved { capability, .. }) => {
@@ -81,6 +213,16 @@ impl<'w, 't> Fs<'w, 't> {
             return Err(Refusal::Fs(FsError::NotFound));
         };
         self.checked(&FsRequest::Revoke { grant }).await?;
+        Ok(())
+    }
+
+    /// Refuse replacement-by-name. The final Revoke still checks the exact
+    /// generational ID if the namespace changes after this lookup.
+    pub async fn unshare_exact(&mut self, name: &Name, expected: GrantId) -> Result<(), Refusal> {
+        if self.named_grant(name).await? != Some(expected) {
+            return Err(Refusal::Fs(FsError::NotFound));
+        }
+        self.checked(&FsRequest::Revoke { grant: expected }).await?;
         Ok(())
     }
 

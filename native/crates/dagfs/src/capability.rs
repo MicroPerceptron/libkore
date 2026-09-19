@@ -89,18 +89,43 @@ impl FsViewCapability {
         self.endpoint.rights()
     }
 
-    pub fn derive_invocation(&self) -> Option<ChanSendToken> {
-        verbs::derive_owned_chan_send_with_rights(
+    pub fn derive_invocation_outcome(&self) -> Result<ChanSendToken, verbs::EndpointDeriveError> {
+        verbs::derive_owned_chan_send_outcome(
             self.endpoint.slot(),
             Self::INVOCATION_DELEGATE_RIGHTS,
         )
     }
 
+    pub fn derive_invocation(&self) -> Option<ChanSendToken> {
+        self.derive_invocation_outcome().ok()
+    }
+
+    /// Derive and send a binding directly from this retained source. No
+    /// temporary local endpoint outlives the atomic transfer attempt.
+    pub async fn transfer_binding<T: kore_rt::transport::Transport>(
+        &self,
+        tx: &kore_rt::chan::ChanTx<'_, T>,
+    ) -> Result<(), kore_rt::chan::SendError> {
+        tx.transfer_derived_send(self.endpoint.slot(), Self::INVOCATION_DELEGATE_RIGHTS)
+            .await
+    }
+
+    pub fn derive_binding_outcome(&self) -> Result<ChanSendToken, verbs::EndpointDeriveError> {
+        self.derive_invocation_outcome()
+    }
+
     pub fn derive_binding(&self) -> Option<ChanSendToken> {
-        verbs::derive_owned_chan_send_with_rights(
-            self.endpoint.slot(),
-            Self::INVOCATION_DELEGATE_RIGHTS,
-        )
+        self.derive_binding_outcome().ok()
+    }
+
+    /// Select this view as a grant destination without sending invocation or
+    /// further delegation authority.
+    pub fn derive_grant_target_outcome(&self) -> Result<ChanSendToken, verbs::EndpointDeriveError> {
+        verbs::derive_owned_chan_send_outcome(self.endpoint.slot(), FS_GRANT_TARGET_RIGHTS)
+    }
+
+    pub fn derive_grant_target(&self) -> Option<ChanSendToken> {
+        self.derive_grant_target_outcome().ok()
     }
 
     pub fn into_endpoint(self) -> Result<ChanSendToken, Self> {

@@ -118,6 +118,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "elf"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -234,6 +240,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-exec-client"
+version = "0.0.1"
+dependencies = [
+ "kore-abi",
+ "kore-app",
+ "kore-ring",
+ "kore-rt",
+ "kore-svc-dagfs",
+ "kore-svc-image",
+ "kore-svc-mm",
+ "kore-window",
+ "zerocopy",
+]
+
+[[package]]
 name = "kore-ffi"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -246,6 +267,38 @@ name = "kore-hint"
 version = "0.0.0"
 dependencies = [
  "raw-cpuid",
+]
+
+[[package]]
+name = "kore-hostlink"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "heapless",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-hostlink-shmem"
+version = "0.0.0"
+
+[[package]]
+name = "kore-ld"
+version = "0.1.1"
+dependencies = [
+ "bitflags",
+ "elf",
+ "heapless",
+ "kore-abi",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-nvme"
+version = "0.0.0"
+dependencies = [
+ "kore-abi",
+ "kore-driver",
 ]
 
 [[package]]
@@ -289,8 +342,52 @@ dependencies = [
  "kore-app",
  "kore-dagfs",
  "kore-driver",
+ "kore-exec-client",
  "kore-rt",
  "zeroize",
+]
+
+[[package]]
+name = "kore-svc-block"
+version = "0.0.1"
+dependencies = [
+ "kore-abi",
+ "kore-driver",
+ "kore-nvme",
+ "kore-rt",
+ "kore-svc-device",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-svc-dagfs"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "crc",
+ "heapless",
+ "kore-abi",
+ "kore-collections",
+ "kore-dagfs",
+ "kore-driver",
+ "kore-hostlink",
+ "kore-nvme",
+ "kore-ring",
+ "kore-rt",
+ "kore-svc-block",
+ "kore-svc-extract",
+ "kore-svc-hostlink",
+ "kore-workspace-sync",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-svc-device"
+version = "0.0.0"
+dependencies = [
+ "heapless",
+ "kore-abi",
+ "kore-rt",
 ]
 
 [[package]]
@@ -303,10 +400,84 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-svc-hostlink"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "heapless",
+ "kore-abi",
+ "kore-driver",
+ "kore-hostlink",
+ "kore-hostlink-shmem",
+ "kore-rt",
+ "kore-svc-device",
+ "kore-virtio",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-svc-image"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "kore-abi",
+ "kore-ld",
+ "kore-rt",
+ "kore-svc-mm",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-svc-mm"
+version = "0.0.0"
+dependencies = [
+ "kore-abi",
+ "kore-rt",
+]
+
+[[package]]
+name = "kore-svc-output"
+version = "0.0.1"
+dependencies = [
+ "kore-abi",
+ "kore-ring",
+ "kore-rt",
+ "kore-uart",
+]
+
+[[package]]
+name = "kore-uart"
+version = "0.0.0"
+
+[[package]]
+name = "kore-virtio"
+version = "0.0.0"
+dependencies = [
+ "kore-abi",
+ "kore-driver",
+ "kore-rt",
+ "kore-svc-device",
+]
+
+[[package]]
 name = "kore-window"
 version = "0.0.1"
 dependencies = [
  "kore-abi",
+ "kore-ring",
+ "kore-rt",
+ "kore-svc-output",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-workspace-sync"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "heapless",
+ "unicode-normalization",
+ "zerocopy",
 ]
 
 [[package]]
@@ -425,6 +596,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "toml_datetime"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -477,6 +654,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "winnow"

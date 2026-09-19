@@ -200,8 +200,8 @@ mod tests {
 
     #[test]
     fn a_zeroed_block_fails_closed() {
-        let b = MachineBlock::read_from_bytes(&[0u8; core::mem::size_of::<MachineBlock>()])
-            .unwrap();
+        let b =
+            MachineBlock::read_from_bytes(&[0u8; core::mem::size_of::<MachineBlock>()]).unwrap();
         assert!(!b.validate(), "abi 0 must expose nothing");
         assert_eq!(b.logical_cpus(), None);
         assert_eq!(b.best_lane(), None);

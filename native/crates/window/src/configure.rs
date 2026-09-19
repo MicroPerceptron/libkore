@@ -187,7 +187,10 @@ mod tests {
         let half = Fraction::permille(500, 500).unwrap();
         assert_eq!((half.width_permille(), half.height_permille()), (500, 500));
         assert_eq!(Fraction::from_word(half.word()), Some(half));
-        assert_eq!(Fraction::from_word(Fraction::FULL.word()), Some(Fraction::FULL));
+        assert_eq!(
+            Fraction::from_word(Fraction::FULL.word()),
+            Some(Fraction::FULL)
+        );
         // Reserved high bits and out-of-range axes are refused, never guessed.
         assert_eq!(Fraction::from_word(1 << 32), None);
         assert_eq!(Fraction::from_word(0), None);
@@ -202,7 +205,10 @@ mod tests {
         assert_eq!(Fraction::FULL.resolve(1280, 800), (1280, 800));
         // Rounds to nearest, and a tiny domain still yields a real window.
         assert_eq!(Fraction::permille(1, 1).unwrap().resolve(100, 100), (1, 1));
-        assert_eq!(Fraction::permille(333, 333).unwrap().resolve(10, 10), (3, 3));
+        assert_eq!(
+            Fraction::permille(333, 333).unwrap().resolve(10, 10),
+            (3, 3)
+        );
     }
 
     #[test]

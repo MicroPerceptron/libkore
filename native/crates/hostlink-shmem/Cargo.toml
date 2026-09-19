@@ -1,0 +1,14 @@
+[package]
+name = "kore-hostlink-shmem"
+version = "0.0.0"
+edition = "2024"
+description = "Allocation-free bidirectional shared-memory byte plane for HostLink (#538)."
+publish = false
+
+# TRIPWIRE: this core is mapped by both sides of a PCI shared-memory window.
+# It owns no allocator, lock, transport, payload schema, or device semantics.
+[dependencies]
+
+[[bench]]
+name = "memory_plane"
+harness = false

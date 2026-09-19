@@ -504,14 +504,28 @@ fn inventory_queries_preserve_record_and_count_modes() {
 #[test]
 fn device_claim_query_is_an_access_only_root_observation() {
     let mut builder = SessionBuilder::new();
-    builder.read_device_claim(SlotRef::from_wire(3), 17, SlotRef::from_wire(8)).unwrap();
+    builder
+        .read_device_claim(SlotRef::from_wire(3), 17, SlotRef::from_wire(8))
+        .unwrap();
     let mut out = [0u8; DESCRIPTOR_MAX];
     let n = builder.finish(&mut out).unwrap();
     let (_, invs, args) = parse(&out[..n]);
     assert_eq!(invs.len(), 1);
     assert_eq!(invs[0].kind, kore_abi::session::DERIVE_KIND_DEVICE_RECORD);
     assert_eq!(invs[0].requested, 0);
-    assert_eq!(args, &[17, 0, 0, 0, kore_abi::session::INVENTORY_QUERY_DEVICE_CLAIM, 0, 0, 0]);
+    assert_eq!(
+        args,
+        &[
+            17,
+            0,
+            0,
+            0,
+            kore_abi::session::INVENTORY_QUERY_DEVICE_CLAIM,
+            0,
+            0,
+            0
+        ]
+    );
 }
 
 /// The park block (Phase A, `res/USERLAND.md` §3.4.2/3): `park_standing`
@@ -2094,4 +2108,42 @@ fn selected_irq_only_and_deadline_waits_fit_the_inline_carrier() {
             19
         );
     }
+}
+
+#[test]
+fn virtio_pci_layout_queries_are_inert_and_shape_tight() {
+    use kore_abi::session::{
+        DERIVE_KIND_VIRTIO_PCI_LAYOUT, VIRTIO_PCI_LAYOUT_QUERY_COUNT,
+        VIRTIO_PCI_LAYOUT_QUERY_RECORD, VirtioPciLayoutReq,
+    };
+    use zerocopy::TryFromBytes;
+
+    let mut builder = SessionBuilder::new();
+    builder
+        .read_virtio_pci_cap_count(SlotRef::from_wire(4), SlotRef::from_wire(8))
+        .expect("count query stages");
+    builder
+        .read_virtio_pci_cap(SlotRef::from_wire(4), 3, SlotRef::from_wire(9))
+        .expect("record query stages");
+
+    let mut out = [0u8; DESCRIPTOR_MAX];
+    let len = builder.finish(&mut out).expect("queries finish");
+    let (_, invocations, args) = parse(&out[..len]);
+    assert_eq!(invocations.len(), 2);
+    for invocation in invocations {
+        assert_eq!(invocation.kind, DERIVE_KIND_VIRTIO_PCI_LAYOUT);
+        assert_eq!(invocation.requested, 0);
+    }
+    let (count, tail) = VirtioPciLayoutReq::try_ref_from_prefix(args).expect("count request");
+    let (record, _) = VirtioPciLayoutReq::try_ref_from_prefix(tail).expect("record request");
+    assert_eq!(
+        (count.index, count.query),
+        (0, VIRTIO_PCI_LAYOUT_QUERY_COUNT)
+    );
+    assert_eq!(count.reserved, [0; 6]);
+    assert_eq!(
+        (record.index, record.query),
+        (3, VIRTIO_PCI_LAYOUT_QUERY_RECORD)
+    );
+    assert_eq!(record.reserved, [0; 6]);
 }

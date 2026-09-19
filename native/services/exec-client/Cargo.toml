@@ -1,0 +1,26 @@
+[package]
+name = "kore-exec-client"
+version = "0.0.1"
+edition = "2024"
+description = "kore exec protocol and client face: what a caller of exec links, without the spawn engine that answers it."
+publish = false
+
+# Deliberately thin. `kore-svc-exec` cites ~20 sibling services in its founder
+# manifest, so anything that linked the client to name the protocol linked every
+# service in the system. A caller needs the wire vocabulary, the ring geometry
+# and the client face — nothing else.
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+kore-ring = { path = "../../crates/ring" }
+kore-rt = { path = "../../crates/rt" }
+kore-app = { path = "../../crates/app" }
+kore-window = { path = "../../crates/window" }
+kore-svc-dagfs = { path = "../dagfs" }
+# Two leaf constants only (SUPPLY_RIGHTS); mm itself depends on abi + rt alone.
+kore-svc-mm = { path = "../mm" }
+kore-svc-image = { path = "../image" }
+zerocopy = { version = "0.8", default-features = false }
+
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }
+zerocopy = { version = "0.8", default-features = false }

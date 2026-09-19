@@ -262,8 +262,9 @@ impl<'t, T: Transport> ChanTx<'t, T> {
         session
             .send(self.send, staged, rights)
             .map_err(|_| SendError::Refused(Status::Malformed))?;
+        // No WAIT bits: settle result ownership before the next cancellable await.
         reservation.begin_transfer();
-        let committed = match self.transport.commit(&session).await {
+        let committed = match self.transport.commit_affine(&session) {
             Ok(committed) => committed,
             Err(_) => {
                 reservation.settle_proven();
@@ -308,8 +309,9 @@ impl<'t, T: Transport> ChanTx<'t, T> {
         session
             .send(self.send, staged, rights)
             .map_err(|_| SendError::Refused(Status::Malformed))?;
+        // No WAIT bits: settle result ownership before the next cancellable await.
         reservation.begin_transfer();
-        let committed = match self.transport.commit(&session).await {
+        let committed = match self.transport.commit_affine(&session) {
             Ok(committed) => committed,
             Err(_) => {
                 reservation.settle_proven();
@@ -349,8 +351,9 @@ impl<'t, T: Transport> ChanTx<'t, T> {
         session
             .send(self.send, staged, crate::cap::CHANNEL_SPACE_RIGHTS)
             .map_err(|_| SendError::Refused(Status::Malformed))?;
+        // No WAIT bits: settle result ownership before the next cancellable await.
         reservation.begin_transfer();
-        let committed = match self.transport.commit(&session).await {
+        let committed = match self.transport.commit_affine(&session) {
             Ok(committed) => committed,
             Err(_) => {
                 reservation.settle_proven();
@@ -399,8 +402,9 @@ impl<'t, T: Transport> ChanTx<'t, T> {
         session
             .send(self.send, staged, rights)
             .map_err(|_| SendError::Refused(Status::Malformed))?;
+        // No WAIT bits: settle result ownership before the next cancellable await.
         reservation.begin_transfer();
-        let committed = match self.transport.commit(&session).await {
+        let committed = match self.transport.commit_affine(&session) {
             Ok(committed) => committed,
             Err(_) => {
                 reservation.settle_proven();
@@ -442,7 +446,9 @@ impl<'t, T: Transport> ChanTx<'t, T> {
                 capability,
             });
         }
-        let committed = match self.transport.commit(&session).await {
+        // The source cannot be dropped by cancellation between commit and
+        // settlement; the entire non-parking transfer finishes in this poll.
+        let committed = match self.transport.commit_affine(&session) {
             Ok(committed) => committed,
             Err(_) => {
                 core::mem::forget(capability);
@@ -492,8 +498,9 @@ impl<'t, T: Transport> ChanTx<'t, T> {
         session
             .send(self.send, staged, rights)
             .map_err(|_| SendError::Refused(Status::Malformed))?;
+        // No WAIT bits: settle result ownership before the next cancellable await.
         reservation.begin_transfer();
-        let committed = match self.transport.commit(&session).await {
+        let committed = match self.transport.commit_affine(&session) {
             Ok(committed) => committed,
             Err(_) => {
                 reservation.settle_proven();
@@ -825,6 +832,95 @@ impl<'t, T: Transport> ChanRx<'t, T> {
 mod tests {
     use super::*;
     use kore_abi::session::Committed;
+
+    #[test]
+    fn exact_transfer_settles_before_the_first_cancellable_await() {
+        use core::{
+            cell::Cell,
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        struct Capability<'a> {
+            moved: &'a Cell<u8>,
+            dropped: &'a Cell<u8>,
+        }
+        impl Drop for Capability<'_> {
+            fn drop(&mut self) {
+                self.dropped.set(self.dropped.get() + 1);
+            }
+        }
+        impl exact_transfer_sealed::Sealed for Capability<'_> {
+            fn source_slot(&self) -> SlotRef {
+                SlotRef::from_wire(42)
+            }
+            fn release_after_move(self) {
+                self.moved.set(self.moved.get() + 1);
+                core::mem::forget(self);
+            }
+        }
+        impl ExactTransferCapability for Capability<'_> {}
+        struct Nonparking {
+            outcome: Result<Committed, ()>,
+            calls: Cell<u8>,
+        }
+        impl Transport for Nonparking {
+            type Error = ();
+            async fn commit(&self, _: &SessionBuilder) -> Result<Committed, ()> {
+                core::future::pending().await
+            }
+            fn commit_now(&self, session: &SessionBuilder) -> Result<Committed, ()> {
+                assert!(!session.flags().intersects(
+                    kore_abi::session::SessionFlags::WAIT_DELIVERY
+                        | kore_abi::session::SessionFlags::WAIT_IRQ
+                        | kore_abi::session::SessionFlags::WAIT_SLEEP
+                ));
+                self.calls.set(self.calls.get() + 1);
+                self.outcome
+            }
+        }
+        for (outcome, disposition) in [
+            (Ok(Committed::from_raw(Status::Ok.encode(0))), 0),
+            (Ok(Committed::from_raw(Status::WouldBlock.encode(0))), 1),
+            (Ok(Committed::from_raw(Status::Deadline.encode(0))), 2),
+            (Err(()), 2),
+        ] {
+            let transport = Nonparking {
+                outcome,
+                calls: Cell::new(0),
+            };
+            let tx = ChanTx::new(&transport, SlotRef::from_wire(41));
+            let moved = Cell::new(0);
+            let dropped = Cell::new(0);
+            let mut future = core::pin::pin!(tx.transfer_exact(Capability {
+                moved: &moved,
+                dropped: &dropped
+            }));
+            let Poll::Ready(result) = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("affine transfer may not suspend before custody settles");
+            };
+            assert_eq!(transport.calls.get(), 1);
+            match (disposition, result) {
+                (0, Ok(())) => {
+                    assert_eq!(moved.get(), 1);
+                    assert_eq!(dropped.get(), 0);
+                }
+                (1, Err(ExactTransferError::NotMoved { capability, .. })) => {
+                    assert_eq!(moved.get(), 0);
+                    assert_eq!(dropped.get(), 0);
+                    drop(capability);
+                    assert_eq!(dropped.get(), 1);
+                }
+                (2, Err(ExactTransferError::AfterTransfer(_))) => {
+                    assert_eq!(moved.get(), 0);
+                    assert_eq!(dropped.get(), 0);
+                }
+                _ => panic!("wrong custody disposition"),
+            }
+        }
+    }
 
     #[test]
     fn derived_transfer_completion_is_fail_closed() {

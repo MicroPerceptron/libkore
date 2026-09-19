@@ -188,3 +188,31 @@ state. The checked-in guest harness exercises the actual adapter in founded
 `hello`, with C-ABI Rust callbacks; separate C/Zig consumers verify generated
 language bindings. It does not claim a C/Zig CRT, automatic stack unwinding,
 initial-process exit hooks, asynchronous cancellation or physical acceptance.
+
+## Compatibility tuple — current-Kore integration (libkore #19)
+
+Recorded together, as the issue requires, so the graph can be reproduced rather
+than reconstructed:
+
+| component | value |
+|---|---|
+| Kore commit | `22a67a3ace8f068417fe6d011a97559af823b91c` |
+| native export source revision | same — `native/provenance.json` |
+| exported packages / files | 29 / 397 |
+| libkore commit | this one |
+| distribution lockfiles | `Cargo.lock` and `native/Cargo.lock`, regenerated together with the export |
+| host commit | vkore `codex/vkore-40-current-kore` |
+| Kore ISO SHA-256 | recorded in vkore's `config/real-stack.lock.mk` alongside the guest commit it was built from |
+
+The Kore revision is the head of `codex/vkore-994-hostlink`
+(MicroPerceptron/kore#1015), which is **in review and not merged**. This export
+is therefore a candidate, not a release baseline: re-run
+`tools/sync-native.py <kore-checkout> --revision <reviewed-commit>` and update
+this table when that PR lands. Nothing here should be read as an approved
+distribution.
+
+`kore-exec-client` joins the exported owners with this revision. It is the exec
+protocol and caller face split out of `kore-svc-exec`, whose crate cites about
+twenty sibling services in its founder manifest — exporting the client used to
+mean exporting all of them. The service that answers exec requests stays in
+Kore; libkore exports only what a caller links.

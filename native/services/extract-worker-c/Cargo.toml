@@ -1,0 +1,17 @@
+[package]
+name = "kore-svc-extract-worker-c"
+version = "0.0.1"
+edition = "2024"
+description = "Isolated C-backed JSON adapter for kore content extraction."
+publish = false
+
+[dependencies]
+kore-svc-extract = { path = "../extract" }
+heapless = { version = "0.9.3", default-features = false }
+blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
+
+[build-dependencies]
+cc = "1.4.0"
+
+[dev-dependencies]
+kore-svc-extract-worker-rust = { path = "../extract-worker-rust" }

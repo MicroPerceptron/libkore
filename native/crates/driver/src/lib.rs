@@ -46,12 +46,12 @@ pub mod accel;
 pub mod block;
 pub mod common;
 pub mod cookie;
-#[cfg(any(test, feature = "host-double"))]
-pub mod host_double;
 /// Read-only GPT discovery — how a block driver learns which blocks are
 /// its (`res/DEVICE_SERVICE.md` §8.1).  Parsing only; the caller does the
 /// I/O, so it is host-testable and device-free.
 pub mod gpt;
+#[cfg(any(test, feature = "host-double"))]
+pub mod host_double;
 pub mod net;
 pub mod ring;
 pub mod seam;
