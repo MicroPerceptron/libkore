@@ -3,3 +3,8 @@
 .zig-cache
 __pycache__/
 *.pyc
+
+# Platform file-browser metadata, never part of the export or the source tree.
+.DS_Store
+Thumbs.db
+desktop.ini
