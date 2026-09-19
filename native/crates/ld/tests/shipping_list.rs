@@ -37,6 +37,13 @@ use std::path::{Path, PathBuf};
 /// deleted — rather than accumulate.
 const UNSHIPPED: &[(&str, &str)] = &[
     (
+        "exec-client",
+        "library, not a service: the exec protocol and caller face, split out of \
+         kore-svc-exec so a client can link them without the spawn engine that \
+         answers them (and without the ~20 sibling services its founder manifest \
+         cites). Nothing founds it; kore-svc-exec and every exec caller link it",
+    ),
+    (
         "display",
         "backend crate: owns the physical display claim and aperture; linked \
          into user/services/compositor, whose founded image is kore-svc-compositor",

@@ -196,13 +196,15 @@ than reconstructed:
 
 | component | value |
 |---|---|
-| Kore commit | `22a67a3ace8f068417fe6d011a97559af823b91c` |
+| Kore commit | `5108c7732e4383109bf86adb55f199fb9447bafb` |
 | native export source revision | same — `native/provenance.json` |
 | exported packages / files | 29 / 397 |
 | libkore commit | this one |
 | distribution lockfiles | `Cargo.lock` and `native/Cargo.lock`, regenerated together with the export |
 | host commit | vkore `codex/vkore-40-current-kore` |
 | Kore ISO SHA-256 | recorded in vkore's `config/real-stack.lock.mk` alongside the guest commit it was built from |
+
+| Kore ISO SHA-256 (verified) | `6303e89f44e513b16a0b164140f464cb01f9d467e2cca10364af5e157399c2b5` |
 
 The Kore revision is the head of `codex/vkore-994-hostlink`
 (MicroPerceptron/kore#1015), which is **in review and not merged**. This export
