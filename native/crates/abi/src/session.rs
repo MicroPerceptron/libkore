@@ -2707,6 +2707,12 @@ pub enum SystemMetric {
     /// [`MemoryStreamSample::to_observation`].  An operand with no sample
     /// answers all-zero rather than refusing, so a reader can walk a range.
     MemoryStream = 21,
+    /// One CPU's boot DRAM stream, alone — operand = the CPU's ordinal in
+    /// the catalog, like the other `Processor*` metrics.  `value` = builtin
+    /// fill rate, bytes per second; `aux` = copy rate in `[39:0]` and the
+    /// scrub fill in 100 MB/s units in `[63:40]`; all zero when that CPU
+    /// was not measured (no run to lend, or it never answered).
+    ProcessorStream = 22,
 }
 
 /// The three physical frame-size classes, as the census operand names them.
@@ -2719,36 +2725,45 @@ pub const MEMORY_STREAM_CLASSES: u16 = 4;
 /// The [`SystemMetric::MemoryStream`] operand of the all-CPUs measurement.
 pub const MEMORY_STREAM_AGGREGATE: u16 = MEMORY_STREAM_CLASS_BASE + MEMORY_STREAM_CLASSES;
 
-/// Authority-free record of one node's boot DRAM stream measurement
+/// Authority-free record of one boot DRAM stream measurement
 /// ([`SystemMetric::MemoryStream`]).  A measured rate, never a link ceiling.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryStreamSample {
     /// The Manifold node slot the run was lent from (node view), the CPU
     /// that ran it (class view), or the CPU count (aggregate view).
     pub slot: u8,
-    /// One agent's fill rate, bytes per second.
+    /// Fill rate through the builtin fill, bytes per second.
     pub write_bps: u64,
-    /// One agent's copy rate, bytes copied per second.
+    /// Copy rate, bytes copied per second.
     pub copy_bps: u64,
     /// HMAT's self-access bandwidth for the node, bytes per second, or `0`.
     pub hmat_bps: u64,
+    /// Fill rate through the kernel's scrub fill (streaming stores where
+    /// the ISA has them), bytes per second.
+    pub streaming_bps: u64,
 }
 
 impl MemoryStreamSample {
-    /// `value` = write rate in `[55:0]` (72 PB/s) with the slot in `[63:56]`;
-    /// `aux` = copy rate in `[39:0]` (1.1 TB/s) and HMAT in MB/s in `[63:40]`.
+    /// `value` = builtin fill rate in `[39:0]` (1.1 TB/s), the scrub fill in
+    /// 100 MB/s units in `[55:40]` (6.5 TB/s), the slot in `[63:56]`;
+    /// `aux` = copy rate in `[39:0]` and HMAT in MB/s in `[63:40]`.
     pub const fn to_observation(self) -> (u64, u64) {
-        const RATE: u64 = (1 << 56) - 1;
-        const COPY: u64 = (1 << 40) - 1;
+        const RATE: u64 = (1 << 40) - 1;
         let write = if self.write_bps > RATE {
             RATE
         } else {
             self.write_bps
         };
-        let copy = if self.copy_bps > COPY {
-            COPY
+        let copy = if self.copy_bps > RATE {
+            RATE
         } else {
             self.copy_bps
+        };
+        let streaming = self.streaming_bps / 100_000_000;
+        let streaming = if streaming > u16::MAX as u64 {
+            u16::MAX as u64
+        } else {
+            streaming
         };
         let hmat = self.hmat_bps / 1_000_000;
         let hmat = if hmat > (1 << 24) - 1 {
@@ -2756,15 +2771,19 @@ impl MemoryStreamSample {
         } else {
             hmat
         };
-        (write | (self.slot as u64) << 56, copy | hmat << 40)
+        (
+            write | streaming << 40 | (self.slot as u64) << 56,
+            copy | hmat << 40,
+        )
     }
 
     pub const fn from_observation(value: u64, aux: u64) -> Self {
         Self {
             slot: (value >> 56) as u8,
-            write_bps: value & ((1 << 56) - 1),
+            write_bps: value & ((1 << 40) - 1),
             copy_bps: aux & ((1 << 40) - 1),
             hmat_bps: (aux >> 40) * 1_000_000,
+            streaming_bps: ((value >> 40) & 0xFFFF) * 100_000_000,
         }
     }
 
@@ -3018,6 +3037,7 @@ impl SystemObserveReq {
                 | SystemMetric::ProcessorRuntime
                 | SystemMetric::MemoryClass
                 | SystemMetric::MemoryStream
+                | SystemMetric::ProcessorStream
         )
     }
 
@@ -5169,6 +5189,7 @@ mod tests {
             write_bps: 31_400_000_000,
             copy_bps: 12_900_000_000,
             hmat_bps: 136_500_000_000,
+            streaming_bps: 80_100_000_000,
         };
         let (value, aux) = sample.to_observation();
         assert_eq!(MemoryStreamSample::from_observation(value, aux), sample);
@@ -5179,11 +5200,13 @@ mod tests {
             write_bps: u64::MAX,
             copy_bps: u64::MAX,
             hmat_bps: u64::MAX,
+            streaming_bps: u64::MAX,
         };
         let (value, aux) = big.to_observation();
         let back = MemoryStreamSample::from_observation(value, aux);
         assert_eq!(back.slot, 255);
-        assert_eq!(back.write_bps, (1 << 56) - 1);
+        assert_eq!(back.write_bps, (1 << 40) - 1);
+        assert_eq!(back.streaming_bps, u64::from(u16::MAX) * 100_000_000);
         assert_eq!(back.copy_bps, (1 << 40) - 1);
         assert_eq!(back.hmat_bps, ((1u64 << 24) - 1) * 1_000_000);
         assert!(SystemObserveReq::takes_operand(SystemMetric::MemoryStream));

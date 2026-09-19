@@ -1,0 +1,12 @@
+[package]
+name = "wasi-files"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A stock wasm32-wasip2 program, the WASI host's filesystem fixture: it creates, writes, reads back, lists and removes a file in its preopen through ordinary std::fs, nothing kore-specific"
+
+# Its own workspace: this builds for wasm32-wasip2, never for kore's targets.
+[workspace]
+
+[profile.release]
+opt-level = "s"

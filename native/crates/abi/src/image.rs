@@ -148,6 +148,18 @@ pub const PROFILE_ENGINE: u32 = 1 << 11;
 /// with the task and cannot address another application's contexts, buffers,
 /// programs, queues, or events.
 pub const PROFILE_ACCELERATOR: u32 = 1 << 10;
+/// Launch profile: exec provisions one private recyclable face on the **GPU**
+/// accelerator row (the Intel Xe row), at its own per-process slots beside
+/// [`PROFILE_ACCELERATOR`]'s NPU face.  Same authority shape as that bit: a
+/// fresh service peer per launch, bound to its recyclable generation, gone
+/// with the task.  Best-effort where the NPU face is not: a machine whose
+/// GPU row is parked (no GuC, no Intel GPU) still launches the process, with
+/// the face's slots vacant, so an interpreter carrying this bit runs
+/// everywhere and answers "unavailable" where it must.
+///
+/// Bit 11 is taken by the engine launch plan on a sibling branch; this is
+/// bit 12 so the two merge without renumbering.
+pub const PROFILE_GPU: u32 = 1 << 12;
 
 pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_FILESYSTEM
@@ -160,7 +172,8 @@ pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_SYSTEM_POWER
     | PROFILE_NETWORK
     | PROFILE_ACCELERATOR
-    | PROFILE_ENGINE;
+    | PROFILE_ENGINE
+    | PROFILE_GPU;
 
 /// Validate the profile vocabulary and its dependencies: both filesystem
 /// auxiliary endpoint kinds are meaningful only beside an actual FS face.
@@ -837,13 +850,16 @@ pub struct ModulePage {
     ///
     /// Exists because [`high_water`](Self::high_water) covers only the
     /// segments the records name, and the startup stub places more than
-    /// that: the static TLS block is placed into the link window but is
-    /// not a module segment. A TLS-bearing executable therefore had its
-    /// first late placement land exactly on its own TLS block. The unit is
-    /// pages below the page rather than an absolute address because that
-    /// fits the sixteen bits this word already had — the same layout, the
-    /// same [`IMAGE_ABI`], and every existing page reads as unrecorded.
-    /// A link window wider than `u16::MAX` pages refuses at link time
+    /// that: the copied data/TLS template views and the static TLS block
+    /// are placed into the link window right after the image but are not
+    /// module segments. Once an executable's image grew past a 64 KiB
+    /// boundary, the late loader's first window (the next 64 KiB line
+    /// above the records) landed inside that placed-but-unnamed range and
+    /// the kernel refused it `AlreadyMapped`. The unit is pages below the
+    /// page rather than an absolute address because that fits the sixteen
+    /// bits this word already had — the same layout, the same
+    /// [`IMAGE_ABI`], and every existing page reads as unrecorded. A link
+    /// window wider than `u16::MAX` pages refuses at link time
     /// (`kore_ld::link`), never truncates here.
     pub placed: U16,
     /// The module table; entries past `count` are zero.
@@ -879,6 +895,7 @@ impl ModulePage {
         self.count.get() == 0
     }
 
+
     /// Record the startup placement high water: `pages` pages below this
     /// page's own address. See [`placed`](Self::placed).
     pub fn record_placed(&mut self, pages: u16) {
@@ -886,10 +903,10 @@ impl ModulePage {
     }
 
     /// One past the highest address the startup **placement** reached —
-    /// the TLS block included — given where this page lives
-    /// (`module_page_va`). `None` when unrecorded. A late placer takes
-    /// the larger of this and [`high_water`](Self::high_water); neither
-    /// alone is the floor.
+    /// template views and the TLS block included — given where this page
+    /// lives (`module_page_va`). `None` when unrecorded. A late placer
+    /// takes the larger of this and [`high_water`](Self::high_water);
+    /// neither alone is the floor.
     pub fn placed_high_water(&self, module_page_va: u64) -> Option<u64> {
         let pages = u64::from(self.placed.get());
         if pages == 0 {
@@ -897,7 +914,6 @@ impl ModulePage {
         }
         module_page_va.checked_sub(pages.checked_mul(MODULE_PAGE_BYTES)?)
     }
-
     /// One past the highest address any recorded segment occupies,
     /// page-rounded — where a **late** loader (`res/IMAGE.md` §8) may start
     /// placing, *for the segments the records name*. The startup stub also
@@ -1178,6 +1194,8 @@ mod tests {
         assert!(profile_valid(PROFILE_SYSTEM_POWER));
         assert!(profile_valid(PROFILE_SYSTEM_POWER | PROFILE_TELEMETRY));
         assert!(profile_valid(PROFILE_ACCELERATOR));
+        assert!(profile_valid(PROFILE_GPU));
+        assert!(profile_valid(PROFILE_ACCELERATOR | PROFILE_GPU));
         assert!(profile_valid(PROFILE_HEAP | PROFILE_INTERACTIVE));
         assert!(profile_valid(
             PROFILE_FILESYSTEM | PROFILE_HEAP | PROFILE_INTERACTIVE
@@ -1338,4 +1356,5 @@ mod tests {
         let b = LdBlock::new(ImageName::new("test").unwrap(), ModuleDescriptor::empty());
         assert_eq!(b.abi.get(), IMAGE_ABI);
     }
+
 }

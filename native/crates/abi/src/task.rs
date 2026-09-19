@@ -621,15 +621,17 @@ pub const BOOTSTRAP_ABI: u16 = 4;
 /// block honest.
 /// The bounded named-capability vocabulary carried in one task's boot page.
 ///
-/// Sixty-four accommodates the production shell's service faces plus its
-/// attenuated child-principal sources while keeping the complete block well below
-/// one 4 KiB boot page.
-///
-/// 80 (from 64): exec's memory-manager client gained its return leg — the
-/// pair on which exec administers per-launch mm faces (one per engine
-/// launch) — and exec's block, the fullest, held exactly 64. Its loader
-/// grant bank was the first name refused. 80 × 8 bytes keeps the whole
-/// block at 712 bytes, still well under the page.
+/// Sixty-four accommodated the production shell's service faces plus its
+/// attenuated child-principal sources.  Eighty (from 64): exec's block
+/// carries five entries per resident provider face (request kick, pair
+/// ring, reply-grant receiver, retained-return sender and landing), and two
+/// growths met there at once — the seventh provider, the Xe row (the GPU
+/// face a `PROFILE_GPU` launch is admitted on), and the memory manager's
+/// return leg, the pair on which exec administers per-launch mm faces (one
+/// per engine launch). Each alone took the block past sixty-four at its
+/// loader grant bank. The page-budget pins below and in `kore_rt::entry`
+/// keep the grown block honest: every later block's offset is derived from
+/// this size, and the whole sequence must still fit one 4 KiB boot page.
 pub const MAX_BOOT_HANDLES: usize = 80;
 
 /// Literal startup values carried beside, but never confused with, arena

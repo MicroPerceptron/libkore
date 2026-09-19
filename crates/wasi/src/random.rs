@@ -9,14 +9,14 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::Wasi;
 use crate::bindings::wasi::random::{insecure, insecure_seed, random};
+use crate::{WasiCtx, WasiCtxView};
 
 /// Largest single draw a guest may request: WASI's `len` is a `u64`, and an
 /// unbounded one would be an allocation the guest chooses.
 const MAX_DRAW: u64 = 1 << 20;
 
-impl Wasi {
+impl WasiCtx {
     fn draw(&mut self, len: u64) -> wasmtime::Result<Vec<u8>> {
         if len > MAX_DRAW {
             wasmtime::bail!("random draw of {len} bytes exceeds {MAX_DRAW}");
@@ -35,26 +35,26 @@ impl Wasi {
     }
 }
 
-impl random::Host for Wasi {
+impl random::Host for WasiCtxView<'_> {
     fn get_random_bytes(&mut self, len: u64) -> wasmtime::Result<Vec<u8>> {
-        self.draw(len)
+        self.ctx.draw(len)
     }
     fn get_random_u64(&mut self) -> wasmtime::Result<u64> {
-        self.word()
+        self.ctx.word()
     }
 }
 
-impl insecure::Host for Wasi {
+impl insecure::Host for WasiCtxView<'_> {
     fn get_insecure_random_bytes(&mut self, len: u64) -> wasmtime::Result<Vec<u8>> {
-        self.draw(len)
+        self.ctx.draw(len)
     }
     fn get_insecure_random_u64(&mut self) -> wasmtime::Result<u64> {
-        self.word()
+        self.ctx.word()
     }
 }
 
-impl insecure_seed::Host for Wasi {
+impl insecure_seed::Host for WasiCtxView<'_> {
     fn insecure_seed(&mut self) -> wasmtime::Result<(u64, u64)> {
-        Ok((self.word()?, self.word()?))
+        Ok((self.ctx.word()?, self.ctx.word()?))
     }
 }

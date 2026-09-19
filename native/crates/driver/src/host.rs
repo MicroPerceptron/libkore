@@ -1472,7 +1472,7 @@ impl PoolRegion {
         })
     }
 
-    /// Zero every dirty page in `[first, first + pages)` — one `write_bytes`
+    /// Zero every dirty page in `[first, first + pages)` — one streaming fill
     /// per contiguous dirty run, nothing for a clean run — then mark the run
     /// clean.  The allocation-time half of the scrub-once contract.
     ///
@@ -1495,9 +1495,11 @@ impl PoolRegion {
                 .min(end);
             let bytes = (run_end - run_start) * PAGE as usize;
             // SAFETY: per the caller's contract the pages are exclusively
-            // claimed and inside the live window.
+            // claimed and inside the live window.  Streaming stores, fenced
+            // on return, so the device that DMAs into this run next sees
+            // the zeros and the scrub cost one bus transfer per line.
             unsafe {
-                core::ptr::write_bytes(self.cpu.add(run_start * PAGE as usize), 0, bytes);
+                kore_scrub::fill_streaming(self.cpu.add(run_start * PAGE as usize), 0, bytes);
             }
             for page in run_start..run_end {
                 self.dirty.clear(page);

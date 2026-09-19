@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use wasmtime::component::Resource;
 use wasmtime_wasi_io::poll::{DynPollable, Pollable, subscribe};
 
-use crate::Wasi;
+use crate::WasiCtxView;
 use crate::bindings::wasi::clocks::{monotonic_clock, wall_clock};
 
 /// Both clocks count nanoseconds (`kore::time`), which is the finest
@@ -18,7 +18,7 @@ fn uptime_ns() -> wasmtime::Result<u64> {
         .map_err(|e| wasmtime::format_err!("monotonic clock unavailable: {e:?}"))
 }
 
-impl monotonic_clock::Host for Wasi {
+impl monotonic_clock::Host for WasiCtxView<'_> {
     fn now(&mut self) -> wasmtime::Result<monotonic_clock::Instant> {
         uptime_ns()
     }
@@ -37,7 +37,7 @@ impl monotonic_clock::Host for Wasi {
             Deadline::Past { yielded: false }
         };
         let deadline = self.table.push(deadline)?;
-        subscribe(&mut self.table, deadline)
+        subscribe(self.table, deadline)
     }
 
     fn subscribe_duration(
@@ -55,11 +55,11 @@ impl monotonic_clock::Host for Wasi {
             }
         };
         let deadline = self.table.push(deadline)?;
-        subscribe(&mut self.table, deadline)
+        subscribe(self.table, deadline)
     }
 }
 
-impl wall_clock::Host for Wasi {
+impl wall_clock::Host for WasiCtxView<'_> {
     fn now(&mut self) -> wasmtime::Result<wall_clock::Datetime> {
         let ns = kore::time::wall()
             .map(|t| t.as_nanos())

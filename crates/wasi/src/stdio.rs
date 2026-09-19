@@ -15,7 +15,7 @@
 //!   ([`ProcessStdioParkStep`]): the endpoint is borrowed only to prepare
 //!   and to settle, never across the wait, so several pollables share it.
 //! - **The line discipline is the launcher's protocol**
-//!   ([`kore_abi::process::ProcessOutputKind`]): the guest wanting input
+//!   ([`kore::abi::process::ProcessOutputKind`]): the guest wanting input
 //!   publishes one `InputReady`, the launcher answers with one canonical
 //!   line (a trailing `\n`, or EOT for end of input), and [`close`]
 //!   publishes the stream's `Closed` only once any requested line has

@@ -38,6 +38,31 @@ pub struct ProcessorRow {
     pub feedback: U32,
     pub nominal_mhz: U32,
     pub maximum_mhz: U32,
+    /// This CPU's boot DRAM stream, alone (`SystemMetric::ProcessorStream`),
+    /// in [`STREAM_UNIT_BPS`] units: fill rate, then copy rate.  Zero =
+    /// unmeasured.
+    pub stream_write: U16,
+    pub stream_copy: U16,
+}
+
+/// Bytes per second per unit of [`ProcessorRow::stream_write`] /
+/// [`ProcessorRow::stream_copy`] (100 MB/s, so 6.5 TB/s per word).
+pub const STREAM_UNIT_BPS: u64 = 100_000_000;
+
+impl ProcessorRow {
+    /// Attach the CPU's solo DRAM stream (bytes per second, saturating).
+    pub fn set_stream(&mut self, write_bps: u64, copy_bps: u64) {
+        let unit = |bps: u64| U16::new((bps / STREAM_UNIT_BPS).min(u64::from(u16::MAX)) as u16);
+        self.stream_write = unit(write_bps);
+        self.stream_copy = unit(copy_bps);
+    }
+    /// `(write, copy)` bytes per second; `(0, 0)` when unmeasured.
+    pub fn stream_bps(&self) -> (u64, u64) {
+        (
+            u64::from(self.stream_write.get()) * STREAM_UNIT_BPS,
+            u64::from(self.stream_copy.get()) * STREAM_UNIT_BPS,
+        )
+    }
 }
 
 #[repr(C)]
@@ -149,8 +174,8 @@ mod tests {
     use super::*;
     #[test]
     fn pages_are_complete_ordered_and_canonical() {
-        assert_eq!(core::mem::size_of::<ProcessorPage>(), 160);
-        assert_eq!(core::mem::size_of::<ProcessorSnapshot>(), 544);
+        assert_eq!(core::mem::size_of::<ProcessorPage>(), 168);
+        assert_eq!(core::mem::size_of::<ProcessorSnapshot>(), 576);
         let mut p = ProcessorPage::default();
         p.available.set(1);
         p.first.set(8);

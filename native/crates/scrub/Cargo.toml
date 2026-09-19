@@ -1,0 +1,11 @@
+[package]
+name = "kore-scrub"
+version = "0.1.0"
+edition = "2024"
+description = "kore's one memory-fill primitive: streaming (non-temporal) stores where the ISA has them, plain stores elsewhere, fenced before return."
+
+# Deliberately DEPENDENCY-FREE and no_std, the kore-collections posture: the
+# kernel's frame zeroing, a driver's DMA-pool scrub, and the boot stream
+# probe all link this one fill, so the scrub rate on a box is one number
+# measured once and improved in one place. `core` is the whole dependency set.
+[dependencies]

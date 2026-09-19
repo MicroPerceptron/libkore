@@ -67,7 +67,9 @@ pub struct SystemSnapshot {
     stream_class: [[U16; 2]; 4],
     stream_all: [U16; 2],
     stream_all_cpus: U16,
-    stream_reserved: U16,
+    /// The all-CPU run's fill rate through the kernel's scrub fill
+    /// (streaming stores), same units — the number a scrub actually gets.
+    stream_all_scrub: U16,
 }
 
 /// Bytes per unit of the class-census fields.
@@ -107,7 +109,7 @@ impl SystemSnapshot {
         stream_class: [[U16::new(0); 2]; 4],
         stream_all: [U16::new(0); 2],
         stream_all_cpus: U16::new(0),
-        stream_reserved: U16::new(0),
+        stream_all_scrub: U16::new(0),
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -153,7 +155,7 @@ impl SystemSnapshot {
             stream_class: [[U16::new(0); 2]; 4],
             stream_all: [U16::new(0); 2],
             stream_all_cpus: U16::new(0),
-            stream_reserved: U16::new(0),
+            stream_all_scrub: U16::new(0),
         }
     }
 
@@ -171,8 +173,8 @@ impl SystemSnapshot {
             && self.fabric_fence_required_domains() <= domains
             && self.class_misses[3] == 0
             && (0..3).all(|c| self.class_free[c].get() <= self.class_carved[c].get())
-            && self.stream_reserved.get() == 0
             && (self.stream_all[0].get() == 0) == (self.stream_all_cpus.get() == 0)
+            && (self.stream_all_cpus.get() != 0 || self.stream_all_scrub.get() == 0)
     }
 
     /// Attach one class of the boot frame-size partition (`class` 0 = 4 KiB,
@@ -234,12 +236,20 @@ impl SystemSnapshot {
         self.stream_class[class] = [stream_unit(write_bps), stream_unit(copy_bps)];
         self
     }
-    /// Attach the all-CPUs concurrent measurement.
-    pub const fn with_stream_all(mut self, cpus: u32, write_bps: u64, copy_bps: u64) -> Self {
+    /// Attach the all-CPUs concurrent measurement (`scrub_bps` = the same
+    /// run through the kernel's scrub fill).
+    pub const fn with_stream_all(
+        mut self,
+        cpus: u32,
+        write_bps: u64,
+        copy_bps: u64,
+        scrub_bps: u64,
+    ) -> Self {
         if cpus == 0 || write_bps == 0 {
             return self;
         }
         self.stream_all = [stream_unit(write_bps), stream_unit(copy_bps)];
+        self.stream_all_scrub = stream_unit(scrub_bps);
         self.stream_all_cpus = U16::new(if cpus > u16::MAX as u32 {
             u16::MAX
         } else {
@@ -258,12 +268,14 @@ impl SystemSnapshot {
             None => (0, 0),
         }
     }
-    /// Every CPU at once: `(cpus, write, copy)`; `cpus == 0` when unmeasured.
-    pub fn stream_all(self) -> (u32, u64, u64) {
+    /// Every CPU at once: `(cpus, write, copy, scrub fill)`; `cpus == 0`
+    /// when unmeasured.
+    pub fn stream_all(self) -> (u32, u64, u64, u64) {
         (
             u32::from(self.stream_all_cpus.get()),
             u64::from(self.stream_all[0].get()) * STREAM_UNIT_BPS,
             u64::from(self.stream_all[1].get()) * STREAM_UNIT_BPS,
+            u64::from(self.stream_all_scrub.get()) * STREAM_UNIT_BPS,
         )
     }
     /// Whether the kernel measured any stream at all.

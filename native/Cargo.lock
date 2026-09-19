@@ -261,6 +261,7 @@ dependencies = [
  "kore-driver",
  "kore-ring",
  "kore-rt",
+ "kore-scrub",
  "virtio-accel-core",
  "zerocopy",
 ]
@@ -303,6 +304,10 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "kore-scrub"
+version = "0.1.0"
 
 [[package]]
 name = "kore-start"
