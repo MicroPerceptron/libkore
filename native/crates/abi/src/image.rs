@@ -1013,6 +1013,11 @@ pub enum ImageRefusal {
     /// ([`ImageReqWire::op_retired`](crate::svc::ImageReqWire::op_retired));
     /// answered, never silently dropped, and never revived.
     Retired = 6,
+    /// The name is an archive DATA member ([`ARCHIVE_MEMBER_DATA`]): its
+    /// bytes are exportable, but it has no segments, no descriptor, and no
+    /// launch shape, so `Acquire`/`Describe` refuse it rather than answer
+    /// an empty image.
+    NotImage = 7,
 }
 
 // Frozen wire pins (#81; the crate-header wire-freeze discipline).
@@ -1032,6 +1037,10 @@ const _: () = {
     assert!(size_of::<ModulePage>() <= 4096);
     assert!(size_of::<ArchiveHeader>() == 16);
     assert!(size_of::<ArchiveEntry>() == 88);
+    // `kind` took the former reserve's exact place: the last word.
+    assert!(core::mem::offset_of!(ArchiveEntry, kind) == 84);
+    // Zero must stay "image", or every committed v2 archive changes meaning.
+    assert!(ARCHIVE_MEMBER_IMAGE == 0);
 };
 
 /// The embedded image archive's profile-bearing v2 magic (`"KIMGAR2\0"`) — the Limine
@@ -1061,23 +1070,53 @@ impl ArchiveHeader {
     pub const WIRE: usize = 16;
 }
 
+/// [`ArchiveEntry::kind`]: an ELF image — checked, carved, and acquirable
+/// (`res/IMAGE.md` §3). Zero, so every archive packed before the field had a
+/// name (it was a must-be-zero reserve) reads back as all images.
+pub const ARCHIVE_MEMBER_IMAGE: u32 = 0;
+/// [`ArchiveEntry::kind`]: an opaque DATA member (a `.wasm` module, a font, a
+/// table) — bounds-checked only, never ELF-checked, never carved, never
+/// launchable. The image service registers its window so `Export` can lend
+/// the bytes read-only (the filesystem seed copies them into `share/`);
+/// `Acquire` refuses it typed ([`ImageRefusal::NotImage`]). A data member
+/// carries `profile == 0`: a launch profile on something that cannot launch
+/// is a packing error, refused at registration.
+pub const ARCHIVE_MEMBER_DATA: u32 = 1;
+
+/// Whether `kind` is in the archive member vocabulary. An unknown kind fails
+/// closed at registration rather than being treated as either shape.
+pub const fn archive_member_kind_known(kind: u32) -> bool {
+    matches!(kind, ARCHIVE_MEMBER_IMAGE | ARCHIVE_MEMBER_DATA)
+}
+
 /// One archive member's index record: where its bytes live in the blob.
+///
+/// The magic stays [`ARCHIVE_MAGIC`] (`KIMGAR2`) across the introduction of
+/// [`kind`](Self::kind): the field occupies the former must-be-zero reserve,
+/// and zero is [`ARCHIVE_MEMBER_IMAGE`], so every committed v2 archive is
+/// already a valid archive of the extended format and the layout (88 bytes)
+/// is unchanged. A reader that predates the field refuses a data member
+/// (non-zero reserve) rather than mis-reading it, which is the fail-closed
+/// direction; a new magic would have bought nothing but a flag day.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
 pub struct ArchiveEntry {
-    /// The name `Acquire` presents.
+    /// The name `Acquire` (images) or `Export` (both kinds) presents.
     pub name: ImageName,
     /// Byte offset into the archive blob (page-aligned).
     pub offset: U64,
-    /// Byte length (the blob is page-rounded past this; the image's own
-    /// ELF parse bounds what's validated).
+    /// Byte length (the blob is page-rounded past this; an image's own
+    /// ELF parse bounds what's validated, a data member's length is its
+    /// exact exported length).
     pub len: U64,
-    /// Launch profile bits copied into the checked module descriptor.
+    /// Launch profile bits copied into the checked module descriptor. Zero
+    /// on a [`ARCHIVE_MEMBER_DATA`] member.
     pub profile: U32,
-    /// Reserved; must be zero.
-    pub reserved: U32,
+    /// [`ARCHIVE_MEMBER_IMAGE`] or [`ARCHIVE_MEMBER_DATA`] (formerly a
+    /// must-be-zero reserve; see the type docs for why the magic held).
+    pub kind: U32,
 }
 
 impl ArchiveEntry {
@@ -1107,6 +1146,16 @@ mod tests {
         let full = ImageName::new(max).unwrap();
         assert_eq!(full.len(), NAME_BYTES);
         assert_eq!(full.as_str(), Some(max));
+    }
+
+    /// The member-kind vocabulary is closed: image (the old zero reserve)
+    /// and data are known, the next value is not.
+    #[test]
+    fn archive_member_kind_vocabulary_is_closed() {
+        assert!(archive_member_kind_known(ARCHIVE_MEMBER_IMAGE));
+        assert!(archive_member_kind_known(ARCHIVE_MEMBER_DATA));
+        assert!(!archive_member_kind_known(ARCHIVE_MEMBER_DATA + 1));
+        assert!(!archive_member_kind_known(u32::MAX));
     }
 
     #[test]
