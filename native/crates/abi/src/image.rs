@@ -895,7 +895,6 @@ impl ModulePage {
         self.count.get() == 0
     }
 
-
     /// Record the startup placement high water: `pages` pages below this
     /// page's own address. See [`placed`](Self::placed).
     pub fn record_placed(&mut self, pages: u16) {
@@ -1405,5 +1404,4 @@ mod tests {
         let b = LdBlock::new(ImageName::new("test").unwrap(), ModuleDescriptor::empty());
         assert_eq!(b.abi.get(), IMAGE_ABI);
     }
-
 }
