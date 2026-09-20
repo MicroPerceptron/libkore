@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/MicroPerceptron/kore",
-  "revision": "5108c7732e4383109bf86adb55f199fb9447bafb",
+  "revision": "74ae24c87323dd7bc7ac0a12770c25ec8c8c4852",
   "packages": {
     "crates/abi": "kore-abi",
     "crates/app": "kore-app",
