@@ -137,6 +137,36 @@ impl NvmeSqe {
         c
     }
 
+    /// Set Features — Host Memory Buffer (FID 0x0D), enabling it.
+    ///
+    /// `hsize_pages` is the buffer's total size and `list` the IOVA of the
+    /// [`HmbDescriptor`] table with `entries` rows; both sizes are in
+    /// **`CC.MPS` units**, not the 4 KiB units Identify reports in.  The
+    /// table's address must be 16-byte aligned (CDW13 bits 3:0 are
+    /// reserved).  Memory Return (CDW11 bit 1) is never set: this core
+    /// allocates a fresh buffer every bring-up and hands nothing back.
+    pub fn enable_host_memory_buffer(hsize_pages: u32, list: IovaAddr, entries: u32) -> Self {
+        let mut c = Self::zeroed();
+        c.cdw0 = AdminOpcode::SetFeatures as u32;
+        c.cdw10 = 0x0D;
+        c.cdw11 = 1; // EHM
+        c.cdw12 = hsize_pages;
+        c.cdw13 = list.0 as u32;
+        c.cdw14 = (list.0 >> 32) as u32;
+        c.cdw15 = entries;
+        c
+    }
+
+    /// Set Features — Host Memory Buffer (FID 0x0D), disabling it: the
+    /// controller stops using the buffer, after which its memory may be
+    /// released.  Every other field is zero, as the spec asks for a disable.
+    pub fn disable_host_memory_buffer() -> Self {
+        let mut c = Self::zeroed();
+        c.cdw0 = AdminOpcode::SetFeatures as u32;
+        c.cdw10 = 0x0D;
+        c
+    }
+
     /// Create I/O Completion Queue (physically contiguous).
     pub fn create_io_cq(qid: u16, size: u16, dma: IovaAddr, vector: u16, ien: bool) -> Self {
         let mut c = Self::zeroed();
@@ -248,6 +278,32 @@ pub struct DsmRange {
 }
 
 const _: () = assert!(mem::size_of::<DsmRange>() == 16);
+
+/// One Host Memory Buffer descriptor (16 bytes, spec Figure): a memory
+/// page aligned chunk the controller may read and write for as long as the
+/// buffer is enabled.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HmbDescriptor {
+    /// Buffer address — device-visible, `CC.MPS`-aligned.
+    pub badd: u64,
+    /// Buffer size in `CC.MPS` units.
+    pub bsize: u32,
+    _reserved: u32,
+}
+
+const _: () = assert!(mem::size_of::<HmbDescriptor>() == 16);
+
+impl HmbDescriptor {
+    /// A chunk of `pages` memory pages at `badd`.
+    pub const fn new(badd: IovaAddr, pages: u32) -> Self {
+        Self {
+            badd: badd.0,
+            bsize: pages,
+            _reserved: 0,
+        }
+    }
+}
 
 impl DsmRange {
     /// A deallocate range: `count` blocks from `lba`.
@@ -382,20 +438,41 @@ pub struct IdentifyController {
     _pad_rab_to_mdts: [u8; 5],
     /// Maximum Data Transfer Size (`2^mdts` pages; 0 = unlimited).
     pub mdts: u8,
-    /// cntlid..nn — to `nn` at offset 516.
-    _pad_after_mdts: [u8; 438],
+    /// cntlid..hmpre — to `hmpre` at offset 272.
+    _pad_mdts_to_hmpre: [u8; 194],
+    /// Host Memory Buffer Preferred Size, in **4 KiB units** (0 = the
+    /// controller does not use a host memory buffer).  A DRAM-less
+    /// controller keeps its mapping tables here; without one it pages them
+    /// from NAND on every access.
+    pub hmpre: u32,
+    /// Host Memory Buffer Minimum Size, in 4 KiB units: a smaller buffer
+    /// may be refused.
+    pub hmmin: u32,
+    /// tnvmcap..nn — to `nn` at offset 516.
+    _pad_hmmin_to_nn: [u8; 236],
     /// Number of Namespaces.
     pub nn: u32,
     /// Optional NVM Command Support.
     pub oncs: u16,
-    _tail: [u8; 3574],
+    /// fuses..hmminds — to `hmminds` at offset 528.
+    _pad_oncs_to_hmminds: [u8; 6],
+    /// Host Memory Buffer Minimum Descriptor Entry Size, in 4 KiB units
+    /// (0 = no constraint): every descriptor must cover at least this.
+    pub hmminds: u32,
+    /// Host Memory Maximum Descriptor Entries (0 = no limit).
+    pub hmmaxd: u16,
+    _tail: [u8; 3562],
 }
 
 const _: () = assert!(mem::size_of::<IdentifyController>() == 4096);
 // Pin the offsets the padding-collapsed fields depend on (spec Figure).
 const _: () = assert!(mem::offset_of!(IdentifyController, mdts) == 77);
+const _: () = assert!(mem::offset_of!(IdentifyController, hmpre) == 272);
+const _: () = assert!(mem::offset_of!(IdentifyController, hmmin) == 276);
 const _: () = assert!(mem::offset_of!(IdentifyController, nn) == 516);
 const _: () = assert!(mem::offset_of!(IdentifyController, oncs) == 520);
+const _: () = assert!(mem::offset_of!(IdentifyController, hmminds) == 528);
+const _: () = assert!(mem::offset_of!(IdentifyController, hmmaxd) == 532);
 
 /// One LBA format descriptor.
 #[repr(C)]

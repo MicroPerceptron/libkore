@@ -49,11 +49,15 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::{
+    ServiceAlloc,
     bounds::{MAX_AUTHORITY_EDGES, MAX_HANDLES_PER_SESSION, MAX_PATH_DEPTH, MAX_SESSIONS},
     error::{FsError, FsResult},
     namespace::{EdgeId, Name, Namespace},
     object::ObjectId,
-    slot::{Keyed, SlotAccess, SlotRead, SlotReservation, SlotTable, SlotWrite, fs_access},
+    slot::{
+        AtomicSlotVec, Keyed, SlotAccess, SlotRead, SlotTable, SlotVecRead, SlotVecReservation,
+        SlotVecWrite, SlotWrite, fs_access,
+    },
 };
 
 /// Total open handles across all sessions.
@@ -297,14 +301,19 @@ impl core::ops::Deref for ValidatedEdge<'_> {
 /// The authority arena: edges, handles, and sessions.
 pub(crate) struct Authority {
     edges: SlotTable<AuthorityEdge, MAX_AUTHORITY_EDGES>,
-    handles: SlotTable<OpenHandle, MAX_HANDLES_TOTAL>,
+    /// Heap-backed because each handle carries an [`EdgeProof`], whose width
+    /// is [`MAX_PATH_DEPTH`]. Raising the depth bound from 8 to 32 therefore
+    /// multiplies this table fourfold, and it lives inside the service's
+    /// `serve` future on the founder's shared stack. Session-scaled rather
+    /// than volume-scaled, so it is here for the depth, not the volume.
+    handles: AtomicSlotVec<OpenHandle, ServiceAlloc>,
     sessions: [Session; MAX_SESSIONS],
 }
 
 /// Unissued handle capacity, including both native quota counters. Retaining
 /// the exact grant claim prevents retirement from skipping this reservation.
 pub(crate) struct PreparedHandle<'a> {
-    record: Option<SlotReservation<'a, OpenHandle, MAX_HANDLES_TOTAL>>,
+    record: Option<SlotVecReservation<'a, OpenHandle, ServiceAlloc>>,
     edge: ValidatedEdge<'a>,
     live_handles: &'a AtomicUsize,
 }
@@ -423,7 +432,8 @@ impl Authority {
     pub(crate) fn new() -> Self {
         Self {
             edges: SlotTable::new(),
-            handles: SlotTable::new(),
+            handles: AtomicSlotVec::try_new_in(MAX_HANDLES_TOTAL, crate::service_alloc())
+                .expect("fs handle arena (bootstrap-scale) — service heap undersized"),
             sessions: [const { Session::vacant() }; MAX_SESSIONS],
         }
     }
@@ -456,7 +466,9 @@ impl Authority {
     /// Admit a rootless peer without leaving an attach operation in flight.
     pub(crate) fn attach_empty_session(&self, session: SessionId) -> FsResult<()> {
         let slot = self.attach_session(session)?;
-        self.sessions[slot].root.store(SESSION_PARKED, Ordering::Release);
+        self.sessions[slot]
+            .root
+            .store(SESSION_PARKED, Ordering::Release);
         Ok(())
     }
 
@@ -513,7 +525,10 @@ impl Authority {
         if self.sessions[slot].closing.load(Ordering::Acquire) {
             return Err(FsError::Busy);
         }
-        if !matches!(self.sessions[slot].root.load(Ordering::Acquire), SESSION_TRANSITION | SESSION_PARKED) {
+        if !matches!(
+            self.sessions[slot].root.load(Ordering::Acquire),
+            SESSION_TRANSITION | SESSION_PARKED
+        ) {
             return Err(FsError::AlreadyExists);
         }
         let (delegated, quota, root, issuer) = {
@@ -723,7 +738,7 @@ impl Authority {
         session: SessionId,
         ids: &[Handle],
     ) -> FsResult<
-        heapless::Vec<(Handle, SlotWrite<'a, OpenHandle, MAX_HANDLES_TOTAL>), MAX_HANDLES_TOTAL>,
+        heapless::Vec<(Handle, SlotVecWrite<'a, OpenHandle, ServiceAlloc>), MAX_HANDLES_TOTAL>,
     > {
         let mut claims = heapless::Vec::new();
         for handle in ids {
@@ -1259,7 +1274,7 @@ impl Authority {
         &self,
         session: SessionId,
         handle: Handle,
-    ) -> FsResult<SlotRead<'_, OpenHandle, MAX_HANDLES_TOTAL>> {
+    ) -> FsResult<SlotVecRead<'_, OpenHandle, ServiceAlloc>> {
         self.root_grant(session)?;
         let record = self
             .handles
@@ -2129,11 +2144,16 @@ mod tests {
         assert_eq!(auth.root_grant(peer), Err(FsError::Busy));
         let claim = auth.claim_view_slot(peer.index() as usize).unwrap();
         assert_eq!(auth.detach_session(peer), Err(FsError::Busy));
-        assert_eq!(auth.install_delegated_root(peer, source, Rights::READ), Err(FsError::Busy));
+        assert_eq!(
+            auth.install_delegated_root(peer, source, Rights::READ),
+            Err(FsError::Busy)
+        );
         drop(claim);
         assert!(auth.detach_session(peer).unwrap().is_empty());
         auth.attach_empty_session(peer).unwrap();
-        let grant = auth.install_delegated_root(peer, source, Rights::READ).unwrap();
+        let grant = auth
+            .install_delegated_root(peer, source, Rights::READ)
+            .unwrap();
         assert_eq!(auth.root_grant(peer), Ok(grant));
         assert!(!auth.detach_session(peer).unwrap().is_empty());
         assert!(auth.validated_edge(source).is_ok());

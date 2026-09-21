@@ -372,29 +372,61 @@ fn removing_a_subtree_releases_every_object_beneath_it() {
 #[test]
 fn the_object_arena_refuses_when_full_without_corrupting_the_namespace() {
     let (mut engine, session, root) = engine_with_one();
-    // The private root already owns one object slot, so distinct children fill
-    // the object arena one entry before they fill this directory's edge arena.
-    // Handles are closed as we go, so the refusal we observe is the namespace
-    // running out of room rather than the session running out of handles.
+    // Filling the object arena now needs more than one directory: an object
+    // bound of MAX_OBJECTS against MAX_DIR_ENTRIES entries per directory means
+    // one directory runs out of edges long before the arena runs out of slots,
+    // and that refusal is a different (also correct) one. So take a handful of
+    // directories up front — the root can only hold MAX_DIR_ENTRIES of them —
+    // and fill them in turn, which keeps this test about the arena it names.
+    //
+    // Handles are closed as we go where possible, so the refusal we observe is
+    // the namespace running out of room rather than the session running out of
+    // handles.
+    const SPILLS: usize = 8;
+    assert!(
+        SPILLS * (MAX_DIR_ENTRIES - 1) >= MAX_OBJECTS,
+        "the spill directories must be able to hold the whole object arena"
+    );
     let mut created = 0usize;
-    loop {
+    let mut buckets = Vec::new();
+    for index in 0..SPILLS {
+        let made = block_on(engine.create(
+            session,
+            root,
+            &name(&format!("d{index}")),
+            ObjectKind::Directory,
+        ))
+        .expect("a spill directory beneath the root");
+        created += 1;
+        buckets.push(made.handle);
+    }
+
+    let mut at = 0usize;
+    let refusal = loop {
         let file_name = format!("f{created}");
-        match block_on(engine.create(session, root, &name(&file_name), ObjectKind::File)) {
+        match block_on(engine.create(session, buckets[at], &name(&file_name), ObjectKind::File)) {
             Ok(made) => {
                 engine.close(session, made.handle).unwrap();
                 created += 1;
             }
-            Err(err) => {
-                assert_eq!(err, FsError::OutOfObjects);
-                break;
-            }
+            // This bucket is full; move to the next one.
+            Err(FsError::OutOfEdges) if at + 1 < buckets.len() => at += 1,
+            Err(err) => break err,
         }
-    }
+    };
+    assert_eq!(refusal, FsError::OutOfObjects);
+    // The private root already owns one object slot; everything else created,
+    // files and spill directories alike, accounts for the rest of the arena.
     assert_eq!(created, MAX_OBJECTS - 1);
     // Everything created is still correctly there and readable.
-    assert_eq!(list_names(&engine, session, root).unwrap().len(), created);
+    assert_eq!(list_names(&engine, session, root).unwrap().len(), SPILLS);
     let probe = engine
-        .open_at(session, root, &name("f0"), Rights::ALL)
+        .open_at(
+            session,
+            buckets[0],
+            &name(&format!("f{SPILLS}")),
+            Rights::ALL,
+        )
         .unwrap();
     assert_eq!(
         engine.stat(session, probe.handle).unwrap().kind,

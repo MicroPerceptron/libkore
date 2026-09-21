@@ -94,6 +94,28 @@ pub enum FsRequest {
         length: u32,
         expected: Revision,
     },
+    /// Reserve a private replacement. One outstanding replacement per session
+    /// and volume; begin captures the current revision, even for ANY_REVISION.
+    BeginReplace {
+        handle: Handle,
+        length: u64,
+        expected: Revision,
+    },
+    /// Append the next contiguous chunk to the private replacement.
+    WriteReplacement {
+        handle: Handle,
+        offset: u64,
+        window_offset: u32,
+        length: u32,
+    },
+    /// Publish only a complete replacement with unchanged authority/revision.
+    CommitReplace {
+        handle: Handle,
+    },
+    /// Discard private bytes; client death also discards them.
+    AbortReplace {
+        handle: Handle,
+    },
     Append {
         handle: Handle,
         window_offset: u32,
@@ -313,6 +335,7 @@ impl FsRequest {
             self,
             FsRequest::Read { .. }
                 | FsRequest::WriteAt { .. }
+                | FsRequest::WriteReplacement { .. }
                 | FsRequest::Append { .. }
                 | FsRequest::List { .. }
                 | FsRequest::ListGrants { .. }

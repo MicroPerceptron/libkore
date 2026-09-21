@@ -20,7 +20,9 @@ use core::cell::{Cell, RefCell};
 
 use kore_abi::device::IovaAddr;
 
-use crate::commands::{AdminOpcode, IdentifyController, IdentifyNamespace, NvmeCqe, NvmeSqe};
+use crate::commands::{
+    AdminOpcode, HmbDescriptor, IdentifyController, IdentifyNamespace, NvmeCqe, NvmeSqe,
+};
 use crate::regs::{
     CC_EN, CC_SHN_MASK, CSTS_RDY, CSTS_SHST_COMPLETE, CSTS_SHST_MASK, REG_ACQ, REG_AQA, REG_ASQ,
     REG_CAP, REG_CC, REG_CSTS, REG_DOORBELL_BASE, REG_VS,
@@ -132,6 +134,15 @@ pub(crate) struct DeviceState {
     swallow: u32,
     /// The withheld completions: `(queue index, cid, status code)`.
     held: Vec<(usize, u16, u8)>,
+    /// Host Memory Buffer facts Identify advertises (test knob), in the
+    /// spec's 4 KiB units: preferred, minimum, and the descriptor ceiling.
+    hmpre: u32,
+    hmmin: u32,
+    hmmaxd: u16,
+    /// The buffer the driver enabled: `(HSIZE in pages, descriptor count)`.
+    hmb: Option<(u32, u32)>,
+    /// Set Features 0x0D disables accepted.
+    hmb_disables: u32,
 }
 
 impl DeviceState {
@@ -160,6 +171,11 @@ impl DeviceState {
             lbads: MOCK_BLOCK_SIZE.trailing_zeros() as u8,
             swallow: 0,
             held: Vec::new(),
+            hmpre: 0,
+            hmmin: 0,
+            hmmaxd: 0,
+            hmb: None,
+            hmb_disables: 0,
         }
     }
 
@@ -230,11 +246,52 @@ impl DeviceState {
                 }
             }
             x if x == AdminOpcode::SetFeatures as u8 => {
-                // Number of Queues: echo the request back (allocated == asked).
-                if sqe.cdw10 & 0xFF == 0x07 {
-                    (0, sqe.cdw11)
-                } else {
-                    (0, 0)
+                match sqe.cdw10 & 0xFF {
+                    // Number of Queues: echo the request back (allocated == asked).
+                    0x07 => (0, sqe.cdw11),
+                    // Host Memory Buffer: check the shape the spec fixes, then
+                    // record what the driver handed over.
+                    0x0D => {
+                        if sqe.cdw11 & 1 == 0 {
+                            self.hmb = None;
+                            self.hmb_disables += 1;
+                            (0, 0)
+                        } else {
+                            let list = u64::from(sqe.cdw13) | (u64::from(sqe.cdw14) << 32);
+                            let entries = sqe.cdw15;
+                            let too_many = self.hmmaxd != 0 && entries > u32::from(self.hmmaxd);
+                            if list & 0xF != 0 || entries == 0 || too_many {
+                                (0x02, 0) // Invalid Field
+                            } else {
+                                // Sum the table the way a controller would: MPS
+                                // pages per descriptor, at the host pointer the
+                                // mock's IOVAs are.
+                                let mps = 1u64 << (12 + ((self.cc >> 7) & 0xF));
+                                let mut pages = 0u64;
+                                for i in 0..entries as usize {
+                                    // SAFETY: the driver handed a host pointer to
+                                    // `entries` descriptors it owns.
+                                    let d = unsafe { &*((list as *const HmbDescriptor).add(i)) };
+                                    if d.badd % mps != 0 || d.bsize == 0 {
+                                        pages = u64::MAX;
+                                        break;
+                                    }
+                                    pages += u64::from(d.bsize);
+                                }
+                                let hmmin_pages = (u64::from(self.hmmin) << 12) / mps;
+                                if pages == u64::MAX
+                                    || pages != u64::from(sqe.cdw12)
+                                    || pages < hmmin_pages
+                                {
+                                    (0x02, 0)
+                                } else {
+                                    self.hmb = Some((sqe.cdw12, entries));
+                                    (0, 0)
+                                }
+                            }
+                        }
+                    }
+                    _ => (0, 0),
                 }
             }
             x if x == AdminOpcode::CreateIoCq as u8 => {
@@ -445,6 +502,9 @@ impl DeviceState {
         idc.nn = 1;
         // Identify Controller ONCS bit 2: Dataset Management supported.
         idc.oncs = 1 << 2;
+        idc.hmpre = self.hmpre;
+        idc.hmmin = self.hmmin;
+        idc.hmmaxd = self.hmmaxd;
         idc.mn[..5].copy_from_slice(b"kmock");
     }
 
@@ -533,6 +593,27 @@ impl MockNvmeDevice {
     /// untouched).
     pub fn set_lbads(&self, lbads: u8) {
         self.state.borrow_mut().lbads = lbads;
+    }
+
+    /// Advertise a Host Memory Buffer appetite from the next Identify
+    /// Controller on, in the spec's 4 KiB units (test knob — a DRAM-less
+    /// controller).
+    pub fn set_hmb(&self, preferred_units: u32, min_units: u32, max_descriptors: u16) {
+        let mut state = self.state.borrow_mut();
+        state.hmpre = preferred_units;
+        state.hmmin = min_units;
+        state.hmmaxd = max_descriptors;
+    }
+
+    /// The host memory buffer the driver enabled — `(HSIZE in memory
+    /// pages, descriptor count)` — or `None` (test probe).
+    pub fn hmb(&self) -> Option<(u32, u32)> {
+        self.state.borrow().hmb
+    }
+
+    /// Set Features 0x0D disables the controller accepted (test probe).
+    pub fn hmb_disables(&self) -> u32 {
+        self.state.borrow().hmb_disables
     }
 
     /// Withhold the next `n` I/O completions: each command executes, but

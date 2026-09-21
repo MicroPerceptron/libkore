@@ -1,0 +1,9 @@
+// kore's WASI 0.2 host implements the `wasi:cli/command` world from `deps/`.
+// The deps are WASI 0.2.12's WIT as shipped in wasmtime-wasi 47.0.4
+// (Apache-2.0 WITH LLVM-exception, the WASI subgroup's definitions),
+// unmodified; bindgen! needs one package here to find the world by.
+package kore:wasi;
+
+world host {
+  include wasi:cli/imports@0.2.12;
+}

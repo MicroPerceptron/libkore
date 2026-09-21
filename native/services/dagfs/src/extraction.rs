@@ -16,6 +16,7 @@ use kore_svc_extract::{
 };
 
 use crate::{
+    ServiceAlloc,
     authority::{Handle, SessionId},
     bounds::{
         DERIVED_WIRE_CHUNK_BYTES, MAX_DERIVED_RESULTS, MAX_DERIVED_WIRE_CHUNKS, MAX_LENT_VERSIONS,
@@ -29,7 +30,7 @@ use crate::{
         SlotWrite,
     },
 };
-use core::alloc::Allocator;
+use alloc::boxed::Box;
 
 /// Identity stamped by the FS serving host for one extraction connection.
 ///
@@ -133,23 +134,26 @@ pub(crate) struct ExtractionState<K> {
     /// ([`MAX_DERIVED_RESULTS`] = [`MAX_OBJECTS`]) and drawn from the service
     /// heap, so a fully-indexed namespace fits — the fixed 64-slot arena sat
     /// below the object ceiling and refused mid-reindex on a full volume.
-    results: AtomicSlotVec<DerivedResult<K>, dyn Allocator>,
-    wire_chunks: AtomicSlotVec<WireChunk, dyn Allocator>,
+    results: AtomicSlotVec<DerivedResult<K>, ServiceAlloc>,
+    wire_chunks: AtomicSlotVec<WireChunk, ServiceAlloc>,
     /// Result-arena cells owned by each object slot, as a
     /// `MAX_OBJECTS` × [`MAX_DERIVED_RESULTS`] occupancy bitmap (row = object
     /// slot). Query lookup touches only the visible candidate's row; hidden
     /// result occupancy and contention cannot change another view's work or
     /// refusal behavior. Replaces a per-object `AtomicU64` whose 64-bit width
     /// capped the result arena below the object count.
-    result_slots: AtomicBitVec<dyn Allocator>,
+    result_slots: AtomicBitVec<ServiceAlloc>,
     /// Rebuildable per-object index generations. A hidden object's publication
     /// cannot perturb another authority partition's observation identity.
-    result_generations: [AtomicU64; MAX_OBJECTS],
+    result_generations: Box<[AtomicU64]>,
     /// Result mutation is scoped to one object-arena cell. A replacement
     /// generation may briefly contend with reclamation of its predecessor,
     /// but every record comparison still uses the full generational
     /// [`ObjectId`], so neither generation can select or purge the other.
-    result_claims: [AtomicBool; MAX_OBJECTS],
+    /// Heap-backed with the arenas above: both are one entry per object, so
+    /// they scale with the volume and must not sit in the `serve` future's
+    /// stack frame.
+    result_claims: Box<[AtomicBool]>,
 }
 
 struct ResultClaim<'a>(&'a AtomicBool);
@@ -181,8 +185,25 @@ impl<K: Copy> ExtractionState<K> {
                 .expect("fs derived wire-chunk arena (bootstrap-scale) — service heap undersized"),
             result_slots: AtomicBitVec::try_new_in(MAX_OBJECTS * MAX_DERIVED_RESULTS, alloc)
                 .expect("fs result-occupancy bitmap (bootstrap-scale) — service heap undersized"),
-            result_generations: [const { AtomicU64::new(1) }; MAX_OBJECTS],
-            result_claims: [const { AtomicBool::new(false) }; MAX_OBJECTS],
+            result_generations: {
+                let mut v = alloc::vec::Vec::new();
+                v.try_reserve_exact(MAX_OBJECTS).expect(
+                    "fs derived-result generations (bootstrap-scale) — service heap undersized",
+                );
+                for _ in 0..MAX_OBJECTS {
+                    v.push(AtomicU64::new(1));
+                }
+                v.into_boxed_slice()
+            },
+            result_claims: {
+                let mut v = alloc::vec::Vec::new();
+                v.try_reserve_exact(MAX_OBJECTS)
+                    .expect("fs derived-result claims (bootstrap-scale) — service heap undersized");
+                for _ in 0..MAX_OBJECTS {
+                    v.push(AtomicBool::new(false));
+                }
+                v.into_boxed_slice()
+            },
         }
     }
 
@@ -633,7 +654,7 @@ impl<K: Copy> ExtractionState<K> {
 
         // Claim the complete footprint before removing the first record.
         let mut claimed =
-            Vec::<SlotVecWrite<'_, DerivedResult<K>, dyn Allocator>, MAX_DERIVED_RESULTS>::new();
+            Vec::<SlotVecWrite<'_, DerivedResult<K>, ServiceAlloc>, MAX_DERIVED_RESULTS>::new();
         for key in matches {
             claimed
                 .push(self.results.try_write(key).map_err(|error| match error {

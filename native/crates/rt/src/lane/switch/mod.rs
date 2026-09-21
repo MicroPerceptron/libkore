@@ -10,6 +10,38 @@
 //! registers (vector state included) and saves none of them; the
 //! kernel's own switch path is untouched.
 
+/// Whether this target has a proven switch sequence — the public face of
+/// [`FiberSwitch::available`], for runtimes built on the same seam (the
+/// Wasmtime fiber contract in `crates/wasm-platform`).
+pub fn available() -> bool {
+    Switch::available()
+}
+
+/// Lay a fresh suspended frame at `stack_top` so the first [`switch`] to the
+/// returned SP enters `entry(arg)`. `None` where [`available`] is false —
+/// there is no frame to lay, and a caller must refuse rather than switch.
+///
+/// # Safety
+/// As [`FiberSwitch::seed`]: `stack_top` is the 16-aligned top of writable,
+/// exclusively owned stack memory with room for the frame below it, and
+/// `entry` never returns.
+pub unsafe fn seed(stack_top: u64, entry: extern "C" fn(usize) -> !, arg: usize) -> Option<u64> {
+    // SAFETY: forwarded verbatim.
+    Switch::available().then(|| unsafe { Switch::seed(stack_top, entry, arg) })
+}
+
+/// Save this stack's callee-saved set and SP into `*save`, adopt `to_sp`,
+/// and continue wherever that stack was suspended; returns when a later
+/// switch resumes `*save`.
+///
+/// # Safety
+/// As [`FiberSwitch::switch`]; and [`available`] must be true (the floor's
+/// switch is a no-op, which would return immediately without switching).
+pub unsafe fn switch(save: *mut u64, to_sp: u64) {
+    // SAFETY: forwarded verbatim.
+    unsafe { Switch::switch(save, to_sp) }
+}
+
 /// The contract: seed a fresh fiber frame, and swap stacks.
 pub(crate) trait FiberSwitch {
     /// Whether this target has a proven switch sequence.

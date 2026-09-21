@@ -200,14 +200,36 @@ impl<'t, T: Transport> ChanTx<'t, T> {
     /// happens-before this kick, and a consumed post means the receiver
     /// is awake and will drain every source after it re-posts.
     pub async fn send(&self, notice: Notice) -> Result<(), SendError> {
-        let mut s = SessionBuilder::new();
-        s.notice(self.send, notice.cookie, notice.payload)
-            .map_err(|_| SendError::Refused(Status::Malformed))?;
+        let s = self.notice_session(notice)?;
         let committed = self
             .transport
             .commit(&s)
             .await
             .map_err(|_| SendError::Transport)?;
+        Self::notice_outcome(committed)
+    }
+
+    /// [`send`](Self::send), committed synchronously — the same one-notice
+    /// session through [`Transport::commit_now`]. For callers that cannot
+    /// await: a synchronous stream operation that must publish its ring
+    /// write before returning (the process stream's `*_now` operations).
+    pub fn send_now(&self, notice: Notice) -> Result<(), SendError> {
+        let s = self.notice_session(notice)?;
+        let committed = self
+            .transport
+            .commit_now(&s)
+            .map_err(|_| SendError::Transport)?;
+        Self::notice_outcome(committed)
+    }
+
+    fn notice_session(&self, notice: Notice) -> Result<SessionBuilder, SendError> {
+        let mut s = SessionBuilder::new();
+        s.notice(self.send, notice.cookie, notice.payload)
+            .map_err(|_| SendError::Refused(Status::Malformed))?;
+        Ok(s)
+    }
+
+    fn notice_outcome(committed: crate::transport::Committed) -> Result<(), SendError> {
         if committed.failing_index() != 0 {
             return Err(SendError::Refused(Status::Malformed));
         }
@@ -605,8 +627,13 @@ impl<'t, T: Transport> NoticeRx<'t, T> {
             }
         }
 
-        let mut landing =
-            ReturnedCapability::reserve().ok_or(RecvError::Refused(Status::Denied))?;
+        // A landing retained by `rearm` is reused: the same slot, scrubbed
+        // by the repost, so a post the kernel already resolved cannot leave
+        // its reservation stranded.
+        let mut landing = match self.landing.take() {
+            Some(landing) => landing,
+            None => ReturnedCapability::reserve().ok_or(RecvError::Refused(Status::Denied))?,
+        };
         let mut session = SessionBuilder::new();
         session
             .post_recv(self.recv, landing.target())
@@ -618,12 +645,23 @@ impl<'t, T: Transport> NoticeRx<'t, T> {
                 self.standing = true;
                 Ok(None)
             }
-            Ok(c) => match classify_rotating_post(c) {
-                RotatingPostCommit::Retry => Err(RecvError::Refused(Status::WouldBlock)),
-                RotatingPostCommit::Refused(status) => Err(RecvError::Refused(status)),
-                RotatingPostCommit::Standing => unreachable!("handled above"),
-            },
-            Err(_) => Err(RecvError::Transport),
+            // A refused repost retains the landing (Reserved, never released):
+            // after `rearm` it may be the target of a post the kernel still
+            // holds, and a released slot re-reserved elsewhere would put two
+            // owners under one standing post. Retained, it is simply reused
+            // by the next attempt; a fresh reservation costs nothing to keep.
+            Ok(c) => {
+                self.landing = Some(landing);
+                match classify_rotating_post(c) {
+                    RotatingPostCommit::Retry => Err(RecvError::Refused(Status::WouldBlock)),
+                    RotatingPostCommit::Refused(status) => Err(RecvError::Refused(status)),
+                    RotatingPostCommit::Standing => unreachable!("handled above"),
+                }
+            }
+            Err(_) => {
+                self.landing = Some(landing);
+                Err(RecvError::Transport)
+            }
         }
     }
 
@@ -662,6 +700,37 @@ impl<'t, T: Transport> NoticeRx<'t, T> {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Forget a standing post the kernel has already resolved. The executor's
+    /// alternate arm reports `Delivery` for a post it found gone; when the
+    /// landing then reads vacant (a spurious wake — no record reached it),
+    /// parking again on the same belief would resolve gone again at once, a
+    /// livelock at trap speed. Disarm the belief and keep the reserved
+    /// landing: the next [`try_recv`](Self::try_recv) re-posts onto it.
+    pub fn rearm(&mut self) {
+        if !self.standing {
+            return;
+        }
+        if let Some(landing) = self.landing.as_mut() {
+            landing.disarm_post();
+        }
+        self.standing = false;
+    }
+
+    /// Settle an alternate-delivery wake on this post: the notice, if one
+    /// landed, or `None` after re-arming a spuriously resolved post. Every
+    /// alternate-post consumer treats the notice as a wake and re-reads its
+    /// own state for truth, so `None` is ordinary, never an error.
+    pub fn settle_delivery(&mut self) -> Result<Option<Notice>, RecvError> {
+        if !self.standing {
+            return self.try_recv();
+        }
+        let delivered = self.try_recv()?;
+        if delivered.is_none() {
+            self.rearm();
+        }
+        Ok(delivered)
     }
 
     /// Release a possibly standing runtime-owned landing after the caller has

@@ -238,6 +238,35 @@ impl<'w, 't> Fs<'w, 't> {
         open_path(self, path, rights).await
     }
 
+    /// The task-visible root itself — [`open`](Self::open) of the empty
+    /// path, without a walk.
+    pub async fn open_root(&mut self, rights: Rights) -> Result<View, Refusal> {
+        View::from_opened(self.checked(&FsRequest::OpenRoot { rights }).await?)
+    }
+
+    /// One containment step: the child `name` of `parent`, and nothing else.
+    ///
+    /// Unlike [`open`](Self::open), a missing child is `NotFound` — never a
+    /// fall back to the task's named grants. That is the resolution a
+    /// sandboxed guest's paths need (a WASI host resolves each component
+    /// from the guest's own preopen), so that a guest naming `libs/…` or an
+    /// embedder's private grant reaches only what lies beneath its preopen.
+    pub async fn open_at(
+        &mut self,
+        parent: &View,
+        name: Name,
+        rights: Rights,
+    ) -> Result<View, Refusal> {
+        View::from_opened(
+            self.checked(&FsRequest::OpenAt {
+                parent: parent.handle,
+                name,
+                rights,
+            })
+            .await?,
+        )
+    }
+
     /// Enter a granted file or subtree root directly.
     pub async fn open_grant(&mut self, grant: GrantId, rights: Rights) -> Result<View, Refusal> {
         View::from_opened(

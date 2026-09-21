@@ -159,7 +159,7 @@ this merged tree. No physical-hardware acceptance is inferred from these runs.
 
 ## Native TLS and independent thread lifecycle
 
-The current export records Kore `2a45f8bce5db65e7713f11c89d7eb5d2d9a04d3f`
+The TLS lifecycle export recorded Kore `2a45f8bce5db65e7713f11c89d7eb5d2d9a04d3f`
 from PR #962: 14 native packages and 223 exact source files. It adds native TLS
 provisioning, owner-checked native tickets and a process-lifetime controller for
 cross-worker create/join/detach. Loader publication and the founded guest witness
@@ -189,7 +189,34 @@ state. The checked-in guest harness exercises the actual adapter in founded
 language bindings. It does not claim a C/Zig CRT, automatic stack unwinding,
 initial-process exit hooks, asynchronous cancellation or physical acceptance.
 
-## Compatibility tuple — current-Kore integration (libkore #19)
+
+## Closed native exit vocabulary (prior baseline)
+
+The earlier closed-exit export recorded Kore `b4113c30a8f2ae95a02e511664798eb85505a7c6`:
+14 native packages and 223 exact source files. It includes the intervening #962
+owner updates and the closed exit vocabulary. Public integer constructors are
+removed; the session builder requires the same `ExitCode` as the thread API.
+The ABI layout remains signed 32-bit, with canonical report validation shared by
+all consumers. The facade also re-exports the typed alias macro as `exit_codes!`.
+
+That Kore revision passed host tests, all three architecture checks, user and
+service verification, fresh boot/test builds, kernel and production QEMU gates,
+20 repeated shell launches plus exact 256/257/271/-1 probes, and a screen-decoded
+store launch returning 256. Digests and boot manifests verified. These are
+emulator results, not physical-hardware acceptance. The known lifetime
+capability-tag budget is unchanged.
+
+For this export, `make fmt test check docs owners cross miri bindings-check`
+passed, including the renamed-consumer exit alias and C/Zig declarations and ABI
+assertions on all three Kore architectures. The complete local-owner override
+passed its type-identity checks and duplicate-owner negative control. Both
+workspace dependency locks remain unchanged and pass locked resolution; the
+exporter verifies byte equality against the recorded Kore commit.
+
+## Prior vKore integration tuple (libkore #19)
+
+This is the pre-merge baseline. The refreshed candidate export and validation
+are still pending; this table does not certify the merged source.
 
 Recorded together, as the issue requires, so the graph can be reproduced rather
 than reconstructed:
@@ -199,7 +226,7 @@ than reconstructed:
 | Kore commit | `74ae24c87323dd7bc7ac0a12770c25ec8c8c4852` |
 | native export source revision | same — `native/provenance.json` |
 | exported packages / files | 29 / 397 |
-| libkore commit | this one |
+| libkore commit | `46e110a27fb3ccb0d270eb217ba2d3476581fa85` |
 | distribution lockfiles | `Cargo.lock` and `native/Cargo.lock`, regenerated together with the export |
 | host commit | vkore `codex/vkore-40-current-kore` |
 | Kore ISO SHA-256 | recorded in vkore's `config/real-stack.lock.mk` alongside the guest commit it was built from |
@@ -218,3 +245,45 @@ protocol and caller face split out of `kore-svc-exec`, whose crate cites about
 twenty sibling services in its founder manifest — exporting the client used to
 mean exporting all of them. The service that answers exec requests stays in
 Kore; libkore exports only what a caller links.
+
+
+## Current-main integration candidate — 2026-09-21
+
+The candidate now exports Kore `f175014461c5549c59eba97c09e88afe2f8f677b`,
+which merges main `29138e0955e81569aac8c657d156d392a80d8670` into the
+vKore native integration. The export contains **31 packages and 412 files**,
+verified byte-for-byte against that committed source. It includes main's
+entry/crash interfaces and the affine exec client. This branch also incorporates
+libkore alpha `7fffce33b0aa00d38351a219d90cd6cf3460f48e`, retaining the WASI
+and ordinary Rust entry surfaces. Both distribution locks were updated for the
+new dependency closure while preserving existing resolved versions.
+
+`make fmt test check docs owners cross miri bindings-check` passed with the
+pinned Rust toolchain, cbindgen 0.29.4, and Zig 0.16.0. This includes:
+
+- 505 passing host Rust tests (6 ignored) and 7 Python tooling tests;
+- no-default-feature checking, Clippy, documentation with facade warnings denied,
+  source provenance, and one package per native owner;
+- all three actual Kore user targets and emitted C allocation/thread/futex symbols;
+- 12 renamed-dependency executables, built and linked in release mode, plus
+  9 missing-allocator negative controls that reject specifically for that reason;
+- 21 ordinary Rust entry programs and 9 invalid-return-type negative controls;
+- Miri, including the native erased-task pointer-provenance regression;
+- generated C/Zig declarations, ABI assertions, and the Zig build-system check.
+
+The renamed-consumer check previously used `cargo check` despite claiming to
+prove final executables. It now uses `cargo build`; the allocator findings above
+are actual final-build results. These fixtures establish linking, not execution
+of their entry points in a guest.
+
+The local/Git composition fixture passed against the merged Kore checkout,
+including its duplicate-owner negative control and native exec, entry, runtime,
+crash, filesystem and foreign-adapter type identities. The fixture's temporary
+Git source is confined to its own lockfile and is not a distribution dependency.
+
+Kore's integration production gate passed with 20/20 founded services, a ready
+shell, complete store seeding, and Lua/SPMD witnesses after its boot-stack fix.
+That image preceded the final source formatting and library-pin update. The final
+committed guest/host compatibility tuple and fresh native UI acceptance are still
+pending; the previous tuple above does not certify this candidate. This is an
+in-review source integration, not an approved release baseline.

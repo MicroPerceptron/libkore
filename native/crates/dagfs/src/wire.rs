@@ -282,6 +282,36 @@ pub fn encode_req(req: &FsRequest) -> FsReqWire {
             w.length = U32::new(length);
             w.expected_revision = U64::new(expected);
         }
+        FsRequest::BeginReplace {
+            handle,
+            length,
+            expected,
+        } => {
+            w.op = FsReqWire::OP_BEGIN_REPLACE;
+            w.handle = U64::new(handle.to_bits());
+            w.offset = U64::new(length);
+            w.expected_revision = U64::new(expected);
+        }
+        FsRequest::WriteReplacement {
+            handle,
+            offset,
+            window_offset,
+            length,
+        } => {
+            w.op = FsReqWire::OP_WRITE_REPLACEMENT;
+            w.handle = U64::new(handle.to_bits());
+            w.offset = U64::new(offset);
+            w.window_offset = U32::new(window_offset);
+            w.length = U32::new(length);
+        }
+        FsRequest::CommitReplace { handle } | FsRequest::AbortReplace { handle } => {
+            w.op = if matches!(req, FsRequest::CommitReplace { .. }) {
+                FsReqWire::OP_COMMIT_REPLACE
+            } else {
+                FsReqWire::OP_ABORT_REPLACE
+            };
+            w.handle = U64::new(handle.to_bits());
+        }
         FsRequest::Append {
             handle,
             window_offset,
@@ -673,6 +703,19 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
             length: w.length.get(),
             expected: w.expected_revision.get(),
         },
+        FsReqWire::OP_BEGIN_REPLACE => FsRequest::BeginReplace {
+            handle,
+            length: w.offset.get(),
+            expected: w.expected_revision.get(),
+        },
+        FsReqWire::OP_WRITE_REPLACEMENT => FsRequest::WriteReplacement {
+            handle,
+            offset: w.offset.get(),
+            window_offset: w.window_offset.get(),
+            length: w.length.get(),
+        },
+        FsReqWire::OP_COMMIT_REPLACE => FsRequest::CommitReplace { handle },
+        FsReqWire::OP_ABORT_REPLACE => FsRequest::AbortReplace { handle },
         FsReqWire::OP_APPEND => FsRequest::Append {
             handle,
             window_offset: w.window_offset.get(),
@@ -901,13 +944,21 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
             }
             let mode = match w.kind {
                 0 | 1 if control_payload_except_handle_is_empty(w) => {
-                    if w.kind == 0 { crate::ViewBindingMode::Inherited }
-                    else { crate::ViewBindingMode::Isolated }
+                    if w.kind == 0 {
+                        crate::ViewBindingMode::Inherited
+                    } else {
+                        crate::ViewBindingMode::Isolated
+                    }
                 }
-                2 if w.handle2.get() == 0 && w.offset.get() == 0
-                    && w.expected_revision.get() == 0 && w.length.get() == 0
-                    && w.name2_len == 0 && w.name2.iter().all(|byte| *byte == 0) =>
-                    crate::ViewBindingMode::Resources(take_name(&w.name, w.name_len)?),
+                2 if w.handle2.get() == 0
+                    && w.offset.get() == 0
+                    && w.expected_revision.get() == 0
+                    && w.length.get() == 0
+                    && w.name2_len == 0
+                    && w.name2.iter().all(|byte| *byte == 0) =>
+                {
+                    crate::ViewBindingMode::Resources(take_name(&w.name, w.name_len)?)
+                }
                 _ => return None,
             };
             FsRequest::BindView {
@@ -1298,9 +1349,11 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         FsRequest::Read { .. } | FsRequest::ReadVersion { .. } => FsResponse::Transferred {
             count: w.count.get(),
         },
-        FsRequest::WriteAt { .. } | FsRequest::Resize { .. } => FsResponse::Committed {
-            revision: w.revision.get(),
-        },
+        FsRequest::WriteAt { .. } | FsRequest::Resize { .. } | FsRequest::CommitReplace { .. } => {
+            FsResponse::Committed {
+                revision: w.revision.get(),
+            }
+        }
         FsRequest::Append { .. } => FsResponse::Appended {
             offset: w.len.get(),
             revision: w.revision.get(),
@@ -1376,6 +1429,9 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         | FsRequest::DetachEdge { .. }
         | FsRequest::Revoke { .. }
         | FsRequest::Sync { .. }
+        | FsRequest::BeginReplace { .. }
+        | FsRequest::WriteReplacement { .. }
+        | FsRequest::AbortReplace { .. }
         | FsRequest::DeferCommits { .. }
         | FsRequest::SetSystemSeed { .. }
         | FsRequest::ReleaseVersion { .. }
@@ -1458,85 +1514,71 @@ pub fn decode_rep_unambiguous(w: &FsRepWire) -> Option<(FsResponse, u8)> {
 ///
 /// The request/reply rings are uncorrelated SPSC pairs, so this is the check
 /// that a reply belongs to the call in flight rather than to the previous one.
+///
+/// A `match` on the request, not one `matches!` over the pair: the compiler
+/// then refuses to build until a new [`FsRequest`] variant names the reply it
+/// answers with. Under a single `matches!` an unpaired verb evaluates to
+/// `false` instead, and [`FsClient::call`](crate::client::FsClient::call)
+/// reads its every successful reply as a desynchronized ring — a phantom
+/// transport fault that would hold for the life of the verb, with nothing in
+/// the host tests to see it.
 pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
     if matches!(response, FsResponse::Refused(_)) {
         // Any request may be refused.
         return true;
     }
-    matches!(
-        (request, response),
-        (
-            FsRequest::OpenRoot { .. }
-                | FsRequest::OpenAt { .. }
-                | FsRequest::OpenGrant { .. }
-                | FsRequest::Create { .. },
-            FsResponse::Opened { .. }
-        ) | (FsRequest::Stat { .. }, FsResponse::Stat { .. })
-            | (FsRequest::List { .. }, FsResponse::Listed { .. })
-            | (
-                FsRequest::ListGrants { .. },
-                FsResponse::GrantsListed { .. }
-            )
-            | (
-                FsRequest::SystemStatus { .. },
-                FsResponse::SystemStatusReported { .. }
-            )
-            | (
-                FsRequest::Read { .. } | FsRequest::ReadVersion { .. },
-                FsResponse::Transferred { .. }
-            )
-            | (
-                FsRequest::WriteAt { .. } | FsRequest::Resize { .. },
-                FsResponse::Committed { .. }
-            )
-            | (FsRequest::Append { .. }, FsResponse::Appended { .. })
-            | (
-                FsRequest::Grant { .. }
-                    | FsRequest::GrantScoped { .. }
-                    | FsRequest::GrantView { .. },
-                FsResponse::Granted { .. }
-            )
-            | (
-                FsRequest::LendVersion { .. } | FsRequest::LendExecutable { .. },
-                FsResponse::VersionLent { .. }
-            )
-            | (
-                FsRequest::CommitDerived { .. },
-                FsResponse::DerivedCommitted { .. }
-            )
-            | (
-                FsRequest::DerivedInfo { .. },
-                FsResponse::DerivedInfo { .. }
-            )
-            | (FsRequest::Search { .. }, FsResponse::Searched { .. })
-            | (FsRequest::TakeAdmission, FsResponse::PeerAdmitted { .. })
-            | (
-                FsRequest::AttachWindow { .. },
-                FsResponse::WindowAttached { .. }
-            )
-            | (
-                FsRequest::RegisterSystemView { .. }
-                    | FsRequest::RegisterPrivateView { .. }
-                    | FsRequest::ApplyView { .. }
-                    | FsRequest::BindView { .. }
-                    | FsRequest::Close { .. }
-                    | FsRequest::Rename { .. }
-                    | FsRequest::Relocate { .. }
-                    | FsRequest::Link { .. }
-                    | FsRequest::Unlink { .. }
-                    | FsRequest::DetachEdge { .. }
-                    | FsRequest::Revoke { .. }
-                    | FsRequest::Sync { .. }
-                    | FsRequest::DeferCommits { .. }
-                    | FsRequest::SetSystemSeed { .. }
-                    | FsRequest::ReleaseVersion { .. }
-                    | FsRequest::AdmitPeer { .. }
-                    | FsRequest::RetirePeer { .. }
-                    | FsRequest::ConfirmRetired { .. }
-                    | FsRequest::ClosePeer,
-                FsResponse::Done
-            )
-    )
+    match request {
+        FsRequest::OpenRoot { .. }
+        | FsRequest::OpenAt { .. }
+        | FsRequest::OpenGrant { .. }
+        | FsRequest::Create { .. } => matches!(response, FsResponse::Opened { .. }),
+        FsRequest::Stat { .. } => matches!(response, FsResponse::Stat { .. }),
+        FsRequest::List { .. } => matches!(response, FsResponse::Listed { .. }),
+        FsRequest::ListGrants { .. } => matches!(response, FsResponse::GrantsListed { .. }),
+        FsRequest::SystemStatus { .. } => {
+            matches!(response, FsResponse::SystemStatusReported { .. })
+        }
+        FsRequest::Read { .. } | FsRequest::ReadVersion { .. } => {
+            matches!(response, FsResponse::Transferred { .. })
+        }
+        FsRequest::WriteAt { .. } | FsRequest::Resize { .. } | FsRequest::CommitReplace { .. } => {
+            matches!(response, FsResponse::Committed { .. })
+        }
+        FsRequest::Append { .. } => matches!(response, FsResponse::Appended { .. }),
+        FsRequest::Grant { .. } | FsRequest::GrantScoped { .. } | FsRequest::GrantView { .. } => {
+            matches!(response, FsResponse::Granted { .. })
+        }
+        FsRequest::LendVersion { .. } | FsRequest::LendExecutable { .. } => {
+            matches!(response, FsResponse::VersionLent { .. })
+        }
+        FsRequest::CommitDerived { .. } => matches!(response, FsResponse::DerivedCommitted { .. }),
+        FsRequest::DerivedInfo { .. } => matches!(response, FsResponse::DerivedInfo { .. }),
+        FsRequest::Search { .. } => matches!(response, FsResponse::Searched { .. }),
+        FsRequest::TakeAdmission => matches!(response, FsResponse::PeerAdmitted { .. }),
+        FsRequest::AttachWindow { .. } => matches!(response, FsResponse::WindowAttached { .. }),
+        FsRequest::RegisterSystemView { .. }
+        | FsRequest::RegisterPrivateView { .. }
+        | FsRequest::ApplyView { .. }
+        | FsRequest::BindView { .. }
+        | FsRequest::Close { .. }
+        | FsRequest::Rename { .. }
+        | FsRequest::Relocate { .. }
+        | FsRequest::Link { .. }
+        | FsRequest::Unlink { .. }
+        | FsRequest::DetachEdge { .. }
+        | FsRequest::Revoke { .. }
+        | FsRequest::Sync { .. }
+        | FsRequest::BeginReplace { .. }
+        | FsRequest::WriteReplacement { .. }
+        | FsRequest::AbortReplace { .. }
+        | FsRequest::DeferCommits { .. }
+        | FsRequest::SetSystemSeed { .. }
+        | FsRequest::ReleaseVersion { .. }
+        | FsRequest::AdmitPeer { .. }
+        | FsRequest::RetirePeer { .. }
+        | FsRequest::ConfirmRetired { .. }
+        | FsRequest::ClosePeer => matches!(response, FsResponse::Done),
+    }
 }
 
 #[cfg(test)]
@@ -1547,7 +1589,8 @@ mod tests {
     #[test]
     fn resource_namespace_wire_refuses_missing_names_and_reserved_payload() {
         let request = FsRequest::BindView {
-            handle: Handle::from_bits(0x100000001), rights: Rights::READ,
+            handle: Handle::from_bits(0x100000001),
+            rights: Rights::READ,
             mode: crate::ViewBindingMode::Resources(Name::new("input").unwrap()),
             announced: SlotRef::from_wire(17),
         };
@@ -1567,9 +1610,14 @@ mod tests {
 
     #[test]
     fn isolated_bind_view_round_trips_and_unknown_modes_refuse() {
-        for (kind, mode) in [(0, crate::ViewBindingMode::Inherited),
+        for (kind, mode) in [
+            (0, crate::ViewBindingMode::Inherited),
             (1, crate::ViewBindingMode::Isolated),
-            (2, crate::ViewBindingMode::Resources(Name::new("selected").unwrap()))] {
+            (
+                2,
+                crate::ViewBindingMode::Resources(Name::new("selected").unwrap()),
+            ),
+        ] {
             let request = FsRequest::BindView {
                 handle: Handle::from_bits(0x100000001),
                 rights: Rights::READ,
@@ -1594,6 +1642,37 @@ mod tests {
     /// cannot tell from a service that simply never answers.
     /// `Create` is the one request whose reserved byte carries data, and
     /// only there: every other verb still refuses a non-zero byte.
+    #[test]
+    fn atomic_replacement_wire_round_trips() {
+        let handle = Handle::from_bits(0x1234);
+        for req in [
+            FsRequest::BeginReplace {
+                handle,
+                length: u64::from(u32::MAX) + 1,
+                expected: 9,
+            },
+            FsRequest::WriteReplacement {
+                handle,
+                offset: 5,
+                window_offset: 7,
+                length: 3,
+            },
+            FsRequest::CommitReplace { handle },
+            FsRequest::AbortReplace { handle },
+        ] {
+            assert_eq!(decode_req(&encode_req(&req)), Some(req));
+            let reply = if matches!(req, FsRequest::CommitReplace { .. }) {
+                FsResponse::Committed { revision: 10 }
+            } else {
+                FsResponse::Done
+            };
+            assert_eq!(
+                decode_rep_for(&req, &encode_rep(&reply, 0)),
+                Some((reply, 0))
+            );
+        }
+    }
+
     #[test]
     fn create_carries_a_subtype_and_every_other_verb_keeps_reserved0_zero() {
         let stamped = FsRequest::Create {

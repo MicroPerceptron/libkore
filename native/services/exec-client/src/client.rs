@@ -728,8 +728,9 @@ impl ExecutableCapability {
 /// ownership.
 #[derive(Debug)]
 pub struct SpawnedTask {
-    /// Hash-derived task id carried in the data reply.
-    pub id: u64,
+    /// Public diagnostic identity, queried through the held task capability.
+    /// None means the optional query failed; callers may retry through handle.
+    pub identity: Option<kore_abi::task::TaskIdentity>,
     /// Validated linked-image segment count returned by exec; zero for an
     /// unlinked founding.
     pub segments: u8,
@@ -878,7 +879,7 @@ fn finish_invoke_reply<T: Transport>(
             };
             match verbs::claim_direct_returned_task(returned, handle_rights) {
                 Ok(handle) => Ok(SpawnOutcome::Spawned(SpawnedTask {
-                    id: handle.id(),
+                    identity: handle.identity().ok(),
                     segments,
                     snapshot,
                     filesystem,
@@ -1417,6 +1418,8 @@ impl<'w, 't, T: Transport> RingExec<'w, 't, T> {
     /// [`Self::seed_app`]; `manifest` reports whether the system package
     /// manifest stands, which exec writes once every executable and library
     /// has seeded — so it is normally true only on the last library's reply.
+    /// A [`BOOTSTRAP_DATA`](crate::BOOTSTRAP_DATA) name seeds that data
+    /// member into `share/<dir>/` through the same request and reply.
     pub async fn seed_library(
         &mut self,
         target: kore_abi::image::ImageName,
@@ -1984,8 +1987,8 @@ impl<'w, 't, T: Transport> RingExec<'w, 't, T> {
     }
 
     /// Invoke with a parent handle that may attenuate lifecycle observers into
-    /// sibling workers. This authority is opt-in, the service gates it against
-    /// the executable's authenticated launch profile, and ordinary invocation
+    /// sibling workers. This opt-in authority is available for any authorized
+    /// spawn and does not change the child's grants. Ordinary invocation
     /// remains non-delegable.
     pub async fn invoke_delegable_with_auxiliaries<
         A: ReturnCapability,

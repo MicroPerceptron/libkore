@@ -139,6 +139,46 @@ pub(crate) fn route(request: FsRequest, has_system: bool) -> Result<RoutedReques
                 },
             )
         }
+        BeginReplace {
+            handle,
+            length,
+            expected,
+        } => {
+            let (store, handle) = split_handle(handle);
+            RoutedRequest::One(
+                store,
+                BeginReplace {
+                    handle,
+                    length,
+                    expected,
+                },
+            )
+        }
+        WriteReplacement {
+            handle,
+            offset,
+            window_offset,
+            length,
+        } => {
+            let (store, handle) = split_handle(handle);
+            RoutedRequest::One(
+                store,
+                WriteReplacement {
+                    handle,
+                    offset,
+                    window_offset,
+                    length,
+                },
+            )
+        }
+        CommitReplace { handle } => {
+            let (store, handle) = split_handle(handle);
+            RoutedRequest::One(store, CommitReplace { handle })
+        }
+        AbortReplace { handle } => {
+            let (store, handle) = split_handle(handle);
+            RoutedRequest::One(store, AbortReplace { handle })
+        }
         Close { handle } => {
             let (store, handle) = split_handle(handle);
             RoutedRequest::One(store, Close { handle })
@@ -679,6 +719,54 @@ mod tests {
 
     fn system_handle(bits: u64) -> Handle {
         Handle::from_bits(bits | SYSTEM_TAG)
+    }
+
+    #[test]
+    fn replacements_keep_their_volume_and_native_handle() {
+        let native = Handle::from_bits(7);
+        let tagged = Handle::from_bits(join_bits(Store::System, native.to_bits()));
+        for (wire, local) in [
+            (
+                FsRequest::BeginReplace {
+                    handle: tagged,
+                    length: 3,
+                    expected: 2,
+                },
+                FsRequest::BeginReplace {
+                    handle: native,
+                    length: 3,
+                    expected: 2,
+                },
+            ),
+            (
+                FsRequest::WriteReplacement {
+                    handle: tagged,
+                    offset: 1,
+                    window_offset: 0,
+                    length: 2,
+                },
+                FsRequest::WriteReplacement {
+                    handle: native,
+                    offset: 1,
+                    window_offset: 0,
+                    length: 2,
+                },
+            ),
+            (
+                FsRequest::CommitReplace { handle: tagged },
+                FsRequest::CommitReplace { handle: native },
+            ),
+            (
+                FsRequest::AbortReplace { handle: tagged },
+                FsRequest::AbortReplace { handle: native },
+            ),
+        ] {
+            assert_eq!(
+                route(wire, true),
+                Ok(RoutedRequest::One(Store::System, local))
+            );
+            assert_eq!(route(wire, false), Err(FsError::InvalidHandle));
+        }
     }
 
     #[test]

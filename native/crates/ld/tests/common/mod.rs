@@ -207,6 +207,8 @@ pub struct Fixture {
     pub zero_bloom: bool,
     /// Emit `DT_INIT_ARRAY`/`DT_FINI_ARRAY` at fixed data offsets.
     pub init_fini: bool,
+    /// Number of entries in the finalizer array.
+    pub fini_count: u64,
     /// Shift every vaddr (loads, dynamic tags, entry, relro) by this
     /// page-aligned amount — the nonzero-link-base variant.
     pub vaddr_base: u64,
@@ -239,6 +241,7 @@ impl Default for Fixture {
             bss_tail_gap_pages: 0,
             zero_bloom: false,
             init_fini: false,
+            fini_count: 1,
             vaddr_base: 0,
             extra_loads: 0,
             strtab_vaddr_override: None,
@@ -400,7 +403,7 @@ impl Fixture {
             dynamic.push((DT_INIT_ARRAY, DATA_VADDR + 0x400 + vb));
             dynamic.push((DT_INIT_ARRAYSZ, 16));
             dynamic.push((DT_FINI_ARRAY, DATA_VADDR + 0x440 + vb));
-            dynamic.push((DT_FINI_ARRAYSZ, 8));
+            dynamic.push((DT_FINI_ARRAYSZ, 8 * self.fini_count));
         }
         dynamic.push((DT_NULL, 0));
         let dyn_len = dynamic.len() * 16;

@@ -48,6 +48,8 @@ pub enum LateError {
     TooLarge,
     /// The descriptor and carve plan disagree, or arithmetic overflowed.
     Layout,
+    /// RELRO is not an exact page range inside the private data mapping.
+    Relro,
 }
 
 /// One copy from the object's file bytes into a window: `dst` is relative
@@ -205,6 +207,19 @@ impl LateLayout {
             }
         };
 
+        if let Some((off, len)) = checked.relro {
+            let data = data.as_ref().ok_or(LateError::Relro)?;
+            let end = off.checked_add(len).ok_or(LateError::Relro)?;
+            let data_end = data.vaddr.checked_add(data.len).ok_or(LateError::Relro)?;
+            if len == 0
+                || off % PAGE_SIZE != 0
+                || len % PAGE_SIZE != 0
+                || off < data.vaddr
+                || end > data_end
+            {
+                return Err(LateError::Relro);
+            }
+        }
         let span = match data {
             Some(ref span) => span.vaddr.checked_add(span.len).ok_or(LateError::Layout)?,
             None => code_end,

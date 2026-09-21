@@ -47,5 +47,5 @@ protocol  = "kore_svc_device::DeviceBroker"
 # row's own claimant band.
 instances = 8
 endows    = ["ROOT_COMPLEX@0", "PLATFORM_BUS@0", "FACE_SUPPLY@0"]
-digest_x86_64  = "blake3:680ccdbc48e248f91afb70eb18d6b630f5d9dbc0f1906e40f6b2409ea374841d"  # res/x86_64/; make boot-digests-x86
-digest_aarch64 = "blake3:561f0487f5139e778dd5ec2aa9d030f5c7cd2e7f7af4a04f7c23e8808aa78899"  # res/aarch64/; make boot-digests-aarch64
+digest_x86_64  = "blake3:6a4b05a8be8855c8997146998eba9643dff1fde4403cc2fcbc816149bd306434"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:d41526af0a94d5e1684a9b410c9374d57161831fd5455b15f1bdb23497e9cc8a"  # res/aarch64/; make boot-digests-aarch64

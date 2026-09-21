@@ -78,23 +78,7 @@ impl Placer {
     /// likely mapped by something else, and the caller has no way to tell
     /// that from a legitimate answer.
     pub fn choose(&mut self, len: u64, align: u64) -> Result<u64, PlaceError> {
-        if !align.is_power_of_two() {
-            return Err(PlaceError::BadAlign);
-        }
-        if len == 0 {
-            return Err(PlaceError::ZeroLen);
-        }
-        // Round up to `align`, without wrapping.
-        let Some(bumped) = self.next.checked_add(align - 1) else {
-            return Err(PlaceError::Exhausted);
-        };
-        let at = bumped & !(align - 1);
-        let Some(after) = at.checked_add(len) else {
-            return Err(PlaceError::Exhausted);
-        };
-        if after > self.end {
-            return Err(PlaceError::Exhausted);
-        }
+        let (at, after) = bump(self.next, self.end, len, align)?;
         self.next = after;
         Ok(at)
     }
@@ -104,6 +88,160 @@ impl Placer {
     /// after rounding up.
     pub const fn remaining(&self) -> u64 {
         self.end.saturating_sub(self.next)
+    }
+
+    /// One past the highest address handed out so far — the placement
+    /// high-water mark a world reports through
+    /// `LinkWorld::placed_high_water`, so a later placer over the same
+    /// window can start above everything this one placed.
+    pub const fn cursor(&self) -> u64 {
+        self.next
+    }
+}
+
+/// The one checked bump both placers use: round `next` up to `align`,
+/// fit `len` below `end`, and answer `(at, after)`.
+///
+/// Factored out so the [`Placer`] and [`SharedPlacer`] cannot drift: the
+/// failure mode of a second copy is not a compile error but an
+/// *overlapping address*, which this module's own doc calls out as
+/// silent rather than loud.
+const fn bump(next: u64, end: u64, len: u64, align: u64) -> Result<(u64, u64), PlaceError> {
+    if !align.is_power_of_two() {
+        return Err(PlaceError::BadAlign);
+    }
+    if len == 0 {
+        return Err(PlaceError::ZeroLen);
+    }
+    // Round up to `align`, without wrapping.
+    let Some(bumped) = next.checked_add(align - 1) else {
+        return Err(PlaceError::Exhausted);
+    };
+    let at = bumped & !(align - 1);
+    let Some(after) = at.checked_add(len) else {
+        return Err(PlaceError::Exhausted);
+    };
+    if after > end {
+        return Err(PlaceError::Exhausted);
+    }
+    Ok((at, after))
+}
+
+/// The `next` value meaning "no window published yet". Not a plausible
+/// cursor: a window ending at `u64::MAX` is already refused by
+/// [`Placer::new`]'s saturation, so this cannot collide with a live base.
+const UNARMED: u64 = u64::MAX;
+
+/// A [`Placer`] several consumers share, without a lock.
+///
+/// The owned `Placer` is `&mut` by design: one linker, one window, one
+/// caller. A task that *also* hands its link window to a second consumer
+/// — a wasm engine placing guest memory beside the late loader's modules
+/// — cannot use two `Placer` values over one window, because each would
+/// hand out the other's addresses. Two cursors over one window is the
+/// bug this type exists to make unrepresentable.
+///
+/// Monotone and lock-free, mimicking `kore_rt::heap`'s supply cursors: a
+/// checked `try_update` means a losing racer retries against the winner's
+/// mark rather than serialising behind it, and arithmetic that would wrap
+/// refuses instead of answering a low, probably-mapped address.
+/// Nothing is ever freed, so a compare-and-set that only advances is the
+/// whole of the concurrency story.
+pub struct SharedPlacer {
+    next: core::sync::atomic::AtomicU64,
+    /// One past the window's last byte, or `0` for *unarmed* — a placer
+    /// whose window is not known yet and which therefore refuses every
+    /// request. Fail-closed is the only safe default for a `static`: a
+    /// consumer that places before the window is published must get a
+    /// typed refusal, never address zero.
+    end: core::sync::atomic::AtomicU64,
+}
+
+impl SharedPlacer {
+    /// A shared placer over `[base, base + len)`.
+    pub const fn new(base: u64, len: u64) -> Self {
+        Self {
+            next: core::sync::atomic::AtomicU64::new(base),
+            end: core::sync::atomic::AtomicU64::new(base.saturating_add(len)),
+        }
+    }
+
+    /// An unarmed placer, for a `static` whose window is only known once
+    /// the task can read its own geometry. Refuses until [`arm`](Self::arm).
+    pub const fn unarmed() -> Self {
+        Self {
+            next: core::sync::atomic::AtomicU64::new(UNARMED),
+            end: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Publish the window, once. A second call refuses and leaves the
+    /// first window **and its cursor** intact, so a second consumer cannot
+    /// silently re-base a cursor that earlier placements were already
+    /// derived from — every one of those addresses would become reusable.
+    ///
+    /// The claim is the compare-and-set on `next` away from [`UNARMED`],
+    /// so a losing arm writes nothing at all. `end` is released only after
+    /// that claim is won, and [`choose`](Self::choose) acquires `end`
+    /// first: observing an armed `end` therefore guarantees observing the
+    /// matching `next`. Publishing `next` first (the obvious order) is
+    /// wrong in both directions — a refused arm would clobber a live
+    /// cursor, and a racing `choose` could read the new base against the
+    /// old window.
+    pub fn arm(&self, base: u64, len: u64) -> Result<(), PlaceError> {
+        use core::sync::atomic::Ordering;
+        let end = base.saturating_add(len);
+        if end <= base {
+            return Err(PlaceError::ZeroLen);
+        }
+        if base == UNARMED {
+            return Err(PlaceError::Exhausted);
+        }
+        self.next
+            .compare_exchange(UNARMED, base, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| PlaceError::Exhausted)?;
+        self.end.store(end, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether a window has been published.
+    pub fn is_armed(&self) -> bool {
+        self.end.load(core::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    /// Choose and consume a span, as [`Placer::choose`], from any thread.
+    ///
+    /// The closure re-runs [`bump`] against whatever mark won the race, so
+    /// a concurrent caller never receives an address derived from a stale
+    /// cursor.
+    pub fn choose(&self, len: u64, align: u64) -> Result<u64, PlaceError> {
+        use core::sync::atomic::Ordering;
+        let end = self.end.load(Ordering::Acquire);
+        if end == 0 {
+            return Err(PlaceError::Exhausted);
+        }
+        let mut refusal = PlaceError::Exhausted;
+        self.next
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                match bump(next, end, len, align) {
+                    Ok((_, after)) => Some(after),
+                    Err(error) => {
+                        refusal = error;
+                        None
+                    }
+                }
+            })
+            .map_err(|_| refusal)
+            .and_then(|previous| bump(previous, end, len, align).map(|(at, _)| at))
+    }
+
+    /// Bytes still placeable, ignoring alignment loss — diagnostics only,
+    /// and immediately stale under concurrency. An unarmed placer has none.
+    pub fn remaining(&self) -> u64 {
+        use core::sync::atomic::Ordering;
+        self.end
+            .load(Ordering::Acquire)
+            .saturating_sub(self.next.load(Ordering::Acquire))
     }
 }
 
@@ -200,5 +338,106 @@ mod tests {
         let mut p = Placer::new(u64::MAX - 0x10, u64::MAX);
         assert_eq!(p.remaining(), 0x10);
         assert_eq!(p.choose(0x100, 0x1), Err(PlaceError::Exhausted));
+    }
+    /// The drift guard the shared placer exists for: for one request
+    /// sequence it must answer exactly what the owned placer answers.
+    /// If these ever diverge, two consumers of one window overlap, and
+    /// this module's doc says that failure is silent rather than loud.
+    #[test]
+    fn shared_and_owned_placers_agree() {
+        let requests = [(0x1234, 0x1000), (0x1, 0x1_0000), (0x2000, 0x1000), (0x8, 0x8)];
+        let mut owned = Placer::new(0x1000_0000, 0x10_0000);
+        let shared = SharedPlacer::new(0x1000_0000, 0x10_0000);
+        for (len, align) in requests {
+            assert_eq!(owned.choose(len, align), shared.choose(len, align));
+        }
+        assert_eq!(owned.remaining(), shared.remaining());
+    }
+
+    /// Refusals agree too — a shared placer must not turn a caller bug
+    /// into a different (or absent) error than the owned one.
+    #[test]
+    fn shared_placer_refuses_identically() {
+        let mut owned = Placer::new(0x2000_0000, 0x2000);
+        let shared = SharedPlacer::new(0x2000_0000, 0x2000);
+        for (len, align) in [(0x1000u64, 0x3u64), (0, 0x1000), (0x4000, 0x1000)] {
+            assert_eq!(owned.choose(len, align), shared.choose(len, align));
+        }
+        // A refused choose consumes nothing, on either.
+        assert_eq!(owned.remaining(), 0x2000);
+        assert_eq!(shared.remaining(), 0x2000);
+    }
+
+    /// The property that makes it shareable: concurrent callers receive
+    /// disjoint, aligned spans and none is handed out twice.
+    #[test]
+    fn concurrent_placements_never_overlap() {
+        use std::vec::Vec;
+
+        const THREADS: usize = 8;
+        const EACH: usize = 64;
+        const LEN: u64 = 0x1000;
+
+        let placer = std::sync::Arc::new(SharedPlacer::new(0x4000_0000, 0x100_0000));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let placer = std::sync::Arc::clone(&placer);
+            handles.push(std::thread::spawn(move || {
+                (0..EACH)
+                    .map(|_| placer.choose(LEN, LEN).expect("window is large enough"))
+                    .collect::<Vec<u64>>()
+            }));
+        }
+        let mut spans: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("no placer thread panics"))
+            .collect();
+
+        assert_eq!(spans.len(), THREADS * EACH);
+        spans.sort_unstable();
+        spans.dedup();
+        assert_eq!(spans.len(), THREADS * EACH, "an address was handed out twice");
+        for pair in spans.windows(2) {
+            assert!(pair[0] + LEN <= pair[1], "spans overlap");
+        }
+        assert!(spans.iter().all(|at| at % LEN == 0), "a span was misaligned");
+    }
+    /// Fail-closed: a `static` placer refuses until its window is known,
+    /// rather than answering an address in an unpublished window.
+    #[test]
+    fn an_unarmed_placer_refuses_everything() {
+        let p = SharedPlacer::unarmed();
+        assert!(!p.is_armed());
+        assert_eq!(p.remaining(), 0);
+        assert_eq!(p.choose(0x1000, 0x1000), Err(PlaceError::Exhausted));
+    }
+
+    /// Arming publishes the window exactly once. A second arm refuses and
+    /// leaves the first window — otherwise a late consumer could re-base a
+    /// cursor that earlier placements were already derived from, and every
+    /// one of those addresses would silently become reusable.
+    #[test]
+    fn arming_is_once_and_the_first_window_wins() {
+        let p = SharedPlacer::unarmed();
+        assert_eq!(p.arm(0x5000_0000, 0x10_0000), Ok(()));
+        assert!(p.is_armed());
+        let first = p.choose(0x1000, 0x1000).expect("fits");
+
+        assert_eq!(p.arm(0x9000_0000, 0x10_0000), Err(PlaceError::Exhausted));
+        let second = p.choose(0x1000, 0x1000).expect("fits");
+        assert!(
+            (0x5000_0000..0x5010_0000).contains(&second),
+            "a refused re-arm must not move the cursor into the new window"
+        );
+        assert!(second >= first + 0x1000, "the cursor kept advancing");
+    }
+
+    /// A degenerate window is refused at arm time rather than producing a
+    /// placer that answers its own base.
+    #[test]
+    fn arming_an_empty_window_refuses() {
+        let p = SharedPlacer::unarmed();
+        assert_eq!(p.arm(0x5000_0000, 0), Err(PlaceError::ZeroLen));
+        assert!(!p.is_armed());
     }
 }

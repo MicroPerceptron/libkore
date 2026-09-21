@@ -129,6 +129,37 @@ pub const PROFILE_SYSTEM_POWER: u32 = 1 << 8;
 /// service's pair, issues the two read-only verbs, and stamps the answers
 /// before the child starts — the filesystem snapshot's shape exactly.
 pub const PROFILE_NETWORK: u32 = 1 << 9;
+/// The program hosts an **execution engine** — an interpreter or a loaded
+/// native image — whose working set exceeds the ordinary launch arena.
+///
+/// This names a *class*, not a size: the launcher owns the numbers
+/// (`kore_svc_exec::founder::LaunchPlan`), exactly as it already decides
+/// whether to charge a launch for the trailing heap interval at all from
+/// [`PROFILE_HEAP`]. A bit rather than a per-row byte count because the
+/// profile word already crosses exec's wire, authenticated with the image,
+/// while a new size field would widen the reply record. Meaningful only
+/// beside [`PROFILE_HEAP`]: an engine with no heap has nowhere to run.
+pub const PROFILE_ENGINE: u32 = 1 << 11;
+/// Launch profile: exec provisions one private recyclable accelerator face.
+///
+/// The bit grants no device authority by itself. Exec admits a fresh service
+/// peer for this launch, and the accelerator host binds every object created
+/// through that peer to its exact recyclable generation. The face disappears
+/// with the task and cannot address another application's contexts, buffers,
+/// programs, queues, or events.
+pub const PROFILE_ACCELERATOR: u32 = 1 << 10;
+/// Launch profile: exec provisions one private recyclable face on the **GPU**
+/// accelerator row (the Intel Xe row), at its own per-process slots beside
+/// [`PROFILE_ACCELERATOR`]'s NPU face.  Same authority shape as that bit: a
+/// fresh service peer per launch, bound to its recyclable generation, gone
+/// with the task.  Best-effort where the NPU face is not: a machine whose
+/// GPU row is parked (no GuC, no Intel GPU) still launches the process, with
+/// the face's slots vacant, so an interpreter carrying this bit runs
+/// everywhere and answers "unavailable" where it must.
+///
+/// Bit 11 is taken by the engine launch plan on a sibling branch; this is
+/// bit 12 so the two merge without renumbering.
+pub const PROFILE_GPU: u32 = 1 << 12;
 
 pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_FILESYSTEM
@@ -139,7 +170,10 @@ pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_INTERACTIVE
     | PROFILE_WINDOW_CONTROL
     | PROFILE_SYSTEM_POWER
-    | PROFILE_NETWORK;
+    | PROFILE_NETWORK
+    | PROFILE_ACCELERATOR
+    | PROFILE_ENGINE
+    | PROFILE_GPU;
 
 /// Validate the profile vocabulary and its dependencies: both filesystem
 /// auxiliary endpoint kinds are meaningful only beside an actual FS face.
@@ -147,6 +181,7 @@ pub const fn profile_valid(profile: u32) -> bool {
     profile & !PROFILE_KNOWN == 0
         && (profile & PROFILE_FS_VIEW_BINDER == 0 || profile & PROFILE_FILESYSTEM != 0)
         && (profile & PROFILE_FS_GRANT_TARGET == 0 || profile & PROFILE_FILESYSTEM != 0)
+        && (profile & PROFILE_ENGINE == 0 || profile & PROFILE_HEAP != 0)
 }
 
 /// Segment ceiling per image — up to eight `PT_LOAD`s plus one `PT_TLS`
@@ -808,8 +843,25 @@ pub struct ModulePage {
     pub flags: U16,
     /// Live records.
     pub count: U16,
-    /// Reserved; zero.
-    pub reserved: U16,
+    /// How much of the link window the startup placement consumed, in
+    /// pages counted **down from this page's own address**; `0` means
+    /// *unrecorded* (a page stamped before this field existed, or a world
+    /// that does not report placement).
+    ///
+    /// Exists because [`high_water`](Self::high_water) covers only the
+    /// segments the records name, and the startup stub places more than
+    /// that: the copied data/TLS template views and the static TLS block
+    /// are placed into the link window right after the image but are not
+    /// module segments. Once an executable's image grew past a 64 KiB
+    /// boundary, the late loader's first window (the next 64 KiB line
+    /// above the records) landed inside that placed-but-unnamed range and
+    /// the kernel refused it `AlreadyMapped`. The unit is pages below the
+    /// page rather than an absolute address because that fits the sixteen
+    /// bits this word already had — the same layout, the same
+    /// [`IMAGE_ABI`], and every existing page reads as unrecorded. A link
+    /// window wider than `u16::MAX` pages refuses at link time
+    /// (`kore_ld::link`), never truncates here.
+    pub placed: U16,
     /// The module table; entries past `count` are zero.
     pub records: [ModuleRecord; MAX_MODULE_RECORDS],
 }
@@ -821,7 +873,7 @@ impl ModulePage {
             abi: U16::new(IMAGE_ABI),
             flags: U16::new(0),
             count: U16::new(0),
-            reserved: U16::new(0),
+            placed: U16::new(0),
             records: [ModuleRecord::vacant(); MAX_MODULE_RECORDS],
         }
     }
@@ -843,9 +895,29 @@ impl ModulePage {
         self.count.get() == 0
     }
 
+    /// Record the startup placement high water: `pages` pages below this
+    /// page's own address. See [`placed`](Self::placed).
+    pub fn record_placed(&mut self, pages: u16) {
+        self.placed = U16::new(pages);
+    }
+
+    /// One past the highest address the startup **placement** reached —
+    /// template views and the TLS block included — given where this page
+    /// lives (`module_page_va`). `None` when unrecorded. A late placer
+    /// takes the larger of this and [`high_water`](Self::high_water);
+    /// neither alone is the floor.
+    pub fn placed_high_water(&self, module_page_va: u64) -> Option<u64> {
+        let pages = u64::from(self.placed.get());
+        if pages == 0 {
+            return None;
+        }
+        module_page_va.checked_sub(pages.checked_mul(MODULE_PAGE_BYTES)?)
+    }
     /// One past the highest address any recorded segment occupies,
     /// page-rounded — where a **late** loader (`res/IMAGE.md` §8) may start
-    /// placing: everything the startup stub mapped lies below it.  `None`
+    /// placing, *for the segments the records name*. The startup stub also
+    /// places what no record names (the static TLS block); take the larger
+    /// of this and [`placed_high_water`](Self::placed_high_water).  `None`
     /// for an empty page or on overflow (a lying record is refused, not
     /// clamped).
     pub fn high_water(&self) -> Option<u64> {
@@ -940,6 +1012,11 @@ pub enum ImageRefusal {
     /// ([`ImageReqWire::op_retired`](crate::svc::ImageReqWire::op_retired));
     /// answered, never silently dropped, and never revived.
     Retired = 6,
+    /// The name is an archive DATA member ([`ARCHIVE_MEMBER_DATA`]): its
+    /// bytes are exportable, but it has no segments, no descriptor, and no
+    /// launch shape, so `Acquire`/`Describe` refuse it rather than answer
+    /// an empty image.
+    NotImage = 7,
 }
 
 // Frozen wire pins (#81; the crate-header wire-freeze discipline).
@@ -959,6 +1036,10 @@ const _: () = {
     assert!(size_of::<ModulePage>() <= 4096);
     assert!(size_of::<ArchiveHeader>() == 16);
     assert!(size_of::<ArchiveEntry>() == 88);
+    // `kind` took the former reserve's exact place: the last word.
+    assert!(core::mem::offset_of!(ArchiveEntry, kind) == 84);
+    // Zero must stay "image", or every committed v2 archive changes meaning.
+    assert!(ARCHIVE_MEMBER_IMAGE == 0);
 };
 
 /// The embedded image archive's profile-bearing v2 magic (`"KIMGAR2\0"`) — the Limine
@@ -988,23 +1069,53 @@ impl ArchiveHeader {
     pub const WIRE: usize = 16;
 }
 
+/// [`ArchiveEntry::kind`]: an ELF image — checked, carved, and acquirable
+/// (`res/IMAGE.md` §3). Zero, so every archive packed before the field had a
+/// name (it was a must-be-zero reserve) reads back as all images.
+pub const ARCHIVE_MEMBER_IMAGE: u32 = 0;
+/// [`ArchiveEntry::kind`]: an opaque DATA member (a `.wasm` module, a font, a
+/// table) — bounds-checked only, never ELF-checked, never carved, never
+/// launchable. The image service registers its window so `Export` can lend
+/// the bytes read-only (the filesystem seed copies them into `share/`);
+/// `Acquire` refuses it typed ([`ImageRefusal::NotImage`]). A data member
+/// carries `profile == 0`: a launch profile on something that cannot launch
+/// is a packing error, refused at registration.
+pub const ARCHIVE_MEMBER_DATA: u32 = 1;
+
+/// Whether `kind` is in the archive member vocabulary. An unknown kind fails
+/// closed at registration rather than being treated as either shape.
+pub const fn archive_member_kind_known(kind: u32) -> bool {
+    matches!(kind, ARCHIVE_MEMBER_IMAGE | ARCHIVE_MEMBER_DATA)
+}
+
 /// One archive member's index record: where its bytes live in the blob.
+///
+/// The magic stays [`ARCHIVE_MAGIC`] (`KIMGAR2`) across the introduction of
+/// [`kind`](Self::kind): the field occupies the former must-be-zero reserve,
+/// and zero is [`ARCHIVE_MEMBER_IMAGE`], so every committed v2 archive is
+/// already a valid archive of the extended format and the layout (88 bytes)
+/// is unchanged. A reader that predates the field refuses a data member
+/// (non-zero reserve) rather than mis-reading it, which is the fail-closed
+/// direction; a new magic would have bought nothing but a flag day.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
 pub struct ArchiveEntry {
-    /// The name `Acquire` presents.
+    /// The name `Acquire` (images) or `Export` (both kinds) presents.
     pub name: ImageName,
     /// Byte offset into the archive blob (page-aligned).
     pub offset: U64,
-    /// Byte length (the blob is page-rounded past this; the image's own
-    /// ELF parse bounds what's validated).
+    /// Byte length (the blob is page-rounded past this; an image's own
+    /// ELF parse bounds what's validated, a data member's length is its
+    /// exact exported length).
     pub len: U64,
-    /// Launch profile bits copied into the checked module descriptor.
+    /// Launch profile bits copied into the checked module descriptor. Zero
+    /// on a [`ARCHIVE_MEMBER_DATA`] member.
     pub profile: U32,
-    /// Reserved; must be zero.
-    pub reserved: U32,
+    /// [`ARCHIVE_MEMBER_IMAGE`] or [`ARCHIVE_MEMBER_DATA`] (formerly a
+    /// must-be-zero reserve; see the type docs for why the magic held).
+    pub kind: U32,
 }
 
 impl ArchiveEntry {
@@ -1034,6 +1145,16 @@ mod tests {
         let full = ImageName::new(max).unwrap();
         assert_eq!(full.len(), NAME_BYTES);
         assert_eq!(full.as_str(), Some(max));
+    }
+
+    /// The member-kind vocabulary is closed: image (the old zero reserve)
+    /// and data are known, the next value is not.
+    #[test]
+    fn archive_member_kind_vocabulary_is_closed() {
+        assert!(archive_member_kind_known(ARCHIVE_MEMBER_IMAGE));
+        assert!(archive_member_kind_known(ARCHIVE_MEMBER_DATA));
+        assert!(!archive_member_kind_known(ARCHIVE_MEMBER_DATA + 1));
+        assert!(!archive_member_kind_known(u32::MAX));
     }
 
     #[test]
@@ -1120,6 +1241,9 @@ mod tests {
         // filesystem auxiliaries do.
         assert!(profile_valid(PROFILE_SYSTEM_POWER));
         assert!(profile_valid(PROFILE_SYSTEM_POWER | PROFILE_TELEMETRY));
+        assert!(profile_valid(PROFILE_ACCELERATOR));
+        assert!(profile_valid(PROFILE_GPU));
+        assert!(profile_valid(PROFILE_ACCELERATOR | PROFILE_GPU));
         assert!(profile_valid(PROFILE_HEAP | PROFILE_INTERACTIVE));
         assert!(profile_valid(
             PROFILE_FILESYSTEM | PROFILE_HEAP | PROFILE_INTERACTIVE
@@ -1173,6 +1297,24 @@ mod tests {
             d.segs[0].access = seg::ACCESS_R | seg::ACCESS_X;
             assert!(d.validate(), "kind {k} must validate");
         }
+    }
+
+    /// The placement high water reads back as pages below the page, and a
+    /// page that never recorded one says so rather than answering an
+    /// address a placer would then land on.
+    #[test]
+    fn placed_high_water_reads_back_and_zero_means_unrecorded() {
+        let page_va = 0x5000_0000 + 0x0800_0000 - MODULE_PAGE_BYTES;
+        let mut page = ModulePage::new();
+        assert_eq!(page.placed_high_water(page_va), None);
+        page.record_placed(3);
+        assert_eq!(
+            page.placed_high_water(page_va),
+            Some(page_va - 3 * MODULE_PAGE_BYTES)
+        );
+        // A count that would reach below address zero refuses, not wraps.
+        page.record_placed(u16::MAX);
+        assert_eq!(page.placed_high_water(2 * MODULE_PAGE_BYTES), None);
     }
 
     #[test]

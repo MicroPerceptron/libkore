@@ -110,25 +110,49 @@ fn bring_up_pacer(deadline_ns: Option<u64>) -> BringUpPacer {
     }
 }
 const IO_QDEPTH: u16 = 32;
-/// Capability-backed DMA bytes requested from the block provisioner.
-const FS_DMA_POOL_BYTES: usize = 0x20_0000;
+/// Capability-backed DMA bytes requested from the block provisioner — a
+/// mirror of the block row's `DMA_POOL@1` (the founder's LARGE class), which
+/// is subleased whole; the request is an intent, not a size.
+const FS_DMA_POOL_BYTES: usize = 0x800_0000;
+/// The filesystem's OWN share of that pool: the queue/control graph plus the
+/// four cumulatively allocated buffers of a whole-disk -> region rebuild.
+/// Held at the ordinary 2 MiB class the row used to be founded with, so the
+/// page ceiling below does not move with the pool; everything above it is
+/// the controller's host memory buffer.
+const FS_IO_DMA_BYTES: usize = 0x20_0000;
 /// Largest controller page whose complete queue/control graph plus the four
 /// cumulatively allocated buffers of a whole-disk -> region rebuild fits the
-/// founded 2 MiB DMA pool. At 512 KiB, the four page-aligned queue starts
+/// filesystem's 2 MiB share. At 512 KiB, the four page-aligned queue starts
 /// consume so much padding that even the first filesystem buffer cannot be
 /// admitted.
-const MAX_FS_NVME_PAGE_BYTES: u64 = (FS_DMA_POOL_BYTES / 8) as u64;
+const MAX_FS_NVME_PAGE_BYTES: u64 = (FS_IO_DMA_BYTES / 8) as u64;
+/// Most host memory the controller is offered for its mapping tables
+/// (Identify HMPRE decides how much of it is taken; 0 there takes none).
+/// 64 MiB is what a DRAM-less PCIe 4 consumer part asks for and what Linux
+/// grants it by default; the pool leaves room for it beside the
+/// filesystem's own share.
+const FS_HMB_MAX_BYTES: u64 = 0x400_0000;
+const _: () = assert!(
+    FS_IO_DMA_BYTES as u64 + FS_HMB_MAX_BYTES <= FS_DMA_POOL_BYTES as u64,
+    "the filesystem's share and the host memory buffer must fit the founded pool"
+);
 
 const fn fs_nvme_page_supported(page: MemPage) -> bool {
     page.bytes() <= MAX_FS_NVME_PAGE_BYTES
 }
 
 /// Completion-wait budget for one route-parked block operation, in
-/// nanoseconds — the failure edge, not pacing (`kore-svc-swap-nvme`'s
-/// reasoning): a healthy device completes in microseconds, and on expiry
-/// the wait's final poll still catches an undelivered completion before
-/// the channel is declared lost.  Read fresh per wait from the
-/// founder-published clock page, so it needs no executor anchor.
+/// nanoseconds — one **round** of the wait, not the device timeout.  It is
+/// the interrupt-loss recovery cadence: on expiry the wait's final poll
+/// catches a completion whose interrupt never arrived, at a cost of one
+/// second rather than the whole stall ceiling.  A healthy controller that
+/// has simply not finished is granted further rounds by the provider
+/// (`provider::block::STALL_BUDGETS`, 30 s in all — Linux's I/O timeout),
+/// because a DRAM-less consumer drive under garbage collection is slow for
+/// seconds and was being refused, and the filesystem operation on top of it
+/// failed, on a budget written for a device that answers in microseconds.
+/// Read fresh per wait from the founder-published clock page, so it needs
+/// no executor anchor.
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 const OP_BUDGET_NS: u64 = 1_000_000_000;
 
@@ -241,6 +265,7 @@ impl DeviceBinding for NvmeFsBinding {
             1,
             IO_QDEPTH,
             vector,
+            FS_HMB_MAX_BYTES,
             &mut pacer,
             kore_driver::host::relax,
             BRING_UP_FALLBACK_POLLS,
@@ -354,6 +379,12 @@ impl DirectNvme {
     /// containment.  `None` if already torn down.
     fn teardown(&mut self) -> Option<kore_driver::host::BindingTeardown<BlockError>> {
         self.bound.take().map(BoundDevice::teardown)
+    }
+
+    /// Host memory the controller holds for its mapping tables, in bytes
+    /// (0 = none granted).
+    pub fn host_memory_buffer_bytes(&self) -> u64 {
+        self.backend().host_memory_buffer_bytes()
     }
 
     /// The completion wait's books: `(parks, fires, deadline waits, spin
@@ -633,6 +664,13 @@ impl MountedEngine {
         }
     }
 
+    fn establish_admin_share(&mut self) -> bool {
+        match self {
+            Self::Durable { fs, .. } => fs.establish_admin_share(),
+            Self::Volatile(fs) => fs.establish_admin_share(),
+        }
+    }
+
     fn establish_admin_pkgs(&mut self) -> bool {
         match self {
             Self::Durable { fs, .. } => fs.establish_admin_pkgs(),
@@ -693,6 +731,13 @@ impl MountedEngine {
         match self {
             Self::Durable { fs, .. } => fs.install_libs_view(session),
             Self::Volatile(fs) => fs.install_libs_view(session),
+        }
+    }
+
+    fn install_share_view(&mut self, session: SessionId) -> bool {
+        match self {
+            Self::Durable { fs, .. } => fs.install_share_view(session),
+            Self::Volatile(fs) => fs.install_share_view(session),
         }
     }
 
@@ -876,6 +921,9 @@ impl MountedFs {
                 if !system.establish_admin_pkgs() {
                     return Err(27);
                 }
+                if !system.establish_admin_share() {
+                    return Err(31);
+                }
             }
             None if !self.system_designated => {
                 if !self.user.establish_admin_source() {
@@ -889,6 +937,9 @@ impl MountedFs {
                 }
                 if !self.user.establish_admin_pkgs() {
                     return Err(27);
+                }
+                if !self.user.establish_admin_share() {
+                    return Err(31);
                 }
             }
             // A designated system extent exists but is unavailable. Publish
@@ -984,6 +1035,7 @@ impl MountedFs {
                 {
                     let _ = system.install_apps_view(SessionId::new(peer.slot() as u16));
                     let _ = system.install_libs_view(SessionId::new(peer.slot() as u16));
+                    let _ = system.install_share_view(SessionId::new(peer.slot() as u16));
                 }
                 router::tag_response(Store::User, response)
             }
@@ -1728,7 +1780,8 @@ impl DurableService {
                         shared.control(|device| {
                             let route = device.route_stats();
                             let health = device.health().ok();
-                            (route, physical, health)
+                            let hmb = device.host_memory_buffer_bytes();
+                            (route, physical, health, hmb)
                         })
                     })
                     .ok()
@@ -1740,7 +1793,8 @@ impl DurableService {
                     mut spin_waits,
                     mut monitor_sleeps,
                     mut monitor_turns,
-                ) = device.map(|(route, _, _)| route).unwrap_or_default();
+                ) = device.map(|(route, _, _, _)| route).unwrap_or_default();
+                let host_memory_buffer = device.is_some_and(|(_, _, _, hmb)| hmb != 0);
                 // These counters live on the one physical backend, not on a
                 // lane. Report them through exactly one engine before the two
                 // status records are folded, or every wait would double.
@@ -1753,7 +1807,7 @@ impl DurableService {
                     monitor_turns = 0;
                 }
                 let storage = match (device, occupied_blocks) {
-                    (Some((_, physical, health)), Some(occupied_blocks))
+                    (Some((_, physical, health, _)), Some(occupied_blocks))
                         if physical.block_size == volume.block_size =>
                     {
                         let block_bytes = u64::from(volume.block_size);
@@ -1804,6 +1858,7 @@ impl DurableService {
                         == crate::persistence::MountMode::DegradedReadOnly,
                     route_held,
                     channel_lost,
+                    host_memory_buffer,
                     note,
                     user_lifecycle: user_lifecycle.wire(),
                     system_lifecycle: system_lifecycle.wire(),
@@ -1862,6 +1917,7 @@ impl DurableService {
             request,
             FsRequest::Create { .. }
                 | FsRequest::WriteAt { .. }
+                | FsRequest::CommitReplace { .. }
                 | FsRequest::Append { .. }
                 | FsRequest::Resize { .. }
                 | FsRequest::Rename { .. }
@@ -2083,12 +2139,12 @@ fn open_workspace_channel(
 
     let kick = boot
         .handle(role::SVC_SEND, WORKSPACE_CLIENT_INDEX)
-        .ok_or(StartFailure::new(31))?;
+        .ok_or(StartFailure::new(32))?;
     let ring = boot
         .handle(role::SVC_RING, WORKSPACE_CLIENT_INDEX)
-        .ok_or(StartFailure::new(32))?;
-    let leased = kore_rt::cap::verbs::take_view(ring).ok_or(StartFailure::new(33))?;
-    let window = kore_rt::cap::verbs::map_view(leased).ok_or(StartFailure::new(34))?;
+        .ok_or(StartFailure::new(33))?;
+    let leased = kore_rt::cap::verbs::take_view(ring).ok_or(StartFailure::new(34))?;
+    let window = kore_rt::cap::verbs::map_view(leased).ok_or(StartFailure::new(35))?;
     // SAFETY: the founded leaf and its mapping remain held for the task's
     // lifetime, like the block client above. This is the only client-side
     // attacher for HostLink's importer pair; neither broker nor agents receive
@@ -2100,7 +2156,7 @@ fn open_workspace_channel(
         HostLinkWire::REQUEST_CAPACITY,
         HostLinkWire::RESPONSE_CAPACITY,
     )
-    .map_err(|_| StartFailure::new(35))?;
+    .map_err(|_| StartFailure::new(36))?;
     Ok(RingHostLink::new(
         transport,
         rings,
@@ -2128,9 +2184,8 @@ fn open_workspace_channel(
 /// user region, 24 durable-workspace publication, 25 application-store
 /// publication, 26 system-region channel construction, 27 the probe inside
 /// the system region, 28 system-lane containment or missing-era retirement,
-/// 29 archive-era root admission, and 30 bounded system reformat. Details
-/// 31–35 identify missing workspace kick/ring, invalid view, failed mapping,
-/// or malformed rings; 36 means the user mount was absent at attachment.
+/// 29 archive-era root admission, 30 bounded system reformat, and 31
+/// shared-data publication. Details 32–37 identify workspace attachment faults.
 /// Renumber nothing; append new details so a photographed metal failure
 /// remains decodable.
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
@@ -2160,7 +2215,7 @@ pub async fn run(rt: kore_rt::entry::Rt) -> ! {
         Err(failure) => refuse_with(&rt, failure.payload(RUNG_SERVICE_START)),
     };
     let Some(mounted) = service.fs.as_mut() else {
-        refuse_with(&rt, StartFailure::new(36).payload(RUNG_SERVICE_START));
+        refuse_with(&rt, StartFailure::new(37).payload(RUNG_SERVICE_START));
     };
     // A missing capability is a founding failure; a disconnected host is a
     // retryable source condition. Requests attach/refresh through this sole

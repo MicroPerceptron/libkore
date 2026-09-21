@@ -9,4 +9,3 @@ publish = false
 blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
 heapless = { version = "0.9.3", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
-

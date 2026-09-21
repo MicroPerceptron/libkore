@@ -30,8 +30,13 @@
 //! a `MODIFY` share off that lease refuses
 //! unconditionally — there is no mprotect-to-writable path to close.
 //!
-//! At startup the service registers every member of its endowed archive. The
-//! request-side `Register { name, slot }` server arm accepts an image lease
+//! At startup the service registers every member of its endowed archive. An
+//! archive member is either an ELF image or an opaque DATA member
+//! ([`ARCHIVE_MEMBER_DATA`](kore_abi::image::ARCHIVE_MEMBER_DATA)): a data
+//! member is bounds-checked only and registers a record holding nothing but
+//! its member window, so `Export` lends its bytes exactly as it lends an
+//! image's while `Acquire`/`Describe` refuse it
+//! [`NotImage`](ImageRefusal::NotImage). The request-side `Register { name, slot }` server arm accepts an image lease
 //! already delivered into the service arena (#148's no-capability-in-ring
 //! rule); both paths share the same checker, carve, and bounded ownership
 //! machinery.
@@ -552,6 +557,11 @@ struct ImageEntry {
     /// Retained so [`ImageRequest::Export`] can carve the same span again at
     /// read-only rights without re-deriving it from the plan.
     window: Option<(SlotRef, u64, u64, u64)>,
+    /// An archive DATA member ([`kore_abi::image::ARCHIVE_MEMBER_DATA`]): no
+    /// segments, no descriptor (it stays [`ModuleDescriptor::empty`]), only
+    /// the `window` above. The one bit that separates "lend these bytes"
+    /// from "launch this" — in this table, not beside it.
+    data: bool,
 }
 
 #[cfg(feature = "heap")]
@@ -586,6 +596,81 @@ impl ImageEntry {
                 .all(|(lease, _)| lease.is_live())
             && self.source.as_ref().is_none_or(ReturnedCapability::is_live)
     }
+
+    /// The record an archive DATA member registers: its name, stamp, and
+    /// member window over `subject` at `base` — nothing else. `None` when the
+    /// window is not page-shaped (unaligned base, empty, or a rounded end
+    /// that overflows); the archive walk has already bounded it against the
+    /// store.
+    fn data(name: ImageName, seq: u64, subject: SlotRef, base: u64, len: u64) -> Option<Self> {
+        let rounded = len.checked_next_multiple_of(PAGE_BYTES)?;
+        if len == 0 || base % PAGE_BYTES != 0 {
+            return None;
+        }
+        base.checked_add(rounded)?;
+        Some(Self {
+            name,
+            seq,
+            descriptor: ModuleDescriptor::empty(),
+            needed: [None; MAX_DEPENDENCIES],
+            leases: [const { None }; MAX_IMAGE_SEGS],
+            source: None,
+            source_metadata: None,
+            lifecycle: ImageLifecycle::Live,
+            window: Some((subject, base, rounded, len)),
+            data: true,
+        })
+    }
+
+    /// The `Acquire` data half: the descriptor and one `(lease slot, len)`
+    /// per segment. A data member refuses [`NotImage`](ImageRefusal::NotImage)
+    /// before anything else — it has no segments, and answering its empty
+    /// descriptor with zero grants would read as an acquirable empty image.
+    fn acquisition(
+        &self,
+    ) -> Result<(ModuleDescriptor, [Option<(SlotRef, u64)>; MAX_IMAGE_SEGS]), ImageRefusal> {
+        if self.data {
+            return Err(ImageRefusal::NotImage);
+        }
+        if !self.grantable() {
+            return Err(ImageRefusal::Denied);
+        }
+        let mut grants = [None; MAX_IMAGE_SEGS];
+        let mut count = 0usize;
+        for (lease, _) in self.leases.iter().flatten() {
+            let slot = lease.slot().ok_or(ImageRefusal::Denied)?;
+            let dst = grants.get_mut(count).ok_or(ImageRefusal::Denied)?;
+            *dst = Some((slot, lease.len()));
+            count += 1;
+        }
+        if count != self.descriptor.seg_count as usize {
+            return Err(ImageRefusal::Denied);
+        }
+        Ok((self.descriptor, grants))
+    }
+
+    /// The `Export` data half: `(subject, base, page-rounded span, exact
+    /// length)` of the member window — identical for an image and a data
+    /// member, which is the point: the seed copies bytes without caring
+    /// which it is. A generation whose window was not retained (a shape that
+    /// predates the record) exports nothing rather than guessing a span.
+    fn export_window(&self) -> Result<(SlotRef, u64, u64, u64), ImageRefusal> {
+        if !self.grantable() {
+            return Err(ImageRefusal::Denied);
+        }
+        self.window.ok_or(ImageRefusal::Denied)
+    }
+}
+
+/// One archive member's admission verdict — the whole-archive preflight's
+/// unit, run before any record or lease exists.
+#[cfg(feature = "heap")]
+enum MemberAdmission {
+    /// An ELF image the checker accepted; its plan sizes the slot budget.
+    Image(CheckedImage),
+    /// A data member: name, profile-zero, and page-shaped bounds checked;
+    /// no ELF check, no carve, no owned slot.
+    Data,
 }
 
 /// Retry at most one failed registration's bounded segment set per pass.
@@ -660,6 +745,9 @@ enum ImageStartFailure {
     ValidationGeometry = 11,
     FaceSupplyGeometry = 12,
     FaceWindowMap = 13,
+    /// An unknown [`ArchiveEntry::kind`](kore_abi::image::ArchiveEntry), or
+    /// a data member carrying a launch profile. Appended, never renumbered.
+    MemberKind = 14,
 }
 
 #[cfg(feature = "heap")]
@@ -1463,27 +1551,12 @@ impl ImageService {
         generation: ImageGeneration,
     ) -> Result<(ModuleDescriptor, [Option<(SlotRef, u64)>; MAX_IMAGE_SEGS]), ImageRefusal> {
         let slot = generation.slot;
-        let entry = self
-            .images
+        self.images
             .get(slot)
             .and_then(Option::as_ref)
             .filter(|entry| generation_matches(generation, slot, entry.seq))
-            .ok_or(ImageRefusal::Unknown)?;
-        if !entry.grantable() {
-            return Err(ImageRefusal::Denied);
-        }
-        let mut grants = [None; MAX_IMAGE_SEGS];
-        let mut count = 0usize;
-        for (lease, _) in entry.leases.iter().flatten() {
-            let slot = lease.slot().ok_or(ImageRefusal::Denied)?;
-            let dst = grants.get_mut(count).ok_or(ImageRefusal::Denied)?;
-            *dst = Some((slot, lease.len()));
-            count += 1;
-        }
-        if count != entry.descriptor.seg_count as usize {
-            return Err(ImageRefusal::Denied);
-        }
-        Ok((entry.descriptor, grants))
+            .ok_or(ImageRefusal::Unknown)?
+            .acquisition()
     }
 
     fn reply_acquisition(
@@ -1518,6 +1591,44 @@ impl ImageService {
         );
         let end = offset.checked_add(len)?;
         Some((entry.offset.get(), bytes.get(offset..end)?))
+    }
+
+    /// Admit one archive member without minting anything: bounds for every
+    /// kind, the ELF gate for images only. A data member must be
+    /// profile-zero and page-shaped inside the store (its `Export` lends the
+    /// page-rounded span, so the rounded end — the packer's padding — must
+    /// lie inside `bytes` too). Each failure has its own start rung.
+    fn admit_member(
+        bytes: &[u8],
+        entry: &kore_abi::image::ArchiveEntry,
+    ) -> Result<MemberAdmission, ImageStartFailure> {
+        use kore_abi::image::{ARCHIVE_MEMBER_DATA, ARCHIVE_MEMBER_IMAGE};
+        if entry.name.as_str().is_none() || !kore_abi::image::profile_valid(entry.profile.get()) {
+            return Err(ImageStartFailure::MemberName);
+        }
+        let (offset, window) =
+            Self::archive_member(bytes, entry).ok_or(ImageStartFailure::MemberBounds)?;
+        match entry.kind.get() {
+            ARCHIVE_MEMBER_IMAGE => Self::check(window)
+                .map(MemberAdmission::Image)
+                .map_err(|_| ImageStartFailure::MemberImage),
+            ARCHIVE_MEMBER_DATA => {
+                if entry.profile.get() != 0 {
+                    return Err(ImageStartFailure::MemberKind);
+                }
+                let rounded_end = (window.len() as u64)
+                    .checked_next_multiple_of(PAGE_BYTES)
+                    .and_then(|rounded| offset.checked_add(rounded));
+                let shaped = !window.is_empty()
+                    && offset % PAGE_BYTES == 0
+                    && rounded_end.is_some_and(|end| end <= bytes.len() as u64);
+                if !shaped {
+                    return Err(ImageStartFailure::MemberBounds);
+                }
+                Ok(MemberAdmission::Data)
+            }
+            _ => Err(ImageStartFailure::MemberKind),
+        }
     }
 
     /// Persistent arena names one checked image needs: one final lease per
@@ -1572,15 +1683,11 @@ impl ImageService {
         let mut required_slots = 0usize;
         let mut needs_exec_scratch = false;
         for entry in entries {
-            if entry.name.as_str().is_none()
-                || !kore_abi::image::profile_valid(entry.profile.get())
-                || entry.reserved.get() != 0
-            {
-                return Err(ImageStartFailure::MemberName);
-            }
-            let (_, window) =
-                Self::archive_member(bytes, entry).ok_or(ImageStartFailure::MemberBounds)?;
-            let checked = Self::check(window).map_err(|_| ImageStartFailure::MemberImage)?;
+            // A data member costs a record and nothing else: no carve, so
+            // no owned slot and no exec scratch.
+            let MemberAdmission::Image(checked) = Self::admit_member(bytes, entry)? else {
+                continue;
+            };
             let member_slots = Self::owned_slots(&checked).ok_or(ImageStartFailure::SlotBudget)?;
             required_slots = required_slots
                 .checked_add(member_slots)
@@ -1601,6 +1708,12 @@ impl ImageService {
         for entry in entries {
             let (offset, window) =
                 Self::archive_member(bytes, entry).ok_or(ImageStartFailure::MemberBounds)?;
+            if entry.kind.get() == kore_abi::image::ARCHIVE_MEMBER_DATA {
+                // Admitted above; the record is the window alone.
+                self.register_data(entry.name, offset, window.len() as u64)
+                    .map_err(|_| ImageStartFailure::RegisterCarve)?;
+                continue;
+            }
             if self
                 .register(
                     entry.name,
@@ -1616,6 +1729,32 @@ impl ImageService {
                 return Err(ImageStartFailure::RegisterCarve);
             }
         }
+        Ok(())
+    }
+
+    /// Record one admitted archive DATA member: its window over the store,
+    /// under a fresh shadowing stamp. No lease is minted — `Export` carves
+    /// its read-only grant straight off the store span, as for an image.
+    fn register_data(&mut self, name: ImageName, base: u64, len: u64) -> Result<(), ImageRefusal> {
+        if name.as_str().is_none() {
+            return Err(ImageRefusal::BadName);
+        }
+        self.ensure_image_slots(1)?;
+        let idx = self
+            .images
+            .iter()
+            .position(Option::is_none)
+            .ok_or(ImageRefusal::TableFull)?;
+        let next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(ImageRefusal::TableFull)?;
+        let entry = ImageEntry::data(name, self.next_seq, self.store.slot(), base, len)
+            .ok_or(ImageRefusal::BadImage)?;
+        let dst = self.images.get_mut(idx).ok_or(ImageRefusal::TableFull)?;
+        *dst = Some(entry);
+        self.next_seq = next_seq;
+        self.registered = self.registered.saturating_add(1);
         Ok(())
     }
 
@@ -1819,6 +1958,7 @@ impl ImageService {
                 source,
                 source_metadata,
                 lifecycle: ImageLifecycle::RegistrationRollback,
+                data: false,
             };
             self.images[idx] = Some(tombstone);
             self.next_seq = next_seq;
@@ -1837,6 +1977,7 @@ impl ImageService {
             source_metadata,
             lifecycle: ImageLifecycle::Live,
             window: Some((subject, base, rounded_len, bytes.len() as u64)),
+            data: false,
         };
         let Some(dst) = self.images.get_mut(idx) else {
             return Err(ImageRefusal::TableFull);
@@ -2249,6 +2390,11 @@ impl SystemService for ImageService {
                     .and_then(|i| self.images.get(i))
                     .and_then(Option::as_ref)
                 {
+                    // A data member has no descriptor to describe.
+                    Some(entry) if entry.data => {
+                        self.refused = self.refused.saturating_add(1);
+                        sv.reply(ImageResponse::Refused(ImageRefusal::NotImage));
+                    }
                     Some(entry) if entry.grantable() => {
                         sv.reply(ImageResponse::Described {
                             generation: entry.seq,
@@ -2276,31 +2422,21 @@ impl SystemService for ImageService {
                     sv.reply(ImageResponse::Refused(ImageRefusal::BadName));
                     return;
                 }
-                let window = match self
+                // Images and data members export alike: bytes are conveyed
+                // only from the exact extent the registration validated.
+                let window = self
                     .lookup(&name)
                     .and_then(|i| self.images.get(i))
                     .and_then(Option::as_ref)
-                {
-                    Some(entry) if entry.grantable() => entry.window,
-                    Some(_) => {
+                    .ok_or(ImageRefusal::Unknown)
+                    .and_then(ImageEntry::export_window);
+                let (subject, base, rounded, len) = match window {
+                    Ok(window) => window,
+                    Err(refusal) => {
                         self.refused = self.refused.saturating_add(1);
-                        sv.reply(ImageResponse::Refused(ImageRefusal::Denied));
+                        sv.reply(ImageResponse::Refused(refusal));
                         return;
                     }
-                    None => {
-                        self.refused = self.refused.saturating_add(1);
-                        sv.reply(ImageResponse::Refused(ImageRefusal::Unknown));
-                        return;
-                    }
-                };
-                // A generation whose window was not retained (a shape that
-                // predates this record) exports nothing rather than guessing
-                // a span: bytes are conveyed only from the exact extent the
-                // registration validated.
-                let Some((subject, base, rounded, len)) = window else {
-                    self.refused = self.refused.saturating_add(1);
-                    sv.reply(ImageResponse::Refused(ImageRefusal::Denied));
-                    return;
                 };
                 // The same span the segment carves came from, at read-only
                 // rights and with no executable blessing: `Export` conveys
@@ -2541,6 +2677,7 @@ mod tests {
             source_metadata: None,
             lifecycle,
             window: None,
+            data: false,
         }
     }
 
@@ -2709,9 +2846,23 @@ mod tests {
 
         let mut slots = 0usize;
         let mut profiled = 0usize;
+        let mut data = alloc::vec::Vec::new();
         for entry in entries {
-            assert_eq!(entry.reserved.get(), 0);
             let name = entry.name.as_str().expect("archive member name");
+            // Every member is admitted exactly as `register_archive` admits
+            // it; a data member is never handed to the ELF checker.
+            match ImageService::admit_member(bytes, entry).expect("admitted archive member") {
+                MemberAdmission::Image(checked) => {
+                    assert_eq!(entry.kind.get(), kore_abi::image::ARCHIVE_MEMBER_IMAGE);
+                    slots += ImageService::owned_slots(&checked).expect("bounded slot count");
+                }
+                MemberAdmission::Data => {
+                    assert_eq!(entry.kind.get(), kore_abi::image::ARCHIVE_MEMBER_DATA);
+                    assert_eq!(entry.profile.get(), 0);
+                    data.push(name);
+                    continue;
+                }
+            }
             if name == "status" {
                 assert_eq!(
                     entry.profile.get(),
@@ -2752,7 +2903,15 @@ mod tests {
                     kore_abi::image::PROFILE_FILESYSTEM | kore_abi::image::PROFILE_FS_GRANT_TARGET
                 );
                 profiled += 1;
-            } else if matches!(name, "boot:kore-terminal" | "aftershock" | "skylilt") {
+            } else if name == "aftershock" {
+                assert_eq!(
+                    entry.profile.get(),
+                    kore_abi::image::PROFILE_HEAP
+                        | kore_abi::image::PROFILE_CHANNELS
+                        | kore_abi::image::PROFILE_ACCELERATOR
+                );
+                profiled += 1;
+            } else if matches!(name, "boot:kore-terminal" | "skylilt") {
                 assert_eq!(
                     entry.profile.get(),
                     kore_abi::image::PROFILE_HEAP | kore_abi::image::PROFILE_CHANNELS
@@ -2760,13 +2919,17 @@ mod tests {
                 profiled += 1;
             } else if name == "lua" {
                 // `channels`: the VM's worker thread parks on a doorbell
-                // minted off CHANNEL_SPACE (`res/DAGFS.md` §4).
+                // minted off CHANNEL_SPACE (`res/DAGFS.md` §4). `gpu`: the
+                // REPL's `accel` library drives the GPU row's private face,
+                // conveyed best-effort at launch (vacant where the Xe row is
+                // parked).
                 assert_eq!(
                     entry.profile.get(),
                     kore_abi::image::PROFILE_FILESYSTEM
                         | kore_abi::image::PROFILE_HEAP
                         | kore_abi::image::PROFILE_INTERACTIVE
                         | kore_abi::image::PROFILE_CHANNELS
+                        | kore_abi::image::PROFILE_GPU
                 );
                 profiled += 1;
             } else if name == "editor" {
@@ -2796,12 +2959,33 @@ mod tests {
             ) {
                 assert_eq!(entry.profile.get(), kore_abi::image::PROFILE_FILESYSTEM);
                 profiled += 1;
+            } else if name == "wasm-witness" {
+                // `engine`: the founder lays the ENGINE plan (a 128 KiB link
+                // window, a 16 MiB heap) so the native AOT guest's mappings
+                // fit beside the stub (`res/WASM_PLATFORM.md` §4).
+                assert_eq!(
+                    entry.profile.get(),
+                    kore_abi::image::PROFILE_HEAP
+                        | kore_abi::image::PROFILE_ENGINE
+                        | kore_abi::image::PROFILE_INTERACTIVE
+                );
+                profiled += 1;
+            } else if name == "wasm" {
+                // The witness's engine plan, plus what a program the caller
+                // names needs: the filesystem it is read from (and the guest
+                // sees), and the GPU face `kore:accel` hands the guest.
+                assert_eq!(
+                    entry.profile.get(),
+                    kore_abi::image::PROFILE_FILESYSTEM
+                        | kore_abi::image::PROFILE_HEAP
+                        | kore_abi::image::PROFILE_ENGINE
+                        | kore_abi::image::PROFILE_INTERACTIVE
+                        | kore_abi::image::PROFILE_GPU
+                );
+                profiled += 1;
             } else {
                 assert_eq!(entry.profile.get(), 0, "unexpected profile on {name}");
             }
-            let (_, member) = ImageService::archive_member(bytes, entry).expect("archive member");
-            let checked = ImageService::check(member).expect("checked archive image");
-            slots += ImageService::owned_slots(&checked).expect("bounded slot count");
         }
 
         // 42: the prior 36-member archive plus the standalone window-control
@@ -2813,20 +2997,157 @@ mod tests {
         // the recipe, but only under make.
         // 43: plus `lua_demo.so`, the first native Lua module — a library
         // member seeded into `lib/`, never launched.
-        // 44: plus the dedicated native agent runner.
-        assert_eq!(entries.len(), 44);
-        // 172: one persistent final lease per admitted carve. Like the other
-        // heapless ET_DYN applications, `power-ui`, `editor`, `append` and
-        // `sync` each contribute four immutable PT_LOAD carves; `lua_demo.so`
-        // three (rodata, text, one RW union — a module this small has no
-        // separate RELRO segment).
-        // The agent runner contributes four more immutable PT_LOAD carves.
-        assert_eq!(slots, 176);
+        // 44: plus `wasm-witness`, the native AOT WebAssembly witness
+        // (`res/WASM_PLATFORM.md`).
+        // 45: plus `wasm`, the command that runs a WebAssembly program the
+        // caller names (`user/apps/utils/wasm`).
+        // 47: plus the first two DATA members, the stock `wasm32-wasip2`
+        // programs `user/wasm` builds (seeded to `shared/wasm/`).
+        assert_eq!(entries.len(), 48);
+        assert_eq!(data, ["hello.wasm", "echo.wasm"]);
+        // 178: one persistent final lease per admitted carve (data members
+        // carve nothing, so they leave this pin alone). `lua_demo.so`
+        // now contributes four PT_LOAD carves: rodata, text, the relocated
+        // initializer/GOT RELRO page, and writable constructor state. The
+        // state must remain writable after the initializer page is sealed.
+        // `wasm-witness` carries five: the usual four plus a `KIND_TLS`
+        // carve — the platform leaf keeps its mapping table and wasmtime's
+        // TLS slots `#[thread_local]` (`res/WASM_PLATFORM.md` §5), the first
+        // archive member to do so.  `wasm` carries the same five, for the
+        // same reasons: it links the same engine.
+        assert_eq!(slots, 187);
+        // The resident agent runner adds one entry and four PT_LOAD carves.
         // 27: `window` carries its authenticated controller-broker selector,
-        // `pwctl` the power face, `power-ui` a window, `editor` its filesystem,
-        // heap, and channel-space selector as one authenticated profile, and
-        // `append` and `sync` the filesystem profile like every other verb.
-        assert_eq!(profiled, 27);
+        // `pwctl` the power face, `power-ui` a window, `aftershock` a window
+        // plus its accelerator face, `editor` its filesystem, heap, and
+        // channel-space selector as one authenticated profile, and `append`
+        // and `sync` the filesystem profile like every other verb;
+        // `wasm-witness` carries heap and the engine plan, and `wasm` those
+        // plus the filesystem it reads a program from and the GPU face it
+        // hands that program: 29.
+        assert_eq!(profiled, 29);
+    }
+
+    /// A synthetic one-member archive: `payload` at the first page past the
+    /// index, padded to a page, described by one entry of `kind`/`profile`.
+    fn one_member_archive(
+        name: &str,
+        payload: &[u8],
+        kind: u32,
+        profile: u32,
+    ) -> alloc::vec::Vec<u8> {
+        use zerocopy::IntoBytes as _;
+        let page = PAGE_BYTES as usize;
+        let offset = (ArchiveHeader::WIRE + ArchiveEntry::WIRE).next_multiple_of(page);
+        let header = ArchiveHeader {
+            magic: kore_abi::image::ARCHIVE_MAGIC,
+            count: 1.into(),
+            reserved: 0.into(),
+        };
+        let entry = ArchiveEntry {
+            name: ImageName::new(name).expect("fixture name"),
+            offset: (offset as u64).into(),
+            len: (payload.len() as u64).into(),
+            profile: profile.into(),
+            kind: kind.into(),
+        };
+        let mut bytes = alloc::vec::Vec::new();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(entry.as_bytes());
+        bytes.resize(offset, 0);
+        bytes.extend_from_slice(payload);
+        bytes.resize((offset + payload.len()).next_multiple_of(page), 0);
+        bytes
+    }
+
+    fn first_entry(bytes: &[u8]) -> &ArchiveEntry {
+        let index = bytes.get(ArchiveHeader::WIRE..).expect("archive index");
+        let (entries, _) =
+            <[ArchiveEntry]>::try_ref_from_prefix_with_elems(index, 1).expect("one entry");
+        &entries[0]
+    }
+
+    /// A DATA member registers on name and bounds alone: bytes the ELF
+    /// checker refuses outright (a `wasm` magic) are admitted as data, and
+    /// the very same bytes marked as an image are refused as one.
+    #[test]
+    fn data_member_registers_without_the_elf_check() {
+        use kore_abi::image::{ARCHIVE_MEMBER_DATA, ARCHIVE_MEMBER_IMAGE};
+        let wasm = b"\0asm\x01\0\0\0 a stock wasm32-wasip2 program";
+        assert!(ImageService::check(wasm).is_err(), "not an ELF image");
+
+        let archive = one_member_archive("hello.wasm", wasm, ARCHIVE_MEMBER_DATA, 0);
+        assert!(matches!(
+            ImageService::admit_member(&archive, first_entry(&archive)),
+            Ok(MemberAdmission::Data)
+        ));
+
+        let as_image = one_member_archive("hello.wasm", wasm, ARCHIVE_MEMBER_IMAGE, 0);
+        assert_eq!(
+            ImageService::admit_member(&as_image, first_entry(&as_image)).err(),
+            Some(ImageStartFailure::MemberImage)
+        );
+
+        // A launch profile on something that cannot launch is a packing
+        // error; an unknown kind fails closed rather than picking a shape.
+        let profiled = one_member_archive(
+            "hello.wasm",
+            wasm,
+            ARCHIVE_MEMBER_DATA,
+            kore_abi::image::PROFILE_HEAP,
+        );
+        assert_eq!(
+            ImageService::admit_member(&profiled, first_entry(&profiled)).err(),
+            Some(ImageStartFailure::MemberKind)
+        );
+        let unknown = one_member_archive("hello.wasm", wasm, ARCHIVE_MEMBER_DATA + 1, 0);
+        assert_eq!(
+            ImageService::admit_member(&unknown, first_entry(&unknown)).err(),
+            Some(ImageStartFailure::MemberKind)
+        );
+
+        // Bounds: an empty member, or a page-rounded span past the store,
+        // refuses.
+        let empty = one_member_archive("empty.wasm", b"", ARCHIVE_MEMBER_DATA, 0);
+        assert_eq!(
+            ImageService::admit_member(&empty, first_entry(&empty)).err(),
+            Some(ImageStartFailure::MemberBounds)
+        );
+        let truncated = &archive[..archive.len() - 1];
+        assert_eq!(
+            ImageService::admit_member(truncated, first_entry(truncated)).err(),
+            Some(ImageStartFailure::MemberBounds)
+        );
+    }
+
+    /// `Acquire` of a data member refuses `NotImage` — never an empty image
+    /// with zero grants — while `Export` serves its exact member window.
+    #[test]
+    fn data_member_refuses_acquire_and_exports_its_window() {
+        let store = SlotRef::from_wire(7);
+        let base = 3 * PAGE_BYTES;
+        let len = PAGE_BYTES + 5;
+        let name = ImageName::new("echo.wasm").unwrap();
+        let entry = ImageEntry::data(name, 4, store, base, len).expect("page-shaped window");
+
+        assert!(entry.grantable(), "nothing retiring, no lease to die");
+        assert_eq!(entry.acquisition().err(), Some(ImageRefusal::NotImage));
+        assert_eq!(
+            entry.export_window(),
+            Ok((store, base, 2 * PAGE_BYTES, len)),
+            "the page-rounded span, and the exact registered length"
+        );
+
+        // A retiring data record neither exports nor acquires.
+        let mut retiring = ImageEntry::data(name, 5, store, base, len).unwrap();
+        assert!(retiring.try_retire(), "no lease to refuse the teardown");
+        assert_eq!(retiring.export_window(), Err(ImageRefusal::Denied));
+        assert_eq!(retiring.acquisition().err(), Some(ImageRefusal::NotImage));
+
+        // The record admits only page-shaped windows.
+        assert!(ImageEntry::data(name, 6, store, base + 1, len).is_none());
+        assert!(ImageEntry::data(name, 6, store, base, 0).is_none());
+        assert!(ImageEntry::data(name, 6, store, u64::MAX & !(PAGE_BYTES - 1), len).is_none());
     }
 
     #[test]

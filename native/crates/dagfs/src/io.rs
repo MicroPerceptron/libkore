@@ -197,18 +197,61 @@ impl<'w, 't> Fs<'w, 't> {
         result
     }
 
-    /// Replace `file`'s contents with `bytes`: written chunk by chunk from
-    /// offset zero, then resized to exactly `bytes.len()`. Unconditional
-    /// (`ANY_REVISION`): the caller holds the route, and a concurrent writer
-    /// is the service's `Conflict` to report, not this client's to guess.
+    /// Atomically replace an existing file's contents. Private chunks become
+    /// visible together only if the revision captured at begin is unchanged.
+    /// A lost commit reply is ambiguous; do not retry publication blindly.
     pub async fn write_bytes(&mut self, file: &View, bytes: &[u8]) -> Result<(), Refusal> {
+        let handle = file.handle();
+        match self
+            .checked(&FsRequest::BeginReplace {
+                handle,
+                length: bytes.len() as u64,
+                expected: ANY_REVISION,
+            })
+            .await?
+        {
+            FsResponse::Done => {}
+            _ => return Err(Refusal::Pair),
+        }
+        let result = self.write_replacement_chunks(handle, bytes).await;
+        if result.is_err() && self.client.is_idle() {
+            // Never touch the window or issue cleanup past an outstanding
+            // request. Peer teardown owns cleanup after a transport failure.
+            let _ = self.checked(&FsRequest::AbortReplace { handle }).await;
+        }
+        result
+    }
+
+    async fn write_replacement_chunks(
+        &mut self,
+        handle: crate::Handle,
+        bytes: &[u8],
+    ) -> Result<(), Refusal> {
         let mut offset = 0usize;
         while offset < bytes.len() {
-            let count = self.write_at(file, offset as u64, &bytes[offset..]).await?;
+            let count = transfer_len(offset as u64, bytes.len() - offset, self.chunk())?;
+            if !self.client.is_idle() {
+                return Err(Refusal::Pair);
+            }
+            self.window[..count].copy_from_slice(&bytes[offset..offset + count]);
+            match self
+                .checked(&FsRequest::WriteReplacement {
+                    handle,
+                    offset: offset as u64,
+                    window_offset: 0,
+                    length: count as u32,
+                })
+                .await?
+            {
+                FsResponse::Done => {}
+                _ => return Err(Refusal::Pair),
+            }
             offset += count;
         }
-        self.resize(file, bytes.len() as u64).await?;
-        Ok(())
+        match self.checked(&FsRequest::CommitReplace { handle }).await? {
+            FsResponse::Committed { .. } => Ok(()),
+            _ => Err(Refusal::Pair),
+        }
     }
 
     /// Append `bytes` to `file` in one bounded transfer; yields the offset
@@ -241,10 +284,36 @@ impl<'w, 't> Fs<'w, 't> {
         }
     }
 
+    /// Hold this session's durable commits (`true`) or release them
+    /// (`false`, which commits everything held at once).
+    ///
+    /// The durable service commits the whole session-zero tree — a full
+    /// image encode, a metadata write and a device flush — after **every**
+    /// mutating request from a session that is not holding. A multi-request
+    /// transaction therefore pays one flush per request unless it says
+    /// otherwise, and a save of a few chunks was paying five to eight of
+    /// them, serialized on the service's loop behind everyone else's. The
+    /// hold is per session: it never delays another client's commits, and
+    /// the service drops it when this peer dies, so a held transaction can
+    /// never outlive its author.
+    pub async fn hold_commits(&mut self, hold: bool) -> Result<(), Refusal> {
+        self.checked(&FsRequest::DeferCommits { hold }).await?;
+        Ok(())
+    }
+
     /// Replace a complete text file, creating its final edge when absent
-    /// — the editor's save. Streams `bytes` through the bounded window,
-    /// truncates the old tail, then publishes the same plain-text index
+    /// — the editor's save. Stages `bytes` through the bounded window and atomically replaces
+    /// the complete contents, then publishes the same plain-text index
     /// batch the `write` verb does; every view is closed on both paths.
+    ///
+    /// One transaction, one commit: the chunk writes, the truncating resize
+    /// and the index batch are held and published by the single release at
+    /// the end. Before this each of them was a whole-tree commit with its
+    /// own flush, which is what made "close the editor right after saving"
+    /// a race the shell's close grace could lose. The release runs on the
+    /// error path too: mutations already applied to the live engine cannot
+    /// be rolled back, so leaving them uncommitted would only defer their
+    /// publication to the next client's commit rather than prevent it.
     #[cfg(feature = "index")]
     pub async fn replace_file(
         &mut self,
@@ -266,13 +335,26 @@ impl<'w, 't> Fs<'w, 't> {
             }
             Err(error) => return Err(error),
         };
+        // A refused hold is not a failed save: the writes below still
+        // commit, one request at a time, exactly as they did before.
+        let held = self.hold_commits(true).await.is_ok();
         let written = self.write_bytes(&file, bytes).await;
         let outcome = match written {
             Ok(()) => crate::index::classify(crate::index::publish(self, &file, Some(bytes)).await),
             Err(error) => Err(error),
         };
+        let released = if held {
+            self.hold_commits(false).await
+        } else {
+            Ok(())
+        };
         self.close(file).await;
-        outcome.map(|indexed| match indexed {
+        let indexed = outcome?;
+        // The release IS the commit. A save whose bytes landed but whose
+        // commit was refused is not saved; say so rather than report the
+        // index verdict of an unpublished tree.
+        released?;
+        Ok(match indexed {
             crate::index::Indexed::Published => SaveOutcome::Indexed,
             crate::index::Indexed::Incomplete => SaveOutcome::IndexIncomplete,
         })

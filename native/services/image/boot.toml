@@ -21,5 +21,5 @@ endows    = ["IMAGE_STORE@0", "X_MINT@0", "FACE_SUPPLY@0", "CHANNEL_SPACE@0"]
 # linker uses a per-child dynamically minted face.  The first shell owns no
 # image face, so this row is not a `shell_client`.
 shell_client = false
-digest_x86_64  = "blake3:7c554349ee675a4a29a037f0e8788bf79c82c4d2e660ea6c7701b0cdb41383df"  # res/x86_64/; make boot-digests-x86
-digest_aarch64 = "blake3:f44a67391055ef9f40c7d8b4f90d59c3df7fdb4cf868b45341e2972d83323a2d"  # res/aarch64/; make boot-digests-aarch64
+digest_x86_64  = "blake3:ad0d55ada128f7faaf2c005e74fdf7feced0ab1a20bd6d129d2beddd14cb9cf1"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:e1edc10f99971db21d10b1f0bfad883d39eddcbd3eb53c1e708eea68fd3d6d85"  # res/aarch64/; make boot-digests-aarch64

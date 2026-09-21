@@ -87,6 +87,8 @@ pub enum CheckError {
     /// A load segment fits no carve class (e.g. `W|X`), or classes
     /// repeat where they must not.
     Segment,
+    /// RELRO is not an exact page range inside the private data union.
+    Relro,
     /// The dynamic section promises a range the segments don't contain.
     Range,
 }
@@ -540,6 +542,20 @@ fn carve(
     // includes data-union contiguity and pairwise mapping disjointness.
     if !d.validate() {
         return Err(CheckError::Segment);
+    }
+
+    // Shared startup/late admission: sealing may remove write permission only
+    // from complete pages in this module's validated private data union.
+    if let Some((off, len)) = relro {
+        let (start, size) = crate::apply::data_bounds(&d)
+            .map_err(|_| CheckError::Relro)?
+            .ok_or(CheckError::Relro)?;
+        let end = off.checked_add(len).ok_or(CheckError::Relro)?;
+        let data_end = start.checked_add(size).ok_or(CheckError::Relro)?;
+        if len == 0 || off % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || off < start || end > data_end
+        {
+            return Err(CheckError::Relro);
+        }
     }
 
     Ok(CheckedImage {

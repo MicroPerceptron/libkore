@@ -15,8 +15,7 @@ use kore_driver::block::DirectBlockDevice;
 use crate::{
     Engine, FsError, Name, ObjectKind, ObjectSubtype, ProviderError, SessionId, StableObjectId,
     bounds::{
-        MAX_BLOCK_PLACEMENTS, MAX_DERIVED_RESULTS, MAX_DIR_ENTRIES, MAX_DURABLE_DIRECTORIES,
-        MAX_NAME_LEN,
+        MAX_BLOCK_PLACEMENTS, MAX_DERIVED_RESULTS, MAX_DIR_ENTRIES, MAX_DIRECTORIES, MAX_NAME_LEN,
         MAX_OBJECTS,
     },
     namespace::Namespace,
@@ -79,7 +78,55 @@ const LEGACY_MAX_DURABLE_OBJECTS: usize = 64;
 const LEGACY_MAX_DURABLE_EDGES: usize = 128;
 const LEGACY_MAX_DIR_ENTRIES: usize = 32;
 pub const MAX_DURABLE_OBJECTS: usize = MAX_OBJECTS;
-pub const MAX_DURABLE_EDGES: usize = MAX_DURABLE_DIRECTORIES * MAX_DIR_ENTRIES;
+
+/// Containment edges one image may record.
+///
+/// **Deliberately not `MAX_DIRECTORIES * MAX_DIR_ENTRIES`.** That product is
+/// the shape a namespace *could* take if every directory filled; it is not
+/// the shape one takes. A desktop tree measured for
+/// `res/FILESYSTEM_SCALE.md` carries about **1.05 edges per object**, because
+/// a namespace is a tree with a few extra links, while the product reserved
+/// sixteen per object and so spent 87% of the image on adjacency that does
+/// not exist. Paying that ratio is what held the object bound at 136.
+///
+/// The engine's *structural* maximum is still the product, which is larger
+/// than this. A tree that exceeds this cap is refused at commit with
+/// [`PersistenceError::Bounds`] rather than at `link`, because the engine
+/// keeps no global edge total and adding one would put a counter on every
+/// mutation. That is a real gap, and it is bounded on both sides: reaching it
+/// needs twice as many edges as the object bound allows objects, against a
+/// measured ratio near one. Closing it properly wants either a global
+/// admission check or variable-length edge records, which is the same change
+/// that lets `MAX_NAME_LEN` leave 32.
+///
+/// Chosen so an existing volume keeps mounting: `MAX_DIR_ENTRIES` and the
+/// slot size are untouched, and the **reader** admits everything a current
+/// image could record before this decoupling
+/// ([`PRE_DECOUPLING_MAX_DURABLE_EDGES`]), so nothing that was recordable
+/// becomes unreadable and no reformat is implied. This constant is the
+/// **writer's** ceiling only. A pre-decoupling volume carrying more edges
+/// than this — reachable only through hard links, at more than seven per
+/// object — mounts and reads whole; its next commit refuses
+/// [`PersistenceError::Bounds`] until links drop below the ceiling, which is
+/// the same typed refusal any over-bound tree receives.
+pub const MAX_DURABLE_EDGES: usize = 1024;
+
+/// Containment edges a current-profile image written **before**
+/// [`MAX_DURABLE_EDGES`] was decoupled may record: the `16 × 128`
+/// directory × entry product the profile reserved when it was introduced.
+/// Reading validates against this rather than the writer's ceiling, so a
+/// volume that mounted under the old bound still mounts. A count in
+/// `MAX_DURABLE_EDGES + 1 ..= PRE_DECOUPLING_MAX_DURABLE_EDGES` therefore
+/// identifies an old writer, and a count above it is corruption.
+///
+/// A literal because neither factor is a live constant any more:
+/// `MAX_DIRECTORIES` has since moved to 64, and the product was never a
+/// bound this format should have carried (`res/FILESYSTEM_SCALE.md` §4.1).
+const PRE_DECOUPLING_MAX_DURABLE_EDGES: usize = 2048;
+
+// A reader must admit at least what the writer emits, or a freshly committed
+// image would refuse to recover.
+const _: () = assert!(PRE_DECOUPLING_MAX_DURABLE_EDGES >= MAX_DURABLE_EDGES);
 
 // The serialized maxima are one contract: raising any constituent without
 // raising the reservation must fail at compile time, not as a late commit.
@@ -164,10 +211,22 @@ fn root_profile(
     }
 }
 
+/// The writer's `(objects, edges)` ceilings for `profile`.
 fn durable_bounds(profile: ImageProfile) -> (usize, usize) {
     match profile {
         ImageProfile::Legacy => (LEGACY_MAX_DURABLE_OBJECTS, LEGACY_MAX_DURABLE_EDGES),
         ImageProfile::Current => (MAX_DURABLE_OBJECTS, MAX_DURABLE_EDGES),
+    }
+}
+
+/// Containment edges a reader admits from an image of `profile`: the
+/// writer's ceiling plus everything an older writer of the same profile could
+/// lawfully have recorded. The legacy profile never moved, so its two
+/// figures coincide.
+const fn readable_durable_edges(profile: ImageProfile) -> usize {
+    match profile {
+        ImageProfile::Legacy => LEGACY_MAX_DURABLE_EDGES,
+        ImageProfile::Current => PRE_DECOUPLING_MAX_DURABLE_EDGES,
     }
 }
 
@@ -302,13 +361,26 @@ struct DiskDerived {
     digest: [u8; 32],
 }
 
+/// One root's decoded metadata image.
+///
+/// The three tables are heap-backed and reserved to the **counts this image
+/// actually records**, not to the profile's worst case. Inline they came to
+/// 132,168 bytes — the edge table alone was 114,696 — and `Decoded` is built
+/// on the mount path, which runs inside the service's `serve` future on the
+/// founder's shared 4 MiB stack. That is the same coupling the namespace
+/// arenas had, and recovery decodes each of the two roots in turn.
+///
+/// Reserving the recorded counts rather than the bounds also means a small
+/// volume pays for a small volume: the profile maxima are already validated
+/// against [`durable_bounds`] before a single record is read, so the
+/// reservation cannot be driven past them by disk bytes.
 struct Decoded {
     generation: u64,
     era: [u8; ERA_BYTES],
     root: StableObjectId,
-    objects: heapless::Vec<DiskObject, MAX_DURABLE_OBJECTS>,
-    edges: heapless::Vec<DiskEdge, MAX_DURABLE_EDGES>,
-    derived: heapless::Vec<DiskDerived, MAX_DERIVED_RESULTS>,
+    objects: Vec<DiskObject>,
+    edges: Vec<DiskEdge>,
+    derived: Vec<DiskDerived>,
 }
 
 /// The one canonical order of a decoded root's payload extents: each object
@@ -695,13 +767,27 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> PersistentFs<D, B, O>
             } else {
                 None
             };
-            let mut live_extents = heapless::Vec::<DurableExtent, MAX_BLOCK_PLACEMENTS>::new();
+            // Arena-backed like the decoded image above: these are sized by
+            // the placement and derived bounds, and mount runs inside the
+            // service's `serve` future on the founder's shared stack.
+            let alloc = crate::service_alloc();
+            let mut live_extents =
+                crate::slot::BoundedVec::<DurableExtent, crate::ServiceAlloc>::try_new_in(
+                    MAX_BLOCK_PLACEMENTS,
+                    alloc,
+                )
+                .map_err(|_| PersistenceError::Bounds)?;
             for extent in root_payload_extents(&decoded) {
                 live_extents
                     .push(extent)
                     .map_err(|_| PersistenceError::Bounds)?;
             }
-            let mut fallback_extents = heapless::Vec::<DurableExtent, MAX_BLOCK_PLACEMENTS>::new();
+            let mut fallback_extents =
+                crate::slot::BoundedVec::<DurableExtent, crate::ServiceAlloc>::try_new_in(
+                    MAX_BLOCK_PLACEMENTS,
+                    alloc,
+                )
+                .map_err(|_| PersistenceError::Bounds)?;
             if let Some(older) = older.as_ref() {
                 for extent in root_payload_extents(older) {
                     fallback_extents
@@ -729,8 +815,11 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> PersistentFs<D, B, O>
                     storage,
                 )?;
             }
-            let mut recovered_derived =
-                heapless::Vec::<(DiskDerived, BlockKey), MAX_DERIVED_RESULTS>::new();
+            let mut recovered_derived = crate::slot::BoundedVec::<
+                (DiskDerived, BlockKey),
+                crate::ServiceAlloc,
+            >::try_new_in(MAX_DERIVED_RESULTS, alloc)
+            .map_err(|_| PersistenceError::Bounds)?;
             for record in decoded.derived.iter().copied() {
                 let key = recovered.next().ok_or(PersistenceError::Corrupt)?;
                 recovered_derived
@@ -1063,7 +1152,7 @@ fn encode_image<D: DirectBlockDevice, const B: usize, const O: usize>(
     let (max_objects, max_edges) = durable_bounds(profile);
     let graph = engine
         .namespace()
-        .durable_graph::<MAX_DURABLE_EDGES>(root_id)?;
+        .durable_graph(root_id, MAX_DURABLE_EDGES)?;
     if graph.objects.len() > max_objects || graph.edges.len() > max_edges {
         return Err(PersistenceError::Bounds);
     }
@@ -1321,7 +1410,12 @@ fn decode_image(
         0
     };
     let profile = root_profile(root.version, root.data_start, block_size)?;
-    let (max_objects, max_edges) = durable_bounds(profile);
+    let (max_objects, _) = durable_bounds(profile);
+    // Edges are read against what any writer of this profile could have
+    // recorded, not the current writer's ceiling: see
+    // `PRE_DECOUPLING_MAX_DURABLE_EDGES`. The byte total is still pinned by
+    // the exact-length check below, and the image itself by its slot.
+    let max_edges = readable_durable_edges(profile);
     if object_count == 0
         || object_count > max_objects
         || edge_count > max_edges
@@ -1341,7 +1435,12 @@ fn decode_image(
     if required != image.len() {
         return Err(PersistenceError::Corrupt);
     }
-    let mut objects = heapless::Vec::new();
+    // Counts are bounds-checked above, so these reservations are bounded by
+    // the profile and fail closed rather than growing during the fill.
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(object_count)
+        .map_err(|_| PersistenceError::Bounds)?;
     let mut at = IMAGE_HEADER;
     for _ in 0..object_count {
         if CRC.checksum(&image[at..at + 44]) != get_u32(image, at + 44)? {
@@ -1418,22 +1517,23 @@ fn decode_image(
                 return Err(PersistenceError::Corrupt);
             }
         }
-        objects
-            .push(DiskObject {
-                stable,
-                kind,
-                subtype,
-                len,
-                revision,
-                extent,
-            })
-            .map_err(|_| PersistenceError::Bounds)?;
+        objects.push(DiskObject {
+            stable,
+            kind,
+            subtype,
+            len,
+            revision,
+            extent,
+        });
         at += OBJECT_BYTES;
     }
-    if objects.iter().filter(|object| object.kind.is_dir()).count() > MAX_DURABLE_DIRECTORIES {
+    if objects.iter().filter(|object| object.kind.is_dir()).count() > MAX_DIRECTORIES {
         return Err(PersistenceError::Bounds);
     }
-    let mut edges = heapless::Vec::new();
+    let mut edges = Vec::new();
+    edges
+        .try_reserve_exact(edge_count)
+        .map_err(|_| PersistenceError::Bounds)?;
     for _ in 0..edge_count {
         if CRC.checksum(&image[at..at + 52]) != get_u32(image, at + 52)? {
             return Err(PersistenceError::Corrupt);
@@ -1461,13 +1561,11 @@ fn decode_image(
         {
             return Err(PersistenceError::Corrupt);
         }
-        edges
-            .push(DiskEdge {
-                parent,
-                child,
-                name,
-            })
-            .map_err(|_| PersistenceError::Bounds)?;
+        edges.push(DiskEdge {
+            parent,
+            child,
+            name,
+        });
         at += EDGE_BYTES;
     }
     let max_dir_entries = durable_dir_entries(profile);
@@ -1481,7 +1579,10 @@ fn decode_image(
     }) {
         return Err(PersistenceError::Bounds);
     }
-    let mut derived = heapless::Vec::new();
+    let mut derived = Vec::new();
+    derived
+        .try_reserve_exact(derived_count)
+        .map_err(|_| PersistenceError::Bounds)?;
     for _ in 0..derived_count {
         if CRC.checksum(&image[at..at + 64]) != get_u32(image, at + 64)?
             || image[at + 68..at + DERIVED_BYTES]
@@ -1535,14 +1636,12 @@ fn decode_image(
         {
             return Err(PersistenceError::Corrupt);
         }
-        derived
-            .push(DiskDerived {
-                object,
-                input_version,
-                extent,
-                digest,
-            })
-            .map_err(|_| PersistenceError::Bounds)?;
+        derived.push(DiskDerived {
+            object,
+            input_version,
+            extent,
+            digest,
+        });
         at += DERIVED_BYTES;
     }
     validate_graph(root.root, &objects, &edges)?;
@@ -1556,10 +1655,28 @@ fn decode_image(
     })
 }
 
+/// A decoded image must not put the volume on the mount path's stack.
+///
+/// Inline, `Decoded` was **132,168 bytes** — the edge table alone 114,696 —
+/// and recovery decodes each of the two roots in turn inside the service's
+/// `serve` future on the founder's shared 4 MiB stack. The ceiling here is
+/// loose on purpose: it pins the *property* (three handles plus scalars, no
+/// table) rather than a figure, so adding a field is free and re-inlining a
+/// table fails.
+#[cfg(test)]
+#[test]
+fn a_decoded_image_holds_no_table_inline() {
+    let bytes = core::mem::size_of::<Decoded>();
+    assert!(
+        bytes <= 512,
+        "Decoded grew to {bytes} B: a volume-scaled table is inline again"
+    );
+}
+
 fn validate_graph(
     root: StableObjectId,
-    objects: &heapless::Vec<DiskObject, MAX_DURABLE_OBJECTS>,
-    edges: &heapless::Vec<DiskEdge, MAX_DURABLE_EDGES>,
+    objects: &[DiskObject],
+    edges: &[DiskEdge],
 ) -> Result<(), PersistenceError> {
     let Some(root_index) = objects
         .iter()
@@ -2360,7 +2477,7 @@ mod tests {
 
         let mut directories = std::vec::Vec::new();
         let mut edges = std::vec::Vec::new();
-        for stable in 1..=MAX_DURABLE_DIRECTORIES as u64 + 1 {
+        for stable in 1..=MAX_DIRECTORIES as u64 + 1 {
             directories.push(dir(stable));
             if stable != 1 {
                 edges.push(DiskEdge {
@@ -2371,6 +2488,75 @@ mod tests {
             }
         }
         let (image, len, mut record) = fixture(&directories, &edges);
+        make_current(&mut record);
+        assert!(matches!(
+            decode_image(&image[..len], record, 512, 640),
+            Err(PersistenceError::Bounds)
+        ));
+    }
+
+    /// A current-profile image written before the edge budget was decoupled
+    /// could record up to the old `16 × 128` product. Such a volume must keep
+    /// mounting: the reader admits the old product, and only a count past it
+    /// is refused. The writer's ceiling is a separate, lower figure.
+    #[test]
+    fn decoder_admits_pre_decoupling_edge_counts_but_not_more() {
+        let dir = |stable: u64| DiskObject {
+            stable: StableObjectId::new(stable).unwrap(),
+            kind: ObjectKind::Directory,
+            subtype: ObjectSubtype::PLAIN,
+            len: 0,
+            revision: FIRST_REVISION,
+            extent: None,
+        };
+        let file = DiskObject {
+            stable: StableObjectId::new(10).unwrap(),
+            kind: ObjectKind::File,
+            subtype: ObjectSubtype::PLAIN,
+            len: 0,
+            revision: FIRST_REVISION,
+            extent: None,
+        };
+        let current = image_layout(ImageProfile::Current, 512).unwrap();
+        let make_current = |record: &mut RootRecord| {
+            record.block_count = 640;
+            record.data_start = current.data_start;
+            record.arena_blocks = 640 - current.data_start;
+        };
+        let edge = |parent: u64, child: u64, name_text: &str| DiskEdge {
+            parent: StableObjectId::new(parent).unwrap(),
+            child: StableObjectId::new(child).unwrap(),
+            name: name(name_text),
+        };
+
+        // Root 1 holds eight directories and one link to the file; each
+        // directory holds 127 more links. 8 + 1 + 8 × 127 = 1025 edges: one
+        // past the writer's ceiling, well inside the old product, and every
+        // directory inside `MAX_DIR_ENTRIES`.
+        let mut objects = std::vec![dir(1)];
+        let mut edges = std::vec::Vec::new();
+        for sub in 2..=9u64 {
+            objects.push(dir(sub));
+            edges.push(edge(1, sub, &std::format!("d{sub}")));
+            for link in 0..127 {
+                edges.push(edge(sub, 10, &std::format!("l{link}")));
+            }
+        }
+        objects.push(file);
+        edges.push(edge(1, 10, "f"));
+        assert_eq!(edges.len(), MAX_DURABLE_EDGES + 1);
+        let (image, len, mut record) = fixture(&objects, &edges);
+        make_current(&mut record);
+        let decoded = decode_image(&image[..len], record, 512, 640).unwrap();
+        assert_eq!(decoded.edges.len(), MAX_DURABLE_EDGES + 1);
+        assert_eq!(decoded.objects.len(), objects.len());
+
+        // One past the old product is not an old writer; it is corruption.
+        let mut edges = std::vec::Vec::new();
+        for index in 0..=PRE_DECOUPLING_MAX_DURABLE_EDGES {
+            edges.push(edge(1, 10, &std::format!("e{index}")));
+        }
+        let (image, len, mut record) = fixture(&[dir(1), file], &edges);
         make_current(&mut record);
         assert!(matches!(
             decode_image(&image[..len], record, 512, 640),
@@ -2856,7 +3042,7 @@ mod tests {
             let graph = volume
                 .engine()
                 .namespace()
-                .durable_graph::<MAX_DURABLE_EDGES>(root_id)
+                .durable_graph(root_id, MAX_DURABLE_EDGES)
                 .unwrap();
             assert!(graph.objects.len() > LEGACY_MAX_DURABLE_OBJECTS);
             assert!(graph.edges.len() > LEGACY_MAX_DURABLE_EDGES);
@@ -3421,6 +3607,91 @@ mod tests {
                     )
                     .is_ok()
             );
+        });
+    }
+
+    #[test]
+    fn atomic_replacement_cuts_recover_old_or_complete_new() {
+        on_large_stack(|| {
+            for stage in [
+                CommitStage::BeforeMetadata,
+                CommitStage::AfterMetadata,
+                CommitStage::AfterMetadataFlush,
+                CommitStage::AfterRootWrite,
+                CommitStage::AfterRootFlush,
+            ] {
+                let session = SessionId::new(0);
+                let mut volume = crate::block_on(Volume::format(provider(), session)).unwrap();
+                let root = volume
+                    .engine_mut()
+                    .open_root(session, crate::Rights::ALL)
+                    .unwrap();
+                let file = crate::block_on(volume.engine_mut().create(
+                    session,
+                    root.handle,
+                    &name("state"),
+                    ObjectKind::File,
+                ))
+                .unwrap();
+                let old_revision = crate::block_on(volume.engine_mut().write_at(
+                    session,
+                    file.handle,
+                    0,
+                    b"old",
+                    crate::ANY_REVISION,
+                ))
+                .unwrap();
+                crate::block_on(volume.commit(session)).unwrap();
+                let mut replacement = crate::block_on(volume.engine().begin_replace(
+                    session,
+                    file.handle,
+                    3,
+                    old_revision,
+                ))
+                .unwrap();
+                crate::block_on(volume.engine().write_replacement(
+                    session,
+                    &mut replacement,
+                    0,
+                    b"n",
+                ))
+                .unwrap();
+                // Another session's commit while staging must still encode old bytes.
+                crate::block_on(volume.commit(session)).unwrap();
+                crate::block_on(volume.engine().write_replacement(
+                    session,
+                    &mut replacement,
+                    1,
+                    b"ew",
+                ))
+                .unwrap();
+                let new_revision =
+                    crate::block_on(volume.engine().commit_replace(session, &replacement)).unwrap();
+                assert_eq!(
+                    crate::block_on(volume.commit_with_cut(session, Some(stage))),
+                    Err(PersistenceError::Interrupted(stage))
+                );
+                let mut recovered = crate::block_on(volume.restart(session)).unwrap();
+                let root = recovered
+                    .engine_mut()
+                    .open_root(session, crate::Rights::ALL)
+                    .unwrap();
+                let file = recovered
+                    .engine_mut()
+                    .open_at(session, root.handle, &name("state"), crate::Rights::ALL)
+                    .unwrap();
+                let mut bytes = [0; 3];
+                crate::block_on(
+                    recovered
+                        .engine_mut()
+                        .read(session, file.handle, 0, &mut bytes),
+                )
+                .unwrap();
+                let stat = recovered.engine().stat(session, file.handle).unwrap();
+                let old = bytes == *b"old" && stat.revision == old_revision;
+                let new = bytes == *b"new" && stat.revision == new_revision;
+                assert!(old || new, "{stage:?} recovered a hybrid");
+            }
         });
     }
 

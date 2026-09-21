@@ -78,6 +78,8 @@ pub enum BuildError {
     /// The bounded standing-post wait is malformed: an alternate post lacks
     /// its primary, aliases the same channel, or accompanies invocations.
     BadParkShape,
+    /// TASK_EXIT requires the typed [`SessionBuilder::exit`] entry point.
+    UntypedExit,
 }
 
 /// A staged invocation's **result** — the typed SSA reference (`Move D`:
@@ -311,10 +313,14 @@ impl SessionBuilder {
     /// `Derive × Task × TASK_EXIT` — **end the calling task** with
     /// `status`, presenting its own `role::SELF` handle (`MODIFY`).  The
     /// commit does not return.
-    pub fn exit(&mut self, self_handle: SlotRef, status: i32) -> Result<(), BuildError> {
+    pub fn exit(
+        &mut self,
+        self_handle: SlotRef,
+        status: crate::exit::ExitCode,
+    ) -> Result<(), BuildError> {
         let mut req = [0u8; 8];
-        req[0..4].copy_from_slice(&status.to_le_bytes());
-        self.derive_raw(
+        req[0..4].copy_from_slice(&status.get().to_le_bytes());
+        self.derive_inner(
             self_handle,
             Rights::empty(),
             kore_abi::session::DERIVE_KIND_TASK_EXIT,
@@ -322,6 +328,143 @@ impl SessionBuilder {
             // the subject's own slot, which is never written.
             self_handle,
             Some(&req),
+        )
+        .map(|_| ())
+    }
+
+    /// Report the caller's fatal panic with a bounded UTF-8 message.
+    pub fn report_panic(&mut self, task: SlotRef, message: &str) -> Result<(), BuildError> {
+        self.report_panic_with_truncation(task, message, false)
+    }
+
+    pub(crate) fn report_panic_with_truncation(
+        &mut self,
+        task: SlotRef,
+        message: &str,
+        truncated: bool,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        let mut bytes = [0u8; 8 + kore_abi::crash::MESSAGE_BYTES];
+        let mut len = message.len().min(kore_abi::crash::MESSAGE_BYTES);
+        while !message.is_char_boundary(len) {
+            len -= 1;
+        }
+        bytes[..4].copy_from_slice(&(len as u32).to_le_bytes());
+        bytes[4] = u8::from(truncated || len != message.len());
+        bytes[8..8 + len].copy_from_slice(&message.as_bytes()[..len]);
+        self.derive_raw(
+            task,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_PANIC_REPORT,
+            task,
+            Some(&bytes[..8 + len]),
+        )
+        .map(|_| ())
+    }
+
+    /// Read a task's opaque public identity through an ACCESS handle.
+    pub fn task_identity(&mut self, task: SlotRef, result: SlotRef) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        self.derive_raw(
+            task,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_TASK_IDENTITY,
+            result,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// Name a dormant task once. Names are copied into kernel-owned storage.
+    pub fn name_task(
+        &mut self,
+        task: SlotRef,
+        name: kore_abi::task::TaskName,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        let mut bytes = [0u8; 64];
+        let text = name.as_str().as_bytes();
+        bytes[0] = text.len() as u8;
+        bytes[1..1 + text.len()].copy_from_slice(text);
+        self.derive_raw(
+            task,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_TASK_NAME,
+            task,
+            Some(&bytes[..1 + text.len()]),
+        )
+        .map(|_| ())
+    }
+
+    /// Bind an unmapped parent lease before START. Custody remains with parent;
+    /// the kernel reserves the range exclusively until process reaping.
+    pub fn bind_crash(
+        &mut self,
+        task: SlotRef,
+        lease: SlotRef,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        let mut arg = [0u8; 24];
+        arg[..4].copy_from_slice(&lease.index().to_le_bytes());
+        arg[8..16].copy_from_slice(&offset.to_le_bytes());
+        arg[16..24].copy_from_slice(&length.to_le_bytes());
+        self.derive_raw(
+            task,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_CRASH_BIND,
+            task,
+            Some(&arg),
+        )
+        .map(|_| ())
+    }
+
+    /// Read one evidence chunk before revoking the owning process handle.
+    pub fn read_crash(
+        &mut self,
+        task: SlotRef,
+        report: SlotRef,
+        index: u32,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        let mut arg = [0u8; 8];
+        arg[..4].copy_from_slice(&index.to_le_bytes());
+        self.derive_raw(
+            task,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_CRASH_READ,
+            report,
+            Some(&arg),
+        )
+        .map(|_| ())
+    }
+
+    /// End worker admission and drain the calling process owner's peers.
+    pub fn drain_process(
+        &mut self,
+        self_handle: SlotRef,
+        report: SlotRef,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        self.derive_raw(
+            self_handle,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_PROCESS_DRAIN,
+            report,
+            None,
         )
         .map(|_| ())
     }
@@ -460,7 +603,13 @@ impl SessionBuilder {
             return Err(BuildError::TooManyInvocations);
         }
         let is_effect = inv.op == OpCode::Derive as u16
-            && (inv.kind == kore_abi::session::DERIVE_KIND_TASK_START
+            && (inv.kind == kore_abi::session::DERIVE_KIND_PROCESS_DRAIN
+                || inv.kind == kore_abi::session::DERIVE_KIND_TASK_IDENTITY
+                || inv.kind == kore_abi::session::DERIVE_KIND_TASK_NAME
+                || inv.kind == kore_abi::session::DERIVE_KIND_CRASH_BIND
+                || inv.kind == kore_abi::session::DERIVE_KIND_PANIC_REPORT
+                || inv.kind == kore_abi::session::DERIVE_KIND_CRASH_READ
+                || inv.kind == kore_abi::session::DERIVE_KIND_TASK_START
                 || inv.kind == kore_abi::session::DERIVE_KIND_ARENA_EXTEND
                 || inv.kind == kore_abi::session::DERIVE_KIND_DEVICE_ACTIVATE
                 || inv.kind == kore_abi::session::DERIVE_KIND_DEVICE_QUIESCE);
@@ -481,10 +630,25 @@ impl SessionBuilder {
         Ok(off as u32)
     }
 
-    /// Stage a raw derive — the core every typed verb lowers onto:
+    /// Stage a raw derive:
     /// `Derive(subject, requested, kind) → result`, with an optional
-    /// op-specific payload already serialized.
+    /// op-specific payload already serialized. TASK_EXIT is refused: use
+    /// [`exit`](Self::exit) with a typed code instead.
     pub fn derive_raw(
+        &mut self,
+        subject: SlotRef,
+        requested: Rights,
+        kind: u8,
+        result: SlotRef,
+        arg: Option<&[u8]>,
+    ) -> Result<Staged, BuildError> {
+        if kind == kore_abi::session::DERIVE_KIND_TASK_EXIT {
+            return Err(BuildError::UntypedExit);
+        }
+        self.derive_inner(subject, requested, kind, result, arg)
+    }
+
+    fn derive_inner(
         &mut self,
         subject: SlotRef,
         requested: Rights,
@@ -2109,8 +2273,8 @@ impl SessionBuilder {
     }
 
     /// Establish one initialized HID-over-I2C child's firmware-correlated
-    /// GPIO-ready route beneath an authenticated PCI or platform controller.
-    pub fn derive_i2c_hid_gpio_route(
+    /// Child-ready route beneath an authenticated PCI or platform controller.
+    pub fn derive_i2c_hid_ready_route(
         &mut self,
         device: SlotRef,
         rights: Rights,
@@ -2122,7 +2286,7 @@ impl SessionBuilder {
         self.derive_raw(
             device,
             rights,
-            kore_abi::session::DERIVE_KIND_I2C_HID_GPIO_ROUTE,
+            kore_abi::session::DERIVE_KIND_I2C_HID_READY_ROUTE,
             result,
             Some(&req),
         )

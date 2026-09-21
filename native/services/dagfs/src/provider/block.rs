@@ -10,6 +10,7 @@ use core::cell::{Cell, RefCell};
 use kore_driver::block::{BlockChannel, BlockError, BufferId, Completion, DirectBlockDevice};
 
 use crate::{
+    ServiceAlloc,
     bounds::MAX_BLOCK_PLACEMENTS,
     error::ProviderError,
     object::ObjectKind,
@@ -17,7 +18,7 @@ use crate::{
         StorageLimits, StorageProvider,
         extent::{ExtentAllocator, ExtentId},
     },
-    slot::{SlotKey, SlotTable},
+    slot::{AtomicSlotVec, BoundedVec, SlotKey},
 };
 
 /// Payload floor encoded by versions 1 and 2, and by pre-7b version 3 roots.
@@ -105,6 +106,16 @@ struct Placement {
 /// KiB and overflowed the stack by 744 bytes on metal (2026-09-09, two
 /// boots of PR #958): the record's size is part of the stack budget, so a
 /// change to it must be deliberate.
+///
+/// All three tables are arena-backed now, so this record's size is a heap cost
+/// rather than a stack one.  The figure stays pinned because it is the unit
+/// those tables multiply, so it remains the thing to re-derive when
+/// `MAX_BLOCK_PLACEMENTS` rises.
+///
+/// `retired` and `fallback` needed [`BoundedVec`] rather than a bare
+/// `alloc::vec::Vec`, because their **bound is load-bearing**: `is_full` gates
+/// an admission decision and `push` carries the typed `PlacementsFull`
+/// refusal.  A growing vector would turn both of those into silent successes.
 const PLACEMENT_BYTES: usize = 40;
 const _: () = assert!(core::mem::size_of::<Placement>() == PLACEMENT_BYTES);
 
@@ -136,13 +147,16 @@ pub struct BlockProviderStats {
     /// Whole-object copies moved DMA buffer to DMA buffer for a version
     /// lend, never through the CPU.
     pub snapshot_copies: u64,
-    /// Completion waits that ran their budget out without the awaited
-    /// completion arriving.
+    /// Completion waits that ran one budget out without the awaited
+    /// completion arriving.  Every round of a slow command counts, so this
+    /// reads as "how often a command ran past one budget", not "how many
+    /// commands failed".
     pub expired_waits: u64,
-    /// Of those, the ones where the backend reported itself HEALTHY — so the
-    /// device was slow, not dead, and the channel was kept. A rising count is
-    /// a device that needs a longer budget, and would previously have been
-    /// answered by retiring the volume.
+    /// Of those, the rounds where the backend reported itself HEALTHY: the
+    /// device was slow, not dead.  Up to [`STALL_BUDGETS`] such rounds are
+    /// waited out and the command still completes; past the ceiling the
+    /// command is refused `Timeout` and the channel is kept.  `expired -
+    /// slow` is therefore exactly the count of condemned waits.
     pub slow_waits: u64,
 }
 
@@ -167,6 +181,21 @@ struct RecoveryRecord {
     owner: RecoveryOwner,
 }
 
+/// Empty completion budgets a HEALTHY controller may run through before a
+/// command is refused as timed out.
+///
+/// One budget is the backend's own bound — the 1 s route park on NVMe
+/// (`durable.rs` `OP_BUDGET_NS`), a spin batch on the polled posture — and
+/// it is the interrupt-loss recovery cadence, not a device timeout: a
+/// healthy device that has not answered inside one budget is slow, and a
+/// DRAM-less consumer drive under garbage collection is slow for whole
+/// seconds.  Thirty budgets on NVMe is 30 s, the I/O timeout Linux ships,
+/// so a stall Linux would ride out is ridden out here too instead of
+/// failing the filesystem operation on top of it.  A controller that
+/// reports a fault, or one with no liveness signal at all, gets no
+/// extension: for those the first empty budget is still the verdict.
+const STALL_BUDGETS: u32 = 30;
+
 struct State<D: DirectBlockDevice, const B: usize, const O: usize> {
     channel: BlockChannel<D, B, O>,
     io: BufferId,
@@ -174,9 +203,9 @@ struct State<D: DirectBlockDevice, const B: usize, const O: usize> {
     buffer_bytes: usize,
     /// The read-ahead window `io` holds, if any.
     held: Option<HeldRead>,
-    placements: SlotTable<Placement, MAX_BLOCK_PLACEMENTS>,
-    retired: heapless::Vec<Placement, MAX_BLOCK_PLACEMENTS>,
-    fallback: heapless::Vec<Placement, MAX_BLOCK_PLACEMENTS>,
+    placements: AtomicSlotVec<Placement, ServiceAlloc>,
+    retired: BoundedVec<Placement, ServiceAlloc>,
+    fallback: BoundedVec<Placement, ServiceAlloc>,
     extents: ExtentAllocator,
     /// First block the payload allocator may name. Metadata I/O is confined
     /// below this boundary; payload I/O is confined at or above it.
@@ -251,9 +280,12 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> BlockProvider<D, B, O
                 rollback,
                 buffer_bytes: io_bytes,
                 held: None,
-                placements: SlotTable::new(),
-                retired: heapless::Vec::new(),
-                fallback: heapless::Vec::new(),
+                placements: AtomicSlotVec::try_new_in(MAX_BLOCK_PLACEMENTS, crate::service_alloc())
+                    .expect("fs block-placement arena (bootstrap-scale) — service heap undersized"),
+                retired: BoundedVec::try_new_in(MAX_BLOCK_PLACEMENTS, crate::service_alloc())
+                    .expect("fs retired-extent stack (bootstrap-scale) — service heap undersized"),
+                fallback: BoundedVec::try_new_in(MAX_BLOCK_PLACEMENTS, crate::service_alloc())
+                    .expect("fs fallback-extent stack (bootstrap-scale) — service heap undersized"),
                 extents: ExtentAllocator::new(data_start, geometry.block_count)?,
                 data_start,
                 arena_end: geometry.block_count,
@@ -379,7 +411,7 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> BlockProvider<D, B, O
         &self,
         live: &[DurableExtent],
         fallback: &[DurableExtent],
-    ) -> Result<heapless::Vec<BlockKey, MAX_BLOCK_PLACEMENTS>, ProviderError> {
+    ) -> Result<BoundedVec<BlockKey, ServiceAlloc>, ProviderError> {
         if live.len() > MAX_BLOCK_PLACEMENTS || fallback.len() > MAX_BLOCK_PLACEMENTS {
             return Err(ProviderError::PlacementsFull);
         }
@@ -395,7 +427,17 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> BlockProvider<D, B, O
         // Design-bounded like every sibling buffer here: the entry guard
         // caps each input at MAX_BLOCK_PLACEMENTS, so a refused push below
         // is index corruption, never volume pressure.
-        let mut records = heapless::Vec::<RecoveryRecord, { MAX_BLOCK_PLACEMENTS * 2 }>::new();
+        //
+        // Arena-backed rather than inline for the reason recorded on
+        // `PLACEMENT_BYTES`: all four of these are sized by the placement
+        // bound, and mount runs inside the service's `serve` future on the
+        // founder's shared stack.  One allocation each per mount, which is not
+        // a path where that matters, and the rebuild still stays prepared off
+        // to the side and is installed only after every check passes.
+        let alloc = crate::service_alloc();
+        let mut records =
+            BoundedVec::<RecoveryRecord, ServiceAlloc>::try_new_in(MAX_BLOCK_PLACEMENTS * 2, alloc)
+                .map_err(|_| ProviderError::Integrity)?;
         for (index, extent) in live.iter().copied().enumerate() {
             if extent.blocks != 0 {
                 records
@@ -426,13 +468,17 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> BlockProvider<D, B, O
                 .then(left.extent.blocks.cmp(&right.extent.blocks))
         });
 
-        let mut allocations = heapless::Vec::<Option<ExtentId>, MAX_BLOCK_PLACEMENTS>::new();
+        let mut allocations =
+            BoundedVec::<Option<ExtentId>, ServiceAlloc>::try_new_in(MAX_BLOCK_PLACEMENTS, alloc)
+                .map_err(|_| ProviderError::Integrity)?;
         for _ in live {
             allocations
                 .push(None)
                 .map_err(|_| ProviderError::Integrity)?;
         }
-        let mut protected = heapless::Vec::<Placement, MAX_BLOCK_PLACEMENTS>::new();
+        let mut protected =
+            BoundedVec::<Placement, ServiceAlloc>::try_new_in(MAX_BLOCK_PLACEMENTS, alloc)
+                .map_err(|_| ProviderError::Integrity)?;
         let mut rebuilt = ExtentAllocator::new(state.data_start, state.arena_end)?;
         let mut previous_end = state.data_start;
         for group in records.chunk_by(|left, right| {
@@ -482,7 +528,9 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> BlockProvider<D, B, O
             previous_end = end;
         }
 
-        let mut keys = heapless::Vec::<BlockKey, MAX_BLOCK_PLACEMENTS>::new();
+        let mut keys =
+            BoundedVec::<BlockKey, ServiceAlloc>::try_new_in(MAX_BLOCK_PLACEMENTS, alloc)
+                .map_err(|_| ProviderError::Integrity)?;
         for (extent, allocation) in live.iter().copied().zip(allocations) {
             // The entry guard bounds `live` by the verified-empty table's own
             // capacity, so neither insert can refuse; a refusal here is
@@ -791,26 +839,53 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> State<D, B, O> {
         ProviderError::Lost
     }
 
+    /// One empty budget on a controller that reports itself healthy is a
+    /// slow command, not a failed one: grant it another budget, up to
+    /// [`STALL_BUDGETS`].  Each grant is booked as an expired-but-healthy
+    /// wait so `status fs` shows how often a command ran past one budget.
+    /// `false` means the caller's next step is [`expired`](Self::expired):
+    /// the ceiling is spent, or the controller did not vouch for itself.
+    fn extend_wait(&mut self, extensions: &mut u32) -> bool {
+        if *extensions >= STALL_BUDGETS
+            || self.channel.liveness() != kore_driver::block::Liveness::Healthy
+        {
+            return false;
+        }
+        *extensions += 1;
+        self.stats.expired_waits = self.stats.expired_waits.saturating_add(1);
+        self.stats.slow_waits = self.stats.slow_waits.saturating_add(1);
+        true
+    }
+
     async fn wait(&mut self, request: kore_driver::block::RequestId) -> Result<(), ProviderError> {
         // Each empty wait spends the backend's whole bounded budget — the
         // spin default, or a real park on the task's held MSI-X route
         // ([`DirectBlockDevice::wait`]).  This provider submits
         // synchronously, so a mismatched id is never the answer; the
         // anomalous cross-request drain is bounded by the queue depth
-        // rather than a spin count.
-        for _ in 0..=O {
-            // An executor-aware transport makes its correlated progress
-            // here; the direct device's ready default paces in `wait` below.
-            self.channel.progress().await.map_err(map_block)?;
-            match self.channel.wait() {
-                Some(Completion {
-                    request: completed,
-                    result,
-                }) if completed == request => return result.map_err(map_block),
-                Some(_) => {
-                    self.stats.late_completions = self.stats.late_completions.saturating_add(1);
+        // rather than a spin count.  An empty budget is not yet the end: a
+        // controller that vouches for itself is granted further budgets
+        // (`extend_wait`), so a slow device is waited out and only a spent
+        // ceiling or a silent controller reaches `expired`.
+        let mut extensions = 0u32;
+        loop {
+            for _ in 0..=O {
+                // An executor-aware transport makes its correlated progress
+                // here; the direct device's ready default paces in `wait` below.
+                self.channel.progress().await.map_err(map_block)?;
+                match self.channel.wait() {
+                    Some(Completion {
+                        request: completed,
+                        result,
+                    }) if completed == request => return result.map_err(map_block),
+                    Some(_) => {
+                        self.stats.late_completions = self.stats.late_completions.saturating_add(1);
+                    }
+                    None => break,
                 }
-                None => break,
+            }
+            if !self.extend_wait(&mut extensions) {
+                break;
             }
         }
         Err(self.expired())
@@ -824,21 +899,27 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> State<D, B, O> {
         requests: &mut [Option<kore_driver::block::RequestId>; N],
     ) -> Result<(), ProviderError> {
         let mut first_error = None;
-        for _ in 0..=O {
-            self.channel.progress().await.map_err(map_block)?;
-            for completion in self.channel.poll_batch::<N>().into_iter().flatten() {
-                self.settle_many(requests, completion, &mut first_error);
-            }
-            if requests.iter().all(Option::is_none) {
-                return first_error.map_or(Ok(()), Err);
-            }
-            if let Some(completion) = self.channel.wait() {
-                self.settle_many(requests, completion, &mut first_error);
+        let mut extensions = 0u32;
+        'budget: loop {
+            for _ in 0..=O {
+                self.channel.progress().await.map_err(map_block)?;
+                for completion in self.channel.poll_batch::<N>().into_iter().flatten() {
+                    self.settle_many(requests, completion, &mut first_error);
+                }
                 if requests.iter().all(Option::is_none) {
                     return first_error.map_or(Ok(()), Err);
                 }
-            } else {
-                break;
+                if let Some(completion) = self.channel.wait() {
+                    self.settle_many(requests, completion, &mut first_error);
+                    if requests.iter().all(Option::is_none) {
+                        return first_error.map_or(Ok(()), Err);
+                    }
+                } else {
+                    break;
+                }
+            }
+            if !self.extend_wait(&mut extensions) {
+                break 'budget;
             }
         }
         Err(self.expired())
@@ -2029,9 +2110,12 @@ mod tests {
             Err(ProviderError::Timeout),
             "a healthy controller means slow, not dead"
         );
+        // Every round past the first budget was granted on the controller's
+        // own word, then the ceiling refused the command: each round is one
+        // expired-but-healthy wait, and the refusal is one more.
         let stats = provider.stats();
-        assert_eq!(stats.expired_waits, 1);
-        assert_eq!(stats.slow_waits, 1);
+        assert_eq!(stats.expired_waits, u64::from(STALL_BUDGETS) + 1);
+        assert_eq!(stats.slow_waits, u64::from(STALL_BUDGETS) + 1);
         // The door stayed shut: the channel is still usable.
         {
             let state = provider.state.borrow();
@@ -2040,6 +2124,48 @@ mod tests {
                 kore_driver::block::ChannelState::Lost
             );
         }
+    }
+
+    /// A healthy device that answers late — inside the stall ceiling — is
+    /// waited out and the command completes: the rounds it ran past one
+    /// budget are booked, and nothing is refused or condemned.
+    #[test]
+    fn a_healthy_device_that_answers_late_still_completes() {
+        let provider = provider();
+        let key = crate::block_on(provider.allocate(ObjectKind::File, 512)).unwrap();
+        crate::block_on(provider.write(key, 0, &[6u8; 512])).unwrap();
+        let late_by = 3u32;
+        assert!(
+            late_by < STALL_BUDGETS,
+            "the test must sit inside the ceiling"
+        );
+        {
+            let mut state = provider.state.borrow_mut();
+            state
+                .channel
+                .control(|d| d.set_liveness(kore_driver::block::Liveness::Healthy))
+                .unwrap();
+            state
+                .channel
+                .control(|d| d.hold_completions_for(late_by))
+                .unwrap();
+        }
+        assert_eq!(
+            crate::block_on(provider.write(key, 0, &[7u8; 512])),
+            Ok(()),
+            "a slow-but-healthy command completes inside the ceiling"
+        );
+        let stats = provider.stats();
+        assert_eq!(stats.expired_waits, u64::from(late_by));
+        assert_eq!(stats.slow_waits, u64::from(late_by));
+        let mut back = [0u8; 512];
+        assert_eq!(crate::block_on(provider.read(key, 0, &mut back)), Ok(512));
+        assert!(back.iter().all(|b| *b == 7), "the late write landed");
+        let state = provider.state.borrow();
+        assert_ne!(
+            state.channel.state(),
+            kore_driver::block::ChannelState::Lost
+        );
     }
 
     /// The controller's own fatal verdict IS evidence, and retires the

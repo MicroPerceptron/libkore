@@ -288,6 +288,7 @@ pub fn decode_rep(w: &ImageRepWire) -> Option<(ImageResponse, u8)> {
                 x if x == ImageRefusal::BadName as u8 => ImageRefusal::BadName,
                 x if x == ImageRefusal::Denied as u8 => ImageRefusal::Denied,
                 x if x == ImageRefusal::Retired as u8 => ImageRefusal::Retired,
+                x if x == ImageRefusal::NotImage as u8 => ImageRefusal::NotImage,
                 _ => return None,
             })
         }
@@ -520,6 +521,7 @@ mod tests {
             (ImageResponse::Refused(ImageRefusal::TableFull), 0),
             (ImageResponse::Refused(ImageRefusal::BadName), 0),
             (ImageResponse::Refused(ImageRefusal::Denied), 0),
+            (ImageResponse::Refused(ImageRefusal::NotImage), 0),
         ] {
             let (back, g) = decode_rep(&encode_rep(&rep, grants)).expect("decodes");
             assert_eq!(back, rep);

@@ -2412,6 +2412,59 @@ mod tests {
     use crate::svc::{REP_CAP, REQ_CAP, SvcProtocol, split_window, window_bytes};
     use crate::transport::TrapTransport;
 
+    /// `retire_incomplete` is the protocol boundary between bundles.  An
+    /// asker that spends its bounded admission re-ask and gives up leaves
+    /// its accepted components behind; without retirement the next launch's
+    /// matching part answers `Duplicate` forever, the bundle never
+    /// completes, and no admission verdict is ever published.  A new `Ring`
+    /// proves the abandonment — so the leftovers are retired, and while any
+    /// of them is still closing the replacement must be refused rather than
+    /// assembled beside a live owner.
+    ///
+    /// Host coverage stops at the assembler's own state.  Seating the
+    /// replacement cannot be exercised off metal: `is_lease_with` and
+    /// `is_kind_with` are `false` for `not(target_os = "none")`, so
+    /// `accepts` always answers `WrongAuthority` and `push` can never seat a
+    /// component here.  What this proves is the decision the three services
+    /// key on — whether the cell is clear for the replacement, or still owes
+    /// a close.
+    #[test]
+    fn a_new_ring_retires_an_abandoned_partial_bundle() {
+        let mut assembler = PeerBundleAssembler::new(0, true);
+
+        // Nothing was abandoned: the services' `!is_empty()` guard never
+        // fires, and retirement of an empty cell reports it clear.
+        assert!(assembler.is_empty());
+        assert!(assembler.retire_incomplete());
+
+        // An asker accepted a kick and a return endpoint, then gave up.
+        assembler.kick = Some(ReturnedCapability::test_live(SlotRef::from_wire(11)));
+        assembler.return_recv = Some(ReturnedCapability::test_live(SlotRef::from_wire(12)));
+        assert!(!assembler.is_empty());
+
+        // Those owners have not closed, so the replacement is refused and
+        // every leftover stays owned for a later attempt.  This is the
+        // `Pending`/`Conflict`/`Busy` arm in mm, dagfs, power and accel.
+        assert!(!assembler.retire_incomplete());
+        assert!(assembler.kick.is_some());
+        assert!(assembler.return_recv.is_some());
+
+        // A partial close releases what settled and keeps the rest, so the
+        // retry never re-retires an owner that is already gone.
+        assembler.kick = Some(ReturnedCapability::test_dead_lineage(SlotRef::from_wire(11)));
+        assert!(!assembler.retire_incomplete());
+        assert!(assembler.kick.is_none());
+        assert!(assembler.return_recv.is_some());
+
+        // Once the last lineage settles the cell is clear again — the state
+        // a replacement bundle needs, and the one that lets the service
+        // admit this `Ring` instead of refusing it.
+        assembler.return_recv = Some(ReturnedCapability::test_dead_lineage(SlotRef::from_wire(12)));
+        assert!(assembler.retire_incomplete());
+        assert!(assembler.is_empty());
+        assert!(assembler.return_recv.is_none());
+    }
+
     struct NoCaps;
 
     impl Bundle for NoCaps {

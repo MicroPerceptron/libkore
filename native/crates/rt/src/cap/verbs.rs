@@ -899,7 +899,11 @@ mod metal {
     /// queue write happens-before this notice, so a receiver that
     /// consumed a post is awake and will drain every source after it
     /// re-posts.
+    // This frame must end before panic/refusal proceeds to TASK_EXIT. Under
+    // LTO its full-batch builder otherwise stays live in panic_terminate,
+    // stacking roughly 10 KiB of notification storage under the exit path.
     #[cfg(target_os = "none")]
+    #[inline(never)]
     pub fn post_notice(send: SlotRef, cookie: u64, payload: u64) -> bool {
         use crate::session::SessionBuilder;
         use crate::transport::{Transport, TrapTransport};
@@ -980,10 +984,10 @@ mod metal {
         None
     }
 
-    /// Establish the firmware-correlated GPIO-ready route for one initialized
+    /// Establish the firmware-correlated child-ready route for one initialized
     /// HID child behind this exact controller capability.
     #[cfg(target_os = "none")]
-    pub fn establish_i2c_hid_gpio<C: crate::cap::I2cHidSubject>(
+    pub fn establish_i2c_hid_ready<C: crate::cap::I2cHidSubject>(
         dev: &C,
         child: u32,
     ) -> Option<RouteToken> {
@@ -992,7 +996,7 @@ mod metal {
 
         let owned = crate::cap::OwnedSlot::reserve()?;
         let mut b = SessionBuilder::new();
-        b.derive_i2c_hid_gpio_route(
+        b.derive_i2c_hid_ready_route(
             dev.i2c_subject_slot(),
             DEVICE_CHILD_RIGHTS,
             child,
@@ -1007,7 +1011,7 @@ mod metal {
     }
 
     #[cfg(not(target_os = "none"))]
-    pub fn establish_i2c_hid_gpio<C: crate::cap::I2cHidSubject>(
+    pub fn establish_i2c_hid_ready<C: crate::cap::I2cHidSubject>(
         _dev: &C,
         _child: u32,
     ) -> Option<RouteToken> {
@@ -3197,11 +3201,26 @@ mod metal {
         /// The device-publish session refused (status; `0` = build) —
         /// the IOVA leg: domain attach, window registration, the map.
         Publish(u8),
-        /// Fabric registration (1), observation (2), or route admission (3) refused.
+        /// Fabric registration (1), observation (2), or route admission (3)
+        /// refused.  The payload is `stage[1:0] | status << 2`, where
+        /// `status` is the refusing session's wire status (1..=6) or 7 for
+        /// a local refusal (no slot, malformed report, busy, quarantined) —
+        /// see [`fabric`](Self::fabric).  Every kernel-side route refusal
+        /// reaches ring 3 as `Status::Denied`, so the stage is the finer
+        /// signal until a fault-detail channel exists.
         Fabric(u8),
     }
 
     impl DmaMapFault {
+        /// The fabric arm with its stage and the fault that stopped it.
+        pub fn fabric(stage: u8, fault: FabricRouteFault) -> Self {
+            let status = match fault {
+                FabricRouteFault::Commit(status) => status.min(6),
+                _ => 7,
+            };
+            Self::Fabric((stage & 3) | (status << 2))
+        }
+
         /// Pack as `stage[2:0] | status << 3` — the note-detail byte.
         pub fn code(self) -> u8 {
             match self {
@@ -3239,33 +3258,44 @@ mod metal {
     fn map_named_cpu_view(lease: SlotRef, report: SlotRef) -> Result<MappedLeaseView, DmaMapFault> {
         map_named_cpu_view_outcome(lease, report).map_err(|error| match error {
             LeaseMapError::Refused(LeaseMapRefusal::Capacity) => DmaMapFault::Slot,
-            LeaseMapError::Refused(LeaseMapRefusal::Kernel(status)) => DmaMapFault::Map(status as u8),
+            LeaseMapError::Refused(LeaseMapRefusal::Kernel(status)) => {
+                DmaMapFault::Map(status as u8)
+            }
             LeaseMapError::Refused(LeaseMapRefusal::Geometry) => DmaMapFault::Geometry,
             _ => DmaMapFault::Map(0),
         })
     }
 
     #[cfg(target_os = "none")]
-    fn map_named_cpu_view_outcome(lease: SlotRef, report: SlotRef) -> Result<MappedLeaseView, LeaseMapError> {
+    fn map_named_cpu_view_outcome(
+        lease: SlotRef,
+        report: SlotRef,
+    ) -> Result<MappedLeaseView, LeaseMapError> {
         use crate::session::SessionBuilder;
         use crate::transport::{Transport, TrapTransport};
         let refused = LeaseMapError::Refused;
         let owner = crate::cap::OwnedSlot::reserve().ok_or(refused(LeaseMapRefusal::Capacity))?;
         let mut map = SessionBuilder::new();
-        let view = map.map_owned_named(
-            lease,
-            Rights::ACCESS | Rights::MODIFY | Rights::REVOKE,
-            owner.slot(),
-        ).map_err(|_| refused(LeaseMapRefusal::Build))?;
-        map.cpu_view_geometry(view, report).map_err(|_| refused(LeaseMapRefusal::Build))?;
-        let committed = TrapTransport::new().commit_now(&map)
+        let view = map
+            .map_owned_named(
+                lease,
+                Rights::ACCESS | Rights::MODIFY | Rights::REVOKE,
+                owner.slot(),
+            )
+            .map_err(|_| refused(LeaseMapRefusal::Build))?;
+        map.cpu_view_geometry(view, report)
+            .map_err(|_| refused(LeaseMapRefusal::Build))?;
+        let committed = TrapTransport::new()
+            .commit_now(&map)
             .map_err(|_| refused(LeaseMapRefusal::NotIssued))?;
         match classify_named_map_result(committed) {
             Some(Ok(())) => {}
             Some(Err(status)) => return Err(refused(LeaseMapRefusal::Kernel(status))),
-            None => return Err(LeaseMapError::Uncertain(
-                crate::cap::UncertainLeaseMap::new(owner, lease),
-            )),
+            None => {
+                return Err(LeaseMapError::Uncertain(
+                    crate::cap::UncertainLeaseMap::new(owner, lease),
+                ));
+            }
         }
         let geometry = crate::entry::geometry::slot_record_va(report)
             .and_then(|ptr| {
@@ -3295,9 +3325,11 @@ mod metal {
     fn named_map_geometry(g: kore_abi::session::GeomReport) -> Option<(NonNull<u8>, usize)> {
         let base = NonNull::new(usize::try_from(g.base).ok()? as *mut u8)?;
         let len = usize::try_from(g.len).ok()?;
-        (len != 0 && g.base % 4096 == 0 && g.len % 4096 == 0
+        (len != 0
+            && g.base % 4096 == 0
+            && g.len % 4096 == 0
             && usize::try_from(g.base.checked_add(g.len)?).is_ok())
-            .then_some((base, len))
+        .then_some((base, len))
     }
 
     /// Pool storage is initialized before publication; imported storage belongs
@@ -3424,31 +3456,25 @@ mod metal {
 
         // Admit the whole window before creating aliases. Pool allocations and
         // imported storage share this custody chain; only initialization differs.
-        let registration =
-            register_fabric_lease(window_slot).map_err(|_| DmaMapFault::Fabric(1))?;
-        let facts = registration
-            .describe()
-            .map_err(|_| DmaMapFault::Fabric(2))?;
-        let request = kore_abi::session::FabricRouteReq {
-            destination: facts.domain.into(),
-            offset: 0.into(),
-            bytes: len.into(),
-            source_reset: facts.reset.into(),
-            source_power: facts.power.into(),
-            source_allocation: facts.allocation.into(),
-            destination_reset: facts.reset.into(),
-            destination_power: facts.power.into(),
-            destination_allocation: facts.allocation.into(),
-            access: 7,
-            operation: 1,
-            // Fresh pool storage or CPU-produced import protocol handoff;
-            // this does not attest a foreign device's fence.
-            synchronization: 1,
-            reserved: [0; 5],
-        };
+        let registration = register_fabric_lease(window_slot).map_err(|fault| {
+            DmaMapFault::fabric(
+                1,
+                match fault {
+                    FabricRegistrationFault::Commit(status) => FabricRouteFault::Commit(status),
+                    _ => FabricRouteFault::Build,
+                },
+            )
+        })?;
+        // Fresh pool storage or CPU-produced import protocol handoff; the
+        // declared fence does not attest a foreign device's fence.
         let route = registration
-            .open_route(&request)
-            .map_err(|_| DmaMapFault::Fabric(3))?;
+            .open_self_route(
+                len,
+                kore_abi::session::FabricOp::IommuMap,
+                kore_abi::session::FabricAccess::all(),
+                kore_abi::session::FabricSync::Fenced,
+            )
+            .map_err(|fault| DmaMapFault::fabric(3, fault))?;
         let (cpu_view, device_owner) =
             map_route_dma_views(&route, device, iova, len, contents, device_write)?;
         let geom = GeomReport {
@@ -3576,7 +3602,9 @@ mod metal {
             if len == 0 || len % 4096 != 0 || iova % 4096 != 0 || iova.checked_add(len).is_none() {
                 return Err(DmaMapFault::Bounds);
             }
-            let info = route.describe().map_err(|_| DmaMapFault::Fabric(2))?;
+            let info = route
+                .describe()
+                .map_err(|_| DmaMapFault::fabric(2, FabricRouteFault::MalformedReport))?;
             if info.bytes != len || info.operation != 1 || info.access & 3 != 3 {
                 return Err(DmaMapFault::Bounds);
             }
@@ -3826,6 +3854,21 @@ mod metal {
     pub fn reclaim_extent(_view: SlotRef, _supply: &SupplyToken) -> Option<(u64, u64)> {
         None
     }
+
+    /// [`reclaim_extent`] for a view that arrived on a **retained** return
+    /// leg ([`ReturnMode::RetainedAny`](crate::service::ReturnMode)): the
+    /// return retires the record out of its runtime-owned landing, so the
+    /// owner's reservation is released without the revoke its drop would
+    /// otherwise attempt on the now-vacant slot. A refused return keeps
+    /// the owner, whose drop revokes the record as usual.
+    pub fn reclaim_returned_extent(
+        view: crate::cap::ReturnedCapability,
+        supply: &SupplyToken,
+    ) -> Option<(u64, u64)> {
+        let reclaimed = reclaim_extent(view.slot()?, supply)?;
+        view.release_after_proven_move();
+        Some(reclaimed)
+    }
     /// Possess a delivered **`MemLease`** — the shape an image-service
     /// `Acquire` grant arrives in, and the one [`take_view`] refuses.
     ///
@@ -4034,6 +4077,9 @@ mod metal {
             kore_abi::session::ViewMapWindow::Surfaces => {
                 map_stashed_view_request(view, Some(kore_abi::session::SurfaceMapLane::First))
             }
+            // The heap window places the task's own heap-supply carves
+            // (`heap::source`), never a peer's view.
+            kore_abi::session::ViewMapWindow::Heap => None,
         }
     }
 
@@ -4307,12 +4353,20 @@ mod metal {
     /// before its slot may be reused. Unlike [`map_held`], this does not touch
     /// the monotone receiver-map cursor.
     #[cfg(target_os = "none")]
-    pub fn map_owned_lease_at_outcome(lease: SlotRef, va: u64, len: u64) -> Result<MappedLeaseView, LeaseMapError> {
+    pub fn map_owned_lease_at_outcome(
+        lease: SlotRef,
+        va: u64,
+        len: u64,
+    ) -> Result<MappedLeaseView, LeaseMapError> {
         map_owned_whole_lease_at(lease, va, len, kore_abi::session::SHARE_ACCESS_R)
     }
 
     #[cfg(not(target_os = "none"))]
-    pub fn map_owned_lease_at_outcome(_lease: SlotRef, _va: u64, _len: u64) -> Result<MappedLeaseView, LeaseMapError> {
+    pub fn map_owned_lease_at_outcome(
+        _lease: SlotRef,
+        _va: u64,
+        _len: u64,
+    ) -> Result<MappedLeaseView, LeaseMapError> {
         Err(LeaseMapError::Refused(LeaseMapRefusal::Unavailable))
     }
 
@@ -4336,7 +4390,7 @@ mod metal {
     /// view whose drop exact-unshares the mapping.
     #[cfg(target_os = "none")]
     pub fn map_owned_lease_at_rx(lease: SlotRef, va: u64, len: u64) -> Option<MappedLeaseView> {
-        map_owned_whole_lease_at(
+        try_map_owned_whole_lease_at(
             lease,
             va,
             len,
@@ -4392,8 +4446,15 @@ mod metal {
     }
 
     /// Shared whole-lease implementation for the fixed-address view helpers.
+    ///
+    /// The arena slot is reserved by the caller and handed in, so an
+    /// exhausted arena is reported as [`LeaseWindowFault::Slot`] instead of
+    /// being folded into this function's `None` alongside every policy
+    /// refusal.  On any refusal `owned` drops here and releases its
+    /// reservation, exactly as when the reserve lived inside.
     #[cfg(target_os = "none")]
-    fn map_owned_whole_lease_at(
+    fn map_owned_whole_lease_in(
+        owned: crate::cap::OwnedSlot,
         lease: SlotRef,
         va: u64,
         len: u64,
@@ -4426,7 +4487,6 @@ mod metal {
         {
             return Err(refused(LeaseMapRefusal::Build));
         }
-        let owned = crate::cap::OwnedSlot::reserve().ok_or(refused(LeaseMapRefusal::Capacity))?;
         let mut b = SessionBuilder::new();
         let mut rights = Rights::ACCESS | Rights::REVOKE;
         if access & kore_abi::session::SHARE_ACCESS_W != 0 {
@@ -4444,6 +4504,56 @@ mod metal {
                 crate::cap::UncertainLeaseMap::new(owned, lease),
             )),
         }
+    }
+
+    #[cfg(target_os = "none")]
+    fn map_owned_whole_lease_at(
+        lease: SlotRef,
+        va: u64,
+        len: u64,
+        access: u8,
+    ) -> Result<MappedLeaseView, LeaseMapError> {
+        let owned = crate::cap::OwnedSlot::reserve()
+            .ok_or(LeaseMapError::Refused(LeaseMapRefusal::Capacity))?;
+        map_owned_whole_lease_in(owned, lease, va, len, access)
+    }
+
+    /// Reserve the arena slot, then map — the seam that separates "no slot"
+    /// from "refused" for every whole-lease map.
+    #[cfg(target_os = "none")]
+    fn try_map_owned_whole_lease_at(
+        lease: SlotRef,
+        va: u64,
+        len: u64,
+        access: u8,
+    ) -> Result<MappedLeaseView, LeaseWindowFault> {
+        let owned = crate::cap::OwnedSlot::reserve().ok_or(LeaseWindowFault::Slot)?;
+        map_owned_whole_lease_in(owned, lease, va, len, access)
+            .map_err(|_| LeaseWindowFault::Refused)
+    }
+
+    /// [`map_owned_lease_at_rw`] with the refusal named.
+    #[cfg(target_os = "none")]
+    pub fn try_map_owned_lease_at_rw(
+        lease: SlotRef,
+        va: u64,
+        len: u64,
+    ) -> Result<MappedLeaseView, LeaseWindowFault> {
+        try_map_owned_whole_lease_at(
+            lease,
+            va,
+            len,
+            kore_abi::session::SHARE_ACCESS_R | kore_abi::session::SHARE_ACCESS_W,
+        )
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn try_map_owned_lease_at_rw(
+        _lease: SlotRef,
+        _va: u64,
+        _len: u64,
+    ) -> Result<MappedLeaseView, LeaseWindowFault> {
+        Err(LeaseWindowFault::Refused)
     }
 
     #[cfg(not(target_os = "none"))]
@@ -4548,15 +4658,71 @@ mod metal {
         Err(LeaseCarveError::Refused(LeaseCarveRefusal::Unavailable))
     }
 
-    /// Carve one segment lease into a runtime-reserved persistent slot.
-    /// Owners that must retry cleanup use the full outcome API above. This
-    /// compatibility wrapper retains unknown names on unsuccessful cleanup.
+    /// Why an owned lease window could not be produced — the `Slot` arm is
+    /// the one a bare `Option` hides.  An exhausted cap arena never reaches
+    /// the kernel at all, so collapsing it into the same `None` as a kernel
+    /// refusal leaves a caller (a refused window launch, say) unable to say
+    /// whether it ran out of slots or was denied.  Shaped like
+    /// [`BarMapFault`] and [`DeviceMmuFault`]: `Slot` first, one vocabulary
+    /// for the whole lease-window seam.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LeaseWindowFault {
+        /// The task's cap arena had no free slot and could not extend.  No
+        /// session was built and nothing was asked of the kernel.
+        Slot,
+        /// Everything else: a malformed ask, a session that failed to build
+        /// or transport, or one that committed with a non-`Ok` status.  A
+        /// supply lease that has left `LEASE_LIVE` refuses here.
+        Refused,
+    }
+
+    /// Carve one segment lease into a runtime-reserved persistent slot,
+    /// naming the refusal.
+    ///
+    /// This is the ownership-safe service form of [`carve_lease_window`]: the
+    /// caller never chooses an arena index and receives an affine value that
+    /// keeps the allocator reservation paired with the live capability.
+    #[cfg(target_os = "none")]
+    pub fn try_carve_owned_lease_window(
+        subject: SlotRef,
+        offset: u64,
+        len: u64,
+    ) -> Result<StashedLease, LeaseWindowFault> {
+        carve_owned_lease_window_outcome(subject, offset, len).map_err(|error| match error {
+            LeaseCarveError::Refused(LeaseCarveRefusal::Capacity) => LeaseWindowFault::Slot,
+            _ => LeaseWindowFault::Refused,
+        })
+    }
+
+    /// The lossy projection of [`try_carve_owned_lease_window`], kept for the
+    /// callers that have nothing to report.
+    #[cfg(target_os = "none")]
     pub fn carve_owned_lease_window(
         subject: SlotRef,
         offset: u64,
         len: u64,
     ) -> Option<StashedLease> {
-        carve_owned_lease_window_outcome(subject, offset, len).ok()
+        try_carve_owned_lease_window(subject, offset, len).ok()
+    }
+
+    /// Off metal there is no session engine and therefore no owned lease.
+    #[cfg(not(target_os = "none"))]
+    pub fn try_carve_owned_lease_window(
+        _subject: SlotRef,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<StashedLease, LeaseWindowFault> {
+        Err(LeaseWindowFault::Refused)
+    }
+
+    /// Off metal there is no session engine and therefore no owned lease.
+    #[cfg(not(target_os = "none"))]
+    pub fn carve_owned_lease_window(
+        _subject: SlotRef,
+        _offset: u64,
+        _len: u64,
+    ) -> Option<StashedLease> {
+        None
     }
 
     /// Snapshot the runtime allocator's remaining persistent slot capacity.
@@ -5241,6 +5407,21 @@ mod metal {
         None
     }
 
+    /// Whether this thread's read-only slot alias can read `slot` at all —
+    /// the distinction [`take_delivery`]'s `None` folds away: a vacant record
+    /// in a readable slot versus a slot outside the aliased founding/extension
+    /// spans. Diagnostic only; it grants and consumes nothing.
+    #[cfg(target_os = "none")]
+    pub fn slot_readable(slot: SlotRef) -> bool {
+        crate::entry::geometry::slot_record_va(slot).is_some()
+    }
+
+    /// Off the metal userland targets — nothing is aliased.
+    #[cfg(not(target_os = "none"))]
+    pub fn slot_readable(_slot: SlotRef) -> bool {
+        false
+    }
+
     /// Non-owning ingress check that a delivered slot holds a **channel
     /// send end** carrying at least `required` — the
     /// [`ReturnedCapability::is_lease_with`](crate::cap::ReturnedCapability::is_lease_with)
@@ -5742,30 +5923,61 @@ mod metal {
 
         #[test]
         fn named_map_results_cover_both_invocations_without_guessing_rollback() {
-            assert_eq!(classify_named_map_result(committed(Status::Ok, 0)), Some(Ok(())));
-            for status in [Status::Denied, Status::Forged, Status::Revoked,
-                Status::Conflict, Status::Malformed, Status::WouldBlock] {
+            assert_eq!(
+                classify_named_map_result(committed(Status::Ok, 0)),
+                Some(Ok(()))
+            );
+            for status in [
+                Status::Denied,
+                Status::Forged,
+                Status::Revoked,
+                Status::Conflict,
+                Status::Malformed,
+                Status::WouldBlock,
+            ] {
                 for index in 0..=1 {
-                    assert_eq!(classify_named_map_result(committed(status, index)), Some(Err(status)));
+                    assert_eq!(
+                        classify_named_map_result(committed(status, index)),
+                        Some(Err(status))
+                    );
                 }
                 assert_eq!(classify_named_map_result(committed(status, 2)), None);
             }
-            for raw in [Status::Ok.encode(1), Status::Deadline.encode(0),
-                Status::Irq.encode(0), Status::Exited.encode(0),
-                Status::AltDelivery.encode(0), Status::Unfounded.encode(1), 0xffff] {
+            for raw in [
+                Status::Ok.encode(1),
+                Status::Deadline.encode(0),
+                Status::Irq.encode(0),
+                Status::Exited.encode(0),
+                Status::AltDelivery.encode(0),
+                Status::Unfounded.encode(1),
+                0xffff,
+            ] {
                 assert_eq!(classify_named_map_result(Committed::from_raw(raw)), None);
             }
-            assert_eq!(classify_named_map_result(Committed::from_raw(
-                (123u64 << 32) | Status::Ok.encode(0))), Some(Ok(())));
+            assert_eq!(
+                classify_named_map_result(Committed::from_raw(
+                    (123u64 << 32) | Status::Ok.encode(0)
+                )),
+                Some(Ok(()))
+            );
         }
 
         #[test]
         fn named_map_geometry_rejects_unusable_committed_views() {
             use kore_abi::session::GeomReport;
-            let (base, len) = named_map_geometry(GeomReport { base: 0x1000, len: 0x2000 }).unwrap();
+            let (base, len) = named_map_geometry(GeomReport {
+                base: 0x1000,
+                len: 0x2000,
+            })
+            .unwrap();
             assert_eq!((base.as_ptr() as usize, len), (0x1000, 0x2000));
-            for (base, len) in [(0, 4096), (4096, 0), (4097, 4096), (4096, 4097),
-                (u64::MAX - 4095, 4096)] {
+            for (base, len) in [
+                (0, 4096),
+                (4096, 0),
+                (4097, 4096),
+                (4096, 4097),
+                (u64::MAX - 4095, 4096),
+            ] {
                 assert!(named_map_geometry(GeomReport { base, len }).is_none());
             }
         }

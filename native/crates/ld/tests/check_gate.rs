@@ -32,7 +32,7 @@ fn happy_fixture(arch: &ArchRelocs) -> Fixture {
         addend: 0,
     }];
     f.needed = vec!["libkore".into(), "libm".into()];
-    f.relro = Some((DATA_VADDR, 0x200));
+    f.relro = Some((DATA_VADDR, 0x1000));
     f.bss = 0x800;
     f
 }
@@ -104,7 +104,7 @@ fn assert_happy(arch: &ArchRelocs, checked: &kore_ld::check::CheckedImage) {
     assert_eq!(d.dynz.flags.get(), DF_BIND_NOW);
 
     // RELRO rides the checked view, image-relative.
-    assert_eq!(checked.relro, Some((DATA_VADDR, 0x200)));
+    assert_eq!(checked.relro, Some((DATA_VADDR, 0x1000)));
 }
 
 #[test]
@@ -692,6 +692,26 @@ fn pure_tbss_needs_no_file_congruence_or_initialization_lease() {
                 .iter()
                 .flatten()
                 .all(|s| s.kind != seg::KIND_TLS && s.len != 0)
+        );
+    }
+}
+
+#[test]
+fn relro_refuses_partial_pages_and_foreign_ranges_at_registration() {
+    for range in [
+        (DATA_VADDR + 1, 4096),
+        (DATA_VADDR, 4095),
+        (DATA_VADDR, 0),
+        (TEXT_VADDR, 4096),
+        (RO_VADDR, 4096),
+        (DATA_VADDR, 0x10000),
+        (u64::MAX - 4095, 8192),
+    ] {
+        let mut f = happy_fixture(&X86_RELOCS);
+        f.relro = Some(range);
+        assert_eq!(
+            check_image::<X86_64>(&f.build()).unwrap_err(),
+            CheckError::Relro
         );
     }
 }

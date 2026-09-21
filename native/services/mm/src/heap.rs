@@ -565,6 +565,13 @@ mod tests {
             ) -> Result<(MmResponse, Option<StashedLease>), kore_rt::svc::CallError> {
                 Err(kore_rt::svc::CallError::NoOutstanding)
             }
+            async fn supply_in_class(
+                &mut self,
+                _: u64,
+                _: u64,
+            ) -> (MmResponse, Option<StashedLease>) {
+                (MmResponse::Refused(crate::MmRefusal::Quota), None)
+            }
             async fn stats(&mut self) -> Option<kore_abi::monitor::MemorySnapshot> {
                 None
             }
@@ -629,6 +636,9 @@ mod tests {
         }
         async fn supply(&mut self, _: u64) -> (MmResponse, Option<StashedLease>) {
             panic!("heap refill must not use the legacy panicking convenience")
+        }
+        async fn supply_in_class(&mut self, _: u64, _: u64) -> (MmResponse, Option<StashedLease>) {
+            panic!("heap refill must use the observed base-class supply contract")
         }
         async fn supply_observed(
             &mut self,

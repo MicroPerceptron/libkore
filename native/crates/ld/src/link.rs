@@ -247,6 +247,17 @@ pub trait LinkWorld {
         self.choose_base(len, len)
     }
 
+    /// One past the highest address this world's placement has handed
+    /// out — every module, the TLS block, everything — or `None` for a
+    /// world that does not record placement (the test world).
+    ///
+    /// The engine stamps it into the passive page
+    /// (`ModulePage::placed`) so a later placer starts above what the
+    /// stub *mapped*, not only above what the page's records *name*.
+    fn placed_high_water(&self) -> Option<u64> {
+        None
+    }
+
     /// Provenance id of a lease for the passive ABI
     /// ([`ModuleSeg::lease_id`]) — correlation, never authority; worlds
     /// without one report 0.
@@ -279,6 +290,8 @@ pub enum LinkError<E> {
     /// The mapped `.dynamic`/strtab contents contradict the descriptor
     /// (ranges escape the views, `DT_NEEDED` count mismatch).
     BadDynamic(usize),
+    /// An init/fini entry lies outside the load set's executable text.
+    Function(crate::functions::FunctionError, usize),
     /// A `DT_NEEDED` name does not fit [`ImageName`] (empty, > 64
     /// bytes, or embedded NUL).
     NeededName(usize),
@@ -502,6 +515,7 @@ pub fn link_program<A: RelocArch, W: LinkWorld, S: Allocator + Copy>(
     }
     for &i in order[..count].iter().rev() {
         let d = &lt.descs[i as usize];
+        let first = fini.len();
         collect_fns(
             &lt,
             &data,
@@ -511,6 +525,7 @@ pub fn link_program<A: RelocArch, W: LinkWorld, S: Allocator + Copy>(
             &mut fini,
             caps.max_inits,
         )?;
+        fini[first..].reverse();
     }
 
     // ── Phase 6: the passive ABI (`res/IMAGE.md` §8) ────────────────────
@@ -1042,11 +1057,17 @@ fn collect_fns<W: LinkWorld, S: Allocator + Copy>(
         return Err(LinkError::BadDynamic(i));
     }
     let bytes = module_bytes::<W, S>(lt, data, i, off, sz).ok_or(LinkError::BadDynamic(i))?;
-    for w in bytes.chunks_exact(8) {
-        let fn_addr = u64::from_le_bytes(w.try_into().map_err(|_| LinkError::BadDynamic(i))?);
-        if fn_addr == 0 || fn_addr == u64::MAX {
-            continue;
-        }
+    let addresses = crate::functions::function_addresses(bytes, |address| {
+        lt.descs
+            .as_slice()
+            .iter()
+            .enumerate()
+            .any(|(index, descriptor)| {
+                crate::functions::contains_text(descriptor, lt.bases[index], address)
+            })
+    })
+    .map_err(|error| LinkError::Function(error, i))?;
+    for fn_addr in addresses {
         if out.len() >= max_inits {
             return Err(LinkError::TooManyInits);
         }
@@ -1129,6 +1150,19 @@ fn write_module_page<W: LinkWorld, S: Allocator + Copy>(
         .map_err(LinkError::World)?;
     if va % PAGE_SIZE != 0 {
         return Err(LinkError::Layout(0));
+    }
+    // Everything placed so far lies below the page: record how far, in
+    // pages below `va`. A world that reports a cursor above the page, off a
+    // page boundary, or further away than sixteen bits can count is lying
+    // about its own placement — refuse the link rather than stamp a floor
+    // a later placer would trust.
+    if let Some(high_water) = world.placed_high_water() {
+        let below = va.checked_sub(high_water).ok_or(LinkError::Layout(0))?;
+        if below % PAGE_SIZE != 0 {
+            return Err(LinkError::Layout(0));
+        }
+        let pages = u16::try_from(below / PAGE_SIZE).map_err(|_| LinkError::Layout(0))?;
+        page.record_placed(pages);
     }
     let mut window = world
         .alloc_private(va, PAGE_SIZE)

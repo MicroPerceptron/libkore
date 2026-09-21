@@ -32,5 +32,5 @@ supply_quota_bytes = 2147483648 # 2 GiB
 endows    = ["MEM_SUPPLY@0", "MEM_REGION@0"]  # review mirror; asserted === PROFILE.roles
 shell_client = true
 exec_client = true
-digest_x86_64  = "blake3:0bb4dad027c9650edb2bc1f9948585fc999fa31bc25b39af2ef7793b279aa79a"  # res/x86_64/; make boot-digests-x86
-digest_aarch64 = "blake3:1b017c44620840dfca9e66adff67e8feaedd3054aa0a3d4e313365a2ece85213"  # res/aarch64/; make boot-digests-aarch64
+digest_x86_64  = "blake3:2453db70441c41787834351d73de09ff7da0daa1ff804c77c9abbce2e94a7844"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:93bb191f0d54d31b73a4cc0be7b80f0c9072f073c1b8f82ba7a6dee03183289f"  # res/aarch64/; make boot-digests-aarch64

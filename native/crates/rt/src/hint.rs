@@ -13,7 +13,7 @@
 //! the rate as an argument rather than reaching for either, which is what lets
 //! it sit below both.
 
-pub use kore_hint::{AddressMonitor, Monitor, NoMonitor, WaitEnd, available, name};
+pub use kore_hint::{AddressMonitor, Monitor, NoMonitor, WaitEnd};
 
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
@@ -46,4 +46,15 @@ pub fn wait_on(word: &AtomicU32, expected: u32, cap: Duration) -> WaitEnd {
 #[inline]
 pub fn pause_until(cap: Duration) -> WaitEnd {
     kore_hint::pause_until(cap, counter_hz())
+}
+
+/// Report the tier the capped runtime can actually enter, not merely an
+/// available instruction (baseline WFE cannot honor a microsecond deadline).
+pub fn available() -> bool {
+    Monitor::available()
+        && Monitor::deadline_after(Duration::from_micros(1), counter_hz()).is_some()
+}
+
+pub fn name() -> &'static str {
+    if available() { Monitor::name() } else { "none" }
 }

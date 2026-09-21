@@ -7,8 +7,8 @@
 //! independently, with explicit contention and no filesystem-global lock.
 
 pub use kore_collections::{
-    AtomicBitVec, AtomicSlotMap as SlotTable, AtomicSlotVec, SlotAccess, SlotId as SlotKey,
-    SlotRead, SlotReservation, SlotVecRead, SlotVecWrite, SlotWrite,
+    AtomicBitVec, AtomicSlotMap as SlotTable, AtomicSlotVec, BoundedVec, SlotAccess,
+    SlotId as SlotKey, SlotRead, SlotVecRead, SlotVecReservation, SlotVecWrite, SlotWrite,
 };
 
 use crate::error::FsError;

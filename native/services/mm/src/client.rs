@@ -89,6 +89,17 @@ pub trait MmClient {
         bytes: u64,
         budget_ns: u64,
     ) -> Result<(MmResponse, Option<StashedLease>), CallError>;
+    /// [`supply`](Self::supply) in a named frame class: `align` is the
+    /// lease alignment in bytes (`0`/4 KiB base class, 2 MiB or 1 GiB huge
+    /// classes — `res/ACCEL_MEMORY_SCALE.md` §1.2, the alignment *is* the
+    /// class).  A huge-class supply is rounded to a whole number of its
+    /// units and metered against mm's huge quota, so an accelerator working
+    /// set neither competes with nor drains the launcher's base allowance.
+    async fn supply_in_class(
+        &mut self,
+        bytes: u64,
+        align: u64,
+    ) -> (MmResponse, Option<StashedLease>);
 
     /// Read the lessor's bounded provider-owned snapshot. A malformed or
     /// refused response returns `None`; the operation never carries a grant.
@@ -182,7 +193,10 @@ impl<T: kore_rt::transport::Transport> RingMm<'_, '_, T> {
         &mut self,
         budget_ns: u64,
     ) -> Result<Option<kore_abi::monitor::MemorySnapshot>, CallError> {
-        let reply = self.0.resume_exact_bounded(&MmRequest::Stats, budget_ns).await?;
+        let reply = self
+            .0
+            .resume_exact_bounded(&MmRequest::Stats, budget_ns)
+            .await?;
         self.finish_stats(reply)
     }
 
@@ -199,18 +213,244 @@ impl<T: kore_rt::transport::Transport> RingMm<'_, '_, T> {
     }
 }
 
+/// **Administration of per-launch faces** — exec's pair only, over its
+/// retained return leg (`return_tx` sends, `return_land` is the landing the
+/// request announces). The shapes are the accelerator and power faces'.
+impl<T: kore_rt::transport::Transport> RingMm<'_, '_, T> {
+    /// Derive and convey one face component atomically while retaining the
+    /// source lineage. `AfterTransfer` means custody moved: resume this
+    /// operation rather than deriving and conveying a second component.
+    pub fn is_idle(&self) -> bool {
+        self.0.is_idle()
+    }
+
+    /// Observe one already-published admission component without sending again.
+    pub async fn resume_admit_component_bounded(
+        &mut self,
+        part: kore_rt::svc::PeerBundlePart,
+        return_land: kore_abi::session::SlotRef,
+        budget_ns: u64,
+    ) -> Result<MmResponse, kore_rt::svc::CallError> {
+        let request = MmRequest::AdmitPeer {
+            part,
+            announced: return_land,
+        };
+        let reply = self.0.resume_exact_bounded(&request, budget_ns).await?;
+        if reply.grants != 0
+            || reply.delivered.iter().any(Option::is_some)
+            || reply.retained.iter().any(Option::is_some)
+        {
+            self.0.poison_retained(reply.retained);
+            return Err(kore_rt::svc::CallError::Wire);
+        }
+        Ok(reply.response)
+    }
+
+    async fn cleanup_bounded(
+        &mut self,
+        request: MmRequest,
+        budget_ns: u64,
+    ) -> Result<MmResponse, kore_rt::svc::CallError> {
+        let pair = &mut self.0;
+        let reply = if pair.is_idle() {
+            pair.call_bounded(&request, budget_ns).await?
+        } else {
+            pair.resume_exact_bounded(&request, budget_ns).await?
+        };
+        if reply.grants != 0
+            || reply.delivered.iter().any(Option::is_some)
+            || reply.retained.iter().any(Option::is_some)
+        {
+            pair.poison_retained(reply.retained);
+            return Err(kore_rt::svc::CallError::Wire);
+        }
+        Ok(reply.response)
+    }
+
+    pub async fn take_admission_bounded(
+        &mut self,
+        budget_ns: u64,
+    ) -> Result<MmResponse, kore_rt::svc::CallError> {
+        self.cleanup_bounded(MmRequest::TakeAdmission, budget_ns)
+            .await
+    }
+    pub async fn retire_peer_bounded(
+        &mut self,
+        peer: kore_rt::svc::PeerId,
+        budget_ns: u64,
+    ) -> Result<MmResponse, kore_rt::svc::CallError> {
+        self.cleanup_bounded(MmRequest::RetirePeer { peer }, budget_ns)
+            .await
+    }
+    pub async fn confirm_retired_bounded(
+        &mut self,
+        peer: kore_rt::svc::PeerId,
+        budget_ns: u64,
+    ) -> Result<MmResponse, kore_rt::svc::CallError> {
+        self.cleanup_bounded(MmRequest::ConfirmRetired { peer }, budget_ns)
+            .await
+    }
+
+    pub async fn admit_component_staged<F>(
+        &mut self,
+        return_tx: kore_abi::session::SlotRef,
+        return_land: kore_abi::session::SlotRef,
+        part: kore_rt::svc::PeerBundlePart,
+        rights: kore_abi::cap::Rights,
+        stage: F,
+    ) -> Result<MmResponse, kore_rt::svc::StagedReturnError>
+    where
+        F: FnOnce(
+            kore_rt::svc::ReturnDeriver<'_>,
+        ) -> Result<kore_rt::svc::StagedReturn, kore_rt::svc::ReturnDeriveError>,
+    {
+        let request = MmRequest::AdmitPeer {
+            part,
+            announced: return_land,
+        };
+        let reply = self
+            .0
+            .call_with_staged_return(&request, return_tx, rights, stage)
+            .await?;
+        Ok(reply.response)
+    }
+
+    /// Consume the identity of the most recently assembled face.
+    pub async fn take_peer_admission(&mut self) -> Result<MmResponse, kore_rt::svc::CallError> {
+        self.0
+            .call(&MmRequest::TakeAdmission)
+            .await
+            .map(|reply| reply.response)
+    }
+
+    /// Request retirement of one exact face generation.
+    pub async fn retire_peer(
+        &mut self,
+        peer: kore_rt::svc::PeerId,
+    ) -> Result<MmResponse, kore_rt::svc::CallError> {
+        self.0
+            .call(&MmRequest::RetirePeer { peer })
+            .await
+            .map(|reply| reply.response)
+    }
+
+    /// Fence retirement: `Accepted` only once the face is closed and every
+    /// supply it minted has returned, so the caller reclaims the face's
+    /// local backing no earlier. `Refused(Pending)` means ask again later.
+    pub async fn confirm_retired(
+        &mut self,
+        peer: kore_rt::svc::PeerId,
+    ) -> Result<MmResponse, kore_rt::svc::CallError> {
+        self.0
+            .call(&MmRequest::ConfirmRetired { peer })
+            .await
+            .map(|reply| reply.response)
+    }
+}
+
+/// Where an engine-profile process finds its per-launch mm face.
+///
+/// Window applications occupy index 0 of the `SVC_RING`/`SVC_SEND`/
+/// `SVC_GRANT` namespaces, the NPU and power faces index 1 and the GPU face
+/// index 2, so the mm face takes index 3 and an engine program may hold
+/// every one of them (exec pins the disjointness where it sees all the
+/// faces). A face mints supplies and reads the books only, so no return leg
+/// reaches the process.
+pub mod process_face {
+    /// mm request doorbell (`role::SVC_SEND`).
+    pub const REQUEST_KICK: u16 = 3;
+    /// mm request/reply ring backing (`role::SVC_RING`).
+    pub const CONTROL_RING: u16 = 3;
+    /// Receiver for mm's reply grants (`role::SVC_GRANT`).
+    pub const GRANT_RECV: u16 = 3;
+}
+
+/// A process's own mm face plus the affine ring lease that keeps its mapped
+/// control window alive. Its supplies are metered on the face's own lane.
+#[cfg(target_os = "none")]
+pub struct ProcessMm {
+    pub client: RingMm<'static, 'static, kore_rt::transport::TrapTransport>,
+    _ring: kore_rt::cap::LeaseToken,
+}
+
+/// The class a heap reservation is minted in: 2 MiB, so every granule the
+/// heap window maps off it is a huge leaf and lands end to end, and so it is
+/// metered against the face's huge-class quota (the boot policy's), not the
+/// base class's.
+#[cfg(target_os = "none")]
+const HEAP_RESERVATION_CLASS: u64 = 0x20_0000;
+
+#[cfg(target_os = "none")]
+impl ProcessMm {
+    /// **Reserve heap before a large synchronous job.** Ask mm for `bytes`
+    /// more (rounded up to whole 2 MiB units) on this process's own face and
+    /// adopt the grant into the heap ([`kore_rt::heap::adopt_supply`]), so
+    /// the job's allocations — which cannot wait on a service — find room.
+    ///
+    /// The response is mm's own on refusal (`Quota` names the face's
+    /// budget); `Refused(Denied)` also covers a grant the heap could not
+    /// adopt (the lease is then revoked, never leaked).
+    pub async fn reserve_heap(&mut self, bytes: u64) -> Result<(), MmResponse> {
+        let (response, lease) = self
+            .client
+            .supply_in_class(bytes, HEAP_RESERVATION_CLASS)
+            .await;
+        let lease = lease.ok_or(response)?;
+        kore_rt::heap::adopt_supply(lease)
+            .map_err(|_| MmResponse::Refused(crate::service::MmRefusal::Denied))
+    }
+}
+
+/// Attach the per-launch mm face an engine-profile launch delivered.
+/// `None` for a process launched without one.
+#[cfg(target_os = "none")]
+pub fn attach_process_face(rt: &kore_rt::entry::Rt) -> Option<ProcessMm> {
+    use kore_abi::task::role;
+    use kore_rt::cap::verbs;
+    use kore_rt::svc::{ClientEndpoints, GrantPin, SvcClient, client_rings};
+
+    let boot = rt.bootstrap();
+    let ring = verbs::take_lease(boot.handle(role::SVC_RING, process_face::CONTROL_RING)?)?;
+    let window = verbs::map_held_rw(ring.slot())?;
+    // SAFETY: this process is the sole client-side attachment over the
+    // task-lifetime ring lease delivered by exec.
+    let window: &'static mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(window.cast::<u8>().as_ptr(), window.len()) };
+    let rings =
+        client_rings::<crate::MemoryManager>(window, kore_rt::svc::REQ_CAP, kore_rt::svc::REP_CAP)
+            .ok()?;
+    let kick = boot.handle(role::SVC_SEND, process_face::REQUEST_KICK)?;
+    let grant = boot.handle(role::SVC_GRANT, process_face::GRANT_RECV)?;
+    let mut grants = [const { None }; kore_rt::service::MAX_GRANTS];
+    grants[0] = Some(GrantPin::retained(grant));
+    Some(ProcessMm {
+        client: RingMm(
+            SvcClient::new(
+                kore_rt::entry::transport(),
+                rings,
+                ClientEndpoints { kick, grants },
+            )
+            .with_reply_wait(rt.doorbell()?),
+        ),
+        _ring: ring,
+    })
+}
+
 impl<T: kore_rt::transport::Transport> MmClient for RingMm<'_, '_, T> {
     async fn request(&mut self, req: MmRequest) -> (MmResponse, Option<ReturnedCapability>) {
         self.call(&req).await
     }
 
     async fn supply(&mut self, bytes: u64) -> (MmResponse, Option<StashedLease>) {
-        let (response, delivered) = self
-            .call(&MmRequest::Supply {
-                size: bytes,
-                align: 0,
-            })
-            .await;
+        self.supply_in_class(bytes, 0).await
+    }
+
+    async fn supply_in_class(
+        &mut self,
+        bytes: u64,
+        align: u64,
+    ) -> (MmResponse, Option<StashedLease>) {
+        let (response, delivered) = self.call(&MmRequest::Supply { size: bytes, align }).await;
         let lease = delivered.and_then(|owner| {
             // Kind + rights checked at possession; a mismatched delivery
             // drops through the owner (revoked, slot reopened) — the
@@ -407,26 +647,46 @@ mod tests {
     #[test]
     fn stats_rejects_grants_and_wrong_reply_kinds_without_reopening_the_pair() {
         for (response, grants) in [
-            (MmResponse::Stats(kore_abi::monitor::MemorySnapshot::EMPTY), 1),
+            (
+                MmResponse::Stats(kore_abi::monitor::MemorySnapshot::EMPTY),
+                1,
+            ),
             (MmResponse::Released, 0),
         ] {
             let transport = ReplyTransport(Cell::new(true), Cell::new(0));
             let mut window = Window([0; WINDOW_BYTES]);
-            let (client, _) = kore_rt::svc::split_window::<MemoryManager>(&mut window.0, REQ_CAP, REP_CAP).unwrap();
+            let (client, _) =
+                kore_rt::svc::split_window::<MemoryManager>(&mut window.0, REQ_CAP, REP_CAP)
+                    .unwrap();
             let mut mm = RingMm(SvcClient::new(
-                &transport, client, ClientEndpoints {
+                &transport,
+                client,
+                ClientEndpoints {
                     kick: SlotRef::from_wire(100),
                     grants: [None; kore_rt::service::MAX_GRANTS],
                 },
             ));
             let reply = |response, grants| CallReply {
-                response, grants,
+                response,
+                grants,
                 delivered: [None; kore_rt::service::MAX_GRANTS],
                 retained: [const { None }; kore_rt::service::MAX_GRANTS],
             };
-            assert_eq!(mm.finish_stats(reply(MmResponse::Refused(MmRefusal::Denied), 0)), Ok(None));
-            assert_eq!(mm.finish_stats(reply(MmResponse::Stats(kore_abi::monitor::MemorySnapshot::EMPTY), 0)), Ok(None));
-            assert_eq!(mm.finish_stats(reply(response, grants)), Err(CallError::Wire));
+            assert_eq!(
+                mm.finish_stats(reply(MmResponse::Refused(MmRefusal::Denied), 0)),
+                Ok(None)
+            );
+            assert_eq!(
+                mm.finish_stats(reply(
+                    MmResponse::Stats(kore_abi::monitor::MemorySnapshot::EMPTY),
+                    0
+                )),
+                Ok(None)
+            );
+            assert_eq!(
+                mm.finish_stats(reply(response, grants)),
+                Err(CallError::Wire)
+            );
             assert!(!mm.0.is_idle());
             assert_eq!(run(mm.resume_stats_bounded(1)), Err(CallError::Poisoned));
         }

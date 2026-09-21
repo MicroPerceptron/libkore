@@ -10,7 +10,7 @@
 //! can publish the complete DMA graph before the device is allowed to master
 //! it. Then Identify Controller + Namespace fill [`DeviceInfo`].
 
-use crate::commands::{IdentifyController, IdentifyNamespace, NvmeSqe};
+use crate::commands::{HmbDescriptor, IdentifyController, IdentifyNamespace, NvmeSqe};
 use crate::prp::MemPage;
 use crate::qpair::{Completion, Qpair};
 use crate::regs::{
@@ -23,6 +23,7 @@ use kore_driver::block::{CompletionPacer, CountedPacer};
 
 use core::fmt;
 use core::mem::size_of;
+use core::sync::atomic::{Ordering, fence};
 
 /// Admin queue depth (spec allows up to 4096; 32 is the conventional
 /// bring-up size and covers every setup command outstanding at once).
@@ -54,6 +55,58 @@ pub struct DeviceInfo {
     /// Every metadata-free LBA data size the namespace offers (bit `k` =
     /// `512 << k` bytes) — the active one is `block_size`.
     pub supported_block_sizes: u32,
+    /// Host Memory Buffer the controller would like, in bytes (Identify
+    /// HMPRE; 0 = it uses none).  A DRAM-less controller keeps its mapping
+    /// tables here and pages them from NAND without one.
+    pub hmb_preferred_bytes: u64,
+    /// The smallest Host Memory Buffer the controller accepts (HMMIN).
+    pub hmb_min_bytes: u64,
+    /// The smallest chunk one descriptor may name (HMMINDS; 0 = no floor).
+    pub hmb_min_descriptor_bytes: u64,
+    /// Descriptors the controller accepts at most (HMMAXD; 0 = no limit).
+    pub hmb_max_descriptors: u16,
+    /// Host Memory Buffer currently enabled, in bytes (0 = none).
+    pub hmb_bytes: u64,
+}
+
+/// Identify reports the Host Memory Buffer sizes in **fixed 4 KiB units**
+/// — not `CC.MPS`, which is the unit Set Features takes them in.  The
+/// conversion to pages happens once, at the command builder.
+const fn hmb_units_to_bytes(units: u32) -> u64 {
+    (units as u64) << 12
+}
+
+/// Chunks a host memory buffer may be built from — 64 MiB in the 4 MiB
+/// pieces a capability host carves from a grown DMA window, which is more
+/// than any consumer-class HMMAXD this driver has met.
+pub const HMB_MAX_CHUNKS: usize = 16;
+
+/// A host memory buffer the controller is using: the descriptor table and
+/// the chunks it names.  Retained by the controller for exactly as long as
+/// the feature is enabled — the device reads and writes these frames at
+/// any moment, so they outlive every command and are released only after
+/// the controller acknowledged the disable.
+pub struct HostMemoryBuffer<B> {
+    list: B,
+    chunks: [Option<B>; HMB_MAX_CHUNKS],
+    bytes: u64,
+}
+
+impl<B> HostMemoryBuffer<B> {
+    /// Bytes the controller was given.
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Chunks the buffer is made of.
+    pub fn chunks(&self) -> usize {
+        self.chunks.iter().flatten().count()
+    }
+
+    /// The descriptor table's storage.
+    pub fn list(&self) -> &B {
+        &self.list
+    }
 }
 
 /// Decode Identify Controller MDTS in the units fixed by the base spec:
@@ -81,6 +134,8 @@ pub struct Controller<R: Regs, D: DmaPool> {
     page: MemPage,
     admin: Qpair<D::Buf, D::Buf>,
     info: DeviceInfo,
+    /// The host memory buffer in use, if one was enabled.
+    hmb: Option<HostMemoryBuffer<D::Buf>>,
 }
 
 /// A disabled NVMe controller whose admin queues have been allocated and
@@ -221,6 +276,7 @@ impl<R: Regs, D: DmaPool> PreparedController<R, D> {
             page,
             admin,
             info,
+            hmb: None,
         })
     }
 }
@@ -428,6 +484,10 @@ impl<R: Regs, D: DmaPool> Controller<R, D> {
         self.info.mdts_bytes = mdts_bytes(idc.mdts, self.caps.mpsmin)?;
         self.info.num_namespaces = idc.nn;
         self.info.oncs = idc.oncs;
+        self.info.hmb_preferred_bytes = hmb_units_to_bytes(idc.hmpre);
+        self.info.hmb_min_bytes = hmb_units_to_bytes(idc.hmmin);
+        self.info.hmb_min_descriptor_bytes = hmb_units_to_bytes(idc.hmminds);
+        self.info.hmb_max_descriptors = idc.hmmaxd;
 
         // Identify Namespace 1 into the same buffer (reused).
         self.admin_wait_paced(NvmeSqe::identify_namespace(1, buf.iova()), pacer)?;
@@ -559,6 +619,101 @@ impl<R: Regs, D: DmaPool> Controller<R, D> {
         self.set_num_queues_paced(want, &mut pacer)
     }
 
+    /// **Enable a Host Memory Buffer** made of `chunks` (device-visible,
+    /// `CC.MPS`-aligned, each a whole number of pages) described in `list`
+    /// (16 bytes per chunk, 16-byte aligned).  The controller retains both
+    /// until [`disable_host_memory_buffer`](Self::disable_host_memory_buffer)
+    /// succeeds — which [`shutdown`](Self::shutdown) attempts first — because
+    /// the device may read or write these frames at any moment after this
+    /// returns `Ok`.  Returns the bytes the controller was given.
+    ///
+    /// The sizing decision is the caller's: it has Identify's
+    /// [`hmb_preferred_bytes`](DeviceInfo::hmb_preferred_bytes) and the
+    /// floors, and it owns the memory.  What this checks is the spec's
+    /// shape — at least one chunk, no more than HMMAXD, each chunk
+    /// page-aligned and page-sized, none below HMMINDS, the whole not below
+    /// HMMIN — and refuses `Geometry` rather than hand the device a table it
+    /// would reject or, worse, misread.
+    pub fn enable_host_memory_buffer(
+        &mut self,
+        list: D::Buf,
+        chunks: [Option<D::Buf>; HMB_MAX_CHUNKS],
+        pacer: &mut dyn CompletionPacer,
+    ) -> Result<u64> {
+        if self.hmb.is_some() {
+            return Err(Error::Geometry);
+        }
+        let page = self.page.bytes() as u64;
+        let count = chunks.iter().flatten().count();
+        let max = usize::from(self.info.hmb_max_descriptors);
+        if count == 0 || (max != 0 && count > max) {
+            return Err(Error::Geometry);
+        }
+        if list.len() < count * size_of::<HmbDescriptor>() || list.iova().0 & 0xF != 0 {
+            return Err(Error::Geometry);
+        }
+        let mut total = 0u64;
+        for (index, chunk) in chunks.iter().flatten().enumerate() {
+            let bytes = chunk.len() as u64;
+            let aligned = chunk.iova().0 % page == 0 && bytes % page == 0;
+            if bytes == 0 || !aligned || bytes < self.info.hmb_min_descriptor_bytes {
+                return Err(Error::Geometry);
+            }
+            let pages = u32::try_from(bytes / page).map_err(|_| Error::Geometry)?;
+            total = total.checked_add(bytes).ok_or(Error::Geometry)?;
+            let descriptor = HmbDescriptor::new(chunk.iova(), pages);
+            // SAFETY: `list` is a DMA buffer this task owns for its whole
+            // life, and the bound above proved room for `count` entries;
+            // volatile because the device reads the table after submit.
+            unsafe {
+                (list.cpu() as *mut HmbDescriptor)
+                    .add(index)
+                    .write_volatile(descriptor);
+            }
+        }
+        if total < self.info.hmb_min_bytes {
+            return Err(Error::Geometry);
+        }
+        let hsize = u32::try_from(total / page).map_err(|_| Error::Geometry)?;
+        // The table is complete before the doorbell publishes it.
+        fence(Ordering::Release);
+        let entries = count as u32;
+        self.admin_wait_paced(
+            NvmeSqe::enable_host_memory_buffer(hsize, list.iova(), entries),
+            pacer,
+        )?;
+        self.info.hmb_bytes = total;
+        self.hmb = Some(HostMemoryBuffer {
+            list,
+            chunks,
+            bytes: total,
+        });
+        Ok(total)
+    }
+
+    /// The host memory buffer in use, if any.
+    pub fn host_memory_buffer(&self) -> Option<&HostMemoryBuffer<D::Buf>> {
+        self.hmb.as_ref()
+    }
+
+    /// **Disable the Host Memory Buffer**, releasing its memory only once
+    /// the controller acknowledged: a refused or timed-out disable keeps the
+    /// buffer retained, because the device may still be writing it.  A
+    /// no-op when none is enabled.
+    pub fn disable_host_memory_buffer(
+        &mut self,
+        max_polls: u32,
+        mut pause: impl FnMut(),
+    ) -> Result<()> {
+        if self.hmb.is_none() {
+            return Ok(());
+        }
+        self.admin_wait(NvmeSqe::disable_host_memory_buffer(), max_polls, &mut pause)?;
+        self.info.hmb_bytes = 0;
+        self.hmb = None;
+        Ok(())
+    }
+
     /// Negotiate queue counts through a composed pacer.
     pub fn set_num_queues_paced(
         &mut self,
@@ -586,6 +741,13 @@ impl<R: Regs, D: DmaPool> Controller<R, D> {
     /// half-quiesced controller is exactly why capability retirement is
     /// unconditional.
     pub fn shutdown(&mut self, max_polls: u32, mut pause: impl FnMut()) -> Result<()> {
+        // The host memory buffer goes first, while the controller can still
+        // take an admin command.  A refused disable is not fatal to the
+        // shutdown: once `CSTS.SHST` reports complete the controller masters
+        // nothing, so the frames are safe — and they stay retained in
+        // `self.hmb` until `into_seam` regardless, which is what makes a
+        // silent device harmless rather than a use-after-release.
+        let _ = self.disable_host_memory_buffer(max_polls, &mut pause);
         let cc = self.regs.read32(REG_CC);
         self.regs
             .write32(REG_CC, (cc & !CC_SHN_MASK) | CC_SHN_NORMAL);
@@ -634,5 +796,132 @@ mod tests {
     #[test]
     fn hostile_mdts_shift_refuses() {
         assert_eq!(mdts_bytes(u8::MAX, 0), Err(Error::Geometry));
+    }
+
+    use super::{Controller, HMB_MAX_CHUNKS};
+    use crate::mock::{MockBuf, MockNvmeDevice};
+    use crate::seam::DmaPool;
+    use kore_driver::block::CountedPacer;
+
+    /// A live mock controller, identified, advertising a DRAM-less
+    /// appetite: `preferred`/`min` in 4 KiB units, at most `max` chunks.
+    fn dram_less(
+        preferred: u32,
+        min: u32,
+        max: u16,
+    ) -> (
+        MockNvmeDevice,
+        Controller<MockNvmeDevice, crate::mock::MockPool>,
+    ) {
+        let dev = MockNvmeDevice::new();
+        dev.set_hmb(preferred, min, max);
+        let mut ctrl = Controller::bring_up(dev.clone(), dev.pool(), 16, || {}).unwrap();
+        ctrl.identify(16, || {}).unwrap();
+        (dev, ctrl)
+    }
+
+    fn chunks(
+        ctrl: &Controller<MockNvmeDevice, crate::mock::MockPool>,
+        sizes: &[usize],
+    ) -> [Option<MockBuf>; HMB_MAX_CHUNKS] {
+        let mut out = [const { None }; HMB_MAX_CHUNKS];
+        for (slot, bytes) in sizes.iter().enumerate() {
+            out[slot] = Some(ctrl.pool().alloc_aligned(*bytes, 4096).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn identify_decodes_the_host_memory_buffer_appetite_in_bytes() {
+        let (_dev, ctrl) = dram_less(16_384, 1_024, 8);
+        let info = ctrl.info();
+        assert_eq!(
+            info.hmb_preferred_bytes,
+            64 << 20,
+            "HMPRE is in 4 KiB units"
+        );
+        assert_eq!(info.hmb_min_bytes, 4 << 20);
+        assert_eq!(info.hmb_max_descriptors, 8);
+        assert_eq!(info.hmb_bytes, 0, "nothing enabled yet");
+    }
+
+    #[test]
+    fn a_host_memory_buffer_is_enabled_from_page_chunks_and_disabled_first_at_shutdown() {
+        // 16 KiB preferred, 8 KiB minimum, four descriptors at most.
+        let (dev, mut ctrl) = dram_less(4, 2, 4);
+        let table = chunks(&ctrl, &[8192, 8192]);
+        let list = ctrl.pool().alloc(4096).unwrap();
+        let mut pacer = CountedPacer::new(16, || {});
+        assert_eq!(
+            ctrl.enable_host_memory_buffer(list, table, &mut pacer),
+            Ok(16_384)
+        );
+        // HSIZE is in the configured page (4 KiB here): 4 pages, 2 entries.
+        assert_eq!(dev.hmb(), Some((4, 2)));
+        let hmb = ctrl.host_memory_buffer().expect("retained while enabled");
+        assert_eq!(hmb.bytes(), 16_384);
+        assert_eq!(hmb.chunks(), 2);
+        assert_eq!(ctrl.info().hmb_bytes, 16_384);
+        // A second enable while one stands is refused, not stacked.
+        let again = chunks(&ctrl, &[8192, 8192]);
+        let list2 = ctrl.pool().alloc(4096).unwrap();
+        assert_eq!(
+            ctrl.enable_host_memory_buffer(list2, again, &mut pacer),
+            Err(Error::Geometry)
+        );
+        // Shutdown disables the buffer before CC.SHN, and releases it.
+        ctrl.shutdown(16, || {}).unwrap();
+        assert_eq!(dev.hmb(), None);
+        assert_eq!(dev.hmb_disables(), 1);
+        assert!(ctrl.host_memory_buffer().is_none());
+        assert_eq!(ctrl.info().hmb_bytes, 0);
+    }
+
+    #[test]
+    fn a_table_the_controller_would_reject_is_refused_before_it_is_sent() {
+        // Too many descriptors for HMMAXD.
+        let (dev, mut ctrl) = dram_less(4, 1, 1);
+        let table = chunks(&ctrl, &[8192, 8192]);
+        let list = ctrl.pool().alloc(4096).unwrap();
+        let mut pacer = CountedPacer::new(16, || {});
+        assert_eq!(
+            ctrl.enable_host_memory_buffer(list, table, &mut pacer),
+            Err(Error::Geometry)
+        );
+        assert_eq!(dev.hmb(), None, "nothing reached the device");
+
+        // Below the controller's minimum.
+        let (dev, mut ctrl) = dram_less(8, 4, 0);
+        let table = chunks(&ctrl, &[4096]);
+        let list = ctrl.pool().alloc(4096).unwrap();
+        assert_eq!(
+            ctrl.enable_host_memory_buffer(list, table, &mut pacer),
+            Err(Error::Geometry)
+        );
+        assert_eq!(dev.hmb(), None);
+
+        // A chunk that is not a whole number of the CONFIGURED page: an
+        // 8 KiB-page controller handed a 4 KiB chunk (the pool cannot
+        // produce a non-4 KiB length, so the page is what moves).
+        let dev = MockNvmeDevice::new().with_mps(1).unwrap();
+        dev.set_hmb(4, 0, 0);
+        let mut ctrl = Controller::bring_up(dev.clone(), dev.pool(), 16, || {}).unwrap();
+        ctrl.identify(16, || {}).unwrap();
+        assert_eq!(ctrl.page().bytes(), 8192);
+        let mut table = [const { None }; HMB_MAX_CHUNKS];
+        table[0] = Some(ctrl.pool().alloc_aligned(4096, 8192).unwrap());
+        let list = ctrl.pool().alloc(4096).unwrap();
+        assert_eq!(
+            ctrl.enable_host_memory_buffer(list, table, &mut pacer),
+            Err(Error::Geometry)
+        );
+        assert_eq!(dev.hmb(), None);
+    }
+
+    #[test]
+    fn a_controller_without_a_buffer_shuts_down_without_a_disable() {
+        let (dev, mut ctrl) = dram_less(0, 0, 0);
+        ctrl.shutdown(16, || {}).unwrap();
+        assert_eq!(dev.hmb_disables(), 0);
     }
 }

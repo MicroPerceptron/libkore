@@ -320,6 +320,7 @@ pub struct WindowClient<'w, 't, T: Transport> {
     focused: bool,
     visible: bool,
     observed_scheme: Option<crate::appearance::ColorScheme>,
+    observed_density: Option<crate::appearance::Density>,
     queried: bool,
 }
 
@@ -358,6 +359,7 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
             focused: false,
             visible: true,
             observed_scheme: None,
+            observed_density: None,
             queried: false,
         })
     }
@@ -391,6 +393,9 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
             || self.channel.state().is_some_and(|state| {
                 self.observed_scheme
                     .is_some_and(|seen| state.color_scheme() != seen)
+                    || self
+                        .observed_density
+                        .is_some_and(|seen| state.density() != seen)
             })
         {
             return;
@@ -431,6 +436,14 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
 
     pub fn pop_output(&mut self) -> Option<OutChunk> {
         self.output.pop()
+    }
+
+    /// Observe native rendering density; this also closes the state-before-park race.
+    pub fn density(&mut self) -> crate::appearance::Density {
+        if let Some(state) = self.channel.state() {
+            self.observed_density = Some(state.density());
+        }
+        self.observed_density.unwrap_or_default()
     }
 
     /// Read and acknowledge the resolved appearance. Opting in makes
@@ -712,6 +725,23 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
         self.retire_tombstone().await?;
         self.configuration = None;
         Ok(())
+    }
+
+    /// Ask the controller to close this window — the keyboard's ESC/Q and
+    /// an app's own close action take the path the chrome's close dot
+    /// takes. The compositor raises the same `close_requested` latch and
+    /// echoes `Event::CloseRequested` down this window's channel; the app
+    /// then leaves through its ordinary close path once it sees the echo,
+    /// after the controller has begun its own teardown. `Ok(serial)` is
+    /// the configure serial the request is held under; an already-asked
+    /// window answers again rather than refusing. A `Busy` refusal is
+    /// retryable: the window is already closing, or the event ring could
+    /// not take the echo this instant.
+    pub async fn request_close(&mut self) -> Result<u64, ClientError> {
+        match self.surface_request(SurfaceRequest::RequestClose).await? {
+            SurfaceResponse::CloseRequested { serial } => Ok(serial),
+            _ => Err(ClientError::Protocol),
+        }
     }
 
     async fn read_configuration(&mut self) -> Result<Configure, ClientError> {
@@ -1079,6 +1109,58 @@ mod tests {
 
     fn drive<F: core::future::Future>(future: F) -> F::Output {
         kore_rt::try_block_on(future, 8).expect("future did not resolve")
+    }
+
+    #[test]
+    fn density_published_before_wait_is_observed_without_parking() {
+        use crate::channel::WindowState;
+        use kore_rt::svc::SvcProtocol;
+        #[repr(align(64))]
+        struct Buffer<const N: usize>([u8; N]);
+        let mut pair = Buffer([0; wire::SURFACE_PAIR_BYTES]);
+        let mut event_memory = Buffer([0; 4096]);
+        WindowWire::init_pair_window(&mut pair.0, REQ_CAP, REP_CAP).unwrap();
+        let transport = CountingTransport::new();
+        let mut client = WindowClient::from_memory(
+            &transport,
+            &mut pair.0,
+            ClientEndpoints {
+                kick: SlotRef::from_wire(1),
+                grants: [const { None }; MAX_GRANTS],
+            },
+        )
+        .unwrap();
+        let (mut producer, channel) = kore_ring::event::split::<WindowState, EventWire>(
+            &mut event_memory.0,
+            crate::event::EVENT_CAP,
+        )
+        .unwrap();
+        client.channel = channel;
+        let original_flags = WindowState::VISIBLE | WindowState::FOCUSED | WindowState::LIGHT;
+        let mut state = WindowState {
+            flags: original_flags,
+            ..WindowState::default()
+        };
+        producer.replace_state(state);
+        assert_eq!(client.density(), crate::appearance::Density::Native);
+        state.set_density(crate::appearance::Density::Double);
+        producer.replace_state(state);
+        // No event record: the state change and its wake can precede wait_change.
+        // Poll once; an actual event wait would be Pending on the unchanged seq.
+        let mut future = core::pin::pin!(client.wait_change(core::time::Duration::from_secs(1)));
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert!(core::future::Future::poll(future.as_mut(), &mut cx).is_ready());
+        drop(future);
+        assert_eq!(
+            state.flags & (WindowState::FOCUSED | WindowState::VISIBLE | WindowState::LIGHT),
+            original_flags
+        );
+        state.set_density(crate::appearance::Density::Native);
+        assert_eq!(state.density(), crate::appearance::Density::Native);
+        assert_eq!(
+            state.flags & (WindowState::FOCUSED | WindowState::VISIBLE | WindowState::LIGHT),
+            original_flags
+        );
     }
 
     #[test]

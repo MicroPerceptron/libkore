@@ -192,6 +192,14 @@ fn verify_image<A: RelocArch>(path: &Path, kind: ImageKind) {
         assert!(defined, "{tag}: .dynsym does not define {symbol}");
         if matches!(kind, ImageKind::LateModule { .. }) {
             assert!(!has_tls, "{tag}: a late module may not carry PT_TLS");
+            let checked = kore_ld::check::check_image::<A>(&data)
+                .unwrap_or_else(|e| panic!("{tag}: late module check: {e:?}"));
+            assert!(
+                checked.relro.is_some(),
+                "{tag}: native witness must exercise RELRO sealing"
+            );
+            kore_ld::late::LateLayout::plan(&checked, u64::MAX, u64::MAX)
+                .unwrap_or_else(|e| panic!("{tag}: late protection layout: {e:?}"));
         }
     }
     if let ImageKind::NeedsLibrary(required) = kind {

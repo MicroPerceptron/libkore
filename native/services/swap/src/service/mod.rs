@@ -904,7 +904,7 @@ fn thread_witness() {
 /// while its joinee is live (the shape that wedged under TCG timing) instead of
 /// every round riding the probe's already-exited fast path.
 ///
-/// Two child shapes:
+/// Three child shapes:
 /// - **sprinters** exit the instant they run — the join commits its park
 ///   in the same window the exit publishes, sampling the Dekker pairing
 ///   (`install_joiner` vs `mark_exited`/drain) under real SMP timing;
@@ -916,6 +916,9 @@ fn thread_witness() {
 ///   a live child instead of relying on a 3 ms timing guess. Its exit drain must
 ///   deliver the installed waiter's wake, which is what the kernel's one-shot
 ///   `join-park: PASS` marker attests.
+///
+/// The last child panics with 48 KiB of its 64 KiB stack occupied. Its
+/// joined status must be PANIC; all other children must report OK.
 ///
 /// A join that never resolves wedges this witness right here, and the
 /// gang markers downstream (`spmd-gang: founded 2/2`, `retired epoch`)
@@ -929,12 +932,17 @@ fn join_storm() -> bool {
     use core::sync::atomic::Ordering;
     use kore_rt::cap::verbs;
 
-    for round in 0u32..16 {
+    // Preserve the existing sixteen exit/join races; the final one also
+    // exercises terminal stack headroom.
+    const ROUNDS: u32 = 16;
+    for round in 0u32..ROUNDS {
         let linger = round == 0;
         let entry: fn() = if linger {
             STORM_LINGERER_READY.store(false, Ordering::Release);
             STORM_LINGERER_GO.store(false, Ordering::Release);
             storm_lingerer
+        } else if round == ROUNDS - 1 {
+            storm_stack_panic
         } else {
             storm_sprinter
         };
@@ -971,7 +979,17 @@ fn join_storm() -> bool {
         }
         loop {
             match kore_rt::thread::join(child) {
-                Ok(_) => break,
+                Ok(status) => {
+                    let expected = if round == ROUNDS - 1 {
+                        kore_rt::exit::ExitCode::PANIC.get()
+                    } else {
+                        kore_rt::exit::ExitCode::OK.get()
+                    };
+                    if status != Some(expected) {
+                        return false;
+                    }
+                    break;
+                }
                 Err(refused) => {
                     // The affine ticket rides back on a typed refusal
                     // (slots, transport).  Pace the retry on the deadline
@@ -993,6 +1011,25 @@ fn join_storm() -> bool {
 /// becomes `thread::exit(ExitCode::OK)` while the parent's join is still
 /// committing.
 fn storm_sprinter() {}
+
+/// Exercise terminal handling with three quarters of an ordinary 64 KiB
+/// worker stack occupied. PTL input faulted in the exit stack probe because
+/// inlined notice + exit + backoff builders overlapped. The final storm join
+/// must observe PANIC before the downstream gang gate markers can appear.
+#[inline(never)]
+fn storm_stack_panic() {
+    const OCCUPIED_BYTES: usize = 48 * 1024;
+    let occupied = [0u8; OCCUPIED_BYTES];
+    storm_panic_with_live_frame(core::hint::black_box(&occupied));
+}
+
+/// The opaque borrowed buffer keeps the caller's frame live across panic;
+/// a local buffer never passed to a callee can be optimized away before it.
+#[inline(never)]
+fn storm_panic_with_live_frame(occupied: &[u8]) -> ! {
+    core::hint::black_box(occupied);
+    panic!("worker panic with occupied stack witness");
+}
 
 /// A storm child that proves readiness, waits for its parent's immediate-join
 /// handoff, then stays live for a large bounded margin while the parent installs

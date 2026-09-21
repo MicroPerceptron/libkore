@@ -23,7 +23,11 @@ fn view_placement_requests_only_a_window_not_more_authority() {
     use kore_abi::session::{DERIVE_KIND_VIEW_MAP, ViewMapReq, ViewMapWindow};
     use zerocopy::TryFromBytes;
 
-    for window in [ViewMapWindow::Map, ViewMapWindow::Surfaces] {
+    for window in [
+        ViewMapWindow::Map,
+        ViewMapWindow::Surfaces,
+        ViewMapWindow::Heap,
+    ] {
         let mut builder = SessionBuilder::new();
         builder
             .map_view_in(SlotRef::from_wire(2), window, SlotRef::from_wire(3))
@@ -2146,4 +2150,180 @@ fn virtio_pci_layout_queries_are_inert_and_shape_tight() {
         (3, VIRTIO_PCI_LAYOUT_QUERY_RECORD)
     );
     assert_eq!(record.reserved, [0; 6]);
+}
+
+#[test]
+fn typed_exit_serializes_every_status_bit_and_raw_exit_cannot_bypass_it() {
+    use crate::ExitCode;
+    use kore_abi::session::{DERIVE_KIND_TASK_EXIT, ExitReq};
+    use zerocopy::TryFromBytes;
+    let slot = SlotRef::from_wire(2);
+    for code in [
+        ExitCode::OK,
+        ExitCode::APPLICATION_0,
+        ExitCode::APPLICATION_1,
+        ExitCode::APPLICATION_15,
+        ExitCode::LINK_FAILED,
+        ExitCode::PANIC,
+    ] {
+        let mut builder = SessionBuilder::new();
+        builder.exit(slot, code).unwrap();
+        let mut out = [0u8; DESCRIPTOR_MAX];
+        let len = builder.finish(&mut out).unwrap();
+        let (_, invs, args) = parse(&out[..len]);
+        assert_eq!(invs.len(), 1);
+        assert_eq!(invs[0].kind, DERIVE_KIND_TASK_EXIT);
+        assert_eq!(invs[0].subject.get(), 2);
+        let (req, rest) = ExitReq::try_ref_from_prefix(args).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(req.status.get(), code.get());
+        assert_eq!(req.reserved, [0; 4]);
+    }
+    let mut builder = SessionBuilder::new();
+    assert_eq!(
+        builder.derive_raw(
+            slot,
+            Rights::empty(),
+            DERIVE_KIND_TASK_EXIT,
+            slot,
+            Some(&[0; 8])
+        ),
+        Err(BuildError::UntypedExit)
+    );
+    builder.exit(slot, ExitCode::APPLICATION_1).unwrap();
+    let mut out = [0u8; DESCRIPTOR_MAX];
+    let len = builder.finish(&mut out).unwrap();
+    let (_, invs, args) = parse(&out[..len]);
+    assert_eq!(
+        invs.len(),
+        1,
+        "rejected raw exit must not stage an invocation"
+    );
+    assert_eq!(args.len(), ExitReq::WIRE, "nor consume argument storage");
+}
+
+#[test]
+fn process_drain_is_a_standalone_authenticated_self_operation() {
+    use kore_abi::session::DERIVE_KIND_PROCESS_DRAIN;
+    let mut b = SessionBuilder::new();
+    b.drain_process(SlotRef::from_wire(3), SlotRef::from_wire(5))
+        .unwrap();
+    let mut bytes = [0u8; DESCRIPTOR_MAX];
+    let length = b.finish(&mut bytes).unwrap();
+    let (header, invocations, args) = parse(&bytes[..length]);
+    assert_eq!(header.flags.get(), 0);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].op.get(), OpCode::Derive as u16);
+    assert_eq!(invocations[0].kind, DERIVE_KIND_PROCESS_DRAIN);
+    assert_eq!(invocations[0].subject.get(), 3);
+    assert_eq!(invocations[0].result.get(), 5);
+    assert_eq!(invocations[0].requested, 0);
+    assert_eq!(invocations[0].arg.get(), Invocation::NO_ARG);
+    assert!(args.is_empty());
+    assert!(b.start(SlotRef::from_wire(3)).is_err());
+    let mut b = SessionBuilder::new();
+    b.start(SlotRef::from_wire(3)).unwrap();
+    assert!(
+        b.drain_process(SlotRef::from_wire(3), SlotRef::from_wire(5))
+            .is_err()
+    );
+    assert!(kore_abi::session::derive_kind_known(
+        DERIVE_KIND_PROCESS_DRAIN
+    ));
+}
+
+#[test]
+fn crash_read_and_panic_are_standalone_and_preserve_their_payloads() {
+    use kore_abi::session::{DERIVE_KIND_CRASH_READ, DERIVE_KIND_PANIC_REPORT};
+    let task = SlotRef::from_wire(3);
+    let report = SlotRef::from_wire(5);
+    let mut b = SessionBuilder::new();
+    b.read_crash(task, report, 63).unwrap();
+    assert!(b.start(task).is_err());
+    let mut bytes = [0; DESCRIPTOR_MAX];
+    let length = b.finish(&mut bytes).unwrap();
+    let (_, invocations, args) = parse(&bytes[..length]);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].kind, DERIVE_KIND_CRASH_READ);
+    assert_eq!(invocations[0].subject.get(), 3);
+    assert_eq!(invocations[0].result.get(), 5);
+    assert_eq!(args, &[63, 0, 0, 0, 0, 0, 0, 0]);
+
+    let mut b = SessionBuilder::new();
+    b.report_panic(task, "panic \u{20ac}").unwrap();
+    assert!(b.read_crash(task, report, 0).is_err());
+    let length = b.finish(&mut bytes).unwrap();
+    let (_, invocations, args) = parse(&bytes[..length]);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].kind, DERIVE_KIND_PANIC_REPORT);
+    assert_eq!(invocations[0].subject.get(), 3);
+    assert_eq!(u32::from_le_bytes(args[..4].try_into().unwrap()), 9);
+    assert_eq!(&args[4..8], &[0; 4]);
+    assert_eq!(&args[8..], "panic \u{20ac}".as_bytes());
+    let mut b = SessionBuilder::new();
+    b.start(task).unwrap();
+    assert!(b.report_panic(task, "too late").is_err());
+}
+
+#[test]
+fn crash_binding_is_standalone_and_uses_held_memory_coordinates() {
+    let task = SlotRef::from_wire(3);
+    let lease = SlotRef::from_wire(7);
+    let mut b = SessionBuilder::new();
+    b.bind_crash(task, lease, 8192, 4096).unwrap();
+    assert!(b.start(task).is_err());
+    let mut bytes = [0; DESCRIPTOR_MAX];
+    let length = b.finish(&mut bytes).unwrap();
+    let (_, invocations, args) = parse(&bytes[..length]);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(
+        invocations[0].kind,
+        kore_abi::session::DERIVE_KIND_CRASH_BIND
+    );
+    assert_eq!(args.len(), 24);
+    assert_eq!(u32::from_le_bytes(args[..4].try_into().unwrap()), 7);
+    assert_eq!(&args[4..8], &[0; 4]);
+    assert_eq!(u64::from_le_bytes(args[8..16].try_into().unwrap()), 8192);
+    assert_eq!(u64::from_le_bytes(args[16..24].try_into().unwrap()), 4096);
+}
+
+#[test]
+fn task_name_is_bounded_copied_and_standalone() {
+    let mut b = SessionBuilder::new();
+    let name = kore_abi::task::TaskName::new("hello/worker-2").unwrap();
+    b.name_task(SlotRef::from_wire(7), name).unwrap();
+    assert_eq!(
+        b.name_task(SlotRef::from_wire(8), name),
+        Err(BuildError::EffectMustStandAlone)
+    );
+    let mut bytes = [0; DESCRIPTOR_MAX];
+    let n = b.finish(&mut bytes).unwrap();
+    let (_, invs, args) = parse(&bytes[..n]);
+    assert_eq!(invs.len(), 1);
+    assert_eq!(invs[0].kind, kore_abi::session::DERIVE_KIND_TASK_NAME);
+    let payload = &args[invs[0].arg.get() as usize..];
+    assert_eq!(payload[0] as usize, name.as_str().len());
+    assert_eq!(
+        &payload[1..1 + payload[0] as usize],
+        name.as_str().as_bytes()
+    );
+}
+
+#[test]
+fn task_identity_query_is_standalone_and_has_no_arguments() {
+    let mut b = SessionBuilder::new();
+    let task = SlotRef::from_wire(7);
+    let result = SlotRef::from_wire(8);
+    b.task_identity(task, result).unwrap();
+    assert_eq!(
+        b.task_identity(task, result),
+        Err(BuildError::EffectMustStandAlone)
+    );
+    let mut bytes = [0; DESCRIPTOR_MAX];
+    let n = b.finish(&mut bytes).unwrap();
+    let (_, invs, args) = parse(&bytes[..n]);
+    assert_eq!(invs.len(), 1);
+    assert_eq!(invs[0].kind, kore_abi::session::DERIVE_KIND_TASK_IDENTITY);
+    assert_eq!(invs[0].arg.get(), u32::MAX);
+    assert!(args.is_empty());
 }

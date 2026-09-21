@@ -133,15 +133,18 @@ pub(crate) enum ExecFault {
     NoDoorbellNotice,
     /// The kernel reported alternate delivery with no alternate post standing.
     AltDeliveryNoPost,
-    /// An alternate-delivery completion carried no delivery.
-    AltDeliveryNoDelivery,
+    // Rung 0x62 (`AltDeliveryNoDelivery`) is retired: a readable, vacant
+    // alternate landing is a spurious wake the mux tolerates and counts
+    // (`alt_vacant_wakes`). The number stays reserved so old photographs
+    // decode; no new fault may reuse it.
     /// The doorbell re-post could not even be staged.
     RepostStage,
     /// The doorbell re-post was refused with this status.
     RepostRefused(Status),
     /// The park itself was refused with this status.
     ParkRefused(Status),
-    /// [`UNKNOWN_STATUS_TOLERANCE`] consecutive unenumerated statuses.
+    /// [`UNKNOWN_STATUS_TOLERANCE`] consecutive unenumerated statuses. Rung
+    /// `0x70 | status` — one per status, so the exit code alone names it.
     UnknownStatusStorm(Status),
     /// The park itself could not be committed — the trap did not open.
     ParkTransport,
@@ -149,6 +152,11 @@ pub(crate) enum ExecFault {
     /// compose, and this is executor-internal state rather than anything the
     /// kernel reported: two futures installed contradictory wake sources.
     AltDeliveryWithIrqPark,
+    /// The kernel reported alternate delivery into a landing slot this
+    /// thread's read-only slot alias cannot read at all — distinct from a
+    /// readable slot holding no record, which is tolerated (retired rung
+    /// 0x62). The detail carries the slot index.
+    AltDeliveryUnreadable(u32),
 }
 
 impl ExecFault {
@@ -159,13 +167,16 @@ impl ExecFault {
         let (rung, detail): (u64, u64) = match self {
             Self::NoDoorbellNotice => (0x60, 0),
             Self::AltDeliveryNoPost => (0x61, 0),
-            Self::AltDeliveryNoDelivery => (0x62, 0),
             Self::RepostStage => (0x63, 0),
             Self::RepostRefused(s) => (0x64, s as u16 as u64),
             Self::ParkRefused(s) => (0x65, s as u16 as u64),
-            Self::UnknownStatusStorm(s) => (0x66, s as u16 as u64),
+            // One rung per storming status (0x70..): the exit ABI retains only
+            // the rung, and the status IS the finding — a photograph of the
+            // exit code must name it without the beacon's detail bits.
+            Self::UnknownStatusStorm(s) => (0x70 | (s as u16 as u64 & 0xf), s as u16 as u64),
             Self::ParkTransport => (0x67, 0),
             Self::AltDeliveryWithIrqPark => (0x68, 0),
+            Self::AltDeliveryUnreadable(slot) => (0x69, u64::from(slot)),
         };
         rung | (detail << 8)
     }
@@ -283,6 +294,9 @@ pub struct Executor<'t, T: ParkTransport> {
     /// Idle parks a bell resolved — never committed, because a peer rang
     /// first.  The syscall pair (`park` + re-post) this seam removes.
     bell_cycles: Cell<u64>,
+    /// Alternate wakes whose landing read vacant — spurious by contract, not
+    /// faults; a rising rate is the signal a kernel delivery race exists.
+    alt_vacant_wakes: Cell<u64>,
 }
 
 impl<T: ParkTransport> Drop for Executor<'_, T> {
@@ -356,6 +370,7 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
             bell: wake::current(),
             bell_seen: Cell::new(0),
             bell_cycles: Cell::new(0),
+            alt_vacant_wakes: Cell::new(0),
         }
     }
 
@@ -399,6 +414,11 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
     /// bell protocol is disabled outright.
     pub fn bell_cycles(&self) -> u64 {
         self.bell_cycles.get()
+    }
+
+    /// Spurious alternate wakes tolerated so far (see the `AltDelivery` arm).
+    pub fn alt_vacant_wakes(&self) -> u64 {
+        self.alt_vacant_wakes.get()
     }
 
     /// The executor's event-driven clock (ns) — advanced by `Deadline`
@@ -643,7 +663,20 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
                     executor_fault(ExecFault::AltDeliveryNoPost)
                 };
                 if verbs::take_delivery(alt.land).is_none() {
-                    executor_fault(ExecFault::AltDeliveryNoDelivery);
+                    // An unreadable landing is structural and stays fatal.
+                    if !verbs::slot_readable(alt.land) {
+                        executor_fault(ExecFault::AltDeliveryUnreadable(alt.land.index()));
+                    }
+                    // A readable, vacant landing is a **spurious alternate
+                    // wake**: the kernel resolved the post gone while no
+                    // record reached the slot (observed on metal from the
+                    // NPU completion lane, 2026-09-17). The mux must not
+                    // reject it — the owning future re-checks its own state
+                    // on the ready leg, and every alternate-post consumer in
+                    // the tree treats the notice as a wake, never as truth.
+                    // Counted so the rate stays legible in telemetry.
+                    self.alt_vacant_wakes
+                        .set(self.alt_vacant_wakes.get().wrapping_add(1));
                 }
                 // Both posts may have completed before resolution.  Consume
                 // and re-stand the level-triggered doorbell when present, but
@@ -707,6 +740,19 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
                     executor_fault(ExecFault::UnknownStatusStorm(s));
                 }
                 self.unknown_statuses.set(seen);
+                // With an alternate post registered, the refusal is very
+                // likely *about that post* — a service retiring a client's
+                // completion lane leaves the parked park naming a dead
+                // channel, which the kernel answers `Malformed` on every
+                // re-park (observed on metal: the accel seal on DeviceLost).
+                // Re-parking blind can only storm; waking the owner as a
+                // spurious alternate wake lets it settle, find the channel
+                // gone, and take its own fallback. Consumers already treat
+                // a recordless Delivery as a wake, never as truth.
+                if alternate.is_some() {
+                    self.ctx.note_wake(time::WakeReason::Delivery);
+                    self.wake_all(root_hdr);
+                }
             }
         }
     }
@@ -1043,15 +1089,16 @@ mod tests {
         let faults = [
             ExecFault::NoDoorbellNotice,
             ExecFault::AltDeliveryNoPost,
-            ExecFault::AltDeliveryNoDelivery,
             ExecFault::RepostStage,
             ExecFault::RepostRefused(Status::Denied),
             ExecFault::ParkRefused(Status::Denied),
             ExecFault::UnknownStatusStorm(Status::Denied),
+            ExecFault::UnknownStatusStorm(Status::Malformed),
             ExecFault::ParkTransport,
             ExecFault::AltDeliveryWithIrqPark,
+            ExecFault::AltDeliveryUnreadable(7),
         ];
-        let mut rungs = [0u64; 9];
+        let mut rungs = [0u64; 10];
         for (slot, fault) in rungs.iter_mut().zip(faults) {
             let payload = fault.payload();
             let rung = payload & 0xff;

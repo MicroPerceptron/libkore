@@ -585,10 +585,10 @@ pub const SHELL_CONFIG_STAGE_DERIVED: u8 = 5;
 /// No transport status exists because the userland trap could not commit.
 pub const SHELL_CONFIG_ERROR_TRANSPORT: u8 = 0xfe;
 
-/// The terminal renderer's own program-band exit vocabulary. These codes
-/// cross the ordinary task-exit and shell witness paths; the renderer needs
-/// no service beacon or extra diagnostic capability to name its failing phase.
-/// Keep discriminants stable so a photographed boot remains decodable.
+/// The terminal renderer's closed failure phases. `exit_code()` assigns each
+/// phase an application-reserved slot on the ordinary task-exit path; the
+/// enum discriminants are phase identities, not the wire exit numbers. The
+/// shared decoder keeps photographed failures attributable to their phase.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalRendererFailure {
@@ -605,20 +605,30 @@ pub enum TerminalRendererFailure {
 
 impl TerminalRendererFailure {
     pub const fn exit_code(self) -> crate::exit::ExitCode {
-        crate::exit::ExitCode::app(self as u8)
+        match self {
+            Self::Bootstrap => crate::ExitCode::APPLICATION_0,
+            Self::SurfaceRequest => crate::ExitCode::APPLICATION_1,
+            Self::SurfaceMap => crate::ExitCode::APPLICATION_2,
+            Self::Application => crate::ExitCode::APPLICATION_3,
+            Self::Scratch => crate::ExitCode::APPLICATION_4,
+            Self::WorkerAdmission => crate::ExitCode::APPLICATION_5,
+            Self::Render => crate::ExitCode::APPLICATION_6,
+            Self::Commit => crate::ExitCode::APPLICATION_7,
+            Self::TargetGeometry => crate::ExitCode::APPLICATION_8,
+        }
     }
 
     pub const fn from_exit_code(code: i32) -> Option<Self> {
         match code {
-            x if x == Self::Bootstrap as i32 => Some(Self::Bootstrap),
-            x if x == Self::SurfaceRequest as i32 => Some(Self::SurfaceRequest),
-            x if x == Self::SurfaceMap as i32 => Some(Self::SurfaceMap),
-            x if x == Self::Application as i32 => Some(Self::Application),
-            x if x == Self::Scratch as i32 => Some(Self::Scratch),
-            x if x == Self::WorkerAdmission as i32 => Some(Self::WorkerAdmission),
-            x if x == Self::Render as i32 => Some(Self::Render),
-            x if x == Self::Commit as i32 => Some(Self::Commit),
-            x if x == Self::TargetGeometry as i32 => Some(Self::TargetGeometry),
+            x if x == Self::Bootstrap.exit_code().get() => Some(Self::Bootstrap),
+            x if x == Self::SurfaceRequest.exit_code().get() => Some(Self::SurfaceRequest),
+            x if x == Self::SurfaceMap.exit_code().get() => Some(Self::SurfaceMap),
+            x if x == Self::Application.exit_code().get() => Some(Self::Application),
+            x if x == Self::Scratch.exit_code().get() => Some(Self::Scratch),
+            x if x == Self::WorkerAdmission.exit_code().get() => Some(Self::WorkerAdmission),
+            x if x == Self::Render.exit_code().get() => Some(Self::Render),
+            x if x == Self::Commit.exit_code().get() => Some(Self::Commit),
+            x if x == Self::TargetGeometry.exit_code().get() => Some(Self::TargetGeometry),
             _ => None,
         }
     }
@@ -775,25 +785,25 @@ mod shell_failure_tests {
     #[test]
     fn renderer_failure_codes_are_stable_program_exits() {
         for (phase, code, name) in [
-            (TerminalRendererFailure::Bootstrap, 16, "bootstrap"),
+            (TerminalRendererFailure::Bootstrap, 256, "bootstrap"),
             (
                 TerminalRendererFailure::SurfaceRequest,
-                17,
+                257,
                 "surface-request",
             ),
-            (TerminalRendererFailure::SurfaceMap, 18, "surface-map"),
-            (TerminalRendererFailure::Application, 19, "application"),
-            (TerminalRendererFailure::Scratch, 20, "scratch"),
+            (TerminalRendererFailure::SurfaceMap, 258, "surface-map"),
+            (TerminalRendererFailure::Application, 259, "application"),
+            (TerminalRendererFailure::Scratch, 260, "scratch"),
             (
                 TerminalRendererFailure::WorkerAdmission,
-                21,
+                261,
                 "worker-admission",
             ),
-            (TerminalRendererFailure::Render, 22, "render"),
-            (TerminalRendererFailure::Commit, 23, "commit"),
+            (TerminalRendererFailure::Render, 262, "render"),
+            (TerminalRendererFailure::Commit, 263, "commit"),
             (
                 TerminalRendererFailure::TargetGeometry,
-                24,
+                264,
                 "target-geometry",
             ),
         ] {
@@ -883,16 +893,38 @@ mod shell_failure_tests {
 /// testimony), and a seed verdict is not shell testimony.
 pub const COOKIE_STORE: u64 = 0x6B72_5F73_746F_7265; // "kr_store"
 
+/// First executable seed failure, separate from the full store census payload.
+pub const COOKIE_STORE_APP_FAILURE: u64 = 0x6B72_5F73_746F_7246; // "kr_storF"
+
+/// One init phase boundary (`"kr_initP"`): `[7:0]` the phase ordinal,
+/// `[63:8]` init's committed session clock in milliseconds. Posted at
+/// every step of the bring-up ladder so a boot log attributes the
+/// welcome-to-dock interval to the phase that spent it — the kernel
+/// stamps only founding/readiness as a whole, and a serial-less machine
+/// shows nothing at all (#1003).
+pub const COOKIE_INIT_PHASE: u64 = 0x6B72_5F69_6E69_7450; // "kr_initP"
+
+/// One step of init's bring-up that is finer than a phase (`"kr_initS"`):
+/// `[7:0]` the step's index, `[15:8]` its catalogue size (kind 0 only),
+/// `[23:16]` the kind, `[63:24]` init's committed session clock in
+/// milliseconds. Kind 0 is a bootstrap store member about to be installed
+/// (index into `BOOTSTRAP_EXECUTABLES`); kind 1 is one of the named calls
+/// between the `installed` and `extraction` phase stamps (the kernel's
+/// `init_step_name` ladder). Posted before each such call because every one
+/// of them is a deadline-less exec or mm call, and a boot that stalls in one
+/// died with nothing on the glass but "installed 19779 | extraction -": the
+/// kernel keeps the latest per kind and the terminal verdict names the row
+/// or the step, so a stall is one call rather than forty.
+pub const COOKIE_INIT_STEP: u64 = 0x6B72_5F69_6E69_7453; // "kr_initS"
+
 /// Completion cookie for the boot SPMD validate run (`"kr_spmdW"`),
 /// posted by INIT after the store seed: it launches `spmd-witness`
 /// (the one `kore-rt/validate` build) through the ordinary
 /// generation-bound spawn path and forwards the verdict.  Payload 0 is
 /// the clean run; 900 no row/capability; 1000+s is a nonzero witness
-/// exit s, where s = failing-stage×10 + typed-fault code (stages
-/// 1 spmd / 2 room / 3 lane / 4 rotate, faults numbered in each
-/// enum's declaration order from 1 — `1032` reads "lane stage,
-/// fault 2 = Escape"; stages 1 spmd / 2 room / 3 lane / 4 rotate /
-/// 5 dispatch); anything else is the launch's spawn rung.  Like [`COOKIE_STORE`], every failure beneath the
+/// exit s. Application slots 256..261 identify spmd / room / lane / rotate /
+/// dispatch / resident respectively; the terminal output retains each typed
+/// fault. Anything else is the launch's spawn rung. Like [`COOKIE_STORE`], the
 /// summary is deliberately non-fatal: the validate ladder must never
 /// cost a machine that already booted, so this cookie is the ONLY
 /// place a dead SPMD tier and a working one differ at boot — the

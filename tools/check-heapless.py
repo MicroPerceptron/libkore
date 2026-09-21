@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check real renamed-dependency executables in each selectable facade mode.
 
-Three modes, because each is a different final link and only a real executable
+Four modes, because each is a different final link and only a real executable
 proves it:
 
   runtime   default-features = false        -> no allocator required
@@ -86,9 +86,10 @@ def check(arch: str, mode: str) -> None:
             '[package]\nname="libkore-' + mode + '-consumer"\nversion="0.0.0"\nedition="2024"\n'
             '[workspace]\n[dependencies]\n' + dependency
         )
-        (work / "src/main.rs").write_text('#![no_std]\n#![no_main]\n'
-            + (ALLOCATOR if needs_allocator else "")
-            + '''
+        # Keep the distribution's reviewed dependency versions; Cargo adds
+        # only this standalone consumer to its own temporary lockfile.
+        (work / "Cargo.lock").write_bytes((ROOT / "Cargo.lock").read_bytes())
+        body = '''
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_: usize) -> ! {
     ''' + BODY[mode] + '''
@@ -98,17 +99,30 @@ pub extern "C" fn _start(_: usize) -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop { core::hint::spin_loop(); }
 }
-''')
+'''
+        source = work / "src/main.rs"
+        source.write_text('#![no_std]\n#![no_main]\n'
+                          + (ALLOCATOR if needs_allocator else "") + body)
         toolchain = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
-        env = dict(os.environ, RUSTUP_TOOLCHAIN=toolchain)
+        env = dict(os.environ, RUSTUP_TOOLCHAIN=toolchain, CARGO_INCREMENTAL="0")
         env.setdefault("CARGO_TARGET_DIR", str(ROOT / "target/heapless-consumer"))
-        subprocess.run([
-            "cargo", "check", "--target", str(ROOT / f"targets/{arch}-unknown-kore-user.json"),
+        command = [
+            "cargo", "build", "--release", "--target", str(ROOT / f"targets/{arch}-unknown-kore-user.json"),
             "-Z", "json-target-spec", "-Z", "build-std=core,alloc,compiler_builtins",
             "-Z", "build-std-features=compiler-builtins-mem",
-        ], cwd=work, env=env, check=True)
+        ]
+        subprocess.run(command, cwd=work, env=env, check=True)
+        if needs_allocator:
+            source.write_text('#![no_std]\n#![no_main]\n' + body)
+            missing = subprocess.run(command + ["--locked"], cwd=work, env=env,
+                                     text=True, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT)
+            if missing.returncode == 0 or "no global memory allocator found" not in missing.stdout:
+                raise RuntimeError(
+                    f"{arch}/{mode}: expected a missing-allocator rejection\n{missing.stdout}"
+                )
         allocator = "with a consumer allocator" if needs_allocator else "allocation-free"
-        print(f"{mode} executable ({allocator}): {arch}", flush=True)
+        print(f"{mode} executable linked ({allocator}): {arch}", flush=True)
 
 
 if __name__ == "__main__":

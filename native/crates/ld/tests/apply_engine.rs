@@ -104,13 +104,13 @@ fn relative_value() {
         sym: 0,
         addend: 0x123,
     }];
-    f.relro = Some((DATA_VADDR, 0x200));
+    f.relro = Some((DATA_VADDR, 0x1000));
     let (applied, data) = apply_single::<X86_64>(&f.build(), BASE_A).unwrap();
     // B + A = 0x7f00_0000 + 0x123.
     assert_eq!(read64(&data, 0x100), BASE_A + 0x123);
     assert_eq!(applied.applied, 1);
     // RELRO reported absolute: base + image-relative window.
-    assert_eq!(applied.relro, Some((BASE_A + DATA_VADDR, 0x200)));
+    assert_eq!(applied.relro, Some((BASE_A + DATA_VADDR, 0x1000)));
 }
 
 #[test]

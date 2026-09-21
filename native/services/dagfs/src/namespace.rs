@@ -32,16 +32,21 @@
 //! closed. No parent pointer is stored: incoming counts govern reclamation,
 //! while exact edge generations govern route validity.
 
+use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::{
+    ServiceAlloc,
     bounds::{MAX_DIR_ENTRIES, MAX_DIRECTORIES, MAX_LIST_PAGE, MAX_OBJECTS},
     error::{FsError, FsResult, ProviderError},
     object::{
         DirId, Object, ObjectId, ObjectIdExt, ObjectKind, ObjectSubtype, Revision, StableObjectId,
     },
     reach::ReachSet,
-    slot::{SlotKey, SlotRead, SlotReservation, SlotTable, SlotWrite, fs_access},
+    slot::{
+        AtomicSlotVec, BoundedVec, SlotKey, SlotTable, SlotVecRead, SlotVecReservation,
+        SlotVecWrite, fs_access,
+    },
 };
 
 /// One object copied from a fully pinned durable graph snapshot.
@@ -62,10 +67,17 @@ pub(crate) struct DurableGraphEdge {
 }
 
 /// A complete, internally consistent durable namespace image.
-pub(crate) struct DurableGraph<K, const E: usize> {
+///
+/// Both tables are arena-backed. Inline this type was **119,832 bytes**, its
+/// edge table alone 114,688, and it is built on **every commit** rather than
+/// only at mount — so it was the largest single consumer of the `serve`
+/// future's stack, on the hottest path that has one. The edge bound is a
+/// runtime capacity now rather than a const generic, because the caller
+/// already knows it from the volume's profile.
+pub(crate) struct DurableGraph<K> {
     pub(crate) root: StableObjectId,
-    pub(crate) objects: heapless::Vec<DurableGraphObject<K>, MAX_OBJECTS>,
-    pub(crate) edges: heapless::Vec<DurableGraphEdge, E>,
+    pub(crate) objects: BoundedVec<DurableGraphObject<K>, ServiceAlloc>,
+    pub(crate) edges: BoundedVec<DurableGraphEdge, ServiceAlloc>,
 }
 
 pub use kore_dagfs::Name;
@@ -104,10 +116,10 @@ type DirEntries = SlotTable<DirEntry, MAX_DIR_ENTRIES>;
 /// Fresh storage and one parent edge, still hidden behind their native claims.
 /// There is no provider placement to release: cancellation is synchronous.
 pub(crate) struct PreparedCreation<'a, K> {
-    entries: SlotWrite<'a, DirEntries, MAX_DIRECTORIES>,
+    entries: DirWrite<'a>,
     edge: Option<EdgeId>,
-    object: Option<SlotReservation<'a, Object<K>, MAX_OBJECTS>>,
-    directory: Option<SlotReservation<'a, DirEntries, MAX_DIRECTORIES>>,
+    object: Option<SlotVecReservation<'a, Object<K>, ServiceAlloc>>,
+    directory: Option<SlotVecReservation<'a, DirEntries, ServiceAlloc>>,
     snapshot: &'a ObjectSnapshot,
 }
 
@@ -158,6 +170,28 @@ impl<K> Drop for PreparedCreation<'_, K> {
         // their payload nor an object snapshot has been published on abort.
     }
 }
+// The object arena and the directory arena are the namespace's two
+// **volume-scaled** stores, so they are heap-backed rather than inline. A
+// service's whole state is polled inside one `serve` future on the founder's
+// shared 4 MiB stack, which made the object bound and the stack budget the
+// same number: PR #958 overflowed that stack by 744 bytes by growing one
+// placement record 8 bytes. Inline arenas are therefore a capacity ceiling
+// disguised as a footprint, and these aliases are where that coupling is cut.
+// Matches the reasoning already recorded on `ExtractionState`'s arenas.
+// Session-scaled state (handles, authority edges) stays inline on purpose.
+
+/// Heap-backed object arena.
+type ObjectArena<K> = AtomicSlotVec<Object<K>, ServiceAlloc>;
+/// A read claim on one object slot.
+type ObjectRead<'a, K> = SlotVecRead<'a, Object<K>, ServiceAlloc>;
+/// An exclusive claim on one object slot.
+type ObjectWrite<'a, K> = SlotVecWrite<'a, Object<K>, ServiceAlloc>;
+/// Heap-backed arena of directory child lists.
+type DirArena = AtomicSlotVec<DirEntries, ServiceAlloc>;
+/// A read claim on one directory's child list.
+type DirRead<'a> = SlotVecRead<'a, DirEntries, ServiceAlloc>;
+/// An exclusive claim on one directory's child list.
+type DirWrite<'a> = SlotVecWrite<'a, DirEntries, ServiceAlloc>;
 
 /// A canonically ordered set of exact directory mutation claims.
 ///
@@ -180,13 +214,13 @@ const _: () = assert!(MAX_DIRECTORIES < UNCLAIMED as usize);
 struct DirectoryClaim<'a> {
     object: ObjectId,
     dir: DirId,
-    entries: SlotWrite<'a, DirEntries, MAX_DIRECTORIES>,
+    entries: DirWrite<'a>,
 }
 
 /// A checked rename holds its exact directory until publication or drop.
 /// Dropping a prepared mutation has no namespace effect.
 pub(crate) struct PreparedRename<'a> {
-    entries: SlotWrite<'a, DirEntries, MAX_DIRECTORIES>,
+    entries: DirWrite<'a>,
     edge: EdgeId,
     child: ObjectId,
     new: Name,
@@ -213,7 +247,7 @@ pub(crate) struct PreparedRemoval<'a, K> {
     claims: DirectoryClaims<'a>,
     edge: EdgeId,
     child: ObjectId,
-    object: SlotWrite<'a, Object<K>, MAX_OBJECTS>,
+    object: ObjectWrite<'a, K>,
 }
 
 pub(crate) struct PreparedRelocate<'a> {
@@ -335,22 +369,15 @@ pub struct ListEntry {
 
 /// The object arena plus the containment DAG over it.
 pub(crate) struct Namespace<K> {
-    objects: SlotTable<Object<K>, MAX_OBJECTS>,
+    objects: ObjectArena<K>,
     /// Lock-free quota/traversal projection of each object slot.
     ///
     /// File provider transactions retain the canonical object write claim
     /// across suspension. Readers that only need immutable graph shape and
     /// the last committed length use this generation-validated atomic
     /// snapshot instead of contending on the file payload.
-    snapshots: [ObjectSnapshot; MAX_OBJECTS],
-    /// Boxed on purpose. The child-list arena is ~96% of this struct's bytes,
-    /// and the engine that owns it is an inline by-value member of the nested
-    /// mount/format futures — so an inline arena is paid for once per live
-    /// frame, and growing it to cover the private view roots overflowed both
-    /// the founded service's delegated stack and the host test thread's.
-    /// Behind a `Box` the arena is paid for once, on the heap, and `Namespace`
-    /// itself stays small enough to move freely.
-    dirs: alloc::boxed::Box<SlotTable<DirEntries, MAX_DIRECTORIES>>,
+    snapshots: Box<[ObjectSnapshot]>,
+    dirs: DirArena,
     /// Placements the provider refused to release.  A reclamation's
     /// namespace effect has already committed by the time the provider is
     /// asked, so a failed release cannot un-remove the edge; it is counted
@@ -466,12 +493,36 @@ impl ObjectSnapshot {
     }
 }
 
+/// One vacant snapshot per object slot, heap-backed for the reason recorded on
+/// [`ObjectArena`]. `ObjectSnapshot` holds atomics and is deliberately not
+/// `Clone`, so the slice is filled by construction rather than by `resize`.
+fn vacant_snapshots() -> Box<[ObjectSnapshot]> {
+    let mut snapshots = Vec::new();
+    snapshots
+        .try_reserve_exact(MAX_OBJECTS)
+        .expect("fs object-snapshot projection (bootstrap-scale) — service heap undersized");
+    for _ in 0..MAX_OBJECTS {
+        snapshots.push(ObjectSnapshot::vacant());
+    }
+    snapshots.into_boxed_slice()
+}
+
 impl<K: Copy + Eq> Namespace<K> {
     pub(crate) fn new() -> Self {
+        // Bootstrap-scale and fixed after startup, exactly like
+        // `ExtractionState`'s arenas: an allocator that cannot satisfy these
+        // at mount is an undersized service heap, which is a build
+        // configuration error of the same class as the compile-time size
+        // guard — not a runtime volume condition. Keeping construction
+        // infallible is therefore deliberate, and it keeps every caller
+        // (including `Engine::new`) unchanged.
+        let alloc = crate::service_alloc();
         Self {
-            objects: SlotTable::new(),
-            snapshots: [const { ObjectSnapshot::vacant() }; MAX_OBJECTS],
-            dirs: alloc::boxed::Box::new(SlotTable::new()),
+            objects: AtomicSlotVec::try_new_in(MAX_OBJECTS, alloc)
+                .expect("fs object arena (bootstrap-scale) — service heap undersized"),
+            snapshots: vacant_snapshots(),
+            dirs: AtomicSlotVec::try_new_in(MAX_DIRECTORIES, alloc)
+                .expect("fs directory arena (bootstrap-scale) — service heap undersized"),
             leaked_placements: AtomicU32::new(0),
             abandoned_reclaims: AtomicU32::new(0),
             next_stable: AtomicU64::new(1),
@@ -480,16 +531,13 @@ impl<K: Copy + Eq> Namespace<K> {
 
     // ── object access ───────────────────────────────────────────────────────
 
-    pub(crate) fn object(&self, id: ObjectId) -> FsResult<SlotRead<'_, Object<K>, MAX_OBJECTS>> {
+    pub(crate) fn object(&self, id: ObjectId) -> FsResult<ObjectRead<'_, K>> {
         self.objects
             .try_read(id.key())
             .map_err(|error| fs_access(error, FsError::AccessLost))
     }
 
-    pub(crate) fn object_mut(
-        &self,
-        id: ObjectId,
-    ) -> FsResult<SlotWrite<'_, Object<K>, MAX_OBJECTS>> {
+    pub(crate) fn object_mut(&self, id: ObjectId) -> FsResult<ObjectWrite<'_, K>> {
         self.objects
             .try_write(id.key())
             .map_err(|error| fs_access(error, FsError::AccessLost))
@@ -509,7 +557,7 @@ impl<K: Copy + Eq> Namespace<K> {
     pub(crate) fn commit_file_len(
         &self,
         id: ObjectId,
-        object: &mut SlotWrite<'_, Object<K>, MAX_OBJECTS>,
+        object: &mut ObjectWrite<'_, K>,
         len: u64,
     ) -> Revision {
         debug_assert_eq!(object.id(), id.key());
@@ -523,7 +571,7 @@ impl<K: Copy + Eq> Namespace<K> {
     pub(crate) fn hydrate_file_len(
         &self,
         id: ObjectId,
-        object: &mut SlotWrite<'_, Object<K>, MAX_OBJECTS>,
+        object: &mut ObjectWrite<'_, K>,
         len: u64,
     ) -> Revision {
         debug_assert_eq!(object.id(), id.key());
@@ -557,9 +605,7 @@ impl<K: Copy + Eq> Namespace<K> {
         self.abandoned_reclaims.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn objects(
-        &self,
-    ) -> impl Iterator<Item = (ObjectId, SlotRead<'_, Object<K>, MAX_OBJECTS>)> {
+    pub(crate) fn objects(&self) -> impl Iterator<Item = (ObjectId, ObjectRead<'_, K>)> {
         self.objects
             .iter()
             .map(|(key, object)| (ObjectId::from_bits(key.to_bits()), object))
@@ -608,18 +654,34 @@ impl<K: Copy + Eq> Namespace<K> {
     /// typed [`FsError::Busy`]. The guards are released before the caller
     /// performs provider or device I/O, so an fsync cannot pin hot namespace
     /// cache lines for the duration of an NVMe flush.
-    pub(crate) fn durable_graph<const E: usize>(
+    /// `max_edges` is the volume profile's containment-edge ceiling, which
+    /// the caller already holds; it bounds the two edge buffers exactly as the
+    /// old const generic did.
+    ///
+    /// An allocation that cannot be satisfied reports the same error a full
+    /// buffer reports, because it is the same condition from the caller's
+    /// side: the buffer this snapshot needs cannot be provided. Commit is a
+    /// live path in a founded service, so it may not panic — see the contract
+    /// on `Engine::reclaim`.
+    pub(crate) fn durable_graph(
         &self,
         root: ObjectId,
-    ) -> FsResult<DurableGraph<K, E>> {
-        let mut pending = heapless::Vec::<ObjectId, MAX_OBJECTS>::new();
-        let mut objects =
-            heapless::Vec::<(ObjectId, SlotRead<'_, Object<K>, MAX_OBJECTS>), MAX_OBJECTS>::new();
-        let mut dirs = heapless::Vec::<
-            (DirId, SlotRead<'_, DirEntries, MAX_DIRECTORIES>),
-            MAX_DIRECTORIES,
-        >::new();
-        let mut raw_edges = heapless::Vec::<(ObjectId, Name, ObjectId), E>::new();
+        max_edges: usize,
+    ) -> FsResult<DurableGraph<K>> {
+        let alloc = crate::service_alloc();
+        let mut pending = BoundedVec::<ObjectId, ServiceAlloc>::try_new_in(MAX_OBJECTS, alloc)
+            .map_err(|_| FsError::OutOfObjects)?;
+        let mut objects = BoundedVec::<(ObjectId, ObjectRead<'_, K>), ServiceAlloc>::try_new_in(
+            MAX_OBJECTS,
+            alloc,
+        )
+        .map_err(|_| FsError::OutOfObjects)?;
+        let mut dirs =
+            BoundedVec::<(DirId, DirRead<'_>), ServiceAlloc>::try_new_in(MAX_DIRECTORIES, alloc)
+                .map_err(|_| FsError::OutOfObjects)?;
+        let mut raw_edges =
+            BoundedVec::<(ObjectId, Name, ObjectId), ServiceAlloc>::try_new_in(max_edges, alloc)
+                .map_err(|_| FsError::OutOfEdges)?;
         pending.push(root).map_err(|_| FsError::OutOfObjects)?;
 
         while let Some(id) = pending.pop() {
@@ -659,7 +721,9 @@ impl<K: Copy + Eq> Namespace<K> {
                 .ok_or(FsError::AccessLost)
         };
         let root_stable = stable(root)?;
-        let mut copied_objects = heapless::Vec::new();
+        let mut copied_objects =
+            BoundedVec::<DurableGraphObject<K>, ServiceAlloc>::try_new_in(MAX_OBJECTS, alloc)
+                .map_err(|_| FsError::OutOfObjects)?;
         for (id, object) in objects.iter() {
             copied_objects
                 .push(DurableGraphObject {
@@ -672,7 +736,9 @@ impl<K: Copy + Eq> Namespace<K> {
                 })
                 .map_err(|_| FsError::OutOfObjects)?;
         }
-        let mut copied_edges = heapless::Vec::new();
+        let mut copied_edges =
+            BoundedVec::<DurableGraphEdge, ServiceAlloc>::try_new_in(max_edges, alloc)
+                .map_err(|_| FsError::OutOfEdges)?;
         for (parent, name, child) in raw_edges {
             copied_edges
                 .push(DurableGraphEdge {
@@ -712,8 +778,11 @@ impl<K: Copy + Eq> Namespace<K> {
     }
 
     fn graph_usage_inner(&self, root: ObjectId) -> FsResult<GraphUsage> {
-        let mut found = heapless::Vec::<ObjectId, MAX_OBJECTS>::new();
-        let mut pending = heapless::Vec::<ObjectId, MAX_OBJECTS>::new();
+        let alloc = crate::service_alloc();
+        let mut found = BoundedVec::<ObjectId, ServiceAlloc>::try_new_in(MAX_OBJECTS, alloc)
+            .map_err(|_| FsError::OutOfObjects)?;
+        let mut pending = BoundedVec::<ObjectId, ServiceAlloc>::try_new_in(MAX_OBJECTS, alloc)
+            .map_err(|_| FsError::OutOfObjects)?;
         pending.push(root).map_err(|_| FsError::OutOfObjects)?;
         let mut usage = GraphUsage::default();
         while let Some(id) = pending.pop() {
@@ -929,7 +998,7 @@ impl<K: Copy + Eq> Namespace<K> {
 
     // ── edges ───────────────────────────────────────────────────────────────
 
-    fn dir_entries(&self, parent: ObjectId) -> FsResult<SlotRead<'_, DirEntries, MAX_DIRECTORIES>> {
+    fn dir_entries(&self, parent: ObjectId) -> FsResult<DirRead<'_>> {
         let dir = self.object(parent)?.dir().ok_or(FsError::NotDirectory)?;
         // A live directory object always owns a live child list; a missing
         // one would mean the two arenas had desynchronized.
@@ -938,10 +1007,7 @@ impl<K: Copy + Eq> Namespace<K> {
             .map_err(|error| fs_access(error, FsError::AccessLost))
     }
 
-    fn dir_entries_mut(
-        &self,
-        parent: ObjectId,
-    ) -> FsResult<SlotWrite<'_, DirEntries, MAX_DIRECTORIES>> {
+    fn dir_entries_mut(&self, parent: ObjectId) -> FsResult<DirWrite<'_>> {
         let dir = self.object(parent)?.dir().ok_or(FsError::NotDirectory)?;
         self.dirs
             .try_write(dir.0)
@@ -950,7 +1016,11 @@ impl<K: Copy + Eq> Namespace<K> {
 
     /// Claim an explicit directory set in stable slot order.
     fn claim_directories<'a>(&'a self, objects: &[ObjectId]) -> FsResult<DirectoryClaims<'a>> {
-        let mut wanted = heapless::Vec::<(ObjectId, DirId), MAX_DIRECTORIES>::new();
+        let mut wanted = BoundedVec::<(ObjectId, DirId), ServiceAlloc>::try_new_in(
+            MAX_DIRECTORIES,
+            crate::service_alloc(),
+        )
+        .map_err(|_| FsError::OutOfObjects)?;
         for object in objects {
             let dir = self.snapshot(*object)?.dir.ok_or(FsError::NotDirectory)?;
             if let Some((_, existing)) = wanted.iter().find(|(id, _)| id == object) {
@@ -1007,12 +1077,12 @@ impl<K: Copy + Eq> Namespace<K> {
     /// claiming. The claimed traversal revalidates this set before mutation;
     /// an edge added in the observation→claim interval yields `Busy` rather
     /// than escaping the cycle footprint.
-    fn directory_subtree(
-        &self,
-        root: ObjectId,
-    ) -> FsResult<heapless::Vec<ObjectId, MAX_DIRECTORIES>> {
-        let mut found = heapless::Vec::<ObjectId, MAX_DIRECTORIES>::new();
-        let mut pending = heapless::Vec::<ObjectId, MAX_DIRECTORIES>::new();
+    fn directory_subtree(&self, root: ObjectId) -> FsResult<BoundedVec<ObjectId, ServiceAlloc>> {
+        let alloc = crate::service_alloc();
+        let mut found = BoundedVec::<ObjectId, ServiceAlloc>::try_new_in(MAX_DIRECTORIES, alloc)
+            .map_err(|_| FsError::OutOfObjects)?;
+        let mut pending = BoundedVec::<ObjectId, ServiceAlloc>::try_new_in(MAX_DIRECTORIES, alloc)
+            .map_err(|_| FsError::OutOfObjects)?;
         // Marked on enqueue, keyed by directory slot: each directory is
         // queued exactly once, so the worklist is bounded by the arena and
         // membership is O(1) rather than two list scans per edge.
@@ -1074,7 +1144,9 @@ impl<K: Copy + Eq> Namespace<K> {
         // protocol is unchanged — a child directory outside the pinned
         // footprint is `Busy`, and the caller decides `Cycle`.
         let mut seen = ReachSet::new();
-        let mut pending = heapless::Vec::<u8, MAX_DIRECTORIES>::new();
+        let mut pending =
+            BoundedVec::<u8, ServiceAlloc>::try_new_in(MAX_DIRECTORIES, crate::service_alloc())
+                .map_err(|_| FsError::OutOfObjects)?;
         let start_dir = self.snapshot(ancestor)?.dir.ok_or(FsError::NotDirectory)?;
         let start = claims
             .position_of_dir(start_dir, ancestor)
@@ -1414,13 +1486,13 @@ impl<K: Copy + Eq> Namespace<K> {
     /// incoming count changes. Contention therefore returns [`FsError::Busy`]
     /// with the object intact; the engine retains the work item and retries it
     /// cooperatively instead of silently leaking a skipped slot.
-    pub(crate) fn reclaim_one<const N: usize>(
+    pub(crate) fn reclaim_one(
         &self,
         id: ObjectId,
-        placements: &mut heapless::Vec<K, N>,
-        objects: &mut heapless::Vec<ObjectId, MAX_OBJECTS>,
+        placements: &mut BoundedVec<K, ServiceAlloc>,
+        objects: &mut BoundedVec<ObjectId, ServiceAlloc>,
     ) -> FsResult<heapless::Vec<ObjectId, MAX_DIR_ENTRIES>> {
-        let mut object = match self.objects.try_write(id.key()) {
+        let object = match self.objects.try_write(id.key()) {
             Ok(object) => object,
             Err(crate::slot::SlotAccess::Stale) => return Ok(heapless::Vec::new()),
             Err(crate::slot::SlotAccess::Busy) => return Err(FsError::Busy),
@@ -1457,10 +1529,7 @@ impl<K: Copy + Eq> Namespace<K> {
         }
         child_ids.as_mut_slice().sort_unstable_by_key(|id| id.key());
 
-        let mut children = heapless::Vec::<
-            (ObjectId, SlotWrite<'_, Object<K>, MAX_OBJECTS>),
-            MAX_DIR_ENTRIES,
-        >::new();
+        let mut children = heapless::Vec::<(ObjectId, ObjectWrite<'_, K>), MAX_DIR_ENTRIES>::new();
         for child in child_ids {
             let claimed = self
                 .objects
@@ -1510,11 +1579,20 @@ impl<K: Copy + Eq> Namespace<K> {
     pub(crate) fn reclaim(
         &self,
         start: ObjectId,
-        placements: &mut heapless::Vec<K, MAX_OBJECTS>,
-        objects: &mut heapless::Vec<ObjectId, MAX_OBJECTS>,
+        placements: &mut BoundedVec<K, ServiceAlloc>,
+        objects: &mut BoundedVec<ObjectId, ServiceAlloc>,
     ) -> usize {
         let before = objects.len();
-        let mut worklist = heapless::Vec::<ObjectId, MAX_OBJECTS>::new();
+        // The caller's batches are already arena-backed; so is this, for the
+        // same reason. An allocation failure here takes the route a full
+        // worklist takes below: a counted, reportable abandonment, never a
+        // panic (see the contract on `Engine::reclaim`).
+        let Ok(mut worklist) =
+            BoundedVec::<ObjectId, ServiceAlloc>::try_new_in(MAX_OBJECTS, crate::service_alloc())
+        else {
+            self.note_abandoned_reclaim();
+            return 0;
+        };
         worklist
             .push(start)
             .expect("one root fits the object bound");
@@ -1548,10 +1626,7 @@ impl<K: Copy + Eq> Namespace<K> {
     /// ordinary API: the alternative is a racy test that only sometimes
     /// exercises the path it names, and contention is precisely the axis this
     /// service was nondeterministic along.
-    pub(crate) fn claim_object(
-        &self,
-        id: ObjectId,
-    ) -> Option<SlotWrite<'_, Object<K>, MAX_OBJECTS>> {
+    pub(crate) fn claim_object(&self, id: ObjectId) -> Option<ObjectWrite<'_, K>> {
         self.objects.try_write(id.key()).ok()
     }
 
@@ -1576,6 +1651,39 @@ mod tests {
 
     fn name(s: &str) -> Name {
         Name::new(s).expect("test names are valid")
+    }
+
+    /// The namespace must not spend the `serve` future's stack on state that
+    /// scales with the volume.
+    ///
+    /// Before the arenas moved to the heap this type was **130,944 bytes**,
+    /// which is why the object bound and the 4 MiB shared stack were one
+    /// number and why an 8-byte growth in an unrelated record overflowed that
+    /// stack on metal (PR #958). The ceiling here is deliberately loose: it
+    /// pins the *property* (handles and counters only, no arena) rather than
+    /// an exact figure, so adding a counter is free and re-inlining an arena
+    /// fails.
+    #[test]
+    fn the_namespace_holds_no_volume_scaled_arena_inline() {
+        let bytes = core::mem::size_of::<Ns>();
+        assert!(
+            bytes <= 1024,
+            "namespace grew to {bytes} B: a volume-scaled arena is inline again"
+        );
+    }
+
+    /// The commit-path snapshot must not put the volume on the stack either.
+    ///
+    /// Inline this was **119,832 bytes**, its edge table alone 114,688, and
+    /// unlike the decoded image it is built on *every commit* rather than at
+    /// mount. Pins the property, not a figure.
+    #[test]
+    fn the_durable_snapshot_holds_no_table_inline() {
+        let bytes = core::mem::size_of::<DurableGraph<u32>>();
+        assert!(
+            bytes <= 512,
+            "DurableGraph grew to {bytes} B: a volume-scaled table is inline again"
+        );
     }
 
     /// A root directory plus the namespace holding it.
@@ -1970,10 +2078,10 @@ mod tests {
         ns.link(dir, &name("file"), file).unwrap();
 
         let held = ns.object_mut(file).unwrap();
-        assert!(matches!(ns.durable_graph::<16>(root), Err(FsError::Busy)));
+        assert!(matches!(ns.durable_graph(root, 16), Err(FsError::Busy)));
         drop(held);
 
-        let graph = ns.durable_graph::<16>(root).unwrap();
+        let graph = ns.durable_graph(root, 16).unwrap();
         assert_eq!(
             graph.objects.len(),
             3,
@@ -2368,8 +2476,10 @@ mod tests {
         ns.object_mut(file).unwrap().set_storage(7);
 
         let (_, child) = ns.detach(root, &name("f")).unwrap();
-        let mut placements: heapless::Vec<u32, MAX_OBJECTS> = heapless::Vec::new();
-        let mut objects = heapless::Vec::new();
+        let mut placements: BoundedVec<u32, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
+        let mut objects: BoundedVec<ObjectId, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
         assert_eq!(ns.reclaim(child, &mut placements, &mut objects), 1);
         assert_eq!(placements.as_slice(), &[7]);
         assert_eq!(objects.as_slice(), &[file]);
@@ -2384,8 +2494,10 @@ mod tests {
         ns.object_mut(file).unwrap().set_storage(7);
         let (_, child) = ns.detach(root, &name("f")).unwrap();
         let held = ns.object_mut(file).unwrap();
-        let mut placements: heapless::Vec<u32, MAX_OBJECTS> = heapless::Vec::new();
-        let mut objects = heapless::Vec::new();
+        let mut placements: BoundedVec<u32, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
+        let mut objects: BoundedVec<ObjectId, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
 
         assert!(matches!(
             ns.reclaim_one(child, &mut placements, &mut objects),
@@ -2409,8 +2521,10 @@ mod tests {
         ns.object_mut(file).unwrap().set_storage(9);
 
         let (_, child) = ns.detach(root, &name("one")).unwrap();
-        let mut placements: heapless::Vec<u32, MAX_OBJECTS> = heapless::Vec::new();
-        let mut objects = heapless::Vec::new();
+        let mut placements: BoundedVec<u32, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
+        let mut objects: BoundedVec<ObjectId, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
         assert_eq!(ns.reclaim(child, &mut placements, &mut objects), 0);
         assert!(placements.is_empty());
         assert!(ns.exists(file));
@@ -2424,8 +2538,10 @@ mod tests {
         ns.object_mut(file).unwrap().grants_inc();
 
         let (_, child) = ns.detach(root, &name("f")).unwrap();
-        let mut placements: heapless::Vec<u32, MAX_OBJECTS> = heapless::Vec::new();
-        let mut objects = heapless::Vec::new();
+        let mut placements: BoundedVec<u32, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
+        let mut objects: BoundedVec<ObjectId, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
         assert_eq!(ns.reclaim(child, &mut placements, &mut objects), 0);
         assert!(ns.exists(file));
 
@@ -2454,8 +2570,10 @@ mod tests {
 
         // Retire the root's only route.
         ns.object_mut(root).unwrap().grants_dec();
-        let mut placements: heapless::Vec<u32, MAX_OBJECTS> = heapless::Vec::new();
-        let mut reclaimed = heapless::Vec::new();
+        let mut placements: BoundedVec<u32, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
+        let mut reclaimed: BoundedVec<ObjectId, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
         let released = ns.reclaim(root, &mut placements, &mut reclaimed);
 
         assert_eq!(released, 4, "root, dir, and both files");
@@ -2477,8 +2595,10 @@ mod tests {
         ns.link(root, &name("kept"), shared).unwrap();
 
         let (_, child) = ns.detach(root, &name("doomed")).unwrap();
-        let mut placements: heapless::Vec<u32, MAX_OBJECTS> = heapless::Vec::new();
-        let mut objects = heapless::Vec::new();
+        let mut placements: BoundedVec<u32, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
+        let mut objects: BoundedVec<ObjectId, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
         ns.reclaim(child, &mut placements, &mut objects);
 
         assert!(!ns.exists(doomed));
@@ -2503,8 +2623,10 @@ mod tests {
         ns.link(shared, &name("leaf"), leaf).unwrap();
 
         let (_, child) = ns.detach(left, &name("shared")).unwrap();
-        let mut placements: heapless::Vec<u32, MAX_OBJECTS> = heapless::Vec::new();
-        let mut objects = heapless::Vec::new();
+        let mut placements: BoundedVec<u32, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
+        let mut objects: BoundedVec<ObjectId, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
         assert_eq!(ns.reclaim(child, &mut placements, &mut objects), 0);
         assert_eq!(ns.edge_child(left_edge), Err(FsError::AccessLost));
         assert_eq!(ns.edge_child(right_edge), Ok(shared));

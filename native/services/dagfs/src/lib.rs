@@ -70,13 +70,24 @@
 
 extern crate alloc;
 
-use core::alloc::Allocator;
-
 /// The one place filesystem-owned, volume-scaled metadata names its allocator.
 /// The service binary installs a private global heap; host tests receive the
-/// host allocator through the same opaque seam.
-pub(crate) fn service_alloc() -> &'static dyn Allocator {
-    static GLOBAL: alloc::alloc::Global = alloc::alloc::Global;
+/// host allocator through the same seam.
+///
+/// Named concretely rather than as `dyn Allocator` because an arena's
+/// `Sync`ness is inherited from its allocator, and `Namespace` **must** stay
+/// `Sync`: the per-object and per-directory claim maps are shared across
+/// threads by the tests that witness "no filesystem-global lock"
+/// (`DAGFS.md` §2), and `dyn Allocator` is not `Sync`. The seam is still one
+/// name in one place; it is simply a type alias instead of an erased trait
+/// object, which is strictly more information and costs no generality — both
+/// builds resolve to the same allocator, differing only in which global heap
+/// `#[global_allocator]` installs behind it.
+pub(crate) type ServiceAlloc = alloc::alloc::Global;
+
+/// The allocator every volume-scaled filesystem arena is built in.
+pub(crate) fn service_alloc() -> &'static ServiceAlloc {
+    static GLOBAL: ServiceAlloc = alloc::alloc::Global;
     &GLOBAL
 }
 
@@ -136,8 +147,8 @@ pub use search::{
 pub use service::{
     FsEndowment, FsRequest, FsResponse, FsService, NativeView, RamService, SYSTEM_APPS_DIR,
     SYSTEM_APPS_GRANT, SYSTEM_APPS_VIEW, SYSTEM_LIBS_DIR, SYSTEM_LIBS_GRANT, SYSTEM_LIBS_VIEW,
-    SYSTEM_PKGS_DIR, SYSTEM_PKGS_GRANT, SYSTEM_SOURCE_GRANT, SYSTEM_WORKSPACE_DIR,
-    WindowAttachment,
+    SYSTEM_PKGS_DIR, SYSTEM_PKGS_GRANT, SYSTEM_SHARE_DIR, SYSTEM_SHARE_GRANT, SYSTEM_SHARE_VIEW,
+    SYSTEM_SOURCE_GRANT, SYSTEM_WORKSPACE_DIR, WindowAttachment,
 };
 
 /// Architecture-neutral service entry selected at this crate boundary.

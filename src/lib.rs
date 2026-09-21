@@ -16,9 +16,11 @@ pub use kore_rt as runtime;
 /// Process-local atomic-word waits, including native async waits.
 pub use kore_rt::futex;
 pub use kore_rt::process;
-pub use kore_rt::{Bundle, ExitCode, main, spmd, task};
+pub use kore_rt::{Bundle, ExitCode, Termination, exit_codes, main, spmd, task};
 #[cfg(feature = "collections")]
 pub mod collections;
+/// Fatal-process evidence, rendering, and explicit parent-side persistence.
+pub mod crash;
 pub mod random;
 pub use kore_rt::executor as task;
 pub use kore_rt::{thread, thread_controller};

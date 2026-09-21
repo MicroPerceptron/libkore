@@ -11,7 +11,7 @@ use kore_abi::mem::{AllocProps, DmaClass, MemAttrs, NumaNode};
 use kore_abi::session::SlotRef;
 use kore_abi::svc::{MmRepWire, MmReqWire};
 
-use kore_rt::svc::SvcProtocol;
+use kore_rt::svc::{PeerBundlePart, PeerId, SvcProtocol};
 
 use crate::service::{MemoryManager, MmRefusal, MmRequest, MmResponse};
 
@@ -51,18 +51,60 @@ pub fn encode_req(req: &MmRequest) -> MmReqWire {
             dma: 0,
             reserved: [0; 5],
         },
-        MmRequest::Stats => MmReqWire {
-            op: MmReqWire::OP_STATS,
-            contiguous: 0,
-            numa: 0.into(),
-            slot: 0.into(),
-            size: 0.into(),
-            align: 0.into(),
-            attrs: 0.into(),
-            dma: 0,
-            reserved: [0; 5],
+        MmRequest::Stats => bare(MmReqWire::OP_STATS),
+        MmRequest::AdmitPeer { part, announced } => MmReqWire {
+            contiguous: encode_part(part),
+            slot: announced.index().into(),
+            ..bare(MmReqWire::OP_ADMIT_PEER)
         },
+        MmRequest::TakeAdmission => bare(MmReqWire::OP_TAKE_ADMISSION),
+        MmRequest::RetirePeer { peer } => MmReqWire {
+            numa: peer.arrival().into(),
+            ..bare(MmReqWire::OP_RETIRE_PEER)
+        },
+        MmRequest::ConfirmRetired { peer } => MmReqWire {
+            numa: peer.arrival().into(),
+            ..bare(MmReqWire::OP_CONFIRM_RETIRED)
+        },
+        MmRequest::ClosePeer => bare(MmReqWire::OP_CLOSE_PEER),
     }
+}
+
+/// An `op` with every argument field zero — the shape each administration
+/// request starts from, and exactly `OP_STATS`.
+fn bare(op: u8) -> MmReqWire {
+    MmReqWire {
+        op,
+        contiguous: 0,
+        numa: 0.into(),
+        slot: 0.into(),
+        size: 0.into(),
+        align: 0.into(),
+        attrs: 0.into(),
+        dma: 0,
+        reserved: [0; 5],
+    }
+}
+
+/// The recyclable-peer part codes every face protocol shares (power's and
+/// accel's wires use the same four).
+const fn encode_part(part: PeerBundlePart) -> u8 {
+    match part {
+        PeerBundlePart::Ring => 0,
+        PeerBundlePart::Kick => 1,
+        PeerBundlePart::ReturnRecv => 2,
+        PeerBundlePart::Grant(index) => 0x80 | index,
+    }
+}
+
+fn decode_part(code: u8) -> Option<PeerBundlePart> {
+    Some(match code {
+        0 => PeerBundlePart::Ring,
+        1 => PeerBundlePart::Kick,
+        2 => PeerBundlePart::ReturnRecv,
+        value if value & 0x80 != 0 => PeerBundlePart::Grant(value & 0x7f),
+        _ => return None,
+    })
 }
 
 /// Lift a wire request — fail-closed.
@@ -110,16 +152,37 @@ pub fn decode_req(w: &MmReqWire) -> Option<MmRequest> {
                 align: w.align.get(),
             })
         }
-        MmReqWire::OP_STATS
-            if w.contiguous == 0
-                && w.numa.get() == 0
-                && w.slot.get() == 0
-                && w.size.get() == 0
-                && w.align.get() == 0
-                && w.attrs.get() == 0
-                && w.dma == 0 =>
+        MmReqWire::OP_STATS if *w == bare(MmReqWire::OP_STATS) => Some(MmRequest::Stats),
+        MmReqWire::OP_ADMIT_PEER
+            if MmReqWire {
+                contiguous: 0,
+                slot: 0.into(),
+                ..*w
+            } == bare(MmReqWire::OP_ADMIT_PEER) =>
         {
-            Some(MmRequest::Stats)
+            Some(MmRequest::AdmitPeer {
+                part: decode_part(w.contiguous)?,
+                announced: SlotRef::from_wire(w.slot.get()),
+            })
+        }
+        MmReqWire::OP_TAKE_ADMISSION if *w == bare(MmReqWire::OP_TAKE_ADMISSION) => {
+            Some(MmRequest::TakeAdmission)
+        }
+        MmReqWire::OP_RETIRE_PEER | MmReqWire::OP_CONFIRM_RETIRED
+            if MmReqWire {
+                numa: 0.into(),
+                ..*w
+            } == bare(w.op) =>
+        {
+            let peer = PeerId::from_arrival(w.numa.get())?;
+            Some(if w.op == MmReqWire::OP_RETIRE_PEER {
+                MmRequest::RetirePeer { peer }
+            } else {
+                MmRequest::ConfirmRetired { peer }
+            })
+        }
+        MmReqWire::OP_CLOSE_PEER if *w == bare(MmReqWire::OP_CLOSE_PEER) => {
+            Some(MmRequest::ClosePeer)
         }
         _ => None,
     }
@@ -139,6 +202,16 @@ pub fn encode_rep(rep: &MmResponse, grants: u8) -> MmRepWire {
             kore_abi::monitor::MemorySnapshot::EMPTY,
         ),
         MmResponse::Stats(memory) => (MmRepWire::TAG_STATS, 0, *memory),
+        MmResponse::Accepted => (
+            MmRepWire::TAG_ACCEPTED,
+            0,
+            kore_abi::monitor::MemorySnapshot::EMPTY,
+        ),
+        MmResponse::PeerAdmitted { .. } => (
+            MmRepWire::TAG_PEER_ADMITTED,
+            0,
+            kore_abi::monitor::MemorySnapshot::EMPTY,
+        ),
         MmResponse::Refused(r) => (
             MmRepWire::TAG_REFUSED,
             match r {
@@ -147,25 +220,43 @@ pub fn encode_rep(rep: &MmResponse, grants: u8) -> MmRepWire {
                 MmRefusal::BadReturn => MmRepWire::REFUSE_BAD_RETURN,
                 MmRefusal::Denied => MmRepWire::REFUSE_DENIED,
                 MmRefusal::Quota => MmRepWire::REFUSE_QUOTA,
+                MmRefusal::Pending => MmRepWire::REFUSE_PENDING,
             },
             kore_abi::monitor::MemorySnapshot::EMPTY,
         ),
     };
+    let mut reserved = [0; 5];
+    if let MmResponse::PeerAdmitted { peer } = rep {
+        reserved[..2].copy_from_slice(&peer.arrival().to_le_bytes());
+    }
     MmRepWire {
         tag,
         refusal,
         grants,
-        reserved: [0; 5],
+        reserved,
         memory,
     }
 }
 
 /// Lift a wire reply + its grant count — fail-closed.
 pub fn decode_rep(w: &MmRepWire) -> Option<(MmResponse, u8)> {
-    if w.reserved != [0; 5] {
+    let admitted = w.tag == MmRepWire::TAG_PEER_ADMITTED;
+    if w.reserved[if admitted { 2 } else { 0 }..] != [0; 5][if admitted { 2 } else { 0 }..] {
         return None;
     }
     let rep = match (w.tag, w.refusal) {
+        (MmRepWire::TAG_ACCEPTED, 0)
+            if w.grants == 0 && w.memory == kore_abi::monitor::MemorySnapshot::EMPTY =>
+        {
+            MmResponse::Accepted
+        }
+        (MmRepWire::TAG_PEER_ADMITTED, 0)
+            if w.grants == 0 && w.memory == kore_abi::monitor::MemorySnapshot::EMPTY =>
+        {
+            MmResponse::PeerAdmitted {
+                peer: PeerId::from_arrival(u16::from_le_bytes([w.reserved[0], w.reserved[1]]))?,
+            }
+        }
         (MmRepWire::TAG_GRANTED, 0)
             if w.grants == 1 && w.memory == kore_abi::monitor::MemorySnapshot::EMPTY =>
         {
@@ -190,6 +281,7 @@ pub fn decode_rep(w: &MmRepWire) -> Option<(MmResponse, u8)> {
                 MmRepWire::REFUSE_BAD_RETURN => MmRefusal::BadReturn,
                 MmRepWire::REFUSE_DENIED => MmRefusal::Denied,
                 MmRepWire::REFUSE_QUOTA => MmRefusal::Quota,
+                MmRepWire::REFUSE_PENDING => MmRefusal::Pending,
                 _ => return None,
             })
         }
@@ -230,9 +322,11 @@ impl SvcProtocol for MemoryManager {
     /// prefab, conveyed through the pre-land bundle — where `run`'s
     /// `OP_SUPPLY` arrives), pair 2 INIT's face (delivered at its
     /// founding round; quiescent until the respawn slices), and pair 3
-    /// exec's provider-snapshot face. Pairs 1–3
-    /// are post-less — no return legs, so `Release` is structurally
-    /// impossible on them. Supply quota is reclaimed through the separate
+    /// exec's face — its provider snapshots and the **administration** of
+    /// per-launch faces, whose components arrive on its return leg (the
+    /// only fixed pair with one). Pairs past these are per-launch faces
+    /// (recyclable peers, one per engine launch), each metered on its own
+    /// lane. Supply quota is reclaimed through the separate
     /// kernel-authenticated lineage-completion reports, and the byte limit
     /// comes from the founder's validated boot policy.
     const SERVE_PAIRS: usize = 4;
@@ -255,7 +349,23 @@ impl SvcProtocol for MemoryManager {
             (MmReqWire::OP_ALLOC | MmReqWire::OP_SUPPLY, MmResponse::Refused(_))
             | (MmReqWire::OP_RELEASE, MmResponse::Released)
             | (MmReqWire::OP_RELEASE, MmResponse::Refused(_))
-            | (MmReqWire::OP_STATS, MmResponse::Stats(_)) => grants == 0,
+            | (MmReqWire::OP_STATS, MmResponse::Stats(_))
+            | (MmReqWire::OP_TAKE_ADMISSION, MmResponse::PeerAdmitted { .. })
+            | (
+                MmReqWire::OP_ADMIT_PEER
+                | MmReqWire::OP_TAKE_ADMISSION
+                | MmReqWire::OP_RETIRE_PEER
+                | MmReqWire::OP_CONFIRM_RETIRED
+                | MmReqWire::OP_CLOSE_PEER,
+                MmResponse::Refused(_),
+            )
+            | (
+                MmReqWire::OP_ADMIT_PEER
+                | MmReqWire::OP_RETIRE_PEER
+                | MmReqWire::OP_CONFIRM_RETIRED
+                | MmReqWire::OP_CLOSE_PEER,
+                MmResponse::Accepted,
+            ) => grants == 0,
             _ => false,
         }
     }
@@ -394,6 +504,58 @@ mod tests {
         assert!(
             decode_rep(&encode_rep(&MmResponse::Released, 1)).is_none(),
             "Released carries no grant"
+        );
+    }
+
+    /// Every administration request round-trips, and each rejects a stray
+    /// bit in a field its opcode does not carry.
+    #[test]
+    fn administration_requests_round_trip_and_refuse_stray_fields() {
+        let peer = PeerId::from_arrival(0x0105).expect("a generation-1 face");
+        for req in [
+            MmRequest::AdmitPeer {
+                part: PeerBundlePart::Ring,
+                announced: SlotRef::from_wire(41),
+            },
+            MmRequest::AdmitPeer {
+                part: PeerBundlePart::Grant(0),
+                announced: SlotRef::from_wire(42),
+            },
+            MmRequest::TakeAdmission,
+            MmRequest::RetirePeer { peer },
+            MmRequest::ConfirmRetired { peer },
+            MmRequest::ClosePeer,
+        ] {
+            let wire = encode_req(&req);
+            let back = decode_req(&wire).expect("canonical encoding decodes");
+            assert_eq!(encode_req(&back), wire);
+            let mut stray = wire;
+            stray.size = 1.into();
+            assert!(decode_req(&stray).is_none(), "{req:?} carries no size");
+        }
+        // A fixed pair's index is not a face arrival.
+        let mut fixed = encode_req(&MmRequest::RetirePeer { peer });
+        fixed.numa = 3.into();
+        assert!(decode_req(&fixed).is_none());
+    }
+
+    #[test]
+    fn peer_admitted_carries_its_arrival_and_nothing_else() {
+        let peer = PeerId::from_arrival(0x0206).unwrap();
+        let wire = encode_rep(&MmResponse::PeerAdmitted { peer }, 0);
+        assert_eq!(
+            decode_rep(&wire),
+            Some((MmResponse::PeerAdmitted { peer }, 0))
+        );
+        let mut stray = wire;
+        stray.reserved[4] = 1;
+        assert!(decode_rep(&stray).is_none());
+        let mut accepted = encode_rep(&MmResponse::Accepted, 0);
+        assert_eq!(decode_rep(&accepted), Some((MmResponse::Accepted, 0)));
+        accepted.reserved[0] = 1;
+        assert!(
+            decode_rep(&accepted).is_none(),
+            "only PeerAdmitted carries bytes"
         );
     }
 }

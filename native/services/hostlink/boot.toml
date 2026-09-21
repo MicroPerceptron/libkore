@@ -8,8 +8,8 @@
 
 [service]
 image        = "kore-svc-hostlink"
-digest_x86_64 = "blake3:5ba2cfa1c7e3fd629079d3218735956fa9ba463d5af0387dd7636b39c6598e89"
-digest_aarch64 = "blake3:54644380c187633b08a928ce2b0245b7d087a376b9a4bc7278ead00f500360de"
+digest_x86_64 = "blake3:80bba98cf8e06415c7a9d3f404fb2db4d11b1955b48cc41ea0292e7c1524e4bc"
+digest_aarch64 = "blake3:537ac8ddf7ae10a479997767a9352ada5ec1908b2567aec5cd1a38f823924229"
 chain        = true
 endowment    = "kore_svc_hostlink::HostLinkEndowment"
 protocol     = "kore_svc_hostlink::HostLinkFront"

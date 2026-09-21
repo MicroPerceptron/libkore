@@ -15,9 +15,10 @@ use kore_driver::seam::{Dma, DmaPool, Regs};
 
 use crate::{
     Controller, Error, Namespace, Qpair,
-    commands::DsmRange,
+    commands::{DsmRange, HmbDescriptor},
+    controller::{DeviceInfo, HMB_MAX_CHUNKS},
     namespace::MAX_NLB_BLOCKS,
-    prp::{ListPage, max_single_list_transfer},
+    prp::{ListPage, MemPage, max_single_list_transfer},
 };
 
 /// Identify Controller ONCS bit 2 (NVM Command Set: Dataset Management).
@@ -67,18 +68,47 @@ pub struct NvmeBlockDevice<R: Regs, P: DmaPool> {
     quiesced: bool,
 }
 
+/// How much host memory to offer the controller for its mapping tables: the
+/// least of what it asks for (Identify HMPRE) and the consumer's allowance,
+/// rounded down to whole controller pages — and nothing at all when the
+/// controller uses none, or when what could be offered is below the floors
+/// it advertises (a buffer it may refuse is not worth the round trip).
+pub fn host_memory_buffer_bytes(info: &DeviceInfo, allowance: u64, page: MemPage) -> u64 {
+    if info.hmb_preferred_bytes == 0 || allowance == 0 {
+        return 0;
+    }
+    let page = page.bytes() as u64;
+    let bytes = info.hmb_preferred_bytes.min(allowance) / page * page;
+    if bytes == 0 || bytes < info.hmb_min_bytes || bytes < info.hmb_min_descriptor_bytes {
+        return 0;
+    }
+    bytes
+}
+
 impl<R: Regs, P: DmaPool> NvmeBlockDevice<R, P> {
     /// Finish identify/queue provisioning and bind one direct channel.
+    /// `hmb_max_bytes` is the most host memory the controller may be given
+    /// for its mapping tables (0 offers none).
     pub fn provision(
         controller: Controller<R, P>,
         qid: u16,
         depth: u16,
         vector: Option<u16>,
+        hmb_max_bytes: u64,
         max_polls: u32,
         pause: fn(),
     ) -> Result<Self, BlockError> {
         let mut pacer = CountedPacer::new(max_polls, pause);
-        Self::provision_paced(controller, qid, depth, vector, &mut pacer, pause, max_polls)
+        Self::provision_paced(
+            controller,
+            qid,
+            depth,
+            vector,
+            hmb_max_bytes,
+            &mut pacer,
+            pause,
+            max_polls,
+        )
     }
 
     /// Finish controller provisioning under one caller-owned pacing budget.
@@ -89,6 +119,7 @@ impl<R: Regs, P: DmaPool> NvmeBlockDevice<R, P> {
         qid: u16,
         depth: u16,
         vector: Option<u16>,
+        hmb_max_bytes: u64,
         pacer: &mut dyn CompletionPacer,
         lifecycle_pause: fn(),
         shutdown_polls: u32,
@@ -101,6 +132,35 @@ impl<R: Regs, P: DmaPool> NvmeBlockDevice<R, P> {
             .map_err(map_submit_error)?;
         if sq < wanted || cq < wanted {
             return Err(BlockError::Backpressure);
+        }
+        // The host memory buffer, before the I/O queues exist (the order
+        // Linux keeps).  One page-aligned allocation is one descriptor: the
+        // pool's IOVA window is contiguous by construction, whatever the
+        // frames beneath it.  A controller that uses none, an allowance
+        // below its minimum, a pool that cannot carry it, or a refusal all
+        // leave the device running WITHOUT one — a slower filesystem, never
+        // a missing one — and the enable takes its own counted budget so a
+        // controller that is slow to take 64 MiB cannot spend the shared
+        // bring-up deadline the queue creation below still needs.  The
+        // buffer is disabled again by `Controller::shutdown`, which the
+        // quiesce hook reaches while bus mastering is still open; the
+        // revoke path that skips quiesce is contained by the host closing
+        // bus mastering (or binding the requester to Abort) before the
+        // frames are reaped, so the controller can never reach memory it
+        // no longer owns.
+        let hmb_bytes = host_memory_buffer_bytes(&info, hmb_max_bytes, controller.page());
+        if hmb_bytes != 0 {
+            let page = controller.page().bytes() as usize;
+            let list = controller
+                .pool()
+                .alloc(size_of::<HmbDescriptor>() * HMB_MAX_CHUNKS);
+            let chunk = controller.pool().alloc_aligned(hmb_bytes as usize, page);
+            if let (Some(list), Some(chunk)) = (list, chunk) {
+                let mut chunks = [const { None }; HMB_MAX_CHUNKS];
+                chunks[0] = Some(chunk);
+                let mut hmb_pacer = CountedPacer::new(shutdown_polls, lifecycle_pause);
+                let _ = controller.enable_host_memory_buffer(list, chunks, &mut hmb_pacer);
+            }
         }
         let qpair = controller
             .create_io_qpair_paced(qid, depth, vector, pacer)
@@ -162,6 +222,12 @@ impl<R: Regs, P: DmaPool> NvmeBlockDevice<R, P> {
 
     pub fn qpair_stats(&self) -> crate::QpairStats {
         self.qpair.stats()
+    }
+
+    /// Host memory the controller holds for its mapping tables, in bytes
+    /// (0 = none granted, or already disabled).
+    pub fn host_memory_buffer_bytes(&self) -> u64 {
+        self.controller.info().hmb_bytes
     }
 
     /// **The word a completion's arrival stores to** — this channel's data
@@ -560,7 +626,7 @@ mod tests {
     fn hardware_neutral_channel_drives_the_real_nvme_core() {
         let dev = MockNvmeDevice::new();
         let ctrl = Controller::bring_up(dev.clone(), dev.pool(), 16, || {}).unwrap();
-        let mut backend = NvmeBlockDevice::provision(ctrl, 1, 8, Some(0), 16, || {}).unwrap();
+        let mut backend = NvmeBlockDevice::provision(ctrl, 1, 8, Some(0), 0, 16, || {}).unwrap();
         assert!(backend.geometry().discard);
         let health = backend.health().expect("typed SMART health sample");
         assert_eq!(health.temperature_celsius, 36);
@@ -624,7 +690,7 @@ mod tests {
     fn larger_controller_page_aligns_data_and_prp_list_buffers() {
         let dev = MockNvmeDevice::new().with_mps(1).unwrap();
         let ctrl = Controller::bring_up(dev.clone(), dev.pool(), 16, || {}).unwrap();
-        let mut backend = NvmeBlockDevice::provision(ctrl, 1, 8, None, 16, || {}).unwrap();
+        let mut backend = NvmeBlockDevice::provision(ctrl, 1, 8, None, 0, 16, || {}).unwrap();
         let page_bytes = 2 * MOCK_BLOCK_SIZE as usize;
         let mut buffer = backend.allocate_buffer(2 * page_bytes).unwrap();
         assert_eq!(buffer.data.iova().0 & 0x1fff, 0);
@@ -653,6 +719,81 @@ mod tests {
         assert_eq!(buffer.bytes(), dev.disk_snapshot(3, 4));
     }
 
+    /// A DRAM-less controller is handed the least of its appetite and the
+    /// consumer's allowance, as one descriptor; a controller that uses none,
+    /// or an allowance under its floor, gets nothing and the mount proceeds.
+    #[test]
+    fn a_dram_less_controller_is_given_a_host_memory_buffer_of_one_descriptor() {
+        // 64 KiB preferred, 16 KiB minimum, four descriptors at most.
+        let dev = MockNvmeDevice::new();
+        dev.set_hmb(16, 4, 4);
+        let ctrl = Controller::bring_up(dev.clone(), dev.pool(), 16, || {}).unwrap();
+        let backend = NvmeBlockDevice::provision(ctrl, 1, 8, None, 1 << 20, 16, || {}).unwrap();
+        assert_eq!(
+            dev.hmb(),
+            Some((16, 1)),
+            "64 KiB = 16 pages, one descriptor"
+        );
+        assert_eq!(backend.host_memory_buffer_bytes(), 64 * 1024);
+
+        // The allowance caps it, in whole pages.
+        let dev = MockNvmeDevice::new();
+        dev.set_hmb(16, 4, 4);
+        let ctrl = Controller::bring_up(dev.clone(), dev.pool(), 16, || {}).unwrap();
+        let backend =
+            NvmeBlockDevice::provision(ctrl, 1, 8, None, 32 * 1024 + 100, 16, || {}).unwrap();
+        assert_eq!(dev.hmb(), Some((8, 1)));
+        assert_eq!(backend.host_memory_buffer_bytes(), 32 * 1024);
+
+        // Below the controller's minimum: not offered.
+        let dev = MockNvmeDevice::new();
+        dev.set_hmb(16, 4, 4);
+        let ctrl = Controller::bring_up(dev.clone(), dev.pool(), 16, || {}).unwrap();
+        let backend = NvmeBlockDevice::provision(ctrl, 1, 8, None, 8 * 1024, 16, || {}).unwrap();
+        assert_eq!(dev.hmb(), None);
+        assert_eq!(backend.host_memory_buffer_bytes(), 0);
+
+        // A controller with no appetite gets none whatever the allowance.
+        let dev = MockNvmeDevice::new();
+        let ctrl = Controller::bring_up(dev.clone(), dev.pool(), 16, || {}).unwrap();
+        let backend = NvmeBlockDevice::provision(ctrl, 1, 8, None, 1 << 30, 16, || {}).unwrap();
+        assert_eq!(dev.hmb(), None);
+        assert_eq!(backend.host_memory_buffer_bytes(), 0);
+    }
+
+    /// The buffer is disabled at the controller before the orderly
+    /// shutdown, through the same quiesce the filesystem takes.
+    #[test]
+    fn quiesce_disables_the_host_memory_buffer_before_shutdown() {
+        let dev = MockNvmeDevice::new();
+        dev.set_hmb(16, 4, 4);
+        let ctrl = Controller::bring_up(dev.clone(), dev.pool(), 16, || {}).unwrap();
+        let mut backend = NvmeBlockDevice::provision(ctrl, 1, 8, None, 1 << 20, 16, || {}).unwrap();
+        assert!(dev.hmb().is_some());
+        backend.quiesce().unwrap();
+        assert_eq!(dev.hmb(), None);
+        assert_eq!(dev.hmb_disables(), 1);
+        assert_eq!(backend.host_memory_buffer_bytes(), 0);
+    }
+
+    /// A pool that cannot carry the buffer leaves the controller without
+    /// one and the filesystem's own budget untouched: provisioning still
+    /// succeeds.
+    #[test]
+    fn a_pool_too_small_for_the_buffer_still_provisions_the_device() {
+        let dev = MockNvmeDevice::new();
+        dev.set_hmb(16_384, 1_024, 8); // 64 MiB preferred, 4 MiB minimum
+        let (pool, _cursor) = BudgetPool::new(2 << 20);
+        let ctrl = Controller::bring_up(dev.clone(), pool, 16, || {}).unwrap();
+        let backend = NvmeBlockDevice::provision(ctrl, 1, 8, None, 64 << 20, 16, || {}).unwrap();
+        assert_eq!(
+            dev.hmb(),
+            None,
+            "2 MiB cannot carry 4 MiB, so none was offered"
+        );
+        assert_eq!(backend.host_memory_buffer_bytes(), 0);
+    }
+
     #[test]
     fn mps_256k_and_four_fs_buffers_fit_the_exact_2mib_budget() {
         const DMA_BUDGET: usize = 2 * 1024 * 1024;
@@ -661,7 +802,7 @@ mod tests {
         let dev = MockNvmeDevice::new().with_mps(6).unwrap();
         let (pool, cursor) = BudgetPool::new(DMA_BUDGET);
         let ctrl = Controller::bring_up(dev, pool, 16, || {}).unwrap();
-        let mut backend = NvmeBlockDevice::provision(ctrl, 1, 32, None, 16, || {}).unwrap();
+        let mut backend = NvmeBlockDevice::provision(ctrl, 1, 32, None, 0, 16, || {}).unwrap();
         let buffers = [
             backend.allocate_buffer(FS_BUFFER).unwrap(),
             backend.allocate_buffer(FS_BUFFER).unwrap(),

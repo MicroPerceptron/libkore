@@ -455,8 +455,8 @@ impl DeviceBroker {
             DeviceSelector::PciI2cHid { .. } => {
                 // The native input profile currently uses Intel LPSS
                 // reset/clock semantics, not arbitrary serial-bus IP.
-                // Linux's intel-lpss-pci.c LNL-M table maps exactly these
-                // I2C functions to its 100 MHz ehl_i2c_info; a852 is UART.
+                // Linux's intel-lpss-pci.c LNL-M / PTL-P tables map these
+                // I2C functions to its 100 MHz ehl_i2c_info; a852/e452 are UART.
                 // https://github.com/torvalds/linux/blob/master/drivers/mfd/intel-lpss-pci.c
                 record.is_native_i2c_hid_candidate()
             }
@@ -1973,15 +1973,71 @@ mod tests {
     fn native_i2c_profile_does_not_reset_unknown_controller_wrappers() {
         let selector = DeviceSelector::PciI2cHid { irq: false };
         let mut record = pci_i2c(DeviceRecord::DRIVER_ENDPOINT | DeviceRecord::HAS_BAR0, 0);
-        for device in [0xa850, 0xa851, 0xa878, 0xa879, 0xa87a, 0xa87b] {
+        for device in [
+            0xa850, 0xa851, 0xa878, 0xa879, 0xa87a, 0xa87b, 0xe450, 0xe451, 0xe478, 0xe479, 0xe47a,
+            0xe47b,
+        ] {
             record.device = device;
             assert!(DeviceBroker::matches(&record, &selector));
         }
-        for (vendor, device) in [(0x8086, 0xa852), (0x8086, 0x9d60), (0x1022, 0xa878)] {
+        for (vendor, device) in [
+            (0x8086, 0xa852),
+            (0x8086, 0x9d60),
+            (0x1022, 0xa878),
+            (0x8086, 0xe452),
+            (0x8086, 0xe425),
+            (0x8086, 0xe427),
+            (0x8086, 0xe430),
+            (0x8086, 0xe446),
+            (0x8086, 0xe477),
+            (0x8086, 0xe47c),
+            (0x1022, 0xe450),
+        ] {
             record.vendor = vendor;
             record.device = device;
             assert!(!DeviceBroker::describes(&record, &selector));
             assert!(!DeviceBroker::matches(&record, &selector));
+        }
+    }
+
+    #[test]
+    fn panther_lake_i2c_inspection_preserves_claim_requirements() {
+        let optional = DeviceSelector::PciI2cHid { irq: false };
+        let routed = DeviceSelector::PciI2cHid { irq: true };
+        // Biggertron's two PCI controllers, as captured by Ubuntu. Candidate
+        // evidence must survive a refusal; it does not confer claim authority.
+        for device in [0xe450, 0xe451] {
+            let mut record = pci_i2c(DeviceRecord::DRIVER_ENDPOINT | DeviceRecord::HAS_BAR0, 0);
+            record.device = device;
+            assert!(record.is_native_i2c_hid_candidate());
+            assert!(DeviceBroker::describes(&record, &routed));
+            assert!(DeviceBroker::matches(&record, &optional));
+            assert!(!DeviceBroker::matches(&record, &routed));
+            record.flags |= DeviceRecord::HAS_LINE;
+            assert!(DeviceBroker::matches(&record, &routed));
+            for corrupt in [
+                |r: &mut DeviceRecord| r.flags &= !DeviceRecord::DRIVER_ENDPOINT,
+                |r: &mut DeviceRecord| r.flags |= DeviceRecord::NOT_DRIVER_ENDPOINT,
+                |r: &mut DeviceRecord| r.flags |= DeviceRecord::IS_BRIDGE,
+                |r: &mut DeviceRecord| r.flags &= !DeviceRecord::HAS_BAR0,
+                |r: &mut DeviceRecord| r.diag = 0,
+            ] {
+                let mut refused = record;
+                corrupt(&mut refused);
+                assert!(DeviceBroker::describes(&refused, &routed));
+                assert!(!DeviceBroker::matches(&refused, &optional));
+            }
+            for corrupt in [
+                |r: &mut DeviceRecord| r.species = DeviceSpecies::Platform,
+                |r: &mut DeviceRecord| r.class ^= 1,
+                |r: &mut DeviceRecord| r.subclass ^= 1,
+                |r: &mut DeviceRecord| r.progif = 1,
+            ] {
+                let mut wrong_kind = record;
+                corrupt(&mut wrong_kind);
+                assert!(!wrong_kind.is_native_i2c_hid_candidate());
+                assert!(!DeviceBroker::describes(&wrong_kind, &optional));
+            }
         }
     }
 

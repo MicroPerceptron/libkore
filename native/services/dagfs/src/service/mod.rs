@@ -66,9 +66,10 @@ use kore_rt::{
 use kore_svc_extract::schema::InputIdentity;
 
 use crate::{
+    ObjectId,
     authority::{GrantId, Handle, Rights, SessionId},
     block_on,
-    bounds::MAX_SESSIONS,
+    bounds::{MAX_AUTHORITY_EDGES, MAX_SESSIONS},
     engine::Engine,
     error::{FsError, FsResult},
     namespace::Name,
@@ -183,6 +184,31 @@ pub const SYSTEM_LIBS_VIEW: &str = "libs";
 /// The administration session's writable grant over it (`sys-lib`, for the
 /// same collision reason as `sys-app`).
 pub const SYSTEM_LIBS_GRANT: &str = "sys-lib";
+/// The shared **data** directory beneath the persisted root: the boot
+/// archive's DATA members (`ARCHIVE_MEMBER_DATA` — stock `.wasm` modules,
+/// for one) land here once, under a per-kind subdirectory
+/// (`shared/wasm/hello.wasm` as a task sees it), and a later install
+/// writes here.  Stamped
+/// `PLAIN`: bytes to read, never an image to run or link.
+/// The directory itself, in the short spelling its two siblings use:
+/// `app` carries the `apps` view and `lib` the `libs` view, and this one
+/// carries `shared`.  Keeping the two apart is not cosmetic —
+/// `view_name_taken` counts a real child of the destination root as a
+/// collision, so a view whose name IS its directory's cannot install into
+/// any session rooted where that directory lives, silently, because every
+/// call site takes the bool with `let _ =`.  On the two-store durable
+/// layout that is every session the system store serves, which is why
+/// `share` was absent from `list` and `shares` on metal while `apps` and
+/// `libs` were there, and why no single-store QEMU gate ever saw it.
+pub const SYSTEM_SHARE_DIR: &str = "share";
+/// The READ-only display name every task view carries for it, beside
+/// `apps` and `libs`, and the name a task types:
+/// `shared/wasm/hello.wasm`.  The longer form, as those two are.
+pub const SYSTEM_SHARE_VIEW: &str = "shared";
+/// The administration session's writable grant over it (`sys-share`, for
+/// the same collision reason as `sys-app`): what exec's data seeder
+/// discovers and writes through.
+pub const SYSTEM_SHARE_GRANT: &str = "sys-share";
 /// The **package** directory: one subtree per installed `.pkg`
 /// (`res/PKG.md`) — a typed manifest plus `app/` and `lib/` members that
 /// `apps/` and `libs/` project by Link edge, never by copy.  No task view;
@@ -190,6 +216,44 @@ pub const SYSTEM_LIBS_GRANT: &str = "sys-lib";
 pub const SYSTEM_PKGS_DIR: &str = "pkgs";
 /// The administration session's writable grant over it.
 pub const SYSTEM_PKGS_GRANT: &str = "sys-pkg";
+
+/// Whether two names differ — `const`, because the invariant below is a
+/// compile-time one.
+const fn name_differs(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return true;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// A view's display name must not be any system directory's own name.
+// `view_name_taken` treats a real child of the destination root as taken,
+// so such a view refuses to install for every session rooted there, and
+// the three call sites discard that refusal (`let _ =`) — the failure is
+// silent, survives every gate whose store has one region, and shows up as
+// a missing name on a metal install.  `share`/`share` shipped exactly that.
+const _: () = {
+    assert!(name_differs(SYSTEM_APPS_VIEW, SYSTEM_APPS_DIR));
+    assert!(name_differs(SYSTEM_APPS_VIEW, SYSTEM_LIBS_DIR));
+    assert!(name_differs(SYSTEM_APPS_VIEW, SYSTEM_SHARE_DIR));
+    assert!(name_differs(SYSTEM_APPS_VIEW, SYSTEM_PKGS_DIR));
+    assert!(name_differs(SYSTEM_LIBS_VIEW, SYSTEM_APPS_DIR));
+    assert!(name_differs(SYSTEM_LIBS_VIEW, SYSTEM_LIBS_DIR));
+    assert!(name_differs(SYSTEM_LIBS_VIEW, SYSTEM_SHARE_DIR));
+    assert!(name_differs(SYSTEM_LIBS_VIEW, SYSTEM_PKGS_DIR));
+    assert!(name_differs(SYSTEM_SHARE_VIEW, SYSTEM_APPS_DIR));
+    assert!(name_differs(SYSTEM_SHARE_VIEW, SYSTEM_LIBS_DIR));
+    assert!(name_differs(SYSTEM_SHARE_VIEW, SYSTEM_SHARE_DIR));
+    assert!(name_differs(SYSTEM_SHARE_VIEW, SYSTEM_PKGS_DIR));
+};
 
 pub use kore_dagfs::{FsRequest, FsResponse};
 
@@ -280,6 +344,9 @@ pub struct FsService<P: StorageProvider> {
     /// The same for the shared library directory (`lib/`): the anchor of
     /// each task's READ-only `libs/` view.
     libs_view: Option<crate::GrantId>,
+    /// The same for the shared data directory (`share/`): the anchor of each
+    /// task's READ-only `share/` view.
+    share_view: Option<crate::GrantId>,
     /// The administration session's writable grant over `pkgs/`; no task
     /// view descends from it.
     pkgs_store: Option<crate::GrantId>,
@@ -287,6 +354,24 @@ pub struct FsService<P: StorageProvider> {
     /// session by construction: a bulk writer defers only its own commits,
     /// never another client's durability.
     deferring: [bool; MAX_SESSIONS],
+    /// Private roots stranded by peers that died, awaiting reclamation on
+    /// the next async dispatch. The peer-death hook is synchronous, and
+    /// reclaiming inside it meant a nested `block_on` in the serve loop —
+    /// see `Engine::detach_session_authority`. Bounded by the authority
+    /// edges one session can hold, which is also the most one death can
+    /// strand; the hook falls back to draining in place only if a burst of
+    /// deaths between two requests outruns it.
+    pending_reclaims: heapless::Vec<ObjectId, MAX_AUTHORITY_EDGES>,
+    /// One private provider placement per authenticated session. The service
+    /// already serializes dispatch; no additional lock or namespace object.
+    replacements: [Option<crate::engine::Replacement<P::Key>>; MAX_SESSIONS],
+    /// Staged replacements whose sessions died, awaiting release on the next
+    /// async dispatch beside `pending_reclaims` — the same rule: nothing
+    /// awaits inside the synchronous peer-death hook. Taken out of the slot
+    /// at death so a reused slot never inherits a dead peer's stage; a
+    /// release the provider refuses stays here and is retried, retaining
+    /// custody. One stage per session bounds it.
+    pending_aborts: heapless::Vec<crate::engine::Replacement<P::Key>, MAX_SESSIONS>,
     /// The storage backend's last posture snapshot, folded into
     /// [`FsRequest::SystemStatus`] answers. The durable entry refreshes it
     /// immediately before delegating a status request; the default zeros
@@ -307,6 +392,8 @@ pub struct FsBackendStatus {
     pub route_held: bool,
     /// The mounted block channel crossed its one-way lost boundary.
     pub channel_lost: bool,
+    /// The controller holds a host memory buffer for its mapping tables.
+    pub host_memory_buffer: bool,
     /// The readiness note ([`crate::durable::note`] vocabulary; `0` is the
     /// fully healthy durable posture).
     pub note: u64,
@@ -427,8 +514,12 @@ impl<P: StorageProvider> FsService<P> {
             host_root: None,
             apps_view: None,
             libs_view: None,
+            share_view: None,
             pkgs_store: None,
             deferring: [false; MAX_SESSIONS],
+            pending_reclaims: heapless::Vec::new(),
+            replacements: core::array::from_fn(|_| None),
+            pending_aborts: heapless::Vec::new(),
             backend: FsBackendStatus::default(),
         }
     }
@@ -820,6 +911,7 @@ impl<P: StorageProvider> FsService<P> {
         // never write, relink, or bless them.
         let _ = self.install_apps_view(session);
         let _ = self.install_libs_view(session);
+        let _ = self.install_share_view(session);
         self.invocation_views[slot] = Some(InvocationView {
             scope,
             grant,
@@ -859,6 +951,7 @@ impl<P: StorageProvider> FsService<P> {
         if result.is_ok() {
             let _ = self.install_apps_view(system);
             let _ = self.install_libs_view(system);
+            let _ = self.install_share_view(system);
         }
         result
     }
@@ -988,8 +1081,37 @@ impl<P: StorageProvider> FsService<P> {
         else {
             return true;
         };
-        if block_on(self.engine.detach_session(SessionId::new(slot as u16))).is_err() {
+        // A staged replacement dies with its session. Its placement is
+        // released on the next dispatch, never here: the same rule as the
+        // stranded roots below. Taking it out of the slot now keeps a
+        // reused slot from inheriting a dead peer's stage.
+        if let Some(stage) = self.replacements[slot].take() {
+            if let Err(stage) = self.pending_aborts.push(stage) {
+                // Only a burst of deaths that outran two dispatches fills
+                // the list; release in place then, as the reclaim fallback
+                // below does, and keep the stage if the provider refuses.
+                if block_on(self.engine.abort_replace(&stage)).is_err() {
+                    self.replacements[slot] = Some(stage);
+                    return false;
+                }
+            }
+        }
+        let Ok(stranded) = self
+            .engine
+            .detach_session_authority(SessionId::new(slot as u16))
+        else {
             return false;
+        };
+        // Authority is gone now; the roots are freed on the next async
+        // dispatch, where reclamation's contention budget means something.
+        // A queue that cannot take them is the burst case: drain it here so
+        // no root is ever dropped on the floor, at the old nested cost.
+        for root in stranded {
+            if let Err(root) = self.pending_reclaims.push(root) {
+                let pending = core::mem::take(&mut self.pending_reclaims);
+                block_on(self.engine.reclaim_stranded(&pending));
+                block_on(self.engine.reclaim_stranded(&[root]));
+            }
         }
         self.peer_via[slot] = None;
         self.peer_task_view[slot] = None;
@@ -1021,6 +1143,26 @@ impl<P: StorageProvider> FsService<P> {
     ) -> FsResponse {
         if sv.via() != crate::service::contract::ADMIN_VIA {
             return FsResponse::Refused(FsError::AccessDenied);
+        }
+        // A `Ring` is the boundary between bundles, so one arriving while the
+        // assembler still owns components proves the previous assembly was
+        // abandoned — its asker spent its bounded re-ask and gave up.  Retire
+        // what it left, and refuse the replacement while any of those owners
+        // is still closing (`PeerBundleAssembler::retire_incomplete`).
+        //
+        // Without this the leftovers are permanent: the next launch's matching
+        // part answers `Duplicate`, the bundle never completes, no verdict is
+        // ever published, and every later launch that needs this face refuses
+        // for the rest of the boot.
+        //
+        // Admin only, and checked before anything else touches the assembler:
+        // a foreign via must never retire the components the administration
+        // pair is still assembling.
+        if matches!(part, PeerBundlePart::Ring)
+            && !self.peer_assembler.is_empty()
+            && !self.peer_assembler.retire_incomplete()
+        {
+            return FsResponse::Refused(FsError::Conflict);
         }
         if self.last_admission.is_some() {
             return FsResponse::Refused(FsError::Conflict);
@@ -1056,6 +1198,22 @@ impl<P: StorageProvider> FsService<P> {
         match self.last_admission.take() {
             Some(Ok(peer)) => FsResponse::PeerAdmitted { peer },
             Some(Err(reason)) => FsResponse::Refused(peer_admission_error(reason)),
+            // No verdict, and the assembler still owns components: this
+            // bundle never completed, so `admit_peer` was never called and
+            // no verdict can EVER be published.  `NotFound` here would be a
+            // lie the asker waits on forever — and exec fences new
+            // provisioning while an id-less face exists, so that wait
+            // refuses every later launch that needs this face.  Retire what
+            // the abandoned assembly still owns and answer terminally, which
+            // is exec's signal to let the peer go.
+            None if !self.peer_assembler.is_empty() => {
+                let _ = self.peer_assembler.retire_incomplete();
+                FsResponse::Refused(FsError::Conflict)
+            }
+            // No verdict and an EMPTY assembler: the bundle completed and
+            // the host has not drained its admission action yet.  One IS
+            // coming, so this is an ordinary "not yet" — settling here would
+            // orphan the face the host is about to admit.
             None => FsResponse::Refused(FsError::NotFound),
         }
     }
@@ -1244,6 +1402,19 @@ impl<P: StorageProvider> FsService<P> {
         }
     }
 
+    /// The shared data directory, `share/` — the same bring-up as `lib/`
+    /// (create-or-adopt, one writable admin grant), anchoring every task's
+    /// READ-only `share` view.
+    pub(crate) fn establish_admin_share(&mut self) -> bool {
+        match self.establish_admin_directory(SYSTEM_SHARE_DIR, SYSTEM_SHARE_GRANT) {
+            Some(grant) => {
+                self.share_view = Some(grant);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The package directory, `pkgs/` — admin-writable, never viewed.
     pub(crate) fn establish_admin_pkgs(&mut self) -> bool {
         match self.establish_admin_directory(SYSTEM_PKGS_DIR, SYSTEM_PKGS_GRANT) {
@@ -1350,6 +1521,16 @@ impl<P: StorageProvider> FsService<P> {
             return false;
         };
         self.install_named_view(session, libs, SYSTEM_LIBS_VIEW)
+    }
+
+    /// The READ-only `share` view beside `libs` — a named grant onto the
+    /// shared data directory.  Best-effort like `libs`: a task without it
+    /// still boots, it just cannot read the shipped data (`shared/wasm/…`).
+    pub(crate) fn install_share_view(&mut self, session: SessionId) -> bool {
+        let Some(share) = self.share_view else {
+            return false;
+        };
+        self.install_named_view(session, share, SYSTEM_SHARE_VIEW)
     }
 
     /// Grant `anchor` (an admin-held directory grant) into `session` as a
@@ -1631,10 +1812,32 @@ impl<P: StorageProvider> FsService<P> {
         request: &FsRequest,
         window: Option<&mut DataWindow<'_>>,
     ) -> FsResponse {
+        self.drain_pending_reclaims().await;
         match self.serve_async(session, request, window).await {
             Ok(response) => response,
             Err(err) => FsResponse::Refused(err),
         }
+    }
+
+    /// Release the placements and reclaim the roots dead peers left behind,
+    /// before the request that woke this dispatch is served. Ordinary await
+    /// points: a `Busy` claim held by an in-flight request resolves on that
+    /// request's next turn, and a placement the provider refuses to release
+    /// stays pending for the next dispatch, retaining custody.
+    async fn drain_pending_reclaims(&mut self) {
+        if !self.pending_aborts.is_empty() {
+            let stages = core::mem::take(&mut self.pending_aborts);
+            for stage in stages {
+                if self.engine.abort_replace(&stage).await.is_err() {
+                    let _ = self.pending_aborts.push(stage);
+                }
+            }
+        }
+        if self.pending_reclaims.is_empty() {
+            return;
+        }
+        let pending = core::mem::take(&mut self.pending_reclaims);
+        self.engine.reclaim_stranded(&pending).await;
     }
 
     /// The dispatch body, written against `?` so every refusal path is one
@@ -1706,6 +1909,12 @@ impl<P: StorageProvider> FsService<P> {
             )?,
 
             FsRequest::Close { handle } => {
+                if let Some(cell) = self.replacements.get_mut(session.index() as usize) {
+                    if let Some(stage) = cell.as_ref().filter(|stage| stage.handle == handle) {
+                        self.engine.abort_replace(stage).await?;
+                        *cell = None;
+                    }
+                }
                 self.engine.close(session, handle)?;
                 FsResponse::Done
             }
@@ -1828,6 +2037,9 @@ impl<P: StorageProvider> FsService<P> {
                 if self.backend.channel_lost {
                     flags |= FsSystemStatusWire::FLAG_CHANNEL_LOST;
                 }
+                if self.backend.host_memory_buffer {
+                    flags |= FsSystemStatusWire::FLAG_HOST_MEMORY_BUFFER;
+                }
                 let wire = FsSystemStatusWire {
                     sessions: self.engine.live_sessions().into(),
                     peers: (self.peer_via.iter().flatten().count() as u16).into(),
@@ -1897,6 +2109,13 @@ impl<P: StorageProvider> FsService<P> {
                     let mut path_len = 0usize;
                     for (component_index, component) in hit.path.iter().enumerate() {
                         if component_index != 0 {
+                            // The wire spelling is proven wide enough for the
+                            // deepest legal path at compile time (`bounds`);
+                            // this keeps a drift there a refusal, never an
+                            // index past the fixed array.
+                            if path_len >= path.len() {
+                                return Err(FsError::Range);
+                            }
                             path[path_len] = b'/';
                             path_len += 1;
                         }
@@ -1958,6 +2177,73 @@ impl<P: StorageProvider> FsService<P> {
                 FsResponse::Transferred {
                     count: count as u32,
                 }
+            }
+            FsRequest::BeginReplace {
+                handle,
+                length,
+                expected,
+            } => {
+                let cell = self
+                    .replacements
+                    .get_mut(session.index() as usize)
+                    .ok_or(FsError::AccessLost)?;
+                if cell.is_some() {
+                    return Err(FsError::Busy);
+                }
+                *cell = Some(
+                    self.engine
+                        .begin_replace(session, handle, length, expected)
+                        .await?,
+                );
+                FsResponse::Done
+            }
+            FsRequest::WriteReplacement {
+                handle,
+                offset,
+                window_offset,
+                length,
+            } => {
+                let stage = self
+                    .replacements
+                    .get_mut(session.index() as usize)
+                    .and_then(Option::as_mut)
+                    .filter(|stage| stage.handle == handle)
+                    .ok_or(FsError::InvalidHandle)?;
+                let src = window
+                    .ok_or(FsError::NoWindow)?
+                    .source(window_offset, length)?;
+                self.engine
+                    .write_replacement(session, stage, offset, src)
+                    .await?;
+                FsResponse::Done
+            }
+            FsRequest::CommitReplace { handle } => {
+                let cell = self
+                    .replacements
+                    .get_mut(session.index() as usize)
+                    .ok_or(FsError::AccessLost)?;
+                let stage = cell
+                    .as_ref()
+                    .filter(|stage| stage.handle == handle)
+                    .ok_or(FsError::InvalidHandle)?;
+                let revision = self.engine.commit_replace(session, stage).await?;
+                // The object owns the placement from this point onward.
+                *cell = None;
+                FsResponse::Committed { revision }
+            }
+            FsRequest::AbortReplace { handle } => {
+                let cell = self
+                    .replacements
+                    .get_mut(session.index() as usize)
+                    .ok_or(FsError::AccessLost)?;
+                if let Some(stage) = cell.as_ref() {
+                    if stage.handle != handle {
+                        return Err(FsError::InvalidHandle);
+                    }
+                    self.engine.abort_replace(stage).await?;
+                    *cell = None;
+                }
+                FsResponse::Done
             }
             FsRequest::WriteAt {
                 handle,
@@ -3305,6 +3591,7 @@ mod recyclable_session_tests {
             durable: true,
             route_held: true,
             channel_lost: true,
+            host_memory_buffer: true,
             user_lifecycle: FsSystemStatusWire::LIFECYCLE_CURRENT,
             system_lifecycle: FsSystemStatusWire::LIFECYCLE_UNDESIGNATED,
             commits: 7,
@@ -3354,6 +3641,7 @@ mod recyclable_session_tests {
         let flags = wire.flags.get();
         assert_ne!(flags & FsSystemStatusWire::FLAG_DURABLE, 0);
         assert_ne!(flags & FsSystemStatusWire::FLAG_ROUTE_HELD, 0);
+        assert_ne!(flags & FsSystemStatusWire::FLAG_HOST_MEMORY_BUFFER, 0);
         assert_eq!(flags & FsSystemStatusWire::FLAG_DEGRADED_READ_ONLY, 0);
         assert_ne!(flags & FsSystemStatusWire::FLAG_WORKSPACE, 0);
         assert_ne!(flags & FsSystemStatusWire::FLAG_SYSTEM_VIEW, 0);
@@ -3469,12 +3757,14 @@ mod recyclable_session_tests {
         assert!(service.establish_admin_source());
         assert!(service.establish_admin_libs());
         assert!(service.establish_admin_pkgs());
+        assert!(service.establish_admin_share());
 
         let system = SessionId::new(0);
         let admin = SessionId::new(crate::service::contract::ADMIN_VIA);
         for (grant_display, directory, member) in [
             (SYSTEM_LIBS_GRANT, SYSTEM_LIBS_DIR, "lua_demo.so"),
             (SYSTEM_PKGS_GRANT, SYSTEM_PKGS_DIR, "kore"),
+            (SYSTEM_SHARE_GRANT, SYSTEM_SHARE_DIR, "wasm"),
         ] {
             let display = Name::new(grant_display).unwrap();
             let held = service
@@ -3525,6 +3815,97 @@ mod recyclable_session_tests {
         assert_eq!(named.len(), 1, "no rival grant is minted");
         assert_eq!(named[0].grant, first, "the standing grant is adopted");
         assert_eq!(service.libs_view, Some(first));
+
+        let first_share = service.share_view.expect("the share anchor is cached");
+        assert!(service.establish_admin_share());
+        assert_eq!(service.share_view, Some(first_share), "share adopts too");
+    }
+
+    /// A task view carries `share` beside `libs`: READ-only, so a task can
+    /// read a shipped data member (`shared/wasm/hello.wasm`) but never write,
+    /// relink, or bless one.  On session zero the name is the directory's own
+    /// child, so the view install declines and the directory is reached
+    /// directly — one object either way.
+    #[test]
+    fn a_task_view_carries_a_read_only_share_window() {
+        let mut service = RamService::default();
+        assert!(service.establish_admin_source());
+        assert!(service.establish_admin_apps());
+        assert!(service.establish_admin_libs());
+        assert!(service.establish_admin_share());
+        assert!(service.establish_admin_workspace());
+
+        let admin = SessionId::new(crate::service::contract::ADMIN_VIA);
+        let share = service.share_view.unwrap();
+        let opened = service
+            .engine
+            .open_grant(admin, share, Rights::ALL)
+            .unwrap();
+        let wasm = Name::new("wasm").unwrap();
+        let directory = block_on(service.engine.create(
+            admin,
+            opened.handle,
+            &wasm,
+            ObjectKind::Directory,
+        ))
+        .unwrap();
+        let member = Name::new("hello.wasm").unwrap();
+        block_on(
+            service
+                .engine
+                .create(admin, directory.handle, &member, ObjectKind::File),
+        )
+        .unwrap();
+        let _ = service.engine.close(admin, directory.handle);
+        let _ = service.engine.close(admin, opened.handle);
+
+        let session = SessionId::new(7);
+        assert!(service.ensure_session(session));
+        assert!(service.install_share_view(session));
+        assert!(service.install_share_view(session), "idempotent");
+        let grants = service.engine.grants(session).unwrap();
+        let share_display = Name::new(SYSTEM_SHARE_VIEW).unwrap();
+        let view: heapless::Vec<_, 8> = grants
+            .iter()
+            .filter(|grant| grant.display_name == Some(share_display))
+            .collect();
+        assert_eq!(view.len(), 1, "one `share` name, installed once");
+        assert_eq!(view[0].rights, Rights::READ_ONLY);
+        assert!(!view[0].rights.contains(Rights::WRITE));
+        assert!(!view[0].rights.contains(Rights::BIND_EXECUTABLE));
+
+        let through = service
+            .engine
+            .open_grant(session, view[0].grant, Rights::READ)
+            .expect("the task opens its share view");
+        let nested = service
+            .engine
+            .open_at(session, through.handle, &wasm, Rights::READ)
+            .expect("the per-kind directory is reachable through the view");
+        service
+            .engine
+            .open_at(session, nested.handle, &member, Rights::READ)
+            .expect("the data member is reachable through the view");
+        assert!(
+            service
+                .engine
+                .open_grant(session, view[0].grant, Rights::WRITE)
+                .is_err(),
+            "the view refuses WRITE"
+        );
+
+        // The session rooted where the system directories themselves live
+        // carries all three views like any other.  It could not while the
+        // view's name was its directory's: `view_name_taken` counts a real
+        // child of the destination root as taken, and the three call sites
+        // discard that refusal.  On the two-store durable layout every
+        // session the system store serves is rooted there, so `shared` was
+        // missing from `list` and `shares` on a metal install while `apps`
+        // and `libs` were present — and no single-store gate could see it.
+        let rooted = SessionId::new(0);
+        assert!(service.install_share_view(rooted), "shared installs");
+        assert!(service.install_apps_view(rooted), "apps installs");
+        assert!(service.install_libs_view(rooted), "libs installs");
     }
 
     /// A task view carries `libs` beside `apps`: READ-only, with neither
@@ -3817,6 +4198,103 @@ mod recyclable_session_tests {
         assert_eq!(native.stable_object, ls.stable_object);
     }
 
+    /// A dead writer's staged replacement is released on the service's next
+    /// dispatch, never inside the synchronous peer-death hook. A release the
+    /// provider refuses stays pending — custody retained — while the dead
+    /// peer's slot is already free for the next admission, and the old bytes
+    /// are what that next peer reads either way.
+    #[test]
+    fn a_dead_writers_stage_is_released_on_the_next_dispatch_not_in_the_hook() {
+        let mut service = RamService::default();
+        assert!(service.establish_admin_source());
+        service
+            .register_private_invocation_view(
+                0xD0,
+                &Name::new("terminal-0").unwrap(),
+                Rights::ALL,
+                None,
+            )
+            .unwrap();
+        let peer = admit_view(&mut service, 0x106, 0xD0, Rights::ALL);
+        let root = service.engine.open_root(peer, Rights::ALL).unwrap();
+        let file = crate::block_on(service.engine.create(
+            peer,
+            root.handle,
+            &Name::new("saved").unwrap(),
+            crate::ObjectKind::File,
+        ))
+        .unwrap();
+        crate::block_on(
+            service
+                .engine
+                .write_at(peer, file.handle, 0, b"old", crate::ANY_REVISION),
+        )
+        .unwrap();
+        assert!(matches!(
+            service.dispatch(
+                peer,
+                &FsRequest::BeginReplace {
+                    handle: file.handle,
+                    length: 6,
+                    expected: crate::ANY_REVISION
+                },
+                None
+            ),
+            FsResponse::Done
+        ));
+        service.dispatch(peer, &FsRequest::AttachWindow { slot: 0, bytes: 3 }, None);
+        let mut backing = *b"new";
+        let mut window = crate::window::DataWindow::new(&mut backing);
+        assert!(matches!(
+            service.dispatch(
+                peer,
+                &FsRequest::WriteReplacement {
+                    handle: file.handle,
+                    offset: 0,
+                    window_offset: 0,
+                    length: 3
+                },
+                Some(&mut window)
+            ),
+            FsResponse::Done
+        ));
+        service
+            .engine
+            .provider()
+            .inject(crate::provider::Fault::Release(
+                crate::error::ProviderError::Media,
+            ));
+        assert!(
+            service.peer_closed(0x106, PeerClose::Died),
+            "the hook never awaits the release; the stage leaves with its peer"
+        );
+        assert!(service.replacements[peer.index() as usize].is_none());
+        assert_eq!(service.pending_aborts.len(), 1);
+        // The dead peer's slot is free at once — the stage no longer lives in
+        // it — and the next dispatch tries the release. The armed fault
+        // refuses that one: custody is retained for the dispatch after.
+        let next = admit_view(&mut service, 0x206, 0xD0, Rights::ALL);
+        let _ = service.dispatch(next, &FsRequest::DeferCommits { hold: false }, None);
+        assert_eq!(
+            service.pending_aborts.len(),
+            1,
+            "a refused release stays pending"
+        );
+        let _ = service.dispatch(next, &FsRequest::DeferCommits { hold: false }, None);
+        assert!(
+            service.pending_aborts.is_empty(),
+            "released once the provider accepts"
+        );
+        let root = service.engine.open_root(next, Rights::ALL).unwrap();
+        let file = service
+            .engine
+            .open_at(next, root.handle, &Name::new("saved").unwrap(), Rights::ALL)
+            .unwrap();
+        let mut bytes = [0; 3];
+        crate::block_on(service.engine.read(next, file.handle, 0, &mut bytes)).unwrap();
+        assert_eq!(&bytes, b"old");
+    }
+
     /// The deferral is per session: a bulk writer holds only its own
     /// commits, and a second client's durability is untouched by it.
     #[test]
@@ -3863,6 +4341,45 @@ mod recyclable_session_tests {
             !service.is_deferring(peer),
             "a dead writer's window must not be inherited by its slot's next occupant"
         );
+    }
+
+    /// A dead peer's authority goes in the hook; its subtree goes on the next
+    /// async dispatch, never inside the hook. The hook is synchronous, and a
+    /// reclamation run inside it was a nested executor that could not let
+    /// the in-flight request holding a claim release it.
+    #[test]
+    fn a_dead_peers_subtree_is_reclaimed_on_the_next_dispatch_not_in_the_hook() {
+        let mut service = RamService::default();
+        let session = SessionId::new(2);
+        assert!(service.ensure_session(session));
+        service.peer_via[2] = Some(0x102);
+        let root = service.engine.open_root(session, Rights::ALL).unwrap();
+        let before = service.engine.object_count();
+        let file = block_on(service.engine.create(
+            session,
+            root.handle,
+            &Name::new("stranded").unwrap(),
+            ObjectKind::File,
+        ))
+        .unwrap();
+        assert_eq!(service.engine.object_count(), before + 1);
+
+        assert!(service.peer_closed(0x102, PeerClose::Orderly));
+        // Authority is gone at once...
+        assert!(service.engine.open_root(session, Rights::READ).is_err());
+        // ...the bytes are not, until a dispatch runs on the service's own
+        // executor.
+        assert_eq!(service.engine.object_count(), before + 1);
+        assert_eq!(service.pending_reclaims.len(), 1);
+        let _ = service.dispatch(
+            session,
+            &FsRequest::Close {
+                handle: file.handle,
+            },
+            None,
+        );
+        assert!(service.pending_reclaims.is_empty());
+        assert!(service.engine.object_count() <= before);
     }
 
     /// One home, one live owner: a second live registration naming the same

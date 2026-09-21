@@ -18,12 +18,19 @@ impl PciBindingContract for NvmeIoPci {
     const INTERRUPTS: InterruptPolicy = InterruptPolicy::Optional(InterruptBlock::SINGLE);
 }
 
-/// The founder gives the control plane one ordinary DMA-capable physical
-/// supply. The NVMe controller itself is claimed from the device broker.
+/// The founder gives the control plane one DMA-capable physical supply of
+/// the LARGE class (`DMA_POOL@1`, 128 MiB — the size the accelerator rows
+/// take). The NVMe controller itself is claimed from the device broker.
+///
+/// The whole pool is subleased to the filesystem, whose own queue and
+/// buffer graph fits the ordinary 2 MiB class exactly; the remainder exists
+/// for the controller's **host memory buffer**: a DRAM-less controller keeps
+/// its mapping tables in host memory and, without one, pages them from NAND
+/// on every access.
 #[derive(kore_rt::Bundle)]
 #[bundle(name = "block")]
 pub struct BlockEndowment {
-    #[bundle(role = role::DMA_POOL)]
+    #[bundle(role = role::DMA_POOL, index = 1)]
     pub pool: SupplyToken,
 }
 

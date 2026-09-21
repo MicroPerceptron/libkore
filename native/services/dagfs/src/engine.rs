@@ -42,6 +42,7 @@ mod namespace_commit;
 pub(crate) use hydration::Hydration;
 
 use crate::{
+    ServiceAlloc,
     authority::{
         Authority, AuthorityKind, AuthorityQuota, EdgeProof, GrantId, Handle, QuotaClaim, Rights,
         Route, SessionId,
@@ -62,6 +63,7 @@ use crate::{
         FreshnessPolicy, MAX_SEARCH_PAGE, MAX_SEARCH_SCAN, QueryIndex, SearchCursor, SearchHit,
         SearchPage, SearchQuery, SearchScore,
     },
+    slot::BoundedVec,
 };
 use kore_svc_extract::{
     registry::ParserId,
@@ -214,6 +216,17 @@ pub struct GrantInfo {
     pub rights: Rights,
     pub quota: AuthorityQuota,
     pub display_name: Option<Name>,
+}
+
+/// Private placement owned by one service session, never by a namespace
+/// route or durable root. Not Copy: cleanup retains custody on refusal.
+pub(crate) struct Replacement<K> {
+    pub(crate) handle: Handle,
+    object: ObjectId,
+    revision: Revision,
+    key: K,
+    length: u64,
+    written: u64,
 }
 
 /// The filesystem engine.
@@ -454,16 +467,45 @@ impl<P: StorageProvider> Engine<P> {
     /// Detach a session: drop its handles, retire the authority edges it
     /// holds, and reclaim whatever that left unreachable.
     pub async fn detach_session(&self, session: SessionId) -> FsResult<()> {
+        let stranded = self.detach_session_authority(session)?;
+        self.reclaim_stranded(&stranded).await;
+        Ok(())
+    }
+
+    /// The synchronous half of [`Self::detach_session`]: revoke the session's
+    /// authority and drop its grants, returning the private roots left with
+    /// no owner. Nothing here awaits, so a service may run it from a
+    /// synchronous hook — the peer-death hook in particular — and reclaim
+    /// the roots later with [`Self::reclaim_stranded`] on its own async path.
+    ///
+    /// Why the split exists: `peer_closed` used to `block_on` the whole
+    /// detach inside the serve loop. Reclamation is bounded by executor
+    /// turns of *contention*, and a nested executor run cannot let the outer
+    /// loop's in-flight requests release the claims it is waiting on, so
+    /// under load a dead client's subtree was abandoned (counted, not freed)
+    /// exactly when the filesystem was busiest. Detached authority is
+    /// immediate either way: after this returns the session cannot open,
+    /// and its roots are unreachable by every other session.
+    pub(crate) fn detach_session_authority(
+        &self,
+        session: SessionId,
+    ) -> FsResult<heapless::Vec<ObjectId, MAX_AUTHORITY_EDGES>> {
         let stranded = self.auth.detach_session(session)?;
         for root in stranded.iter() {
             if let Ok(mut object) = self.ns.object_mut(*root) {
                 object.grants_dec();
             }
         }
-        for root in stranded.iter() {
+        Ok(stranded)
+    }
+
+    /// Reclaim the roots [`Self::detach_session_authority`] handed back — on
+    /// the caller's executor, where a `Busy` claim can actually be released
+    /// by the request holding it.
+    pub(crate) async fn reclaim_stranded(&self, roots: &[ObjectId]) {
+        for root in roots {
             self.reclaim(*root).await;
         }
-        Ok(())
     }
 
     /// Open the session's private root.
@@ -1140,9 +1182,17 @@ impl<P: StorageProvider> Engine<P> {
     /// here. An earlier ancestor revocation may already have retired it. Only
     /// an absent exact edge generation proves that case; contention and other
     /// failures keep the view's cleanup owner. Public Revoke remains unchanged.
-    pub(crate) async fn retire_view_grant(&self, session: SessionId, grant: GrantId) -> FsResult<()> {
+    pub(crate) async fn retire_view_grant(
+        &self,
+        session: SessionId,
+        grant: GrantId,
+    ) -> FsResult<()> {
         match self.revoke(session, grant).await {
-            Err(FsError::AccessLost) if matches!(self.auth.edge(grant), Err(FsError::AccessLost)) => Ok(()),
+            Err(FsError::AccessLost)
+                if matches!(self.auth.edge(grant), Err(FsError::AccessLost)) =>
+            {
+                Ok(())
+            }
             result => result,
         }
     }
@@ -1522,6 +1572,110 @@ impl<P: StorageProvider> Engine<P> {
         result
     }
 
+    pub(crate) async fn begin_replace(
+        &self,
+        session: SessionId,
+        handle: Handle,
+        length: u64,
+        expected: Revision,
+    ) -> FsResult<Replacement<P::Key>> {
+        let route = self.route(session, handle)?;
+        route.rights.require(Rights::WRITE)?;
+        let object = self.ns.object_mut(route.object)?;
+        if !object.kind().is_file() {
+            return Err(FsError::IsDirectory);
+        }
+        if !object.revision_admits(expected) {
+            return Err(FsError::Conflict);
+        }
+        if length > self.provider.limits().max_object_bytes {
+            return Err(FsError::OutOfStorage);
+        }
+        let _quota = self.require_growth_with_claimed(
+            route,
+            &object,
+            0,
+            0,
+            length.saturating_sub(object.len()),
+        )?;
+        let key = self.provider.allocate(ObjectKind::File, length).await?;
+        Ok(Replacement {
+            handle,
+            object: route.object,
+            revision: object.revision(),
+            key,
+            length,
+            written: 0,
+        })
+    }
+
+    pub(crate) async fn write_replacement(
+        &self,
+        session: SessionId,
+        stage: &mut Replacement<P::Key>,
+        offset: u64,
+        bytes: &[u8],
+    ) -> FsResult<()> {
+        let route = self.route(session, stage.handle)?;
+        route.rights.require(Rights::WRITE)?;
+        if route.object != stage.object {
+            return Err(FsError::AccessLost);
+        }
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(FsError::Range)?;
+        if offset != stage.written || end > stage.length {
+            return Err(FsError::Range);
+        }
+        self.provider.write(stage.key, offset, bytes).await?;
+        stage.written = end;
+        Ok(())
+    }
+
+    /// Failure retains the private placement; no fallible operation follows
+    /// retirement of the old placement. The object claim excludes readers
+    /// through that synchronous publication, and immutable leases keep their
+    /// own placement alive through the existing borrower accounting.
+    pub(crate) async fn commit_replace(
+        &self,
+        session: SessionId,
+        stage: &Replacement<P::Key>,
+    ) -> FsResult<Revision> {
+        let route = self.route(session, stage.handle)?;
+        route.rights.require(Rights::WRITE)?;
+        if route.object != stage.object {
+            return Err(FsError::AccessLost);
+        }
+        if stage.written != stage.length {
+            return Err(FsError::Range);
+        }
+        let mut object = self.ns.object_mut(route.object)?;
+        if object.revision() != stage.revision {
+            return Err(FsError::Conflict);
+        }
+        let _quota = self.require_growth_with_claimed(
+            route,
+            &object,
+            0,
+            0,
+            stage.length.saturating_sub(object.len()),
+        )?;
+        if let Some(old) = object.storage() {
+            if self.extraction.storage_borrowers(old, None)? == 0 {
+                self.provider.release(old).await?;
+            }
+        }
+        object.set_storage(stage.key);
+        Ok(self
+            .ns
+            .commit_file_len(route.object, &mut object, stage.length))
+    }
+
+    pub(crate) async fn abort_replace(&self, stage: &Replacement<P::Key>) -> FsResult<()> {
+        self.provider.release(stage.key).await?;
+        Ok(())
+    }
+
     /// Write `src` at `offset`, returning the new revision.
     ///
     /// `expected` is either [`ANY_REVISION`](crate::object::ANY_REVISION) —
@@ -1885,10 +2039,26 @@ impl<P: StorageProvider> Engine<P> {
     /// deadline). A resident unreachable subtree is a bounded, reportable
     /// loss; a wedged filesystem is neither.
     async fn reclaim(&self, start: ObjectId) {
-        // Each file can retain one selected and one unpublished placement.
-        let mut placements: heapless::Vec<P::Key, { 2 * MAX_OBJECTS }> = heapless::Vec::new();
-        let mut objects: heapless::Vec<ObjectId, MAX_OBJECTS> = heapless::Vec::new();
-        let mut worklist = heapless::Vec::<ObjectId, MAX_OBJECTS>::new();
+        // A file can retain both its selected and unpublished placement.
+        // Arena-backed because all three are sized by the object bound, and
+        // this runs inside the service's `serve` future on the founder's
+        // shared stack (see `PLACEMENT_BYTES` in the block provider).  One
+        // reclamation is one subtree unlink, not a per-object event, so three
+        // allocations here are not on a path where that matters.
+        //
+        // An allocator that cannot satisfy them takes the **same** route as a
+        // full worklist below: a counted, reportable abandonment. Neither a
+        // panic nor a spin is available to this function — see the contract
+        // above — so the failure must be a loss, not a refusal.
+        let alloc = crate::service_alloc();
+        let (Ok(mut placements), Ok(mut objects), Ok(mut worklist)) = (
+            BoundedVec::<P::Key, ServiceAlloc>::try_new_in(2 * MAX_OBJECTS, alloc),
+            BoundedVec::<ObjectId, ServiceAlloc>::try_new_in(MAX_OBJECTS, alloc),
+            BoundedVec::<ObjectId, ServiceAlloc>::try_new_in(MAX_OBJECTS, alloc),
+        ) else {
+            self.ns.note_abandoned_reclaim();
+            return;
+        };
         if worklist.push(start).is_err() {
             self.ns.note_abandoned_reclaim();
             return;
@@ -1931,7 +2101,12 @@ impl<P: StorageProvider> Engine<P> {
                 }
             }
         }
-        let mut derived_placements = heapless::Vec::<P::Key, MAX_DERIVED_RESULTS>::new();
+        let Ok(mut derived_placements) =
+            BoundedVec::<P::Key, ServiceAlloc>::try_new_in(MAX_DERIVED_RESULTS, alloc)
+        else {
+            self.ns.note_abandoned_reclaim();
+            return;
+        };
         for object in objects {
             loop {
                 match self.extraction.purge_object(object) {
@@ -2013,6 +2188,105 @@ mod tests {
     }
 
     #[test]
+    fn replacement_is_private_complete_and_revision_checked() {
+        let (engine, session, root) = engine();
+        let file = block_on(engine.create(session, root, &name("save"), ObjectKind::File)).unwrap();
+        block_on(engine.write_at(session, file.handle, 0, b"old tail", ANY_REVISION)).unwrap();
+        let before = engine.stat(session, file.handle).unwrap();
+        let lease_owner = ExtractionOwner::new(1);
+        let (lease, _) = block_on(engine.lend_version(lease_owner, session, file.handle)).unwrap();
+        let mut stage =
+            block_on(engine.begin_replace(session, file.handle, 3, ANY_REVISION)).unwrap();
+        block_on(engine.write_replacement(session, &mut stage, 0, b"n")).unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(
+            block_on(engine.read(session, file.handle, 0, &mut bytes)).unwrap(),
+            8
+        );
+        assert_eq!(&bytes, b"old tail");
+        assert_eq!(
+            block_on(engine.commit_replace(session, &stage)),
+            Err(FsError::Range)
+        );
+        assert_eq!(
+            block_on(engine.write_replacement(session, &mut stage, 2, b"w")),
+            Err(FsError::Range)
+        );
+        block_on(engine.write_replacement(session, &mut stage, 1, b"ew")).unwrap();
+        block_on(engine.commit_replace(session, &stage)).unwrap();
+        assert_eq!(
+            block_on(engine.read(session, file.handle, 0, &mut bytes)).unwrap(),
+            3
+        );
+        assert_eq!(&bytes[..3], b"new");
+        let after = engine.stat(session, file.handle).unwrap();
+        assert_eq!(before.object, after.object);
+        assert_eq!(before.stable_object, after.stable_object);
+        assert_eq!(after.revision, before.revision + 1);
+        block_on(engine.read_lent_version(lease_owner, lease, 0, &mut bytes)).unwrap();
+        assert_eq!(&bytes, b"old tail");
+        block_on(engine.release_lent_version(lease_owner, lease)).unwrap();
+
+        let stage = block_on(engine.begin_replace(session, file.handle, 0, ANY_REVISION)).unwrap();
+        block_on(engine.write_at(session, file.handle, 0, b"NEW", ANY_REVISION)).unwrap();
+        assert_eq!(
+            block_on(engine.commit_replace(session, &stage)),
+            Err(FsError::Conflict)
+        );
+        block_on(engine.abort_replace(&stage)).unwrap();
+        let empty = block_on(engine.begin_replace(session, file.handle, 0, ANY_REVISION)).unwrap();
+        block_on(engine.commit_replace(session, &empty)).unwrap();
+        assert_eq!(engine.stat(session, file.handle).unwrap().len, 0);
+    }
+
+    #[test]
+    fn replacement_rechecks_revocation_before_publication() {
+        let (mut engine, owner, root) = engine();
+        let writer = SessionId::new(1);
+        block_on(engine.attach_session(writer)).unwrap();
+        let file = block_on(engine.create(owner, root, &name("saved"), ObjectKind::File)).unwrap();
+        block_on(engine.write_at(owner, file.handle, 0, b"old", ANY_REVISION)).unwrap();
+        let grant = engine
+            .grant(owner, file.handle, writer, Rights::ALL, None)
+            .unwrap();
+        let writable = engine.open_grant(writer, grant, Rights::ALL).unwrap();
+        let mut stage =
+            block_on(engine.begin_replace(writer, writable.handle, 3, ANY_REVISION)).unwrap();
+        block_on(engine.write_replacement(writer, &mut stage, 0, b"new")).unwrap();
+        block_on(engine.revoke(owner, grant)).unwrap();
+        assert!(block_on(engine.commit_replace(writer, &stage)).is_err());
+        block_on(engine.abort_replace(&stage)).unwrap();
+        let mut bytes = [0; 3];
+        block_on(engine.read(owner, file.handle, 0, &mut bytes)).unwrap();
+        assert_eq!(&bytes, b"old");
+    }
+
+    #[test]
+    fn replacement_provider_failures_preserve_old_contents_and_retry_custody() {
+        let (engine, session, root) = engine();
+        let file = block_on(engine.create(session, root, &name("save"), ObjectKind::File)).unwrap();
+        block_on(engine.write_at(session, file.handle, 0, b"old", ANY_REVISION)).unwrap();
+        let mut stage =
+            block_on(engine.begin_replace(session, file.handle, 3, ANY_REVISION)).unwrap();
+        engine.provider().inject(Fault::Write(ProviderError::Media));
+        assert!(block_on(engine.write_replacement(session, &mut stage, 0, b"new")).is_err());
+        assert_eq!(stage.written, 0);
+        block_on(engine.write_replacement(session, &mut stage, 0, b"new")).unwrap();
+        engine
+            .provider()
+            .inject(Fault::Release(ProviderError::Media));
+        assert!(block_on(engine.commit_replace(session, &stage)).is_err());
+        let mut bytes = [0; 3];
+        block_on(engine.read(session, file.handle, 0, &mut bytes)).unwrap();
+        assert_eq!(&bytes, b"old");
+        engine
+            .provider()
+            .inject(Fault::Release(ProviderError::Media));
+        assert!(block_on(engine.abort_replace(&stage)).is_err());
+        block_on(engine.abort_replace(&stage)).unwrap();
+    }
+
+    #[test]
     fn a_fresh_session_sees_an_empty_root() {
         let (engine, session, root) = engine();
         let info = engine.stat(session, root).unwrap();
@@ -2027,14 +2301,25 @@ mod tests {
     #[test]
     fn retained_view_grant_retirement_distinguishes_contention_from_stale_generation() {
         let (engine, session, root) = engine();
-        let grant = engine.grant(session, root, session, Rights::READ, None).unwrap();
+        let grant = engine
+            .grant(session, root, session, Rights::READ, None)
+            .unwrap();
         let held = engine.auth.edge(grant).unwrap();
-        assert_eq!(block_on(engine.retire_view_grant(session, grant)), Err(FsError::Busy));
-        assert_eq!(block_on(engine.retire_view_grant(SessionId::new(1), grant)), Err(FsError::AccessDenied));
+        assert_eq!(
+            block_on(engine.retire_view_grant(session, grant)),
+            Err(FsError::Busy)
+        );
+        assert_eq!(
+            block_on(engine.retire_view_grant(SessionId::new(1), grant)),
+            Err(FsError::AccessDenied)
+        );
         drop(held);
         assert_eq!(block_on(engine.retire_view_grant(session, grant)), Ok(()));
         assert_eq!(block_on(engine.retire_view_grant(session, grant)), Ok(()));
-        assert_eq!(block_on(engine.revoke(session, grant)), Err(FsError::AccessLost));
+        assert_eq!(
+            block_on(engine.revoke(session, grant)),
+            Err(FsError::AccessLost)
+        );
         assert!(engine.open_root(session, Rights::ALL).is_ok());
     }
 
@@ -2399,7 +2684,10 @@ mod tests {
                     // The directory arena may bound this before the proof
                     // does; either way it must be a typed refusal.
                     assert!(
-                        matches!(err, FsError::Range | FsError::OutOfObjects),
+                        matches!(
+                            err,
+                            FsError::Range | FsError::OutOfObjects | FsError::OutOfHandles
+                        ),
                         "unexpected refusal at depth {depth}: {err:?}"
                     );
                     return;

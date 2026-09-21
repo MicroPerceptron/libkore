@@ -58,6 +58,9 @@ struct TestWorld {
     page_at: Option<u64>,
     /// Test knob: withhold segment `.1` of image `.0`'s leases.
     withhold: Option<(ImageName, usize)>,
+    /// What `placed_high_water` answers; `None` = a world that does not
+    /// record placement (the default, so every existing test stamps 0).
+    placed_high_water: Option<u64>,
 }
 
 impl TestWorld {
@@ -71,6 +74,7 @@ impl TestWorld {
             next_base: 0x1000_0000,
             page_at: None,
             withhold: None,
+            placed_high_water: None,
         }
     }
 
@@ -154,6 +158,10 @@ impl LinkWorld for TestWorld {
     type Lease = (usize, usize);
     type Ro = &'static [u8];
     type Rw = RawWin;
+
+    fn placed_high_water(&self) -> Option<u64> {
+        self.placed_high_water
+    }
 
     fn acquire(
         &mut self,
@@ -326,8 +334,15 @@ fn diamond(world: &mut TestWorld, arch: &ArchRelocs) {
             addend: (TEXT_VADDR + 0x30) as i64,
         },
     ];
+    exe.fini_count = 2;
+    exe.relas.push(Rela {
+        offset: DATA_VADDR + 0x448,
+        rtype: arch.relative,
+        sym: 0,
+        addend: (TEXT_VADDR + 0x38) as i64,
+    });
     exe.init_fini = true;
-    exe.relro = Some((DATA_VADDR, 0x200));
+    exe.relro = Some((DATA_VADDR, 0x1000));
 
     liba.needed = vec!["libc".into()];
     liba.syms = vec![Sym::global("a_fn", TEXT_VADDR + 0x10), Sym::import("c_fn")];
@@ -358,7 +373,7 @@ fn diamond(world: &mut TestWorld, arch: &ArchRelocs) {
         },
     ];
     liba.init_fini = true;
-    liba.relro = Some((DATA_VADDR, 0x200));
+    liba.relro = Some((DATA_VADDR, 0x1000));
 
     libb.needed = vec!["libc".into()];
     libb.syms = vec![
@@ -392,7 +407,7 @@ fn diamond(world: &mut TestWorld, arch: &ArchRelocs) {
         },
     ];
     libb.init_fini = true;
-    libb.relro = Some((DATA_VADDR, 0x200));
+    libb.relro = Some((DATA_VADDR, 0x1000));
 
     libc.syms = vec![
         Sym::global("c_fn", TEXT_VADDR + 0x40),
@@ -419,7 +434,7 @@ fn diamond(world: &mut TestWorld, arch: &ArchRelocs) {
         },
     ];
     libc.init_fini = true;
-    libc.relro = Some((DATA_VADDR, 0x200));
+    libc.relro = Some((DATA_VADDR, 0x1000));
 
     match arch.machine {
         EM_X86_64 => {
@@ -528,6 +543,7 @@ fn diamond_links_once_per_name_and_resolves_across_modules() {
     assert_eq!(
         fini,
         vec![
+            be + TEXT_VADDR + 0x38,
             be + TEXT_VADDR + 0x30,
             bb + TEXT_VADDR + 0x64,
             ba + TEXT_VADDR + 0x60,
@@ -601,7 +617,7 @@ fn diamond_maps_wx_clean_and_seals_after_relocation() {
         .collect();
     assert_eq!(seals.len(), 5);
     assert!(
-        seals.contains(&(be + DATA_VADDR, 0x200)),
+        seals.contains(&(be + DATA_VADDR, 0x1000)),
         "the exe's RELRO window"
     );
     assert_eq!(
@@ -992,6 +1008,34 @@ fn single_static_module_is_first_class() {
     assert!(prog.init.is_empty());
 }
 
+#[test]
+fn initializer_in_writable_data_refuses_before_finalization() {
+    let mut world = TestWorld::new();
+    let mut exe = Fixture::new(EM_X86_64);
+    exe.entry = TEXT_VADDR;
+    exe.init_fini = true;
+    exe.relas = vec![Rela {
+        offset: DATA_VADDR + 0x400,
+        rtype: X86_RELOCS.relative,
+        sym: 0,
+        addend: (DATA_VADDR + 0x100) as i64,
+    }];
+    world.register::<X86_64>("exe", &exe);
+    assert!(matches!(
+        link_program::<X86_64, _, _>(&mut world, &name("exe"), arena(), LinkCaps::DEFAULT),
+        Err(LinkError::Function(
+            kore_ld::functions::FunctionError::Target(0),
+            0
+        ))
+    ));
+    assert!(
+        !world
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Seal { .. } | Op::SetTp(_)))
+    );
+}
+
 /// **The absolute case places itself.**
 ///
 /// `kind::STATIC_EXECUTABLE` is every founded row and the linker stub:
@@ -1216,5 +1260,172 @@ fn pure_tbss_allocates_zeroed_tls_without_a_source_lease_on_every_architecture()
         let (bytes, _, _) = world.template.unwrap();
         assert!(bytes.len() >= 0x101a);
         assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The built images, through the engine the startup stub actually runs
+// ---------------------------------------------------------------------------
+
+/// The startup stub's caller arena, to the byte.
+///
+/// `user/runtime/ld-stub` links with a 4 KiB stack-local arena, not this
+/// suite's generous 64 KiB one. A fixture that links here and refuses there
+/// is the failure this whole test exists to catch *before* a QEMU run, so
+/// the capacity has to match the stub rather than the suite.
+fn stub_arena() -> &'static kore_ld::store::LinkArena<'static> {
+    let buf = Box::leak(Box::new([core::mem::MaybeUninit::<u8>::uninit(); 4096]));
+    Box::leak(Box::new(kore_ld::store::LinkArena::new(buf)))
+}
+
+/// The caps `user/runtime/ld-stub` passes: a program is itself plus at most
+/// one library, with a single init array.
+const STUB_CAPS: LinkCaps = LinkCaps {
+    max_modules: 2,
+    max_inits: 1,
+};
+
+/// **Every built executable must link under the stub's own caps.**
+///
+/// `built_images.rs` asserts the *regime* — segment shape, flags, relocation
+/// classes. It does not link, so an image can satisfy every rule it checks
+/// and still be refused by `link_program` at boot. That refusal is close to
+/// invisible on metal: `refuse_link` keeps the structured diagnostic on the
+/// readiness-NACK path, so an exec-spawned foreground program exits with a
+/// bare `ExitCode::LINK_FAILED` (`-1`) and the typed `LinkError` is dropped.
+///
+/// This closes that gap on the host, where the error survives.
+///
+/// `KORE_USER_IMAGES` unset ⇒ skip, so `make test` stays hermetic.
+#[test]
+fn built_executables_link_under_the_stub_caps() {
+    let Some(root) = std::env::var_os("KORE_USER_IMAGES") else {
+        return;
+    };
+    let dir = std::path::Path::new(&root)
+        .join("x86_64-unknown-kore-user")
+        .join("release");
+    if !dir.is_dir() {
+        return;
+    }
+
+    // Collect every image present — libraries too, since a `DT_NEEDED`
+    // consumer cannot link without the library it names.
+    let mut images: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut executables = Vec::new();
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("image dir is readable")
+        .filter_map(Result::ok)
+        .collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(stem) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Cargo leaves `.d` files and build dirs beside the images.
+        if stem.contains('.') && !stem.ends_with(".so") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if check_image::<X86_64>(&bytes).is_err() || ImageName::new(stem).is_none() {
+            continue;
+        }
+        if !stem.ends_with(".so") {
+            executables.push(stem.to_string());
+        }
+        images.push((stem.to_string(), bytes));
+    }
+
+    // `built_images.rs`'s rule: a set root that selected nothing is a broken
+    // harness, not a pass. Silent green here would hide exactly the class of
+    // failure this test exists to catch.
+    assert!(
+        !executables.is_empty(),
+        "KORE_USER_IMAGES={} selected no linkable executables",
+        dir.display()
+    );
+    println!("linking {} built executables: {}", executables.len(), executables.join(", "));
+
+    // A fresh world per link: the engine consumes leases, so a world that
+    // already linked one program is not a clean stand-in for the founding of
+    // the next.
+    let mut refused = Vec::new();
+    for exe in &executables {
+        let mut world = TestWorld::new();
+        for (stem, bytes) in &images {
+            world.register_bytes::<X86_64>(stem, bytes.clone());
+        }
+        if let Err(error) =
+            link_program::<X86_64, _, _>(&mut world, &name(exe), stub_arena(), STUB_CAPS)
+        {
+            refused.push(format!("{exe}: {error:?}"));
+        }
+    }
+
+    assert!(
+        refused.is_empty(),
+        "these built images link on the host but would exit LINK_FAILED (-1) on \
+         metal with no diagnostic:\n  {}",
+        refused.join("\n  ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The placement high water stamped into the passive page
+// ---------------------------------------------------------------------------
+
+/// A world that reports where its placement ended gets that mark stamped
+/// into the page, as pages below the page — and it reads back as the
+/// address a late placer must start above.
+#[test]
+fn a_reported_placement_cursor_is_stamped_below_the_page() {
+    let mut world = TestWorld::new();
+    diamond(&mut world, &X86_RELOCS);
+    let page_va = 0x5fff_f000;
+    world.page_at = Some(page_va);
+    world.placed_high_water = Some(page_va - 3 * PAGE);
+    let prog = link_program::<X86_64, _, _>(&mut world, &name("exe"), arena(), LinkCaps::DEFAULT)
+        .expect("links");
+    assert_eq!(prog.module_page, page_va);
+
+    let mut bytes = [0u8; core::mem::size_of::<ModulePage>()];
+    world.bytes_at(prog.module_page, &mut bytes);
+    let page = ModulePage::read_from_bytes(&bytes).unwrap();
+    assert_eq!(page.placed.get(), 3);
+    assert_eq!(page.placed_high_water(prog.module_page), Some(page_va - 3 * PAGE));
+}
+
+/// A world that does not record placement stamps nothing, and the page
+/// says *unrecorded* rather than answering an address.
+#[test]
+fn a_world_without_placement_stamps_unrecorded() {
+    let (world, prog) = link_diamond::<X86_64>(&X86_RELOCS);
+    let mut bytes = [0u8; core::mem::size_of::<ModulePage>()];
+    world.bytes_at(prog.module_page, &mut bytes);
+    let page = ModulePage::read_from_bytes(&bytes).unwrap();
+    assert_eq!(page.placed.get(), 0);
+    assert_eq!(page.placed_high_water(prog.module_page), None);
+}
+
+/// A cursor the engine cannot represent — above the page, or off a page
+/// boundary — refuses the link. Stamping a floor a later placer would
+/// trust is the one thing worse than not stamping.
+#[test]
+fn an_unrepresentable_placement_cursor_refuses_the_link() {
+    let page_va = 0x5fff_f000;
+    for bad in [page_va + PAGE, page_va - PAGE / 2] {
+        let mut world = TestWorld::new();
+        diamond(&mut world, &X86_RELOCS);
+        world.page_at = Some(page_va);
+        world.placed_high_water = Some(bad);
+        let err = link_program::<X86_64, _, _>(&mut world, &name("exe"), arena(), LinkCaps::DEFAULT)
+            .expect_err("a lying placement cursor refuses");
+        assert!(matches!(err, LinkError::Layout(_)), "{err:?}");
     }
 }

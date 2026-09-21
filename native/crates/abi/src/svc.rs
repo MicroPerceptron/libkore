@@ -95,6 +95,24 @@ impl MmReqWire {
     /// Read the lessor's bounded, provider-owned allocator snapshot.
     /// Every argument field must remain zero.
     pub const OP_STATS: u8 = 4;
+    /// Exec's administration pair only: one component of a per-launch
+    /// client face (a recyclable peer). `contiguous` carries the part code
+    /// (`0` ring, `1` kick, `2` return receive, `0x80 | n` grant `n`),
+    /// `slot` the announced return landing; every other field is zero.
+    pub const OP_ADMIT_PEER: u8 = 5;
+    /// Exec's administration pair only: consume the verdict of the
+    /// preceding admission. Every argument field is zero.
+    pub const OP_TAKE_ADMISSION: u8 = 6;
+    /// Exec's administration pair only: retire one exact face generation.
+    /// `numa` carries its arrival; every other field is zero.
+    pub const OP_RETIRE_PEER: u8 = 7;
+    /// Exec's administration pair only: fence retirement. Accepted only
+    /// once the face is closed **and** every supply it minted has returned,
+    /// so exec reclaims the face's local backing no earlier. `numa` carries
+    /// its arrival; every other field is zero.
+    pub const OP_CONFIRM_RETIRED: u8 = 8;
+    /// A per-launch face retires itself. Every argument field is zero.
+    pub const OP_CLOSE_PEER: u8 = 9;
 }
 
 /// The memory-manager reply wire form (`MmResponse`'s crossing shape).
@@ -133,6 +151,11 @@ impl MmRepWire {
     pub const TAG_REFUSED: u8 = 3;
     /// `MmResponse::Stats` — no capability grant accompanies the sample.
     pub const TAG_STATS: u8 = 4;
+    /// `MmResponse::Accepted` — an administration step took effect.
+    pub const TAG_ACCEPTED: u8 = 5;
+    /// `MmResponse::PeerAdmitted` — `reserved[0..2]` carries the admitted
+    /// face's arrival (little-endian); the rest stays zero.
+    pub const TAG_PEER_ADMITTED: u8 = 6;
 
     /// `MmRefusal::BadProps`.
     pub const REFUSE_BAD_PROPS: u8 = 1;
@@ -147,6 +170,10 @@ impl MmRepWire {
     /// `TableFull` discipline: a loud wire refusal, never a silent
     /// clamp).
     pub const REFUSE_QUOTA: u8 = 5;
+    /// `MmRefusal::Pending` — the administration step cannot complete yet
+    /// (an admission in flight, or a retired face whose supplies have not
+    /// all returned); ask again.
+    pub const REFUSE_PENDING: u8 = 6;
 }
 
 // ─── monitor — federated telemetry assembly ───────────────────────
@@ -292,6 +319,10 @@ impl PowerReqWire {
     pub const OP_DISPLAY_DIAGNOSTIC: u8 = 13;
     /// Read the cached lid level and runtime close generation; no side effects.
     pub const OP_LID_STATUS: u8 = 14;
+    /// Fixed display owner publishes one immutable evidence word: index, u32 LE, zeros.
+    pub const OP_DISPLAY_EVIDENCE_REPORT: u8 = 15;
+    /// Read one evidence word: index, then zeros. Missing words refuse Unavailable.
+    pub const OP_DISPLAY_EVIDENCE: u8 = 16;
 }
 
 /// The power reply wire form.  A power service mints no authority, so
@@ -322,6 +353,8 @@ impl PowerRepWire {
     pub const TAG_DISPLAY_DIAGNOSTIC: u8 = 7;
     /// Level (0 unknown, 1 open, 2 closed), followed by a little-endian u32 generation.
     pub const TAG_LID_STATUS: u8 = 8;
+    /// Echoed evidence index and its u32 LE value.
+    pub const TAG_DISPLAY_EVIDENCE: u8 = 9;
 
     /// The session refused the transition.  Authority (`MODIFY` absent) and
     /// feasibility (no firmware backend realizes it) are **not separable
@@ -1578,9 +1611,9 @@ impl TaskReqWire {
     /// `Spawn` asks for the returned lifecycle owner to retain `DERIVE`, so
     /// its caller may attenuate an observer into a sibling worker. This bit
     /// is meaningful only with [`SPAWN_RETURN_HANDLE`](Self::SPAWN_RETURN_HANDLE);
-    /// the service must additionally authorize the authenticated launch
-    /// profile, and ordinary exec clients continue to receive a non-delegable
-    /// owner.
+    /// it is available for any otherwise authorized spawn and changes only
+    /// the parent's returned handle, not the child's authority. Ordinary exec
+    /// clients continue to receive a non-delegable owner.
     pub const SPAWN_DELEGABLE_HANDLE: u8 = 1 << 2;
     /// `Invoke` asks exec to return an optional affine wake at grant lane 0,
     /// with the task handle following at lane 1: an attenuated send descendant of the provisioned service response channel that
@@ -1791,41 +1824,59 @@ impl TaskRepWire {
     /// this request; every in-flight admission was retired and the caller
     /// re-derives and retries.
     pub const REFUSE_CONTENDED: u8 = 11;
-    /// `TaskRefusal::PeerAdmissionPending` — the filesystem accepted the
+    /// `TaskRefusal::PeerAdmissionPending` — the face's service accepted the
     /// child's peer bundle but had not yet published the admission verdict
     /// within the bounded re-ask, so no peer identity could be taken.
     /// Nothing is wrong and nothing is lost; the launch is re-issuable.
+    ///
+    /// Every launch-time face raises this — filesystem, power, accelerator
+    /// and memory — so the code names the stage, never the service.  The
+    /// caller learns *which* only from what the launch asked for.
     pub const REFUSE_PEER_ADMISSION_PENDING: u8 = 12;
-    /// `TaskRefusal::PeerRefused` — the filesystem refused the child's peer
-    /// admission for a reason that is neither capacity nor a pending
+    /// `TaskRefusal::PeerRefused` — the face's service refused the child's
+    /// peer admission for a reason that is neither capacity nor a pending
     /// verdict. The remote side is closed; the refusal is terminal.
     pub const REFUSE_PEER_REFUSED: u8 = 13;
     /// `TaskRefusal::PeerAdmissionLost` — the admission verdict could not be
     /// observed at all (a malformed reply or a transport boundary), so
-    /// whether the filesystem admitted the peer is UNKNOWN and its remote
+    /// whether the service admitted the peer is UNKNOWN and its remote
     /// state is reconciled lazily rather than assumed closed.
     pub const REFUSE_PEER_ADMISSION_LOST: u8 = 14;
-    /// `TaskRefusal::PeerServiceUnwired` — a filesystem-profile launch
-    /// reached peer construction without an attached filesystem service.
+    /// `TaskRefusal::PeerServiceUnwired` — a launch whose profile asks for a
+    /// face reached peer construction without that face's service attached.
     pub const REFUSE_PEER_SERVICE_UNWIRED: u8 = 15;
     /// `TaskRefusal::PeerRingTransfer` — the peer's shared ring could not be
-    /// transferred to the filesystem service.
+    /// transferred to the face's service.
     pub const REFUSE_PEER_RING_TRANSFER: u8 = 16;
     /// `TaskRefusal::PeerKickTransfer` — the peer's response-send endpoint
-    /// could not be transferred to the filesystem service.
+    /// could not be transferred to the face's service.
     pub const REFUSE_PEER_KICK_TRANSFER: u8 = 17;
     /// `TaskRefusal::PeerReturnTransfer` — the peer's return-receive endpoint
-    /// could not be transferred to the filesystem service.
+    /// could not be transferred to the face's service.
     pub const REFUSE_PEER_RETURN_TRANSFER: u8 = 18;
     /// `TaskRefusal::PeerTransientUnwired` — exec had no transient mapping
-    /// aperture with which to format the child's private filesystem ring.
+    /// aperture with which to format the child's private ring.
     pub const REFUSE_PEER_TRANSIENT_UNWIRED: u8 = 19;
     /// `TaskRefusal::PeerMemoryUnwired` — exec had no memory-service face
-    /// from which to allocate the child's private filesystem ring.
+    /// from which to allocate the child's private ring.
     pub const REFUSE_PEER_MEMORY_UNWIRED: u8 = 20;
+    /// `TaskRefusal::PeerGrantTransfer` — the accelerator peer's reply-grant
+    /// sender could not be transferred to the service.
+    pub const REFUSE_PEER_GRANT_TRANSFER: u8 = 21;
+    /// `TaskRefusal::PeerAdmissionWedged` — an EARLIER launch left a face
+    /// whose admission verdict was never published, and this launch was
+    /// refused before it asked for anything of its own.
+    ///
+    /// Distinct from [`REFUSE_PEER_ADMISSION_PENDING`](Self::REFUSE_PEER_ADMISSION_PENDING)
+    /// because the two say opposite things about a retry: a pending verdict
+    /// is an ordinary schedule and the next attempt usually lands, while a
+    /// wedged one repeats until the stale face is settled.  Reading one as
+    /// the other is what makes a launch look intermittently slow when it is
+    /// in fact permanently refused.
+    pub const REFUSE_PEER_ADMISSION_WEDGED: u8 = 22;
     /// Terminal Found committed its preceding effects but discarded the
     /// child. An optional wake grant still belongs to this exact response.
-    pub const REFUSE_UNFOUNDED: u8 = 21;
+    pub const REFUSE_UNFOUNDED: u8 = 23;
 }
 
 // Live task discriminants stay disjoint from the frozen retired band on
@@ -2813,6 +2864,15 @@ impl AccelReqWire {
     pub const OP_IMPORT_BUFFER: u8 = 25;
     /// Return an imported allocation after quiescent buffer detachment; subject=buffer.
     pub const OP_EXPORT_BUFFER: u8 = 26;
+    /// Administration pair: request retirement of the exact recyclable peer
+    /// whose generation-stamped arrival is in `subject`.
+    pub const OP_RETIRE_PEER: u8 = 27;
+    /// Administration pair: fence the same peer's retirement before its
+    /// launcher reclaims local backing and channel roots.
+    pub const OP_CONFIRM_RETIRED: u8 = 28;
+    /// `AccelRequest::ReadLog` — copy the tail of the provider's firmware
+    /// log into the staging window: `b` = stage offset, `c` = capacity.
+    pub const OP_READ_LOG: u8 = 29;
 }
 
 /// The accel reply wire form (`AccelResponse`'s crossing shape).  Data
@@ -2911,6 +2971,11 @@ impl AccelRepWire {
     pub const TAG_IMPORT_RETURNED: u8 = 21;
     /// One exact lease grant; id echoes the detached buffer.
     pub const TAG_BUFFER_EXPORTED: u8 = 22;
+    /// The named recyclable peer is absent from the service namespace.
+    pub const TAG_PEER_RETIRED: u8 = 23;
+    /// `AccelResponse::Log` — `id` is how many log bytes now sit at the
+    /// requested stage offset (zero when the provider keeps no log).
+    pub const TAG_LOG: u8 = 24;
 
     /// The backend cannot perform the operation (unsupported verb,
     /// domain, flag set, or cancellation without the capability).
@@ -3307,9 +3372,11 @@ const _: () = {
     assert!(size_of::<MmReqWire>() == 32);
     assert!(size_of::<MmRepWire>() == 72);
     assert!(size_of::<MonitorReqWire>() == 104);
+    // 8-byte head ‖ 280-byte telemetry (240 + the 16-byte frame-class census
+    // + the 24-byte DRAM stream table).
     assert!(
         size_of::<MonitorRepWire>()
-            == 232
+            == 8 + 280
                 + size_of::<crate::processor_status::ProcessorPage>()
                 + size_of::<crate::device::DeviceCensusPage>()
     );
@@ -3342,7 +3409,7 @@ const _: () = {
                 + size_of::<ImageName>()
     ); // 864
     assert!(size_of::<TaskReqWire>() == 864);
-    // 16-byte head ‖ 224 telemetry ‖ 236 filesystem (with the derived
+    // 16-byte head ‖ 256 telemetry ‖ 236 filesystem (with the derived
     // completion-latency moments) ‖ the 76-byte NetSnapshot ‖ the two pages.
     assert!(
         size_of::<TaskRepWire>()
@@ -3955,7 +4022,8 @@ pub struct SurReqWire {
     /// Protocol flags; reserved-zero in v1 (frozen additive headroom).
     pub flags: U32,
     /// The verb's surface id (`DestroySurface` / `Status`); zero when
-    /// the verb names none (`Query`, `CreateSurface`, `Signal`).
+    /// the verb names none (`Query`, `CreateSurface`, `Signal`,
+    /// `RequestClose`).
     pub subject: U64,
     /// Per-verb word (see the `OP_*` docs).
     pub a: U64,
@@ -3991,6 +4059,14 @@ impl SurReqWire {
     /// channel and grant its recv end (the reply's one retained grant);
     /// `COOKIE_DISPLAY_DONE` notices ride it after each present.
     pub const OP_SIGNAL: u8 = 5;
+    /// `SurfaceRequest::RequestClose` — this window's own close, asked
+    /// through the controller's path instead of taken: the compositor
+    /// raises the same `close_requested` the chrome's close dot raises
+    /// and echoes `CloseRequested` down this pair's event channel, so the
+    /// controller observes the close before the app leaves and the app
+    /// leaves only on the echo.  No words; `subject` is zero
+    /// ([`SurRepWire::TAG_CLOSE_REQUESTED`]).
+    pub const OP_REQUEST_CLOSE: u8 = 6;
 
     /// [`OP_CREATE_SURFACE`](Self::OP_CREATE_SURFACE) `b`: CPU-reachable
     /// backing — the one v1 reach.
@@ -4025,7 +4101,8 @@ pub struct SurRepWire {
     /// Reserved; must be zero.
     pub reserved: [u8; 5],
     /// The verb's surface word: a create's fresh id, a destroy/status
-    /// echo, a refusal's echoed subject; zero for `Query`/`Signal`.
+    /// echo, a refusal's echoed subject; zero for `Query`/`Signal`/
+    /// `RequestClose`.
     pub id: U64,
     /// Per-tag word (see the `TAG_*` docs).
     pub a: U64,
@@ -4061,6 +4138,10 @@ impl SurRepWire {
     /// `SurfaceResponse::Refused` — see `refusal`; `id` echoes the
     /// subject the refusal names (zero when the verb named none).
     pub const TAG_REFUSED: u8 = 6;
+    /// `SurfaceResponse::CloseRequested` — `a` = the configure serial the
+    /// close was raised under (never zero: an unconfigured window cannot
+    /// be closing).  The echo itself rides the event channel.
+    pub const TAG_CLOSE_REQUESTED: u8 = 7;
 
     /// A v1 vocabulary gate: an unknown op, a non-XRGB8888 format, a
     /// non-CPU reach, a non-LINEAR modifier, a non-empty flag set.
@@ -4333,7 +4414,12 @@ impl FsReqWire {
     /// `kind` is 1 while verification/copy is active, 0 once complete.
     pub const OP_SET_SYSTEM_SEED: u8 = 42;
     /// The highest defined verb — the codec's range check.
-    pub const OP_MAX: u8 = Self::OP_SET_SYSTEM_SEED;
+    /// Session-owned atomic file replacement (no wire layout change).
+    pub const OP_BEGIN_REPLACE: u8 = 43;
+    pub const OP_WRITE_REPLACEMENT: u8 = 44;
+    pub const OP_COMMIT_REPLACE: u8 = 45;
+    pub const OP_ABORT_REPLACE: u8 = 46;
+    pub const OP_MAX: u8 = Self::OP_ABORT_REPLACE;
 
     /// [`kind`](Self::kind): a file.
     pub const KIND_FILE: u8 = 1;
@@ -4484,11 +4570,19 @@ impl FsDirEntryWire {
 
 /// Maximum bytes in one view-relative search path.
 ///
-/// The filesystem currently admits eight 32-byte components. Seven `/`
-/// separators make the complete bounded spelling 263 bytes. Keeping this
-/// number in the frozen ABI makes a later service-side bound increase an
-/// explicit additive ABI decision instead of silently truncating hits.
-pub const FS_SEARCH_PATH_BYTES: usize = 263;
+/// The filesystem admits thirty-two 32-byte components
+/// (`kore_dagfs::bounds::MAX_PATH_DEPTH` × `MAX_NAME_LEN`); thirty-one `/`
+/// separators make the complete bounded spelling 1,055 bytes. The number is
+/// pinned here rather than derived so a service-side bound increase stays an
+/// explicit wire decision instead of silently truncating hits — and the
+/// client crate asserts at compile time that this spelling covers the
+/// deepest legal path, so the two can only move together. Raised from 263
+/// (eight components) when the depth bound went 8 → 32: at 263 a hit nine
+/// components deep had nowhere to put its ninth separator. Every client and
+/// the service are sealed from one tree, so the record's width is not a
+/// compatibility surface between builds; it is a page-capacity one, and eight
+/// hits (the largest page) take 9,280 of a process's 65,536-byte data window.
+pub const FS_SEARCH_PATH_BYTES: usize = 1055;
 
 /// One authority-filtered structural search hit in the pair's data window.
 ///
@@ -4528,8 +4622,9 @@ pub struct FsSearchHitWire {
 }
 
 impl FsSearchHitWire {
-    /// Bytes one hit occupies in the data window.
-    pub const BYTES: usize = 368;
+    /// Bytes one hit occupies in the data window: the 40-byte fixed prefix,
+    /// the bounded path, the 64-byte snippet and one reserved tail byte.
+    pub const BYTES: usize = 40 + FS_SEARCH_PATH_BYTES + 64 + 1;
 }
 
 /// One authority edge as `ListGrants` lands it in the data window. 48 bytes —
@@ -4738,6 +4833,10 @@ impl FsSystemStatusWire {
     /// durable namespace; this bit says its backing channel can no longer
     /// perform I/O and must not be mistaken for the healthy mount posture.
     pub const FLAG_CHANNEL_LOST: u16 = 1 << 5;
+    /// The controller holds a host memory buffer for its mapping tables
+    /// (unset: it was offered none, or refused it — a DRAM-less part then
+    /// pages its tables from NAND on every access).
+    pub const FLAG_HOST_MEMORY_BUFFER: u16 = 1 << 6;
 
     /// No lifecycle testimony was supplied (the bare volatile harness).
     pub const LIFECYCLE_UNKNOWN: u16 = 0;

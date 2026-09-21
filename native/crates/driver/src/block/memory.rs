@@ -34,6 +34,9 @@ pub struct MemoryBlockDevice<const DISK_BYTES: usize, const BUFFER_BYTES: usize>
     tail: usize,
     queued: usize,
     hold: bool,
+    /// Empty waits still to run out before a held completion is released —
+    /// the stand-in for a device that answers late but does answer.
+    hold_for: Option<u32>,
     fault: Option<BlockError>,
     fault_after: usize,
     flushes: u64,
@@ -77,6 +80,7 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize>
             tail: 0,
             queued: 0,
             hold: false,
+            hold_for: None,
             fault: None,
             fault_after: 0,
             flushes: 0,
@@ -123,6 +127,13 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize>
     }
     pub fn hold_completions(&mut self, hold: bool) {
         self.hold = hold;
+        self.hold_for = None;
+    }
+    /// Hold completions through the next `waits` empty waits, then release
+    /// them: a device that is slow for that many budgets and then completes.
+    pub fn hold_completions_for(&mut self, waits: u32) {
+        self.hold = true;
+        self.hold_for = Some(waits);
     }
     /// Drive the out-of-band liveness answer, standing in for a controller
     /// status register.
@@ -166,6 +177,31 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize> DirectBlockDevice
 
     fn liveness(&mut self) -> crate::block::Liveness {
         self.liveness
+    }
+
+    /// The trait's polled wait, with the late-device double folded in: a
+    /// hold armed for `n` waits runs `n` budgets out empty, then lifts
+    /// itself so the queued completions flow on the wait after.
+    fn wait(&mut self) -> Option<DeviceCompletion> {
+        if let Some(left) = self.hold_for {
+            if left == 0 {
+                self.hold = false;
+                self.hold_for = None;
+            } else {
+                self.hold_for = Some(left - 1);
+                return None;
+            }
+        }
+        use crate::block::CompletionPacer;
+        let mut pacer = crate::block::SpinPacer::default();
+        loop {
+            if let Some(completion) = self.poll() {
+                return Some(completion);
+            }
+            if !pacer.pace() {
+                return self.poll();
+            }
+        }
     }
 
     fn clock_ns(&self) -> Option<u64> {

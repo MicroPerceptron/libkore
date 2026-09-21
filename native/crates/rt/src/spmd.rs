@@ -97,6 +97,8 @@ pub struct Machine {
     pub performance_cores: u8,
     /// Efficiency-class cores machine-wide (Intel E / AMD Zen-c / Arm LITTLE).
     pub efficient_cores: u8,
+    /// Low-power efficiency island CPUs, separate from `efficient_cores`.
+    pub low_power_cores: u8,
     /// Standard-class cores machine-wide — a homogeneous part counts every
     /// core here.  All three zero on a founder that predates the census.
     pub standard_cores: u8,
@@ -128,7 +130,8 @@ pub fn machine() -> Option<Machine> {
         logical_cpus: block.logical_cpus()?,
         best_lane: block.best_lane()?,
         performance_cores,
-        efficient_cores,
+        efficient_cores: efficient_cores.saturating_sub(block.low_power_cores()?),
+        low_power_cores: block.low_power_cores()?,
         standard_cores,
         hardware_feedback: block.hardware_feedback(),
     })
@@ -850,15 +853,19 @@ pub fn resident_run<F: Fn(&'static SpmdCtx, u32)>(ctx: &'static SpmdCtx, worker:
         // its participation (or reading `env`) when the next job overwrites
         // `active`/`env` — the generation race the per-job words would
         // otherwise carry. The one that zeroes `done` publishes the
-        // completion generation; no wake is posted — no worker holds a send
-        // to the launcher (the star's sends are founder→worker only), so the
-        // launcher learns through its own monitored spin on `complete`
-        // (co-resident: at once) or its slice re-read (descheduled: bounded).
+        // completion generation, then posts the star's existing relay send.
+        // A hubless resident gives its receive end to the submitter. The
+        // shared word remains authoritative if the notice coalesces/refuses.
         if ctx.done_word().fetch_sub(1, Ordering::AcqRel) == 1 {
-            ctx.complete_word().store(g, Ordering::Release);
+            ctx.complete_word().store(g, Ordering::SeqCst);
+            let _ = crate::futex::notify_resident_completion();
         }
     }
 }
+
+/// Retain the prior 250 µs observation bound when a channel refuses, the
+/// star was unavailable, or a competing observer owns its alternate post.
+const RESIDENT_WAKE_BACKSTOP_NS: u64 = 250_000;
 
 /// **A resident SPMD region** (R9) — a founded gang that outlives any one
 /// job, dispatched by [`submit`](Self::submit) and fenced by
@@ -1105,9 +1112,8 @@ impl<const N: usize> ResidentRegion<N> {
     }
 
     /// Block until `ticket`'s job completes. Efficient for a co-resident gang
-    /// (the completion store ends the monitored spin at once); a descheduled
-    /// submitter rides the barrier's slice and re-reads, because no worker
-    /// holds a send to wake it.
+    /// through the star's reverse completion channel). A missing/refused
+    /// channel falls back to the bounded barrier wait and shared-word recheck.
     ///
     /// Validation runs before any wait, so an invalid ticket can never park on
     /// a physical generation that this region will not publish.
@@ -1115,7 +1121,11 @@ impl<const N: usize> ResidentRegion<N> {
         match self.tickets.position(ticket)? {
             ResidentTicketPosition::Complete => Ok(()),
             ResidentTicketPosition::Current(generation) => {
-                wait_for_resident_generation(self.region.ctx(), generation);
+                wait_for_resident_generation(
+                    self.region.ctx(),
+                    generation,
+                    self.region.star.as_ref(),
+                );
                 Ok(())
             }
         }
@@ -1123,8 +1133,9 @@ impl<const N: usize> ResidentRegion<N> {
 
     /// Observe completion without blocking an executor's sibling futures or
     /// consuming its standing doorbell. The futex supplies a short monitored
-    /// prelude; longer waits yield to the executor. Workers have no reverse
-    /// completion send, so a bounded park is mandatory even with a live star.
+    /// prelude; longer waits yield to the executor. The star's reverse channel
+    /// is an alternate delivery arm, leaving the executor's own post intact.
+    /// Starless launches and concurrent observers keep the bounded fallback.
     /// A timeout or spurious wake is never completion: re-read the ticket.
     ///
     /// Like `wait`, rejects foreign/stale/unissued tickets before any wait.
@@ -1132,20 +1143,54 @@ impl<const N: usize> ResidentRegion<N> {
     /// its descriptor-lifetime obligation.
     pub async fn wait_async(&self, ticket: ResidentTicket) -> Result<(), ResidentTicketError> {
         self.tickets.position(ticket)?;
+        if self.poll(ticket)? {
+            return Ok(());
+        }
         let complete = self.region.ctx().complete_word();
+        crate::futex::spin_completion(complete, complete.load(Ordering::Acquire));
+        let mut receiver = self
+            .region
+            .star
+            .as_ref()
+            .and_then(|star| star.completion_receiver());
         loop {
             let observed = complete.load(Ordering::Acquire);
             if self.tickets.poll(ticket, observed)? {
                 return Ok(());
             }
+            if let Some(rx) = receiver.as_mut() {
+                // Post before checking the word again. A completion between
+                // either check and parking consumes this exact standing post.
+                if rx.try_recv().is_ok() {
+                    if self.poll(ticket)? {
+                        return Ok(());
+                    }
+                    if let Some(post) = rx.standing_post() {
+                        let reason =
+                            crate::executor::next_wake_on_for(post, RESIDENT_WAKE_BACKSTOP_NS)
+                                .await;
+                        if reason == crate::executor::WakeReason::Delivery {
+                            // A spurious alternate wake re-arms; the complete
+                            // word re-read at the top of the loop is truth.
+                            let _ = rx.settle_delivery();
+                        }
+                        continue;
+                    }
+                    // A delivered old/spurious notice consumed the landing;
+                    // re-post on the next pass rather than parking unarmed.
+                    continue;
+                }
+                // Refused alternate registration is an optimization failure,
+                // not a completion or a reason to abandon the live descriptor.
+            }
             let outcome = crate::futex::wait_async(
                 complete,
                 observed,
-                Some(core::time::Duration::from_micros(250)),
+                Some(core::time::Duration::from_nanos(RESIDENT_WAKE_BACKSTOP_NS)),
             )
             .await;
             if outcome == crate::futex::WaitOutcome::Unsupported {
-                crate::executor::next_wake_for(250_000).await;
+                crate::executor::next_wake_for(RESIDENT_WAKE_BACKSTOP_NS).await;
             }
         }
     }
@@ -1163,7 +1208,11 @@ impl<const N: usize> ResidentRegion<N> {
         // Waiting for the last submitted job first makes the region idle, so
         // the teardown abandons nothing. (Idle already ⇒ this returns at once.)
         if self.tickets.last.is_some() {
-            wait_for_resident_generation(self.region.ctx(), self.tickets.generation);
+            wait_for_resident_generation(
+                self.region.ctx(),
+                self.tickets.generation,
+                self.region.star.as_ref(),
+            );
         }
         let ctx = self.region.ctx();
         // Tell the gang to exit: flip the gate off RUN, THEN step `job` to
@@ -1183,12 +1232,40 @@ impl<const N: usize> ResidentRegion<N> {
 /// Wait for the one compact physical generation already proved current by the
 /// opaque ticket layer. Keeping this separate lets `retire` drain its own last
 /// accepted job without manufacturing or re-validating a public token.
-fn wait_for_resident_generation(ctx: &'static SpmdCtx, generation: u32) {
+fn wait_for_resident_generation(
+    ctx: &'static SpmdCtx,
+    generation: u32,
+    star: Option<&crate::star::Star>,
+) {
     let complete = ctx.complete_word();
+    let current = complete.load(Ordering::Acquire);
+    if current == generation {
+        return;
+    }
+    crate::futex::spin_completion(complete, current);
+    let mut receiver = star.and_then(|star| star.completion_receiver());
     loop {
         let current = complete.load(Ordering::Acquire);
         if current == generation {
             return;
+        }
+        if let Some(rx) = receiver.as_mut() {
+            if rx.try_recv().is_ok() {
+                if complete.load(Ordering::Acquire) == generation {
+                    return;
+                }
+                if let Some(post) = rx.standing_post() {
+                    if crate::futex::wait_standing(
+                        post,
+                        core::time::Duration::from_nanos(RESIDENT_WAKE_BACKSTOP_NS),
+                    ) != crate::futex::WaitOutcome::Unsupported
+                    {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
         }
         crate::barrier::wait_while(complete, current);
     }

@@ -14,16 +14,15 @@
 //! block: the codec refuses shapes, the serve step refuses semantics.
 
 use kore_abi::cap::Rights;
-use kore_abi::session::{SHARE_ACCESS_R, SHARE_ACCESS_W, SHARE_ACCESS_X};
 use kore_abi::image::ImageName;
-use kore_svc_dagfs::Rights as FsRights;
+use kore_abi::session::{SHARE_ACCESS_R, SHARE_ACCESS_W, SHARE_ACCESS_X};
 use kore_abi::svc::{
     MAX_CONVEY, MAX_SPAWN_DATA, MAX_SPAWN_SEGMENTS, MAX_SPAWN_WINDOWS, MAX_SPAWN_WIRING,
     SPAWN_WIRE_MOVE, SpawnData, SpawnSegment, SpawnWindow, SpawnWire, TaskRepWire, TaskReqWire,
 };
+use kore_svc_dagfs::Rights as FsRights;
 
 use kore_rt::svc::{MAX_INVOCATION_AUXILIARIES, SvcProtocol};
-
 
 fn encode_spawn(w: &mut TaskReqWire, s: &SpawnSpec, op: u8) {
     w.op = op;
@@ -657,11 +656,13 @@ pub fn encode_rep(rep: &TaskResponse, grants: u8) -> TaskRepWire {
                 TaskRefusal::Retired => TaskRepWire::REFUSE_RETIRED,
                 TaskRefusal::Contended => TaskRepWire::REFUSE_CONTENDED,
                 TaskRefusal::PeerAdmissionPending => TaskRepWire::REFUSE_PEER_ADMISSION_PENDING,
+                TaskRefusal::PeerAdmissionWedged => TaskRepWire::REFUSE_PEER_ADMISSION_WEDGED,
                 TaskRefusal::PeerRefused => TaskRepWire::REFUSE_PEER_REFUSED,
                 TaskRefusal::PeerAdmissionLost => TaskRepWire::REFUSE_PEER_ADMISSION_LOST,
                 TaskRefusal::PeerServiceUnwired => TaskRepWire::REFUSE_PEER_SERVICE_UNWIRED,
                 TaskRefusal::PeerRingTransfer => TaskRepWire::REFUSE_PEER_RING_TRANSFER,
                 TaskRefusal::PeerKickTransfer => TaskRepWire::REFUSE_PEER_KICK_TRANSFER,
+                TaskRefusal::PeerGrantTransfer => TaskRepWire::REFUSE_PEER_GRANT_TRANSFER,
                 TaskRefusal::PeerReturnTransfer => TaskRepWire::REFUSE_PEER_RETURN_TRANSFER,
                 TaskRefusal::PeerTransientUnwired => TaskRepWire::REFUSE_PEER_TRANSIENT_UNWIRED,
                 TaskRefusal::PeerMemoryUnwired => TaskRepWire::REFUSE_PEER_MEMORY_UNWIRED,
@@ -711,7 +712,8 @@ pub fn decode_rep(w: &TaskRepWire) -> Option<(TaskResponse, u8)> {
         (TaskRepWire::TAG_APP_SEEDED, 0) if w.index & !TaskRepWire::APP_SEED_MASK == 0 => {
             TaskResponse::AppSeeded {
                 seeded: w.index & TaskRepWire::APP_SEEDED != 0,
-                failure: (w.index & TaskRepWire::APP_FAILURE_MASK) >> TaskRepWire::APP_FAILURE_SHIFT,
+                failure: (w.index & TaskRepWire::APP_FAILURE_MASK)
+                    >> TaskRepWire::APP_FAILURE_SHIFT,
             }
         }
         (TaskRepWire::TAG_LIBRARY_SEEDED, 0) if w.index & !TaskRepWire::LIBRARY_SEED_MASK == 0 => {
@@ -779,11 +781,13 @@ pub fn decode_rep(w: &TaskRepWire) -> Option<(TaskResponse, u8)> {
             TaskRepWire::REFUSE_RETIRED => TaskRefusal::Retired,
             TaskRepWire::REFUSE_CONTENDED => TaskRefusal::Contended,
             TaskRepWire::REFUSE_PEER_ADMISSION_PENDING => TaskRefusal::PeerAdmissionPending,
+            TaskRepWire::REFUSE_PEER_ADMISSION_WEDGED => TaskRefusal::PeerAdmissionWedged,
             TaskRepWire::REFUSE_PEER_REFUSED => TaskRefusal::PeerRefused,
             TaskRepWire::REFUSE_PEER_ADMISSION_LOST => TaskRefusal::PeerAdmissionLost,
             TaskRepWire::REFUSE_PEER_SERVICE_UNWIRED => TaskRefusal::PeerServiceUnwired,
             TaskRepWire::REFUSE_PEER_RING_TRANSFER => TaskRefusal::PeerRingTransfer,
             TaskRepWire::REFUSE_PEER_KICK_TRANSFER => TaskRefusal::PeerKickTransfer,
+            TaskRepWire::REFUSE_PEER_GRANT_TRANSFER => TaskRefusal::PeerGrantTransfer,
             TaskRepWire::REFUSE_PEER_RETURN_TRANSFER => TaskRefusal::PeerReturnTransfer,
             TaskRepWire::REFUSE_PEER_TRANSIENT_UNWIRED => TaskRefusal::PeerTransientUnwired,
             TaskRepWire::REFUSE_PEER_MEMORY_UNWIRED => TaskRefusal::PeerMemoryUnwired,
@@ -813,14 +817,17 @@ pub(crate) const fn is_spawn_refusal(refusal: TaskRefusal) -> bool {
             | TaskRefusal::NothingConveyed
             | TaskRefusal::Denied
             | TaskRefusal::ImageUnavailable
-            // The filesystem-profile peer assembly is part of the atomic
-            // spawn, so its three admission refusals are spawn refusals.
+            // A face's peer assembly is part of the atomic spawn, so its
+            // admission refusals — this launch's own verdict still pending,
+            // and an earlier launch's face left wedged — are spawn refusals.
             | TaskRefusal::PeerAdmissionPending
+            | TaskRefusal::PeerAdmissionWedged
             | TaskRefusal::PeerRefused
             | TaskRefusal::PeerAdmissionLost
             | TaskRefusal::PeerServiceUnwired
             | TaskRefusal::PeerRingTransfer
             | TaskRefusal::PeerKickTransfer
+            | TaskRefusal::PeerGrantTransfer
             | TaskRefusal::PeerReturnTransfer
             | TaskRefusal::PeerTransientUnwired
             | TaskRefusal::PeerMemoryUnwired
@@ -1172,6 +1179,9 @@ pub enum TaskRefusal {
     /// mapping, so "not yet" is an ordinary schedule, not a fault — which
     /// is exactly why it must not share a rung with a full table.
     PeerAdmissionPending,
+    /// An earlier launch owns an unresolved admission verdict. This request
+    /// has published no peer components and can retry after reconciliation.
+    PeerAdmissionWedged,
     /// The filesystem refused the peer admission for a reason that is
     /// neither capacity nor a pending verdict (wrong authority, an
     /// unsupported map plan, a malformed ring).  Terminal: the serving host
@@ -1193,6 +1203,8 @@ pub enum TaskRefusal {
     /// The private filesystem peer's response-send (kick) endpoint did not
     /// cross its exact transfer. The ring component had already landed.
     PeerKickTransfer,
+    /// An accelerator or memory peer's reply-grant sender was not transferred.
+    PeerGrantTransfer,
     /// The private filesystem peer's return-receive endpoint did not cross
     /// its exact transfer. The ring and kick components had already landed.
     PeerReturnTransfer,
@@ -1374,7 +1386,6 @@ impl SvcProtocol for ExecProtocol {
     }
 }
 
-
 // The ring-window fit (the founder's `[layout] ring_bytes` contract):
 // the fat v3 request record must keep the whole pair — request ring +
 // reply ring at the REQ_CAP/REP_CAP geometry — inside one founded ring
@@ -1411,7 +1422,13 @@ const _: () = {
     );
     // The spelled-out arithmetic above, pinned: a silent drift in
     // REQ_CAP/REP_CAP or either indexed telemetry page moves this number.
-    assert!(window_bytes::<ExecProtocol>(8, 8) == 14_080);
+    // 14_080 → 14_208 when `SystemSnapshot` gained the scheduler-timer arm
+    // census (16 bytes, carried by each of the eight reply slots), and
+    // 14_208 → 14_336 when it gained the frame-class census (another 16),
+    // 14_336 → 14_528 for the DRAM stream table (24), and 14_528 → 14_592
+    // when each processor row gained its own DRAM stream pair (4 per row,
+    // two rows per page).
+    assert!(window_bytes::<ExecProtocol>(8, 8) == 14_592);
 };
 
 #[cfg(test)]
@@ -1717,8 +1734,20 @@ mod tests {
                 1,
             ),
             (TaskResponse::GenerationRetired, 0),
-            (TaskResponse::AppSeeded { seeded: true, failure: 0 }, 0),
-            (TaskResponse::AppSeeded { seeded: false, failure: 0 }, 0),
+            (
+                TaskResponse::AppSeeded {
+                    seeded: true,
+                    failure: 0,
+                },
+                0,
+            ),
+            (
+                TaskResponse::AppSeeded {
+                    seeded: false,
+                    failure: 0,
+                },
+                0,
+            ),
             (
                 TaskResponse::LibrarySeeded {
                     seeded: true,
@@ -1779,11 +1808,13 @@ mod tests {
             (TaskResponse::Refused(TaskRefusal::Denied), 0),
             (TaskResponse::Refused(TaskRefusal::ImageUnavailable), 0),
             (TaskResponse::Refused(TaskRefusal::PeerAdmissionPending), 0),
+            (TaskResponse::Refused(TaskRefusal::PeerAdmissionWedged), 0),
             (TaskResponse::Refused(TaskRefusal::PeerRefused), 0),
             (TaskResponse::Refused(TaskRefusal::PeerAdmissionLost), 0),
             (TaskResponse::Refused(TaskRefusal::PeerServiceUnwired), 0),
             (TaskResponse::Refused(TaskRefusal::PeerRingTransfer), 0),
             (TaskResponse::Refused(TaskRefusal::PeerKickTransfer), 0),
+            (TaskResponse::Refused(TaskRefusal::PeerGrantTransfer), 0),
             (TaskResponse::Refused(TaskRefusal::PeerReturnTransfer), 0),
             (TaskResponse::Refused(TaskRefusal::PeerTransientUnwired), 0),
             (TaskResponse::Refused(TaskRefusal::PeerMemoryUnwired), 0),

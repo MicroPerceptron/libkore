@@ -327,6 +327,7 @@ dependencies = [
  "kore-driver",
  "kore-ring",
  "kore-rt",
+ "kore-scrub",
  "virtio-accel-core",
  "zerocopy",
 ]
@@ -421,6 +422,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "kore-scrub"
+version = "0.1.0"
+
+[[package]]
+name = "kore-start"
+version = "0.1.0"
+dependencies = [
+ "kore-rt",
 ]
 
 [[package]]
@@ -774,9 +786,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
 dependencies = [
  "bitflags",
  "errno",
@@ -967,9 +979,9 @@ dependencies = [
 
 [[package]]
 name = "virtio-accel-core"
-version = "0.3.7"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16f492bc8552960b9097c81dbd9891f4644f360af7d750b42385a7019bad8d5c"
+checksum = "758d9a32f90f88ae4ae50a7dfb13aa214b20c9a85b797b0eefbe0f77b165840f"
 dependencies = [
  "bitflags",
  "virtio-accel-transport",
@@ -977,9 +989,9 @@ dependencies = [
 
 [[package]]
 name = "virtio-accel-transport"
-version = "0.3.7"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2290cbfb4871f6c8f077b00ff712d848e941a6af5c819fbbd8ae628c0c3ef7cc"
+checksum = "71764cd76e27b5923526e3e1384a317132319d4150f7263abe57fd3f6809afe5"
 
 [[package]]
 name = "wait-timeout"

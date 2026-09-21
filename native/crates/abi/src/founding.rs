@@ -321,7 +321,7 @@ impl FoundingRow {
             return Self::net_note_meaning(rung);
         }
         if self.name_bytes() == ROW_NAME_ACCEL_XE {
-            return Self::xe_note_meaning(rung);
+            return Self::xe_note_meaning(rung, (self.note.get() >> 32) as u8);
         }
         Self::accel_note_meaning(rung)
     }
@@ -371,30 +371,44 @@ impl FoundingRow {
         }
     }
 
-    /// The Lunar Lake Xe row's tail (`kore-svc-accel-xe::note`). Rungs 1-15
+    /// The Xe row's tail (`kore-svc-accel-xe::note`). Rungs 1-15
     /// are the read-only validation ladder; 16 is the GuC bring-up ladder's
     /// completion (deliberately still degraded: submission is not
     /// implemented); 17+ are `16 + kore-xe::xe::bring_up` rungs. The
     /// note's bits 40/41 carry the warm-boot facts (GuC live at claim /
     /// WOPCM locked at claim), which this glance-level decoder leaves to the
     /// row's note map.
-    fn xe_note_meaning(rung: u64) -> &'static [u8] {
+    fn xe_note_meaning(rung: u64, detail_ordinal: u8) -> &'static [u8] {
         match rung {
             4 => b"graphics GMD_ID reads all-ones: the function is not live behind BAR0",
             6 => b"graphics identity exists, but boot ownership was not positively proven",
             7 => b"graphics identity exists, but catalog BAR0 is not user-mappable",
             8 => b"graphics identity and BAR0 exist, but no IOMMU binding covers the driver",
             9 => b"graphics inventory facts satisfy the selector, but the broker refused it",
-            10 => b"no exact Lunar Lake graphics identity/class tuple was enumerated",
-            11 => b"no firmware boot module (provision lnl_guc_70.bin and rebuild the boot media)",
-            12 => b"firmware module is not the pinned Lunar Lake GuC image",
+            10 => b"no Intel graphics function of the display class was enumerated",
+            11 => b"no firmware boot module (provision the generation's GuC image and rebuild the boot media)",
+            12 => b"firmware module is not the pinned GuC image for this generation",
             13 => b"graphics or media GMD identity register could not be read",
-            14 => b"live GMD identity does not match the pinned Lunar Lake profile",
+            14 => b"PCI identity + GMD versions select no implemented generation (detail: refusal ordinal)",
             15 => b"PCI/BAR/GMD/firmware proved; Xe2 MCR/PAT/MOCS submission owner not implemented",
             16 => b"GuC READY with HWConfig retained, PAT/MOCS verified; native submission epoch not implemented",
+            51 => b"generation selected but Frozen: bring-up withheld (promote the sibling to Supported to run it)",
             17 => b"bring-up rung 1: MCR steering semaphore/selector probe refused",
             18 => b"bring-up rung 2: PAT program or all-replica readback refused",
-            19 => b"bring-up rung 3: GGTT window/scratch initialization refused",
+            19 => match detail_ordinal {
+                1 => b"bring-up rung 3: no vacant GGTT span for resident allocation",
+                19 => b"bring-up rung 3: firmware display layout cannot be safely retained",
+                20 => b"bring-up rung 3: running firmware GuC prevents GGTT handoff",
+                21 => b"bring-up rung 3: firmware GGTT aperture reads all ones",
+                2 | 4 | 5 | 6 | 7 | 17 | 18 => b"bring-up rung 3: invalid GGTT allocation geometry",
+                3 => b"bring-up rung 3: GSM aperture is too small",
+                8 | 9 | 10 => b"bring-up rung 3: scratch DMA address is not representable",
+                11 | 13 => b"bring-up rung 3: scratch DMA backing is too small",
+                12 => b"bring-up rung 3: scratch PAT does not match the generation",
+                14 | 15 => b"bring-up rung 3: retained GGTT mapping conflicts with allocation",
+                16 => b"bring-up rung 3: GGTT write-ordering register is outside the MMIO view",
+                _ => b"bring-up rung 3: GGTT window/scratch initialization refused",
+            },
             20 => b"bring-up rung 4: resident firmware GGTT map refused",
             21 => b"bring-up rung 5: minimal ADS build refused",
             22 => b"bring-up rung 6: GuC load parameter block refused",
@@ -418,12 +432,13 @@ impl FoundingRow {
             40 => b"bring-up rung 24: golden-LRC hardware recording refused or reset-required",
             41 => b"bring-up rung 25: queue PPGTT build or witness map refused",
             42 => b"bring-up rung 26: PPGTT TLB-invalidation round trip refused",
-            43 => b"bring-up rung 27: witness storage, NOP job, or compute-LRC build refused",
+            43 => b"bring-up rung 27: witness storage, startup job, or compute-LRC build refused",
             44 => b"bring-up rung 28: memirq page or tracked control plane refused",
             45 => b"bring-up rung 29: REGISTER_CONTEXT or default policy did not complete",
             46 => b"bring-up rung 30: first submit or MODE_SET enable event did not complete",
-            47 => b"bring-up rung 31: NOP-job completion evidence did not arrive",
+            47 => b"bring-up rung 31: startup-job completion evidence did not arrive",
             48 => b"bring-up rung 32: CCS0 ring enable refused (RCU_MODE/RING_MODE/HWSP readback)",
+            49 => b"bring-up rung 33: EU transform result/input/guard mismatch (detail: word index)",
             50 => {
                 b"recording epoch alive: submission GuC READY, CT enabled; golden recording and native queue not implemented"
             }
@@ -438,10 +453,12 @@ impl FoundingRow {
     fn accel_note_meaning(rung: u64) -> &'static [u8] {
         match rung {
             4 => b"buttress (BAR4) reads all-ones: unrouted or parked beyond the claim wake",
+            6 => b"generation selected but Frozen: bring-up withheld (promote the sibling to Supported to run it)",
             11 => b"no firmware boot module (provision the blob, rebuild the boot media)",
             12 => b"firmware module is not the pinned blob (short or digest mismatch)",
             13 => b"bring-up completed but the async NOP job path did not prove",
             14 => b"buttress window (BAR4) would not realize: BAR unassigned by firmware?",
+            15 => b"Intel NPU selects no implemented generation (detail: refusal ordinal, device id)",
             17 => b"bring-up rung 1: buttress power-up refused",
             18 => b"bring-up rung 2: DMA pool exhausted building SMMU structures",
             19 => b"bring-up rung 3: stage-1 walker build or map refused",
@@ -713,7 +730,7 @@ mod tests {
             ),
             (
                 10,
-                b"no exact Lunar Lake graphics identity/class tuple was enumerated",
+                b"no Intel graphics function of the display class was enumerated",
             ),
         ];
         for &(rung, meaning) in expected {

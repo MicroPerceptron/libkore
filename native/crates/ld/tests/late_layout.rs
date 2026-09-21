@@ -12,6 +12,27 @@ use kore_ld::reloc::X86_64;
 
 const NO_LIMIT: u64 = u64::MAX;
 
+#[test]
+fn relro_must_be_an_exact_page_range_inside_private_data() {
+    let mut checked = check_image::<X86_64>(&library().build()).unwrap();
+    checked.relro = Some((DATA_VADDR, 4096));
+    assert!(LateLayout::plan(&checked, NO_LIMIT, NO_LIMIT).is_ok());
+    for range in [
+        (DATA_VADDR, 0),
+        (DATA_VADDR + 8, 4096),
+        (DATA_VADDR, 4095),
+        (TEXT_VADDR, 4096),
+        (DATA_VADDR, 8192),
+        (u64::MAX - 4095, 4096),
+    ] {
+        checked.relro = Some(range);
+        assert_eq!(
+            LateLayout::plan(&checked, NO_LIMIT, NO_LIMIT),
+            Err(LateError::Relro)
+        );
+    }
+}
+
 fn library() -> Fixture {
     let mut f = Fixture::new(EM_X86_64);
     f.syms = vec![Sym::global("alpha", TEXT_VADDR + 0x10)];

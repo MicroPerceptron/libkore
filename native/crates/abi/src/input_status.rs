@@ -54,6 +54,10 @@ pub enum I2cProtocolPhase {
     Steady = 10,
     FeatureGet = 11,
     FeatureSet = 12,
+    /// Initialization worker is inside the kernel-clock sampling trap.
+    InitClock = 13,
+    /// Initialization worker is inside its deadline sleep trap.
+    InitSleep = 14,
 }
 
 impl I2cProtocolPhase {
@@ -72,6 +76,8 @@ impl I2cProtocolPhase {
             10 => Some(Self::Steady),
             11 => Some(Self::FeatureGet),
             12 => Some(Self::FeatureSet),
+            13 => Some(Self::InitClock),
+            14 => Some(Self::InitSleep),
             _ => None,
         }
     }
@@ -91,6 +97,8 @@ impl I2cProtocolPhase {
             Self::Steady => "steady",
             Self::FeatureGet => "feature-get",
             Self::FeatureSet => "feature-set",
+            Self::InitClock => "init-clock",
+            Self::InitSleep => "init-sleep",
         }
     }
 
@@ -288,7 +296,7 @@ pub struct I2cDiagnostic {
 
 /// A running I2C relay has firmware GPIOs but could not derive a pad route.
 pub const I2C_READY_POLL_NO_GPIO_ROUTE: u32 = 1;
-/// A running I2C relay has no firmware GPIO to use as a ready interrupt.
+/// A running I2C relay has no firmware source to use as a ready interrupt.
 pub const I2C_READY_POLL_NO_FIRMWARE_IRQ: u32 = 2;
 /// A running I2C relay parks on its GPIO-ready route; polling is a watchdog.
 pub const I2C_READY_GPIO_IRQ: u32 = 3;
@@ -305,6 +313,9 @@ pub const I2C_READY_POLL_PAD_BIND_REFUSED: u32 = 13;
 pub const I2C_READY_POLL_SETUP_UNAVAILABLE: u32 = 14;
 pub const I2C_READY_POLL_PAD_CONFIGURATION_REFUSED: u32 = 15;
 pub const I2C_READY_POLL_PAD_ALIAS_REFUSED: u32 = 16;
+/// The child uses its firmware GSI through the ordinary line fabric.
+pub const I2C_READY_LINE_IRQ: u32 = 17;
+pub const I2C_READY_POLL_LINE_BIND_REFUSED: u32 = 18;
 
 impl I2cDiagnostic {
     pub fn valid(&self) -> bool {
@@ -362,8 +373,9 @@ pub struct I2cChildStatus {
     /// 5 protocol/length, 6 descriptor parse, 7 clock, 8 generation exhausted,
     /// 9 duplicate slave address on this controller.
     pub error: u8,
-    /// Bit 0: firmware described a GPIO; NOT a claim that it is routed.
+    /// Bit 0: firmware described a child interrupt; NOT a claim that it is routed.
     pub flags: u8,
+    /// All HID input reads, including IRQ-driven reads; not a fallback-poll count.
     pub polls: U32<LittleEndian>,
     pub reports: U32<LittleEndian>,
     pub errors: U32<LittleEndian>,
@@ -414,9 +426,9 @@ pub struct I2cControllerStatus {
     /// Controller transfer-completion IRQs, not HID GPIO-ready IRQs.
     pub wakes: U32<LittleEndian>,
     pub dropped: U32<LittleEndian>,
-    /// Child GPIO-ready route fires. Separate from controller transfer completion.
+    /// Child readiness route fires (GPIO or GSI), separate from controller transfer completion.
     pub gpio_wakes: U32<LittleEndian>,
-    /// GPIO wait deadlines that fell through to the bounded polling watchdog.
+    /// Child-route wait deadlines that fell through to the bounded polling watchdog.
     pub watchdog_deadlines: U32<LittleEndian>,
     pub child: [I2cChildStatus; MAX_I2C_CHILDREN],
 }
@@ -657,7 +669,7 @@ mod tests {
     fn operation_and_input_encodings_are_closed_and_preserve_full_widths() {
         for bits in 0..=u8::MAX {
             let phase = I2cProtocolPhase::from_bits(bits);
-            assert_eq!(phase.is_some(), bits <= 12);
+            assert_eq!(phase.is_some(), bits <= 14);
             if let Some(phase) = phase {
                 let word = if phase == I2cProtocolPhase::None {
                     phase.pack(0, 0)

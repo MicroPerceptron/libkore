@@ -13,7 +13,8 @@
 #![no_std]
 
 use kore_abi::image::{
-    PROFILE_CHANNELS, PROFILE_FILESYSTEM, PROFILE_HEAP, PROFILE_SYSTEM_POWER, profile_valid,
+    PROFILE_ACCELERATOR, PROFILE_CHANNELS, PROFILE_FILESYSTEM, PROFILE_HEAP, PROFILE_SYSTEM_POWER,
+    profile_valid,
 };
 pub use kore_dagfs::FilesystemFace;
 pub use kore_window::WindowFace;
@@ -150,6 +151,27 @@ impl AppBundle for PowerWindow {
     const WAKE: WakeTopology = PowerWindow::WAKE;
 }
 
+/// A window application composed with one private recyclable accelerator
+/// face. The service and compositor share the process executor's wake root;
+/// accelerator completion channels remain explicit per-client grants.
+pub enum AcceleratedWindow {}
+
+impl AcceleratedWindow {
+    pub const PROFILE: u32 = Window::PROFILE | PROFILE_ACCELERATOR;
+    pub const WINDOW_FACE: Option<WindowFace> = Some(WindowFace::STANDALONE);
+    pub const FILESYSTEM_FACE: Option<FilesystemFace> = None;
+    pub const WAKE: WakeTopology = WakeTopology::SharedWindowService;
+}
+
+impl sealed::Sealed for AcceleratedWindow {}
+
+impl AppBundle for AcceleratedWindow {
+    const PROFILE: u32 = AcceleratedWindow::PROFILE;
+    const WINDOW_FACE: Option<WindowFace> = AcceleratedWindow::WINDOW_FACE;
+    const FILESYSTEM_FACE: Option<FilesystemFace> = AcceleratedWindow::FILESYSTEM_FACE;
+    const WAKE: WakeTopology = AcceleratedWindow::WAKE;
+}
+
 /// The window-capable preset selected by an authenticated image profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowBundle {
@@ -178,6 +200,12 @@ impl WindowBundle {
                 face: WindowFace::WITH_FILESYSTEM,
                 wake: WakeTopology::SharedWindowService,
             })
+        } else if profile == AcceleratedWindow::PROFILE {
+            Some(Self {
+                profile,
+                face: WindowFace::STANDALONE,
+                wake: WakeTopology::SharedWindowService,
+            })
         } else {
             None
         }
@@ -199,7 +227,7 @@ impl WindowBundle {
 /// Small import surface for application source. It contains only the five
 /// closed inert presets; implementation coordinates remain explicitly named.
 pub mod prelude {
-    pub use crate::{Command, FilesWindow, FsCommand, PowerWindow, Window};
+    pub use crate::{AcceleratedWindow, Command, FilesWindow, FsCommand, PowerWindow, Window};
 }
 
 const _: () = {
@@ -208,6 +236,7 @@ const _: () = {
     assert!(profile_valid(Window::PROFILE));
     assert!(profile_valid(FilesWindow::PROFILE));
     assert!(profile_valid(PowerWindow::PROFILE));
+    assert!(profile_valid(AcceleratedWindow::PROFILE));
     assert!(WindowFace::WITH_FILESYSTEM.ring() != FilesystemFace::CANONICAL.control_ring());
     assert!(WindowFace::WITH_FILESYSTEM.ring() != FilesystemFace::CANONICAL.data_window());
     assert!(WindowFace::WITH_FILESYSTEM.request_kick() != FilesystemFace::CANONICAL.request_kick());
@@ -233,6 +262,11 @@ mod tests {
         assert_ne!(WindowFace::WITH_FILESYSTEM.ring(), 1);
         assert_ne!(WindowFace::WITH_FILESYSTEM.request_kick(), 0);
         assert_eq!(FilesWindow::FILESYSTEM_FACE, FsCommand::FILESYSTEM_FACE);
+        assert_eq!(
+            AcceleratedWindow::PROFILE,
+            PROFILE_HEAP | PROFILE_CHANNELS | PROFILE_ACCELERATOR
+        );
+        assert_eq!(AcceleratedWindow::WINDOW_FACE, Some(WindowFace::STANDALONE));
     }
 
     #[test]
@@ -244,7 +278,10 @@ mod tests {
             let classified = WindowBundle::from_profile(profile);
             if profile == Window::PROFILE {
                 assert_eq!(classified.unwrap().wake(), WakeTopology::Window);
-            } else if profile == FilesWindow::PROFILE || profile == PowerWindow::PROFILE {
+            } else if profile == FilesWindow::PROFILE
+                || profile == PowerWindow::PROFILE
+                || profile == AcceleratedWindow::PROFILE
+            {
                 assert_eq!(
                     classified.unwrap().wake(),
                     WakeTopology::SharedWindowService

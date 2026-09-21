@@ -13,6 +13,8 @@ members = [
     "crates/ring",
     "crates/rt",
     "crates/rt-macros",
+    "crates/scrub",
+    "crates/start",
     "crates/uart",
     "crates/window",
     "crates/workspace-sync",

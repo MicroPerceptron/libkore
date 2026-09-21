@@ -808,12 +808,6 @@ pub struct TaskToken {
     /// [`take_handle`](verbs::take_handle) reads it off the R/O `SLOTS_VA`
     /// alias.
     slot: SlotRef,
-    /// The founded task's id — the delivered cap's `cid.resource()`
-    /// (Phase-A checkpoint C: a
-    /// task record's "geometry" is its identity, not an address, and the
-    /// resource id *is* carried on the delivered
-    /// [`CapRecord`](kore_abi::cap::CapRecord)).
-    id: u64,
     rec: SealedRec,
     /// Runtime-owned landing for a handle returned by the exec service.
     /// Founder endowments use `None`; a spawn reply keeps this owner for the
@@ -938,11 +932,37 @@ impl SupplyToken {
 }
 
 impl TaskToken {
-    /// The task this handle stands over — the **client-known** id the token
-    /// caches ([`id`](Self::id)): the delivered cap's
-    /// `cid.resource()`.
-    pub fn id(&self) -> u64 {
-        self.id
+    /// Opaque identity, independent of capability routing and ownership.
+    pub fn id(&self) -> Result<kore_abi::task::TaskId, kore_abi::session::Status> {
+        self.identity().map(|identity| identity.id)
+    }
+    /// Query this held task's immutable ID and entropy provenance. No raw
+    /// slot/generation or root CID is returned as a diagnostic identifier.
+    pub fn identity(&self) -> Result<kore_abi::task::TaskIdentity, kore_abi::session::Status> {
+        #[cfg(target_os = "none")]
+        {
+            use crate::{SessionBuilder, Transport, transport::TrapTransport};
+            use kore_abi::{cap::CapRecord, session::Status, task::TaskIdentity};
+            let report = crate::entry::geometry::report_slot().ok_or(Status::Malformed)?;
+            let mut b = SessionBuilder::new();
+            b.task_identity(self.slot, report)
+                .map_err(|_| Status::Malformed)?;
+            let completion = TrapTransport::new()
+                .commit_now(&b)
+                .map_err(|_| Status::Malformed)?;
+            if completion.status() != Status::Ok {
+                return Err(completion.status());
+            }
+            let pointer =
+                crate::entry::geometry::slot_record_va(report).ok_or(Status::Malformed)?;
+            // SAFETY: this thread's kernel-authored report alias after commit.
+            let record = unsafe { core::ptr::read_volatile(pointer as *const CapRecord) };
+            TaskIdentity::decode(&record).ok_or(Status::Malformed)
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            Err(kore_abi::session::Status::Denied)
+        }
     }
 
     /// The rights this handle carries (`ACCESS` wait / `MODIFY` start-or-exit /
@@ -954,6 +974,36 @@ impl TaskToken {
     /// The arena slot this handle was possessed from.
     pub fn slot(&self) -> SlotRef {
         self.slot
+    }
+
+    /// Assign a copied diagnostic label once before START. The kernel checks
+    /// MODIFY on this exact handle and serializes assignment against START.
+    pub fn set_name(
+        &self,
+        name: kore_abi::task::TaskName,
+    ) -> Result<(), kore_abi::session::Status> {
+        #[cfg(target_os = "none")]
+        {
+            use crate::{SessionBuilder, Transport, transport::TrapTransport};
+            use kore_abi::session::Status;
+            let mut session = SessionBuilder::new();
+            session
+                .name_task(self.slot(), name)
+                .map_err(|_| Status::Malformed)?;
+            match TrapTransport::new()
+                .commit_now(&session)
+                .map_err(|_| Status::Malformed)?
+                .status()
+            {
+                Status::Ok => Ok(()),
+                status => Err(status),
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = name;
+            Err(kore_abi::session::Status::Denied)
+        }
     }
 
     /// Explicitly make this completely founded child runnable.
@@ -1059,13 +1109,12 @@ impl LeasedToken {
 
 #[cfg(target_os = "none")]
 impl TaskToken {
-    /// Possess a delivered task handle at `slot` — `id` is the delivered
-    /// cap's `cid.resource()`; the tag stays live (the client keeps its own
-    /// authority); later sessions re-bind it by slot.
-    pub(crate) fn possess(slot: SlotRef, id: u64, rights: Rights) -> Self {
+    /// Possess a delivered task handle at `slot`. The caller has validated
+    /// its record geometry (`_id`); later sessions re-bind it by slot. That
+    /// routing value is not retained as the public diagnostic identity.
+    pub(crate) fn possess(slot: SlotRef, _id: u64, rights: Rights) -> Self {
         Self {
             slot,
-            id,
             rec: SealedRec::possessed(record::RecKind::TaskHandle, rights),
             _returned: None,
         }
@@ -1075,13 +1124,12 @@ impl TaskToken {
     /// name from the runtime reservation that owns that name.
     pub(crate) fn possess_returned(
         slot: SlotRef,
-        id: u64,
+        _id: u64,
         rights: Rights,
         returned: ReturnedCapability,
     ) -> Self {
         Self {
             slot,
-            id,
             rec: SealedRec::possessed(record::RecKind::TaskHandle, rights),
             _returned: Some(returned),
         }
@@ -1089,12 +1137,11 @@ impl TaskToken {
 
     /// Possess a task handle published directly into a runtime-reserved
     /// result slot owned by this task.
-    pub(crate) fn possess_owned(mut owned: OwnedSlot, id: u64, rights: Rights) -> Self {
+    pub(crate) fn possess_owned(mut owned: OwnedSlot, _id: u64, rights: Rights) -> Self {
         owned.activate();
         let slot = owned.slot();
         Self {
             slot,
-            id,
             rec: SealedRec::possessed(record::RecKind::TaskHandle, rights),
             _returned: Some(ReturnedCapability { owned }),
         }
@@ -1301,6 +1348,32 @@ impl FabricRegistrationToken {
         request: &kore_abi::session::FabricRouteReq,
     ) -> Result<FabricRouteToken, verbs::FabricRouteFault> {
         verbs::open_fabric_route(self.owned.slot(), request)
+    }
+
+    /// The common route in one call: describe this registration, build the
+    /// self-route over its first `bytes`, and open it.  Every native DMA
+    /// window and the init witness used to spell this as describe + a
+    /// twelve-field literal + open; the order is now the type's.
+    pub fn open_self_route(
+        &self,
+        bytes: u64,
+        op: kore_abi::session::FabricOp,
+        access: kore_abi::session::FabricAccess,
+        sync: kore_abi::session::FabricSync,
+    ) -> Result<FabricRouteToken, verbs::FabricRouteFault> {
+        let facts = self.describe().map_err(|fault| match fault {
+            verbs::FabricRegistrationFault::Slot => verbs::FabricRouteFault::Slot,
+            verbs::FabricRegistrationFault::Build => verbs::FabricRouteFault::Build,
+            verbs::FabricRegistrationFault::Commit(status) => {
+                verbs::FabricRouteFault::Commit(status)
+            }
+            verbs::FabricRegistrationFault::MalformedReport => {
+                verbs::FabricRouteFault::MalformedReport
+            }
+        })?;
+        let request =
+            kore_abi::session::FabricRouteReq::self_route(&facts, bytes, op, access, sync);
+        self.open_route(&request)
     }
 
     /// Explicitly retire registration before its owning DMA window.
@@ -2430,6 +2503,26 @@ impl ReturnedCapability {
         }
     }
 
+    /// An owner whose lineage was already observed dead, for host tests of
+    /// the code that must distinguish a settled component from one still
+    /// closing.
+    ///
+    /// Off metal there is no other way to reach the settled state: the host
+    /// `retire_owned_slot` answers [`RetireOutcome::Retryable`] for every
+    /// live record, so a `test_live` owner never closes. This is the state a
+    /// real abandoned component reaches when its asker's lineage died before
+    /// the bundle completed.
+    #[cfg(test)]
+    pub(crate) fn test_dead_lineage(slot: SlotRef) -> Self {
+        Self {
+            owned: OwnedSlot {
+                slot,
+                state: OwnedSlotState::Released,
+                _thread_bound: core::marker::PhantomData,
+            },
+        }
+    }
+
     /// Reserve a vacant target for a receive post. Kept inside the runtime:
     /// only the generic service machines may turn a bare reservation into
     /// delivered authority.
@@ -3056,6 +3149,46 @@ impl MappedLeaseView {
         self.len
     }
 
+    /// Permanently remove write access from a page-aligned part of this view.
+    /// The current thread's held address-space capability authorizes the
+    /// existing clear-only protection verb. A refusal leaves the range intact.
+    /// Raw pointers previously obtained from this view must honor the new access.
+    pub fn seal_read_only(&mut self, offset: usize, len: usize) -> bool {
+        if len == 0
+            || offset % 4096 != 0
+            || len % 4096 != 0
+            || offset.checked_add(len).is_none_or(|end| end > self.len)
+        {
+            return false;
+        }
+        let Some(va) = (self.base.as_ptr() as usize).checked_add(offset) else {
+            return false;
+        };
+        #[cfg(target_os = "none")]
+        {
+            let Some(space) = crate::entry::geometry::self_space_slot() else {
+                return false;
+            };
+            let Some(scratch) = OwnedSlot::reserve() else {
+                return false;
+            };
+            // PROTECT mints no record: dropping the reserved name returns it
+            // to this thread's allocator after the synchronous session.
+            verbs::seal_range(
+                space,
+                va as u64,
+                len as u64,
+                kore_abi::session::SHARE_ACCESS_R,
+                scratch.slot(),
+            )
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = va;
+            false
+        }
+    }
+
     /// Borrow the live read-only mapping for validation.
     ///
     /// # Safety
@@ -3071,14 +3204,14 @@ impl MappedLeaseView {
     }
 
     /// Borrow the live mapping mutably — lawful only for a view minted
-    /// writable ([`map_owned_lease_at_rw`](verbs::map_owned_lease_at_rw);
-    /// the kernel refused `W` otherwise, so a read-only view never
-    /// constructs and this cannot alias an immutable page).
+    /// writable ([`map_owned_lease_at_rw`](verbs::map_owned_lease_at_rw))
+    /// which has not subsequently been sealed read-only.
     ///
     /// # Safety
     ///
     /// As [`as_ref`](Self::as_ref), plus: the caller must be the mapping's
-    /// sole toucher for the borrow's duration — met by the stamp shape,
+    /// sole toucher for the borrow's duration, and the entire mapping must
+    /// still be writable — met by the stamp shape,
     /// where the view is private to one control flow and retired before
     /// the lease is conveyed anywhere.
     pub unsafe fn as_mut(&mut self) -> &mut [u8] {
@@ -4582,7 +4715,6 @@ mod retirement_tests {
         let slot = returned.slot().expect("test owner is live");
         TaskToken {
             slot,
-            id: 0xfeed,
             rec: SealedRec {
                 kind: record::RecKind::TaskHandle,
                 rights: Rights::ACCESS | Rights::REVOKE,
@@ -4829,7 +4961,7 @@ mod retirement_tests {
             Err(task) => task,
             Ok(outcome) => panic!("host kill unexpectedly closed: {outcome:?}"),
         };
-        assert_eq!(task.id(), 0xfeed);
+        assert_eq!(task.id(), Err(kore_abi::session::Status::Denied));
         assert_eq!(task.slot(), SlotRef::from_wire(44));
         assert!(
             task._returned
@@ -4850,7 +4982,6 @@ mod retirement_tests {
         );
         let task = TaskToken {
             slot: SlotRef::from_wire(45),
-            id: 0xbeef,
             rec: SealedRec {
                 kind: record::RecKind::TaskHandle,
                 rights: Rights::ACCESS | Rights::REVOKE,

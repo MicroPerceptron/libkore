@@ -23,11 +23,22 @@ boot_data = "archive_digest"
 # themselves arrive through the recyclable-peer seam; the fixed face count
 # therefore stays independent of the installed command set.
 exec_client = true
-# The namespace's child-list arena is boxed (MAX_DIRECTORIES x MAX_DIR_ENTRIES,
-# ~450 KiB) so it does not ride the founded service's delegated stack inside the
-# mount/format futures. That moves it onto this heap, alongside the 128 KiB
-# durable image scratch and the provider's extent bookkeeping, so the 2 MiB
-# default no longer leaves comfortable headroom. 4 MiB covers the working set.
-heap_supply_bytes = 0x0040_0000
-digest_x86_64  = "blake3:b73f7b16bf00e5966a2741ef2ab4294ffc53479254b9eb4b15a06533f9bbb5a2"
-digest_aarch64 = "blake3:28bcca53ec2993b6d408c20fd5f81515e3b1933b1db09a6df9a27967b00afc52"
+# The filesystem's volume-scaled metadata is heap-backed rather than inline:
+# object and directory arenas, placement and extent indexes, the derived
+# index, and the handle arena all live here now, so raising a bound is a heap
+# number instead of a stack one. At MAX_OBJECTS = 512 the fixed startup
+# reservations come to roughly 1.75 MiB PER MOUNTED ENGINE, of which the
+# derived wire-chunk arena alone is 1 MiB — and a provisioned disk (the
+# `kore-fs` + `kore-system` GPT pair every metal machine carries, and the
+# `run-boot-gate-x86-fs-dual` fixture) mounts TWO engines, user and system,
+# each with its own arenas, plus the recovery transients of both.  4 MiB fit
+# the single engine a blank disk mounts and ran out on the second one: the
+# `service heap undersized` expect in `ExtractionState::new` NACKed the row
+# (rung 127, extraction.rs) on every provisioned boot — Gigatron and
+# Biggertron, 2026-09-15, #1003 — while every blank-disk QEMU boot passed.
+# 8 MiB is two engines' fixed reservations with better than 2× headroom for
+# recovery transients and the heap's growth granularity; the fs-dual gate is
+# the witness that keeps it honest.
+heap_supply_bytes = 0x0080_0000
+digest_x86_64  = "blake3:65b1f77e3d37836d2472c895ea327efcdcac0ecbb1e5c8e38ef20c05a8f4b4b5"
+digest_aarch64 = "blake3:04a1de9abfccc334a992d66d9e10b76c553b06f31243110c494d313a57958bba"

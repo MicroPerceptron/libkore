@@ -31,7 +31,9 @@ pub mod heap;
 pub mod service;
 pub mod wire;
 
-pub use client::{MmClient, RingMm, SupplyError};
+pub use client::{MmClient, RingMm, SupplyError, process_face};
+#[cfg(target_os = "none")]
+pub use client::{ProcessMm, attach_process_face};
 pub use service::{
     FREE_SLOTS, MemoryManager, MmEndowment, MmRefusal, MmRequest, MmResponse, MmStats, PAGE_BYTES,
     SUPPLY_QUOTA_BYTES, SUPPLY_RIGHTS,

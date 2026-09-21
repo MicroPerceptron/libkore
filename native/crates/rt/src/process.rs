@@ -238,7 +238,7 @@ struct ProcessStdioPeer<'w, 't, T: Transport> {
     recv_cookie: u64,
 }
 
-impl<T: Transport> ProcessStdioPeer<'_, '_, T> {
+impl<'w, T: Transport> ProcessStdioPeer<'w, '_, T> {
     fn begin_drain(&self) -> ProcessStdioDrain {
         ProcessStdioDrain {
             sequence: self.observed.load(Ordering::SeqCst),
@@ -247,6 +247,29 @@ impl<T: Transport> ProcessStdioPeer<'_, '_, T> {
     }
 
     async fn signal(&self) -> ProcessStdioWake {
+        match self.publish() {
+            Ok(notice) => Self::wake_outcome(
+                ChanTx::new(self.transport, self.send.slot())
+                    .send(notice)
+                    .await,
+            ),
+            Err(wake) => wake,
+        }
+    }
+
+    /// [`signal`](Self::signal), with the notice committed synchronously.
+    fn signal_now(&self) -> ProcessStdioWake {
+        match self.publish() {
+            Ok(notice) => {
+                Self::wake_outcome(ChanTx::new(self.transport, self.send.slot()).send_now(notice))
+            }
+            Err(wake) => wake,
+        }
+    }
+
+    /// Publish this side's change, and name the notice owed to a waiting
+    /// peer (`Err` when none is owed).
+    fn publish(&self) -> Result<Notice, ProcessStdioWake> {
         // Ring cursor publication happens before this call. SeqCst is the
         // register/check fence shared with the address-monitor first tier and
         // makes the post-change value the notice's diagnostic payload.
@@ -255,15 +278,16 @@ impl<T: Transport> ProcessStdioPeer<'_, '_, T> {
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
         if self.peer_waiting.swap(0, Ordering::SeqCst) == 0 {
-            return ProcessStdioWake::PeerNotWaiting;
+            return Err(ProcessStdioWake::PeerNotWaiting);
         }
-        match ChanTx::new(self.transport, self.send.slot())
-            .send(Notice {
-                cookie: self.send_cookie,
-                payload: u64::from(sequence),
-            })
-            .await
-        {
+        Ok(Notice {
+            cookie: self.send_cookie,
+            payload: u64::from(sequence),
+        })
+    }
+
+    fn wake_outcome(sent: Result<(), SendError>) -> ProcessStdioWake {
+        match sent {
             Ok(()) => ProcessStdioWake::Delivered,
             Err(SendError::WouldBlock) => ProcessStdioWake::Coalesced,
             Err(error) => ProcessStdioWake::Unreached(error),
@@ -294,12 +318,44 @@ impl<T: Transport> ProcessStdioPeer<'_, '_, T> {
         mut ready: impl FnMut() -> bool,
         deadline_ns: Option<u64>,
     ) -> Result<ProcessStdioPark, ProcessStdioWaitError> {
+        loop {
+            match self.prepare_park(&drain, &mut ready)? {
+                ProcessStdioParkStep::Changed => return Ok(ProcessStdioPark::StateChanged),
+                // A rotating notice receiver cannot reuse the preceding
+                // landing.  Let that handoff finish, then post its fresh
+                // landing before publishing the process-stream wait state.
+                ProcessStdioParkStep::Handoff => {
+                    crate::executor::next_wake_for(100_000).await;
+                }
+                ProcessStdioParkStep::Park(ticket) => {
+                    let reason = match deadline_ns {
+                        Some(delta_ns) => {
+                            crate::executor::next_wake_on_for(ticket.post, delta_ns).await
+                        }
+                        None => crate::executor::next_wake_on(ticket.post).await,
+                    };
+                    return self.settle_park(ticket, reason);
+                }
+            }
+        }
+    }
+
+    /// Everything a park does before it waits, synchronously: recheck the
+    /// drained state, take one monitor turn, consume a notice that already
+    /// landed, and publish `waiting` with the standing post armed. The wait
+    /// itself is the caller's, so an owner that shares this endpoint can
+    /// await it without holding the endpoint (see [`ProcessStdioParkStep`]).
+    fn prepare_park(
+        &mut self,
+        drain: &ProcessStdioDrain,
+        mut ready: impl FnMut() -> bool,
+    ) -> Result<ProcessStdioParkStep<'w>, ProcessStdioWaitError> {
         assert!(
             core::ptr::eq(drain.source, self.observed),
             "process-stream drain token belongs to another endpoint"
         );
         if self.observed.load(Ordering::SeqCst) != drain.sequence || ready() {
-            return Ok(ProcessStdioPark::StateChanged);
+            return Ok(ProcessStdioParkStep::Changed);
         }
 
         // Cross-process mappings can occupy different virtual addresses, so
@@ -310,30 +366,25 @@ impl<T: Transport> ProcessStdioPeer<'_, '_, T> {
         // before the real channel park.
         crate::hint::wait_on(self.observed, drain.sequence, Duration::from_micros(1));
         if self.observed.load(Ordering::SeqCst) != drain.sequence || ready() {
-            return Ok(ProcessStdioPark::StateChanged);
+            return Ok(ProcessStdioParkStep::Changed);
         }
 
         // Arm the dedicated receive before publishing `waiting`. If a prior
         // signal already landed, consume it and re-run the caller's drain
         // without parking.
-        loop {
-            match self.notice.try_recv() {
-                Ok(Some(notice)) => {
-                    return if self.notice_is_valid(notice) {
-                        Ok(ProcessStdioPark::StateChanged)
-                    } else {
-                        Err(ProcessStdioWaitError::InvalidNotice)
-                    };
-                }
-                Ok(None) => break,
-                // A rotating notice receiver cannot reuse the preceding
-                // landing.  Let that handoff finish, then post its fresh
-                // landing before publishing the process-stream wait state.
-                Err(RecvError::Refused(kore_abi::session::Status::WouldBlock)) => {
-                    crate::executor::next_wake_for(100_000).await;
-                }
-                Err(error) => return Err(ProcessStdioWaitError::Receive(error)),
+        match self.notice.try_recv() {
+            Ok(Some(notice)) => {
+                return if self.notice_is_valid(notice) {
+                    Ok(ProcessStdioParkStep::Changed)
+                } else {
+                    Err(ProcessStdioWaitError::InvalidNotice)
+                };
             }
+            Ok(None) => {}
+            Err(RecvError::Refused(kore_abi::session::Status::WouldBlock)) => {
+                return Ok(ProcessStdioParkStep::Handoff);
+            }
+            Err(error) => return Err(ProcessStdioWaitError::Receive(error)),
         }
         let Some(post) = self.notice.standing_post() else {
             return Err(ProcessStdioWaitError::Receive(RecvError::Refused(
@@ -346,26 +397,78 @@ impl<T: Transport> ProcessStdioPeer<'_, '_, T> {
         // or the producer sees `waiting` and spends the standing post.
         let waiting = ProcessStdioWaiting::publish(self.waiting);
         if self.observed.load(Ordering::SeqCst) != drain.sequence || ready() {
-            return Ok(ProcessStdioPark::StateChanged);
+            return Ok(ProcessStdioParkStep::Changed);
         }
-
         // The task's ordinary executor doorbell remains the primary arm;
         // this affine post is the one bounded alternate. No service reply or
         // process stream can shadow the other.
-        let reason = match deadline_ns {
-            Some(delta_ns) => crate::executor::next_wake_on_for(post, delta_ns).await,
-            None => crate::executor::next_wake_on(post).await,
+        Ok(ProcessStdioParkStep::Park(ProcessStdioParkTicket {
+            post,
+            _waiting: waiting,
+        }))
+    }
+
+    /// Everything a park does after its wait: withdraw `waiting`, then
+    /// consume the notice the wake may have landed.
+    fn settle_park(
+        &mut self,
+        ticket: ProcessStdioParkTicket<'_>,
+        reason: WakeReason,
+    ) -> Result<ProcessStdioPark, ProcessStdioWaitError> {
+        drop(ticket);
+        let delivered = if reason == WakeReason::Delivery {
+            self.notice.settle_delivery()?
+        } else {
+            self.notice.try_recv()?
         };
-        drop(waiting);
-        let delivered = self.notice.try_recv()?;
         match (reason, delivered) {
             (_, Some(notice)) if self.notice_is_valid(notice) => Ok(ProcessStdioPark::StateChanged),
             (_, Some(_)) => Err(ProcessStdioWaitError::InvalidNotice),
-            (WakeReason::Delivery, None) => Err(ProcessStdioWaitError::MissingNotice),
+            // A resolved post with no record is a spurious alternate wake:
+            // the post was re-armed, and the state re-check above is truth.
+            (WakeReason::Delivery, None) => Ok(ProcessStdioPark::Wake(reason)),
             // The primary doorbell won; the alternate post remains standing
             // and `try_recv` correctly left it armed for the next pass.
             (reason, None) => Ok(ProcessStdioPark::Wake(reason)),
         }
+    }
+}
+
+/// One park, split at its wait.
+///
+/// [`ProcessStdioChild::park_after_drain`] awaits a whole park while it holds
+/// the endpoint. An owner that shares the endpoint among several streams —
+/// WASI's stdin, stdout and stderr resources over one process stream, which
+/// `wasi:io/poll` may wait on together — must not hold it across the wait.
+/// It calls [`ProcessStdioChild::prepare_park`], awaits
+/// [`crate::executor::next_wake_on`] with the ticket's post *without* the
+/// endpoint, and hands the ticket back to
+/// [`ProcessStdioChild::settle_park`]. `park_after_drain` is exactly that
+/// sequence, so the two cannot drift.
+#[must_use = "a park step either reports a change or names the wait to perform"]
+pub enum ProcessStdioParkStep<'w> {
+    /// The drained state changed, or a notice already landed: re-drain.
+    Changed,
+    /// The notice receiver is mid-rotation: wait briefly
+    /// (`next_wake_for`), then prepare again.
+    Handoff,
+    /// Await [`next_wake_on`](crate::executor::next_wake_on) on
+    /// [`post`](ProcessStdioParkTicket::post), then settle.
+    Park(ProcessStdioParkTicket<'w>),
+}
+
+/// A published wait: the standing post to park on, and this side's `waiting`
+/// flag, withdrawn when the ticket is settled or dropped.
+#[must_use = "settle the ticket after the wait, or drop it to withdraw the wait"]
+pub struct ProcessStdioParkTicket<'w> {
+    post: crate::transport::ParkPost,
+    _waiting: ProcessStdioWaiting<'w>,
+}
+
+impl ProcessStdioParkTicket<'_> {
+    /// The standing notice post to park on.
+    pub fn post(&self) -> crate::transport::ParkPost {
+        self.post
     }
 }
 
@@ -406,6 +509,17 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
     /// Snapshot the child-to-parent sequence before a total drain.
     pub fn begin_drain(&self) -> ProcessStdioDrain {
         self.peer.begin_drain()
+    }
+
+    /// Arm a stream whose child output kick was wired to the owner's shared
+    /// executor doorbell. The owner must drain every such stream on each wake.
+    /// False requests another drain before parking; the sequence/flag fence
+    /// covers publication racing this registration. No alternate post is used.
+    pub fn arm_shared_doorbell(&self, drain: ProcessStdioDrain) -> bool {
+        assert!(core::ptr::eq(drain.source, self.peer.observed));
+        self.peer.waiting.store(1, Ordering::SeqCst);
+        self.peer.observed.load(Ordering::SeqCst) == drain.sequence
+            && self.output.outstanding() == 0
     }
 
     /// Enqueue one canonical-input record and notify the child. [`Full`]
@@ -497,7 +611,7 @@ pub struct ProcessStdioChild<'w, 't, T: Transport> {
     peer: ProcessStdioPeer<'w, 't, T>,
 }
 
-impl<T: Transport> ProcessStdioChild<'_, '_, T> {
+impl<'w, T: Transport> ProcessStdioChild<'w, '_, T> {
     /// Gracefully consume a reusable child endpoint after its owner has proof
     /// that both wake roots were revoked. Ordinary process children may
     /// instead retain the endpoint until task teardown destroys their arena.
@@ -532,6 +646,22 @@ impl<T: Transport> ProcessStdioChild<'_, '_, T> {
         Ok(self.peer.signal().await)
     }
 
+    /// [`try_recv_stdin`](Self::try_recv_stdin), with the parent's
+    /// capacity notice committed synchronously — for a stream API whose
+    /// read cannot await (WASI's `input-stream.read`).
+    pub fn recv_stdin_now(&mut self) -> Option<(ProcessInputChunk, ProcessStdioWake)> {
+        let record = self.stdin.pop()?;
+        Some((record, self.peer.signal_now()))
+    }
+
+    /// [`try_send_output`](Self::try_send_output), with the parent's data
+    /// notice committed synchronously. [`Full`] alone means nothing was
+    /// published.
+    pub fn send_output_now(&mut self, record: ProcessOutputEvent) -> Result<ProcessStdioWake, Full> {
+        self.output.push(record)?;
+        Ok(self.peer.signal_now())
+    }
+
     /// Advisory published input records awaiting this child.
     pub fn stdin_outstanding(&self) -> u32 {
         self.stdin.outstanding()
@@ -550,18 +680,9 @@ impl<T: Transport> ProcessStdioChild<'_, '_, T> {
         drain: ProcessStdioDrain,
         wait_for: ProcessStdioWaitFor,
     ) -> Result<(), ProcessStdioWaitError> {
-        let stdin = &self.stdin;
-        let output = &self.output;
+        let (stdin, output) = (&self.stdin, &self.output);
         self.peer
-            .park_after_drain_inner(
-                drain,
-                || {
-                    stdin.outstanding() != 0
-                        || (wait_for == ProcessStdioWaitFor::IncomingOrCapacity
-                            && output.capacity_left() != 0)
-                },
-                None,
-            )
+            .park_after_drain_inner(drain, || stdio_ready(stdin, output, wait_for), None)
             .await
             .map(|_| ())
     }
@@ -575,20 +696,48 @@ impl<T: Transport> ProcessStdioChild<'_, '_, T> {
         wait_for: ProcessStdioWaitFor,
         delta_ns: u64,
     ) -> Result<ProcessStdioPark, ProcessStdioWaitError> {
-        let stdin = &self.stdin;
-        let output = &self.output;
+        let (stdin, output) = (&self.stdin, &self.output);
         self.peer
-            .park_after_drain_inner(
-                drain,
-                || {
-                    stdin.outstanding() != 0
-                        || (wait_for == ProcessStdioWaitFor::IncomingOrCapacity
-                            && output.capacity_left() != 0)
-                },
-                Some(delta_ns),
-            )
+            .park_after_drain_inner(drain, || stdio_ready(stdin, output, wait_for), Some(delta_ns))
             .await
     }
+
+    /// The first half of [`park_after_drain`](Self::park_after_drain),
+    /// synchronously: see [`ProcessStdioParkStep`] for the split and why an
+    /// owner sharing this endpoint needs it.
+    ///
+    /// The drain token is borrowed: after a
+    /// [`Handoff`](ProcessStdioParkStep::Handoff) the same drain is offered
+    /// again.
+    pub fn prepare_park(
+        &mut self,
+        drain: &ProcessStdioDrain,
+        wait_for: ProcessStdioWaitFor,
+    ) -> Result<ProcessStdioParkStep<'w>, ProcessStdioWaitError> {
+        let (stdin, output) = (&self.stdin, &self.output);
+        self.peer
+            .prepare_park(drain, || stdio_ready(stdin, output, wait_for))
+    }
+
+    /// The second half: withdraw the wait and consume what the wake landed.
+    pub fn settle_park(
+        &mut self,
+        ticket: ProcessStdioParkTicket<'_>,
+        reason: WakeReason,
+    ) -> Result<ProcessStdioPark, ProcessStdioWaitError> {
+        self.peer.settle_park(ticket, reason)
+    }
+}
+
+/// Whether a child's park has nothing to wait for: input arrived, or (when
+/// asked) output capacity opened.
+fn stdio_ready(
+    stdin: &Consumer<'_, ProcessInputChunk>,
+    output: &Producer<'_, ProcessOutputEvent>,
+    wait_for: ProcessStdioWaitFor,
+) -> bool {
+    stdin.outstanding() != 0
+        || (wait_for == ProcessStdioWaitFor::IncomingOrCapacity && output.capacity_left() != 0)
 }
 
 /// A freshly formatted parent attachment, before its directional wake
@@ -1054,6 +1203,37 @@ mod tests {
             init_stdio(&mut oversized.0[1..]),
             Err(RingError::Misaligned)
         ));
+    }
+
+    #[test]
+    fn shared_doorbell_covers_both_sides_of_registration_and_coalesces() {
+        let transport = OkTransport::new();
+        let mut page = Page::zeroed();
+        let (mut parent, mut child) = split_stdio(&mut page.0, &transport, &transport).unwrap();
+        let before_publish = parent.begin_drain();
+        drive(child.try_send_output(ProcessOutputEvent::stdout(b"a").unwrap())).unwrap();
+        assert!(!parent.arm_shared_doorbell(before_publish));
+        drive(parent.try_recv_output()).unwrap();
+        assert!(parent.arm_shared_doorbell(parent.begin_drain()));
+        assert_eq!(
+            drive(child.try_send_output(ProcessOutputEvent::stdout(b"b").unwrap())).unwrap(),
+            ProcessStdioWake::Delivered
+        );
+        assert_eq!(
+            drive(child.try_send_output(ProcessOutputEvent::stdout(b"c").unwrap())).unwrap(),
+            ProcessStdioWake::PeerNotWaiting
+        );
+        let drain = parent.begin_drain();
+        assert!(!parent.arm_shared_doorbell(drain));
+        assert_eq!(
+            drive(parent.try_recv_output()).unwrap().0.bytes().unwrap(),
+            b"b"
+        );
+        assert_eq!(
+            drive(parent.try_recv_output()).unwrap().0.bytes().unwrap(),
+            b"c"
+        );
+        assert!(parent.arm_shared_doorbell(parent.begin_drain()));
     }
 
     #[test]

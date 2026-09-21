@@ -267,11 +267,11 @@ pub const DERIVE_KIND_VIEW_MAP: u8 = 0xf1;
 pub const DERIVE_KIND_IRQ_ROUTE_LINE: u8 = 0xf0;
 
 /// `Derive × PciDevice/PlatformDevice → IrqRoute` for one initialized
-/// HID-over-I2C child's firmware-correlated GPIO-ready pad. The argument is an
+/// HID-over-I2C child's firmware-correlated readiness source. The argument is an
 /// [`I2cHidReq`] record query whose index is interpreted beneath the already
 /// authenticated controller capability; no GPIO community, pin, GSI or
 /// polarity is caller-selectable.
-pub const DERIVE_KIND_I2C_HID_GPIO_ROUTE: u8 = 0xef;
+pub const DERIVE_KIND_I2C_HID_READY_ROUTE: u8 = 0xef;
 
 /// `Derive × MmioRegion → LeasedIova` for an exact, sponsored peer aperture.
 ///
@@ -284,7 +284,7 @@ pub const DERIVE_KIND_I2C_HID_GPIO_ROUTE: u8 = 0xef;
 /// `bytes` select the exact BAR subrange; neither a whole-BAR inference nor an
 /// ambient PCI-class whitelist exists.
 ///
-/// `0xec` is the next unused selector below [`DERIVE_KIND_I2C_HID_GPIO_ROUTE`]
+/// `0xec` is the next unused selector below [`DERIVE_KIND_I2C_HID_READY_ROUTE`]
 /// once `0xee` (the terminal device quiesce, #847) and `0xed` (its
 /// next-flavor probe) are set aside — the two arcs must compose in either
 /// landing order.
@@ -332,7 +332,7 @@ pub const DEVICE_MMU_RIGHTS: crate::cap::Rights = crate::cap::Rights::ACCESS
 /// offsets and physical BAR addresses never cross this boundary. The kernel
 /// also proves every reported interval lies wholly inside that BAR's
 /// user-mappable prefix before encoding it.
-pub const DERIVE_KIND_VIRTIO_PCI_LAYOUT: u8 = 0xe2;
+pub const DERIVE_KIND_VIRTIO_PCI_LAYOUT: u8 = 0xdc;
 
 /// `Derive × AddrSpace` (the caller's **own** space — any thread view of
 /// it; the kernel verifies by page-table root, the same discriminator
@@ -403,6 +403,125 @@ pub const DERIVE_KIND_PROTECT: u8 = 0xfa;
 /// status has to outlive it for a joiner ([`DERIVE_KIND_TASK_JOIN`]) to
 /// read.  The reap is still the handle's `Revoke`.
 pub const DERIVE_KIND_TASK_EXIT: u8 = 0xfc;
+
+/// Close the calling process owner's worker admission and physically drain
+/// every peer in that exact address space. SELF + MODIFY, sole invocation,
+/// no arguments. Workers and peer handles cannot request this operation.
+/// The result is a bind-inert `ProcessDrainReport`; WouldBlock reports no proof
+/// and may be retried after a concurrent physical reaper completes.
+pub const DERIVE_KIND_PROCESS_DRAIN: u8 = 0xe2;
+
+/// Read one immutable crash-evidence chunk through an owning task handle.
+/// ACCESS + REVOKE, sole invocation. The argument is a little-endian u32
+/// chunk index followed by four zero bytes. No record returns Exited;
+/// live subjects return WouldBlock. Lifecycle observers cannot read stacks.
+pub const DERIVE_KIND_CRASH_READ: u8 = 0xe1;
+/// Report a fatal software panic on SELF. The payload is UTF-8 with a u32
+/// length, four reserved zero bytes, and exactly that many message bytes.
+/// MODIFY, standalone. Never grants the caller authority over another process.
+/// Panic arguments: UTF-8 length u32, truncated u8 (0/1), zero[3], message bytes.
+pub const DERIVE_KIND_PANIC_REPORT: u8 = 0xe0;
+/// Bind a parent-owned, unmapped RAM lease before TASK_START. Arguments are
+/// lease slot u32, reserved-zero u32, page-aligned offset u64 and length u64.
+/// Task MODIFY|REVOKE and lease MODIFY are required. Standalone, no result.
+pub const DERIVE_KIND_CRASH_BIND: u8 = 0xdf;
+/// Assign a bounded UTF-8 task label once before START (Task MODIFY).
+/// Arguments: byte length u8 followed by that many UTF-8 bytes, at most 63.
+pub const DERIVE_KIND_TASK_NAME: u8 = 0xde;
+/// Task ACCESS; standalone, no arguments. Returns an inert TaskIdentity report.
+pub const DERIVE_KIND_TASK_IDENTITY: u8 = 0xdd;
+pub const TASK_IDENTITY_KIND: u16 = 0xFF16;
+pub const TASK_IDENTITY_MAGIC: u64 = 0x6b6f_7265_5449_4431;
+impl crate::task::TaskIdentity {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(TASK_IDENTITY_KIND, TASK_IDENTITY_MAGIC);
+        rec.mac = self.id.bytes();
+        rec.scope_rid = self.quality as u64;
+        rec
+    }
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        if !is_inert_report(rec, TASK_IDENTITY_KIND, TASK_IDENTITY_MAGIC)
+            || rec.holder != crate::cap::Cid::NULL
+            || !rec.rights.is_empty()
+            || rec.epoch != 0
+            || rec.chain_len != 0
+            || rec.chain != [0; crate::cap::MAX_DEPTH]
+            || rec.scope_rid > u8::MAX as u64
+        {
+            return None;
+        }
+        Some(Self {
+            id: crate::task::TaskId::from_bytes(rec.mac),
+            quality: crate::task::TaskIdQuality::decode(rec.scope_rid as u8)?,
+        })
+    }
+}
+pub const CRASH_CHUNK_BYTES: usize = 16;
+pub const CRASH_CHUNK_KIND: u16 = 0xFF15;
+pub const CRASH_CHUNK_MAGIC: u64 = 0x6b6f_7265_4352_5348;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CrashChunk {
+    pub index: u32,
+    pub bytes: [u8; CRASH_CHUNK_BYTES],
+}
+impl CrashChunk {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(CRASH_CHUNK_KIND, CRASH_CHUNK_MAGIC);
+        rec.scope_rid = u64::from(self.index);
+        rec.mac = self.bytes;
+        rec
+    }
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        if !is_inert_report(rec, CRASH_CHUNK_KIND, CRASH_CHUNK_MAGIC)
+            || rec.scope_rid >= (crate::crash::MIN_BUFFER_BYTES / CRASH_CHUNK_BYTES) as u64
+            || rec.holder != crate::cap::Cid::NULL
+            || !rec.rights.is_empty()
+            || rec.epoch != 0
+            || rec.chain_len != 0
+            || rec.chain != [0; crate::cap::MAX_DEPTH]
+        {
+            return None;
+        }
+        Some(Self {
+            index: rec.scope_rid as u32,
+            bytes: rec.mac,
+        })
+    }
+}
+
+/// Successful terminal worker barrier. Forced shutdown skips user finalizers:
+/// arbitrary interrupted user code may have left shared state inconsistent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessDrainReport {
+    pub forced: bool,
+}
+pub const PROCESS_DRAIN_REPORT_KIND: u16 = 0xFF14;
+pub const PROCESS_DRAIN_REPORT_MAGIC: u64 = 0x6b6f_7265_4452_414e;
+impl ProcessDrainReport {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(PROCESS_DRAIN_REPORT_KIND, PROCESS_DRAIN_REPORT_MAGIC);
+        rec.scope_rid = u64::from(self.forced);
+        rec
+    }
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        if !is_inert_report(rec, PROCESS_DRAIN_REPORT_KIND, PROCESS_DRAIN_REPORT_MAGIC)
+            || rec.scope_rid > 1
+        {
+            return None;
+        }
+        let result = Self {
+            forced: rec.scope_rid != 0,
+        };
+        let canonical = result.encode();
+        (rec.holder == canonical.holder
+            && rec.rights == canonical.rights
+            && rec.epoch == canonical.epoch
+            && rec.chain_len == canonical.chain_len
+            && rec.chain == canonical.chain
+            && rec.mac == canonical.mac)
+            .then_some(result)
+    }
+}
 
 /// `Derive × Task` that **joins** the subject task: the result slot
 /// receives a bind-inert [`ExitReport`] once it has exited.  `ACCESS` on
@@ -517,7 +636,7 @@ pub const DERIVE_KIND_DEVICE_ACTIVATE: u8 = 0xf6;
 /// it stopped, the kernel proves what the fabric saw.
 ///
 /// `0xee` is the next unused selector below
-/// [`DERIVE_KIND_I2C_HID_GPIO_ROUTE`].
+/// [`DERIVE_KIND_I2C_HID_READY_ROUTE`].
 pub const DERIVE_KIND_DEVICE_QUIESCE: u8 = 0xee;
 
 /// `Derive × GuestSpace` terminal founding flavor: create one schedulable
@@ -683,12 +802,23 @@ impl ExitReport {
         rec
     }
 
-    /// Decode from the caller's result slot (client side).  `None` for
-    /// anything that is not a deliberate exit report.
+    /// Decode only the exact bind-inert exit encoding, including canonical
+    /// sign extension of its i32 payload. Malformed high bits must not become
+    /// another status (in particular success) through a narrowing cast.
     pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
-        is_inert_report(rec, EXIT_REPORT_KIND, EXIT_REPORT_MAGIC).then_some(Self {
-            status: rec.scope_rid as i64 as i32,
-        })
+        if !is_inert_report(rec, EXIT_REPORT_KIND, EXIT_REPORT_MAGIC) {
+            return None;
+        }
+        let status = i32::try_from(rec.scope_rid as i64).ok()?;
+        let report = Self { status };
+        let canonical = report.encode();
+        (rec.holder == canonical.holder
+            && rec.rights == canonical.rights
+            && rec.epoch == canonical.epoch
+            && rec.chain_len == canonical.chain_len
+            && rec.chain == canonical.chain
+            && rec.mac == canonical.mac)
+            .then_some(report)
     }
 }
 
@@ -1204,9 +1334,11 @@ const _: () = {
     assert!((crate::cap::ResourceKind::PlatformBus as u16) < DERIVE_KIND_I2C_HID_RECORD as u16);
     assert!(DERIVE_KIND_I2C_HID_RECORD != DERIVE_KIND_DEVICE_ACTIVATE);
     assert!(DERIVE_KIND_I2C_HID_RECORD != DERIVE_KIND_IRQ_ROUTE_MSIX);
-    assert!((crate::cap::ResourceKind::PlatformBus as u16) < DERIVE_KIND_I2C_HID_GPIO_ROUTE as u16);
-    assert!(DERIVE_KIND_I2C_HID_GPIO_ROUTE != DERIVE_KIND_IRQ_ROUTE_LINE);
-    assert!(DERIVE_KIND_I2C_HID_GPIO_ROUTE != DERIVE_KIND_I2C_HID_RECORD);
+    assert!(
+        (crate::cap::ResourceKind::PlatformBus as u16) < DERIVE_KIND_I2C_HID_READY_ROUTE as u16
+    );
+    assert!(DERIVE_KIND_I2C_HID_READY_ROUTE != DERIVE_KIND_IRQ_ROUTE_LINE);
+    assert!(DERIVE_KIND_I2C_HID_READY_ROUTE != DERIVE_KIND_I2C_HID_RECORD);
     assert!((crate::cap::ResourceKind::SharedRamRegion as u16) < DERIVE_KIND_PEER_IOVA as u16);
     assert!(DERIVE_KIND_PEER_IOVA != DERIVE_KIND_IRQ_ROUTE_MSIX);
     assert!(DERIVE_KIND_PEER_IOVA != DERIVE_KIND_DEVICE_ACTIVATE);
@@ -1237,7 +1369,13 @@ const _: () = {
 /// Their authenticated subject kinds disambiguate both pairs. This table is a
 /// vocabulary, not a uniqueness proof; the pairwise same-subject assertions
 /// above carry the distinctness that matters.
-const DERIVE_FLAVORS: [u8; 30] = [
+const DERIVE_FLAVORS: [u8; 36] = [
+    DERIVE_KIND_TASK_IDENTITY,
+    DERIVE_KIND_TASK_NAME,
+    DERIVE_KIND_PROCESS_DRAIN,
+    DERIVE_KIND_CRASH_READ,
+    DERIVE_KIND_PANIC_REPORT,
+    DERIVE_KIND_CRASH_BIND,
     DERIVE_KIND_VIRTIO_PCI_LAYOUT,
     DERIVE_KIND_IOVA_ANON,
     DERIVE_KIND_SET_TP,
@@ -1255,7 +1393,7 @@ const DERIVE_FLAVORS: [u8; 30] = [
     DERIVE_KIND_SUPPLY_RELEASE,
     DERIVE_KIND_VIEW_MAP,
     DERIVE_KIND_IRQ_ROUTE_LINE,
-    DERIVE_KIND_I2C_HID_GPIO_ROUTE,
+    DERIVE_KIND_I2C_HID_READY_ROUTE,
     DERIVE_KIND_GUEST_FOUND,
     DERIVE_KIND_DEVICE_QUIESCE,
     DERIVE_KIND_PEER_IOVA,
@@ -1308,7 +1446,10 @@ const _: () = {
 /// both `0xFF05` for ~80 commits because nothing owned the proof.  A new
 /// member joins by adding its row; forgetting to is caught by the arity
 /// assert any time the member count moves.
-const REPORT_KINDS: [u16; 19] = [
+const REPORT_KINDS: [u16; 22] = [
+    TASK_IDENTITY_KIND,
+    PROCESS_DRAIN_REPORT_KIND,
+    CRASH_CHUNK_KIND,
     VIRTIO_PCI_CAP_REPORT_KIND,
     VIRTIO_PCI_CAP_COUNT_REPORT_KIND,
     NOTICE_KIND,
@@ -1800,10 +1941,16 @@ impl ShareReq {
 /// mapping: the task must hold the view and the founder must stamp the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMapWindow {
-    /// Ordinary small views and heap growth, bounded to this thread's stride.
+    /// Ordinary small views, bounded to this thread's stride — and heap
+    /// growth on a thread without a [`Heap`](Self::Heap) window.
     Map,
     /// Large compositor-owned surfaces, separate from that heap stride.
     Surfaces,
+    /// The task's heap window (`geom::HEAP`, GEOM_ABI v7): where the process
+    /// heap maps the carves it takes off its own supply, a monotone cursor
+    /// like [`Map`](Self::Map)'s but task-level and off the per-thread stride
+    /// every view shares. Stamped for founded tasks only.
+    Heap,
 }
 
 /// One of the two fixed, reusable halves of a task's `SURFACES` window.
@@ -1836,6 +1983,7 @@ impl ViewMapWindow {
         match self {
             Self::Map => crate::task::geom::MAP,
             Self::Surfaces => crate::task::geom::SURFACES,
+            Self::Heap => crate::task::geom::HEAP,
         }
     }
 }
@@ -1862,6 +2010,7 @@ impl ViewMapReq {
         }
         match self.window.get() {
             crate::task::geom::MAP if self.lane == 0 => Some(ViewMapWindow::Map),
+            crate::task::geom::HEAP if self.lane == 0 => Some(ViewMapWindow::Heap),
             crate::task::geom::SURFACES if SurfaceMapLane::from_wire(self.lane).is_some() => {
                 Some(ViewMapWindow::Surfaces)
             }
@@ -2532,9 +2681,12 @@ pub enum SystemMetric {
     /// refused it, and a serial-less machine's only view of it.
     IommuFaults = 6,
     /// Live memory-fabric domain registrations (res/MEMORY_FABRIC.md, #697);
-    /// auxiliary = the registry capacity. A minimally exposed health surface:
-    /// the fabric registry is up when this samples, and the count is how many
-    /// allocation domains are registered (zero until a producer registers one).
+    /// value packs domain count in the low word and registry capacity in the
+    /// high word. Auxiliary packs registered extent KiB in `[31:0]`, domains
+    /// with at least one lendable window in `[47:32]`, and domains requiring a
+    /// producer/consumer visibility fence in `[63:48]`. This remains a
+    /// data-only census: it does not attest capability liveness or an
+    /// executable device route.
     Fabric = 7,
     /// Manifold barrier exponents (MANIFOLD §6.3, §14.4): value packs
     /// `α_cpu × 10⁶` in the low word and `α_mem × 10⁶` in the high word;
@@ -2579,6 +2731,222 @@ pub enum SystemMetric {
     Sleep = 17,
     /// Last lid level and close-edge generation; see LidSnapshot.
     Lid = 18,
+    /// Scheduler-timer hardware arms since boot, summed over every CPU;
+    /// auxiliary packs `[63:32]` arms that needed a second try (a
+    /// TSC-deadline write that read back as zero before its instant and was
+    /// written again, or a one-shot count that rounded to zero and was
+    /// clamped to one tick), `[31:0]` arms refused after the second deadline
+    /// write also read zero (the CPU then wakes only on other interrupts
+    /// until an arm lands).  Zero auxiliary on a machine that shows
+    /// deadline-shaped stalls acquits the timer; a growing one convicts it.
+    /// Architectures without a counted arm report zeros.
+    TimerArms = 19,
+    /// One physical frame-size class of the boot partition
+    /// (`res/ACCEL_MEMORY_SCALE.md` §1): the operand is the class
+    /// (0 = 4 KiB base, 1 = 2 MiB, 2 = 1 GiB), and the pair is
+    /// [`MemoryClassCensus::to_observation`] — bytes carved into the class,
+    /// bytes still free in it, and requests the class could not serve from
+    /// its own ledger.  An operand past 2 refuses.
+    MemoryClass = 20,
+    /// The boot-time DRAM stream measurement (`res/RESIDENCY.md` §8 row
+    /// 1), three views by operand range: `0..MEMORY_STREAM_CLASS_BASE` one
+    /// node per index in measurement order (0 is the first node measured,
+    /// which on a UMA machine is the only one; `slot` = node slot, HMAT
+    /// beside it); `MEMORY_STREAM_CLASS_BASE + class` one CPU of that core
+    /// class alone (`slot` = the CPU that ran it); `MEMORY_STREAM_AGGREGATE`
+    /// every CPU at once (`slot` = how many).
+    /// [`MemoryStreamSample::to_observation`].  An operand with no sample
+    /// answers all-zero rather than refusing, so a reader can walk a range.
+    MemoryStream = 21,
+    /// One CPU's boot DRAM stream, alone — operand = the CPU's ordinal in
+    /// the catalog, like the other `Processor*` metrics.  `value` = builtin
+    /// fill rate, bytes per second; `aux` = copy rate in `[39:0]` and the
+    /// scrub fill in 100 MB/s units in `[63:40]`; all zero when that CPU
+    /// was not measured (no run to lend, or it never answered).
+    ProcessorStream = 22,
+}
+
+/// The three physical frame-size classes, as the census operand names them.
+pub const MEMORY_CLASS_COUNT: u16 = 3;
+/// [`SystemMetric::MemoryStream`] operands at and above this name a core
+/// class (`CoreClass` discriminant 0..=3) measured alone.
+pub const MEMORY_STREAM_CLASS_BASE: u16 = 64;
+/// Core classes the stream metric distinguishes.
+pub const MEMORY_STREAM_CLASSES: u16 = 4;
+/// The [`SystemMetric::MemoryStream`] operand of the all-CPUs measurement.
+pub const MEMORY_STREAM_AGGREGATE: u16 = MEMORY_STREAM_CLASS_BASE + MEMORY_STREAM_CLASSES;
+
+/// Authority-free record of one boot DRAM stream measurement
+/// ([`SystemMetric::MemoryStream`]).  A measured rate, never a link ceiling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryStreamSample {
+    /// The Manifold node slot the run was lent from (node view), the CPU
+    /// that ran it (class view), or the CPU count (aggregate view).
+    pub slot: u8,
+    /// Fill rate through the builtin fill, bytes per second.
+    pub write_bps: u64,
+    /// Copy rate, bytes copied per second.
+    pub copy_bps: u64,
+    /// HMAT's self-access bandwidth for the node, bytes per second, or `0`.
+    pub hmat_bps: u64,
+    /// Fill rate through the kernel's scrub fill (streaming stores where
+    /// the ISA has them), bytes per second.
+    pub streaming_bps: u64,
+}
+
+impl MemoryStreamSample {
+    /// `value` = builtin fill rate in `[39:0]` (1.1 TB/s), the scrub fill in
+    /// 100 MB/s units in `[55:40]` (6.5 TB/s), the slot in `[63:56]`;
+    /// `aux` = copy rate in `[39:0]` and HMAT in MB/s in `[63:40]`.
+    pub const fn to_observation(self) -> (u64, u64) {
+        const RATE: u64 = (1 << 40) - 1;
+        let write = if self.write_bps > RATE {
+            RATE
+        } else {
+            self.write_bps
+        };
+        let copy = if self.copy_bps > RATE {
+            RATE
+        } else {
+            self.copy_bps
+        };
+        let streaming = self.streaming_bps / 100_000_000;
+        let streaming = if streaming > u16::MAX as u64 {
+            u16::MAX as u64
+        } else {
+            streaming
+        };
+        let hmat = self.hmat_bps / 1_000_000;
+        let hmat = if hmat > (1 << 24) - 1 {
+            (1 << 24) - 1
+        } else {
+            hmat
+        };
+        (
+            write | streaming << 40 | (self.slot as u64) << 56,
+            copy | hmat << 40,
+        )
+    }
+
+    pub const fn from_observation(value: u64, aux: u64) -> Self {
+        Self {
+            slot: (value >> 56) as u8,
+            write_bps: value & ((1 << 40) - 1),
+            copy_bps: aux & ((1 << 40) - 1),
+            hmat_bps: (aux >> 40) * 1_000_000,
+            streaming_bps: ((value >> 40) & 0xFFFF) * 100_000_000,
+        }
+    }
+
+    /// Whether a measurement is present at all.
+    pub const fn measured(self) -> bool {
+        self.write_bps != 0
+    }
+}
+
+/// Authority-free census of one frame-size class
+/// ([`SystemMetric::MemoryClass`]).  Capacity facts only; it grants nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryClassCensus {
+    /// Bytes carved into the class at boot (free or not).
+    pub carved: u64,
+    /// Bytes free in the class now.
+    pub free: u64,
+    /// Requests of this class served from a finer ledger because the class
+    /// was exhausted — the reservation-miss count the 40/30/30 ruling is
+    /// judged by.
+    pub misses: u64,
+}
+
+impl MemoryClassCensus {
+    /// `value` = carved bytes; `aux` = free bytes in `[47:0]` (256 TiB) and
+    /// misses saturated to 16 bits in `[63:48]`.
+    pub const fn to_observation(self) -> (u64, u64) {
+        let free = if self.free > (1 << 48) - 1 {
+            (1 << 48) - 1
+        } else {
+            self.free
+        };
+        let misses = if self.misses > u16::MAX as u64 {
+            u16::MAX as u64
+        } else {
+            self.misses
+        };
+        (self.carved, free | misses << 48)
+    }
+
+    pub const fn from_observation(value: u64, aux: u64) -> Self {
+        Self {
+            carved: value,
+            free: aux & ((1 << 48) - 1),
+            misses: aux >> 48,
+        }
+    }
+}
+
+/// Authority-free aggregate returned by [`SystemMetric::Fabric`].
+///
+/// This type is the single wire contract between the kernel registry census
+/// and the monitor service.  It describes registered planning facts only; it
+/// does not prove that a capability remains live or that a device route can
+/// execute.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FabricCensus {
+    pub domains: u32,
+    pub capacity: u32,
+    pub extent_bytes: u64,
+    pub lendable_domains: u32,
+    pub fence_required_domains: u32,
+}
+
+/// Number of bytes represented by one extent unit in `SystemObserve`.
+const FABRIC_EXTENT_UNIT_BYTES: u64 = 1 << 10;
+
+impl FabricCensus {
+    /// Encode into the generic observation pair used by `SystemObserve`.
+    /// Extent is represented in KiB and auxiliary domain counts saturate at
+    /// their fixed-width wire fields.
+    pub const fn to_observation(self) -> (u64, u64) {
+        let extent_kib = self.extent_bytes / FABRIC_EXTENT_UNIT_BYTES;
+        let extent_kib = if extent_kib > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            extent_kib as u32
+        };
+        let lendable = if self.lendable_domains > u16::MAX as u32 {
+            u16::MAX
+        } else {
+            self.lendable_domains as u16
+        };
+        let fences = if self.fence_required_domains > u16::MAX as u32 {
+            u16::MAX
+        } else {
+            self.fence_required_domains as u16
+        };
+        (
+            self.domains as u64 | ((self.capacity as u64) << 32),
+            extent_kib as u64 | ((lendable as u64) << 32) | ((fences as u64) << 48),
+        )
+    }
+
+    /// Decode and validate one fabric observation.
+    pub const fn from_observation(value: u64, aux: u64) -> Option<Self> {
+        let out = Self {
+            domains: value as u32,
+            capacity: (value >> 32) as u32,
+            extent_bytes: (aux as u32 as u64) * FABRIC_EXTENT_UNIT_BYTES,
+            lendable_domains: ((aux >> 32) as u16) as u32,
+            fence_required_domains: ((aux >> 48) as u16) as u32,
+        };
+        if (out.capacity != 0 && out.domains > out.capacity)
+            || out.lendable_domains > out.domains
+            || out.fence_required_domains > out.domains
+        {
+            None
+        } else {
+            Some(out)
+        }
+    }
 }
 
 /// Read-only lid mechanism data. Generation advances only on a runtime close
@@ -2718,6 +3086,9 @@ impl SystemObserveReq {
                 | SystemMetric::ProcessorTopology
                 | SystemMetric::ProcessorCache
                 | SystemMetric::ProcessorRuntime
+                | SystemMetric::MemoryClass
+                | SystemMetric::MemoryStream
+                | SystemMetric::ProcessorStream
         )
     }
 
@@ -3055,7 +3426,81 @@ pub struct FabricRouteReq {
     pub reserved: [u8; 5],
 }
 
+bitflags! {
+    /// Route access on the wire (`FabricRouteReq::access`,
+    /// `FabricRouteScopeReq::access`): the three bits the kernel's
+    /// `runtime::fabric::FabricAccess` decodes.  At least one data direction
+    /// is required; `EXCLUSIVE` bars every independently admitted alias.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FabricAccess: u8 {
+        const READ      = 1 << 0;
+        const WRITE     = 1 << 1;
+        const EXCLUSIVE = 1 << 2;
+    }
+}
+
+/// The mapping operation a route admits (`FabricRouteReq::operation`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FabricOp {
+    /// A CPU mapping child (`LeasedRegion`).
+    CpuMap = 0,
+    /// A device mapping child (`LeasedIova`); also admits CPU children.
+    IommuMap = 1,
+}
+
+/// The caller's declared visibility state (`FabricRouteReq::synchronization`).
+/// A declaration, never hardware attestation of a producer fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FabricSync {
+    Unfenced = 0,
+    Fenced = 1,
+}
+
 impl FabricRouteReq {
+    /// A route between two described domains over `offset..offset+bytes`
+    /// of the source, carrying both endpoints' captured generations.  The
+    /// twelve-field literal every call site used to spell by hand.
+    pub fn between(
+        src: &FabricDomainReport,
+        dst: &FabricDomainReport,
+        offset: u64,
+        bytes: u64,
+        op: FabricOp,
+        access: FabricAccess,
+        sync: FabricSync,
+    ) -> Self {
+        Self {
+            destination: dst.domain.into(),
+            offset: offset.into(),
+            bytes: bytes.into(),
+            source_reset: src.reset.into(),
+            source_power: src.power.into(),
+            source_allocation: src.allocation.into(),
+            destination_reset: dst.reset.into(),
+            destination_power: dst.power.into(),
+            destination_allocation: dst.allocation.into(),
+            access: access.bits(),
+            operation: op as u8,
+            synchronization: sync as u8,
+            reserved: [0; 5],
+        }
+    }
+
+    /// The common case: a route whose source and destination are the same
+    /// registered domain (host DRAM mapped into a CPU space or a device
+    /// domain), over the first `bytes` of the registration.
+    pub fn self_route(
+        facts: &FabricDomainReport,
+        bytes: u64,
+        op: FabricOp,
+        access: FabricAccess,
+        sync: FabricSync,
+    ) -> Self {
+        Self::between(facts, facts, 0, bytes, op, access, sync)
+    }
+
     pub fn encode(&self) -> [u8; Self::WIRE] {
         let mut bytes = [0u8; Self::WIRE];
         for (i, value) in [self.destination, self.offset, self.bytes]
@@ -3108,6 +3553,16 @@ pub struct FabricRouteScopeReq {
 }
 
 impl FabricRouteScopeReq {
+    /// A page-granular relative range with attenuated access.
+    pub const fn new(offset: u64, bytes: u64, access: FabricAccess) -> Self {
+        Self {
+            offset: U64::new(offset),
+            bytes: U64::new(bytes),
+            access: access.bits(),
+            reserved: [0; 7],
+        }
+    }
+
     pub const WIRE: usize = 24;
     pub fn valid(&self) -> bool {
         self.bytes.get() != 0
@@ -3782,7 +4237,7 @@ impl I2cGpioPolarity {
     }
 }
 
-/// Kernel-side readiness of one firmware-described I2C-HID GPIO route.
+/// Kernel-side readiness of one firmware-described I2C-HID child route.
 ///
 /// This is configuration evidence, not authority: it explains whether the
 /// immutable boot-time GPIO inventory admitted the pad. The caller must still
@@ -3790,8 +4245,8 @@ impl I2cGpioPolarity {
 /// refuse.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum I2cGpioRouteState {
-    /// Firmware did not describe a GPIO interrupt for this child.
+pub enum I2cReadyRouteState {
+    /// Firmware did not describe a readiness interrupt for this child.
     #[default]
     NotDescribed = 0,
     /// The `GpioInt` source path did not resolve to a discovered community.
@@ -3812,7 +4267,8 @@ pub enum I2cGpioRouteState {
     QuiesceRefused = 8,
     /// The parent GSI could not be installed in the interrupt fabric.
     ParentRouteRefused = 9,
-    /// The parent route and pad geometry are ready for capability derivation.
+    /// The source is described and ready for capability derivation. Line
+    /// admission still occurs in the pin fabric when deriving the capability.
     Ready = 10,
     /// GPIO setup did not publish a diagnostic for this described child.
     SetupUnavailable = 11,
@@ -3824,7 +4280,7 @@ pub enum I2cGpioRouteState {
     PadAliasRefused = 13,
 }
 
-impl I2cGpioRouteState {
+impl I2cReadyRouteState {
     pub const fn from_bits(bits: u32) -> Option<Self> {
         match bits {
             0 => Some(Self::NotDescribed),
@@ -3861,10 +4317,21 @@ pub struct I2cHidReport {
     pub fast_timing: Option<I2cTimingReport>,
     /// Controller input clock established by firmware integration data.
     pub input_clock_hz: Option<u32>,
-    pub gpio_interrupt: Option<I2cGpioInterruptReport>,
-    pub gpio_route_state: I2cGpioRouteState,
+    pub ready_interrupt: Option<I2cReadyInterruptReport>,
+    pub ready_route_state: I2cReadyRouteState,
     pub no_irq: bool,
     pub no_power_after_reset: bool,
+}
+
+/// Data only: deriving this source still requires the exact controller cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum I2cReadyInterruptReport {
+    Gpio(I2cGpioInterruptReport),
+    Line {
+        gsi: u32,
+        edge: bool,
+        active_high: bool,
+    },
 }
 
 /// One HID child's data-ready GPIO description.
@@ -3887,13 +4354,15 @@ const I2C_GPIO_EDGE: u8 = 1 << 3;
 const I2C_QUIRK_NO_IRQ: u8 = 1 << 4;
 const I2C_QUIRK_NO_POWER_AFTER_RESET: u8 = 1 << 5;
 const I2C_INPUT_CLOCK: u8 = 1 << 6;
+const I2C_LINE_INTERRUPT: u8 = 1 << 7;
 const I2C_REPORT_FLAGS: u8 = I2C_STD_TIMING
     | I2C_FAST_TIMING
     | I2C_GPIO_INTERRUPT
     | I2C_GPIO_EDGE
     | I2C_QUIRK_NO_IRQ
     | I2C_QUIRK_NO_POWER_AFTER_RESET
-    | I2C_INPUT_CLOCK;
+    | I2C_INPUT_CLOCK
+    | I2C_LINE_INTERRUPT;
 
 impl I2cHidReport {
     /// Encode as bind-inert data. Zero is the absence sentinel for timing
@@ -3924,13 +4393,28 @@ impl I2cHidReport {
         if self.fast_timing.is_some() {
             flags |= I2C_FAST_TIMING;
         }
-        if let Some(gpio) = self.gpio_interrupt {
-            flags |= I2C_GPIO_INTERRUPT;
-            if gpio.edge {
+        if let Some(interrupt) = self.ready_interrupt {
+            let edge = match interrupt {
+                I2cReadyInterruptReport::Gpio(gpio) => {
+                    flags |= I2C_GPIO_INTERRUPT;
+                    rec.epoch = u32::from(gpio.pin);
+                    rec.chain[0] = gpio.polarity as u32;
+                    gpio.edge
+                }
+                I2cReadyInterruptReport::Line {
+                    gsi,
+                    edge,
+                    active_high,
+                } => {
+                    flags |= I2C_LINE_INTERRUPT;
+                    rec.epoch = gsi;
+                    rec.chain[0] = u32::from(active_high);
+                    edge
+                }
+            };
+            if edge {
                 flags |= I2C_GPIO_EDGE;
             }
-            rec.epoch = u32::from(gpio.pin);
-            rec.chain[0] = gpio.polarity as u32;
         }
         if self.no_irq {
             flags |= I2C_QUIRK_NO_IRQ;
@@ -3942,7 +4426,7 @@ impl I2cHidReport {
             flags |= I2C_INPUT_CLOCK;
             rec.chain[1] = hz;
         }
-        rec.chain[2] = self.gpio_route_state as u32;
+        rec.chain[2] = self.ready_route_state as u32;
         rec.rights = crate::cap::Rights::from_bits_retain(flags);
         rec
     }
@@ -3991,20 +4475,34 @@ impl I2cHidReport {
             None
         };
 
-        let gpio_interrupt = if flags & I2C_GPIO_INTERRUPT != 0 {
-            if rec.epoch > u32::from(u16::MAX) {
-                return None;
+        let ready_interrupt = match flags & (I2C_GPIO_INTERRUPT | I2C_LINE_INTERRUPT) {
+            I2C_GPIO_INTERRUPT => {
+                if rec.epoch > u32::from(u16::MAX) {
+                    return None;
+                }
+                Some(I2cReadyInterruptReport::Gpio(I2cGpioInterruptReport {
+                    pin: rec.epoch as u16,
+                    edge: flags & I2C_GPIO_EDGE != 0,
+                    polarity: I2cGpioPolarity::from_bits(rec.chain[0])?,
+                }))
             }
-            Some(I2cGpioInterruptReport {
-                pin: rec.epoch as u16,
-                edge: flags & I2C_GPIO_EDGE != 0,
-                polarity: I2cGpioPolarity::from_bits(rec.chain[0])?,
-            })
-        } else {
-            if flags & I2C_GPIO_EDGE != 0 || rec.epoch != 0 || rec.chain[0] != 0 {
-                return None;
+            I2C_LINE_INTERRUPT => {
+                if rec.chain[0] > 1 {
+                    return None;
+                }
+                Some(I2cReadyInterruptReport::Line {
+                    gsi: rec.epoch,
+                    edge: flags & I2C_GPIO_EDGE != 0,
+                    active_high: rec.chain[0] != 0,
+                })
             }
-            None
+            0 => {
+                if flags & I2C_GPIO_EDGE != 0 || rec.epoch != 0 || rec.chain[0] != 0 {
+                    return None;
+                }
+                None
+            }
+            _ => return None, // A child cannot name two different source kinds.
         };
         let input_clock_hz = if flags & I2C_INPUT_CLOCK != 0 {
             Some((rec.chain[1] != 0).then_some(rec.chain[1])?)
@@ -4014,8 +4512,8 @@ impl I2cHidReport {
             }
             None
         };
-        let gpio_route_state = I2cGpioRouteState::from_bits(rec.chain[2])?;
-        if gpio_interrupt.is_some() == (gpio_route_state == I2cGpioRouteState::NotDescribed) {
+        let ready_route_state = I2cReadyRouteState::from_bits(rec.chain[2])?;
+        if ready_interrupt.is_some() == (ready_route_state == I2cReadyRouteState::NotDescribed) {
             return None;
         }
         if rec.chain[3..].iter().any(|&word| word != 0) {
@@ -4029,8 +4527,8 @@ impl I2cHidReport {
             standard_timing,
             fast_timing,
             input_clock_hz,
-            gpio_interrupt,
-            gpio_route_state,
+            ready_interrupt,
+            ready_route_state,
             no_irq: flags & I2C_QUIRK_NO_IRQ != 0,
             no_power_after_reset: flags & I2C_QUIRK_NO_POWER_AFTER_RESET != 0,
         })
@@ -4080,7 +4578,7 @@ pub struct VirtioPciCapReport {
     pub notify_multiplier: u32,
 }
 
-pub const VIRTIO_PCI_CAP_REPORT_KIND: u16 = 0xFF14;
+pub const VIRTIO_PCI_CAP_REPORT_KIND: u16 = 0xFF17;
 pub const VIRTIO_PCI_CAP_REPORT_MAGIC: u64 = 0x6B6F_7265_5650_4349; // "koreVPCI"
 
 impl VirtioPciCapReport {
@@ -4121,7 +4619,7 @@ pub struct VirtioPciCapCountReport {
     pub len: u8,
 }
 
-pub const VIRTIO_PCI_CAP_COUNT_REPORT_KIND: u16 = 0xFF15;
+pub const VIRTIO_PCI_CAP_COUNT_REPORT_KIND: u16 = 0xFF18;
 pub const VIRTIO_PCI_CAP_COUNT_REPORT_MAGIC: u64 = 0x6B6F_7265_5650_434E; // "koreVPCN"
 
 impl VirtioPciCapCountReport {
@@ -4228,6 +4726,40 @@ impl SupplyReleaseReport {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn task_identity_reports_validate_quality_and_never_carry_authority() {
+        use crate::task::{TaskId, TaskIdQuality, TaskIdentity};
+        for quality in [
+            TaskIdQuality::Unverified,
+            TaskIdQuality::HardwareOrFirmware,
+            TaskIdQuality::TimingJitter,
+            TaskIdQuality::Degenerate,
+        ] {
+            let identity = TaskIdentity {
+                id: TaskId::from_bytes([0xa5; 16]),
+                quality,
+            };
+            let rec = identity.encode();
+            assert_eq!(TaskIdentity::decode(&rec), Some(identity));
+            assert_eq!(rec.cid, crate::cap::Cid::NULL);
+            for field in 0..9 {
+                let mut bad = rec;
+                match field {
+                    0 => bad.cid = crate::cap::Cid(1),
+                    1 => bad.holder = crate::cap::Cid(1),
+                    2 => bad.parent = crate::cap::Cid(0),
+                    3 => bad.rights = Rights::ACCESS,
+                    4 => bad.epoch = 1,
+                    5 => bad.chain_len = 1,
+                    6 => bad.chain[0] = 1,
+                    7 => bad.scope_rid = 4,
+                    _ => bad.scope_rid = 256,
+                }
+                assert_eq!(TaskIdentity::decode(&bad), None, "field {field}");
+            }
+        }
+    }
 
     #[test]
     fn claim_dma_report_is_canonical_and_bind_inert() {
@@ -4378,14 +4910,14 @@ mod tests {
     #[test]
     fn line_and_i2c_gpio_flavors_are_known_without_aliasing() {
         assert!(derive_kind_known(DERIVE_KIND_IRQ_ROUTE_LINE));
-        assert!(derive_kind_known(DERIVE_KIND_I2C_HID_GPIO_ROUTE));
+        assert!(derive_kind_known(DERIVE_KIND_I2C_HID_READY_ROUTE));
         assert_ne!(DERIVE_KIND_IRQ_ROUTE_LINE, DERIVE_KIND_IRQ_ROUTE_MSIX);
         assert_ne!(DERIVE_KIND_IRQ_ROUTE_LINE, DERIVE_KIND_I2C_HID_RECORD);
-        assert_ne!(DERIVE_KIND_IRQ_ROUTE_LINE, DERIVE_KIND_I2C_HID_GPIO_ROUTE);
+        assert_ne!(DERIVE_KIND_IRQ_ROUTE_LINE, DERIVE_KIND_I2C_HID_READY_ROUTE);
         // The byte below the GPIO route is the terminal device-quiesce flavor
         // (#809 §L); the one below *that* is the next free selector.
         assert_eq!(
-            DERIVE_KIND_I2C_HID_GPIO_ROUTE - 1,
+            DERIVE_KIND_I2C_HID_READY_ROUTE - 1,
             DERIVE_KIND_DEVICE_QUIESCE
         );
         assert!(derive_kind_known(DERIVE_KIND_DEVICE_QUIESCE));
@@ -4566,6 +5098,49 @@ mod tests {
         assert_eq!(req.reserved, [0; 3]);
     }
 
+    #[test]
+    fn fabric_census_owns_and_validates_its_observation_layout() {
+        const TEST_EXTENT_BYTES: u64 = 96 << 20;
+        let census = FabricCensus {
+            domains: 3,
+            capacity: 128,
+            extent_bytes: TEST_EXTENT_BYTES,
+            lendable_domains: 2,
+            fence_required_domains: 1,
+        };
+        let (value, aux) = census.to_observation();
+        assert_eq!(FabricCensus::from_observation(value, aux), Some(census));
+
+        let invalid_lendable = u64::from(4_u16) << 32;
+        assert_eq!(
+            FabricCensus::from_observation(
+                value,
+                (aux & !(u64::from(u16::MAX) << 32)) | invalid_lendable,
+            ),
+            None
+        );
+        let invalid_domains = census.capacity + 1;
+        assert_eq!(
+            FabricCensus::from_observation(
+                u64::from(invalid_domains) | (u64::from(census.capacity) << 32),
+                0,
+            ),
+            None
+        );
+
+        let saturated = FabricCensus {
+            domains: 1,
+            capacity: 1,
+            extent_bytes: u64::MAX,
+            lendable_domains: u32::MAX,
+            fence_required_domains: u32::MAX,
+        }
+        .to_observation();
+        assert_eq!(saturated.1 as u32, u32::MAX);
+        assert_eq!((saturated.1 >> 32) as u16, u16::MAX);
+        assert_eq!((saturated.1 >> 48) as u16, u16::MAX);
+    }
+
     /// DEVICE_ACTIVATE consumes the next registered high flavor and its
     /// second authenticated subject stays an additive, reserved-zero request.
     #[test]
@@ -4654,7 +5229,11 @@ mod tests {
 
     #[test]
     fn view_map_request_is_a_closed_window_selector() {
-        for window in [ViewMapWindow::Map, ViewMapWindow::Surfaces] {
+        for window in [
+            ViewMapWindow::Map,
+            ViewMapWindow::Surfaces,
+            ViewMapWindow::Heap,
+        ] {
             let mut bytes = [0u8; ViewMapReq::WIRE];
             bytes[..2].copy_from_slice(&window.role().to_le_bytes());
             let (req, rest) = ViewMapReq::try_ref_from_prefix(&bytes).unwrap();
@@ -4720,6 +5299,58 @@ mod tests {
     }
 
     #[test]
+    fn memory_class_census_round_trips_and_saturates() {
+        let census = MemoryClassCensus {
+            carved: 6 << 30,
+            free: 5 << 30,
+            misses: 3,
+        };
+        let (value, aux) = census.to_observation();
+        assert_eq!(MemoryClassCensus::from_observation(value, aux), census);
+        let big = MemoryClassCensus {
+            carved: u64::MAX,
+            free: u64::MAX,
+            misses: u64::MAX,
+        };
+        let (value, aux) = big.to_observation();
+        let back = MemoryClassCensus::from_observation(value, aux);
+        assert_eq!(back.carved, u64::MAX);
+        assert_eq!(back.free, (1 << 48) - 1);
+        assert_eq!(back.misses, u64::from(u16::MAX));
+        assert!(SystemObserveReq::takes_operand(SystemMetric::MemoryClass));
+    }
+
+    #[test]
+    fn memory_stream_sample_round_trips_and_saturates() {
+        let sample = MemoryStreamSample {
+            slot: 64,
+            write_bps: 31_400_000_000,
+            copy_bps: 12_900_000_000,
+            hmat_bps: 136_500_000_000,
+            streaming_bps: 80_100_000_000,
+        };
+        let (value, aux) = sample.to_observation();
+        assert_eq!(MemoryStreamSample::from_observation(value, aux), sample);
+        assert!(sample.measured());
+        assert!(!MemoryStreamSample::default().measured());
+        let big = MemoryStreamSample {
+            slot: 255,
+            write_bps: u64::MAX,
+            copy_bps: u64::MAX,
+            hmat_bps: u64::MAX,
+            streaming_bps: u64::MAX,
+        };
+        let (value, aux) = big.to_observation();
+        let back = MemoryStreamSample::from_observation(value, aux);
+        assert_eq!(back.slot, 255);
+        assert_eq!(back.write_bps, (1 << 40) - 1);
+        assert_eq!(back.streaming_bps, u64::from(u16::MAX) * 100_000_000);
+        assert_eq!(back.copy_bps, (1 << 40) - 1);
+        assert_eq!(back.hmat_bps, ((1u64 << 24) - 1) * 1_000_000);
+        assert!(SystemObserveReq::takes_operand(SystemMetric::MemoryStream));
+    }
+
+    #[test]
     fn fabric_route_request_layout_and_refusals() {
         assert_eq!(core::mem::size_of::<FabricRouteReq>(), FabricRouteReq::WIRE);
         let mut bytes = [0u8; FabricRouteReq::WIRE];
@@ -4754,6 +5385,93 @@ mod tests {
         empty = req;
         empty.destination = 0.into();
         assert!(!empty.valid());
+    }
+
+    /// The typed constructors spell exactly the literal the wire expects,
+    /// and every constructor product is valid.
+    #[test]
+    fn fabric_request_constructors_match_the_wire_literal() {
+        let facts = FabricDomainReport {
+            domain: 7,
+            bytes: 1 << 20,
+            owner: 9,
+            reset: 1,
+            power: 2,
+            allocation: 3,
+            cache: 0,
+            coherent: true,
+            needs_fence: false,
+        };
+        let req = FabricRouteReq::self_route(
+            &facts,
+            8192,
+            FabricOp::IommuMap,
+            FabricAccess::all(),
+            FabricSync::Fenced,
+        );
+        assert!(req.valid());
+        let literal = FabricRouteReq {
+            destination: 7.into(),
+            offset: 0.into(),
+            bytes: 8192.into(),
+            source_reset: 1.into(),
+            source_power: 2.into(),
+            source_allocation: 3.into(),
+            destination_reset: 1.into(),
+            destination_power: 2.into(),
+            destination_allocation: 3.into(),
+            access: 7,
+            operation: 1,
+            synchronization: 1,
+            reserved: [0; 5],
+        };
+        assert_eq!(req.encode(), literal.encode());
+        let other = FabricDomainReport {
+            domain: 11,
+            reset: 4,
+            power: 5,
+            allocation: 6,
+            ..facts
+        };
+        let between = FabricRouteReq::between(
+            &facts,
+            &other,
+            4096,
+            4096,
+            FabricOp::CpuMap,
+            FabricAccess::READ,
+            FabricSync::Unfenced,
+        );
+        assert!(between.valid());
+        assert_eq!(between.destination.get(), 11);
+        assert_eq!(between.destination_allocation.get(), 6);
+        assert_eq!(between.source_allocation.get(), 3);
+        assert_eq!(
+            (between.access, between.operation, between.synchronization),
+            (1, 0, 0)
+        );
+        // An exclusive-only access is not a route: the kernel refuses it and
+        // so does `valid`, so a constructor cannot smuggle it in silently.
+        let bad = FabricRouteReq::self_route(
+            &facts,
+            4096,
+            FabricOp::CpuMap,
+            FabricAccess::EXCLUSIVE,
+            FabricSync::Fenced,
+        );
+        assert!(!bad.valid());
+        let scope = FabricRouteScopeReq::new(4096, 8192, FabricAccess::all());
+        assert!(scope.valid());
+        assert_eq!(
+            scope.encode(),
+            FabricRouteScopeReq {
+                offset: 4096.into(),
+                bytes: 8192.into(),
+                access: 7,
+                reserved: [0; 7],
+            }
+            .encode()
+        );
     }
 
     #[test]
@@ -4962,8 +5680,8 @@ mod tests {
                     standard_timing: None,
                     fast_timing: None,
                     input_clock_hz: None,
-                    gpio_interrupt: None,
-                    gpio_route_state: I2cGpioRouteState::NotDescribed,
+                    ready_interrupt: None,
+                    ready_route_state: I2cReadyRouteState::NotDescribed,
                     no_irq: false,
                     no_power_after_reset: false,
                 }
@@ -5088,12 +5806,12 @@ mod tests {
                 lcnt: 0xa0,
             }),
             input_clock_hz: Some(19_200_000),
-            gpio_interrupt: Some(I2cGpioInterruptReport {
+            ready_interrupt: Some(I2cReadyInterruptReport::Gpio(I2cGpioInterruptReport {
                 pin: 37,
                 edge: false,
                 polarity: I2cGpioPolarity::Low,
-            }),
-            gpio_route_state: I2cGpioRouteState::Ready,
+            })),
+            ready_route_state: I2cReadyRouteState::Ready,
             no_irq: true,
             no_power_after_reset: true,
         };
@@ -5109,12 +5827,50 @@ mod tests {
             standard_timing: None,
             fast_timing: None,
             input_clock_hz: None,
-            gpio_interrupt: None,
-            gpio_route_state: I2cGpioRouteState::NotDescribed,
+            ready_interrupt: None,
+            ready_route_state: I2cReadyRouteState::NotDescribed,
             no_irq: false,
             no_power_after_reset: false,
         };
         assert_eq!(I2cHidReport::decode(&minimal.encode()), Some(minimal));
+    }
+
+    #[test]
+    fn i2c_child_line_retains_full_gsi_and_electrical_mode_and_refuses_ambiguous_sources() {
+        for gsi in [0, 84, 108, u32::MAX] {
+            for (edge, active_high) in [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let report = I2cHidReport {
+                    slave_addr: 0x16,
+                    descriptor_register: 1,
+                    speed_hz: 400_000,
+                    standard_timing: None,
+                    fast_timing: None,
+                    input_clock_hz: None,
+                    ready_interrupt: Some(I2cReadyInterruptReport::Line {
+                        gsi,
+                        edge,
+                        active_high,
+                    }),
+                    ready_route_state: I2cReadyRouteState::Ready,
+                    no_irq: false,
+                    no_power_after_reset: false,
+                };
+                let encoded = report.encode();
+                assert_eq!(I2cHidReport::decode(&encoded), Some(report));
+                let mut ambiguous = encoded;
+                ambiguous.rights = crate::cap::Rights::from_bits_retain(
+                    ambiguous.rights.bits() | I2C_GPIO_INTERRUPT,
+                );
+                assert!(I2cHidReport::decode(&ambiguous).is_none());
+                let mut invalid_polarity = encoded;
+                invalid_polarity.chain[0] = 2;
+                assert!(I2cHidReport::decode(&invalid_polarity).is_none());
+                let mut absent = encoded;
+                absent.chain[2] = I2cReadyRouteState::NotDescribed as u32;
+                assert!(I2cHidReport::decode(&absent).is_none());
+            }
+        }
     }
 
     #[test]
@@ -5127,8 +5883,8 @@ mod tests {
                 standard_timing: None,
                 fast_timing: None,
                 input_clock_hz: None,
-                gpio_interrupt: None,
-                gpio_route_state: I2cGpioRouteState::NotDescribed,
+                ready_interrupt: None,
+                ready_route_state: I2cReadyRouteState::NotDescribed,
                 no_irq: false,
                 no_power_after_reset: false,
             };
@@ -5145,8 +5901,8 @@ mod tests {
             standard_timing: None,
             fast_timing: None,
             input_clock_hz: None,
-            gpio_interrupt: None,
-            gpio_route_state: I2cGpioRouteState::NotDescribed,
+            ready_interrupt: None,
+            ready_route_state: I2cReadyRouteState::NotDescribed,
             no_irq: false,
             no_power_after_reset: false,
         };
@@ -5160,7 +5916,7 @@ mod tests {
         assert_eq!(I2cHidReport::decode(&stale_gpio), None);
 
         let mut route_without_gpio = base.encode();
-        route_without_gpio.chain[2] = I2cGpioRouteState::Ready as u32;
+        route_without_gpio.chain[2] = I2cReadyRouteState::Ready as u32;
         assert_eq!(I2cHidReport::decode(&route_without_gpio), None);
 
         let mut unknown_route_state = base.encode();
@@ -5168,16 +5924,16 @@ mod tests {
         assert_eq!(I2cHidReport::decode(&unknown_route_state), None);
 
         let mut missing_route_state = I2cHidReport {
-            gpio_interrupt: Some(I2cGpioInterruptReport {
+            ready_interrupt: Some(I2cReadyInterruptReport::Gpio(I2cGpioInterruptReport {
                 pin: 18,
                 edge: false,
                 polarity: I2cGpioPolarity::Low,
-            }),
-            gpio_route_state: I2cGpioRouteState::Ready,
+            })),
+            ready_route_state: I2cReadyRouteState::Ready,
             ..base
         }
         .encode();
-        missing_route_state.chain[2] = I2cGpioRouteState::NotDescribed as u32;
+        missing_route_state.chain[2] = I2cReadyRouteState::NotDescribed as u32;
         assert_eq!(I2cHidReport::decode(&missing_route_state), None);
 
         let mut stale_clock = base.encode();
@@ -5339,7 +6095,19 @@ mod tests {
     /// so the sign is part of the payload, not a bit pattern to lose.
     #[test]
     fn exit_report_round_trips_bind_inert() {
-        for status in [0i32, 1, 255, i32::MAX, -1, -42, i32::MIN] {
+        for status in [
+            0i32,
+            1,
+            255,
+            256,
+            257,
+            65536,
+            i32::MAX,
+            -1,
+            -256,
+            -42,
+            i32::MIN,
+        ] {
             let rec = ExitReport { status }.encode();
             assert_eq!(rec.cid, crate::cap::Cid::NULL, "a report binds to nothing");
             assert_eq!(ExitReport::decode(&rec), Some(ExitReport { status }));
@@ -5350,6 +6118,32 @@ mod tests {
         assert_eq!(ExitReport::decode(&geom), None);
         assert_eq!(GeomReport::decode(&ExitReport { status: 0 }.encode()), None);
         assert_eq!(ExitReport::decode(&crate::cap::CapRecord::vacant()), None);
+    }
+
+    #[test]
+    fn exit_report_rejects_high_bit_aliases_and_capability_residue() {
+        for bits in [
+            1u64 << 32,
+            0xffff_ffff,
+            0x8000_0000,
+            0x1_0000_0100,
+            0xffff_fffe_0000_0000,
+        ] {
+            let mut rec = ExitReport { status: 0 }.encode();
+            rec.scope_rid = bits;
+            assert_eq!(ExitReport::decode(&rec), None, "{bits:#x}");
+        }
+        let pristine = ExitReport { status: 256 }.encode();
+        let mut variants = [pristine; 6];
+        variants[0].holder = crate::cap::Cid(1);
+        variants[1].rights = crate::cap::Rights::ACCESS;
+        variants[2].epoch = 1;
+        variants[3].chain_len = 1;
+        variants[4].chain[0] = 1;
+        variants[5].mac[0] = 1;
+        for rec in variants {
+            assert_eq!(ExitReport::decode(&rec), None);
+        }
     }
 
     /// The [`DeviceReport`] round-trips every field at its widest value —
@@ -5546,3 +6340,29 @@ const DEVICE_FLAG_PROBE: u8 = crate::device::DeviceRecord::HAS_BINDING
     | crate::device::DeviceRecord::HAS_BAR0
     | crate::device::DeviceRecord::DRIVER_ENDPOINT
     | crate::device::DeviceRecord::HAS_REMAPPED_MSIX;
+
+#[cfg(test)]
+mod process_drain_tests {
+    use super::*;
+    #[test]
+    fn drain_report_is_canonical_data_not_authority() {
+        for forced in [false, true] {
+            let report = ProcessDrainReport { forced };
+            let record = report.encode();
+            assert_eq!(ProcessDrainReport::decode(&record), Some(report));
+            let mut bad = record;
+            bad.scope_rid = 2;
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            let mut bad = record;
+            bad.cid = crate::cap::Cid(1);
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            let mut bad = record;
+            bad.chain_len = 1;
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            let mut bad = record;
+            bad.mac[0] = 1;
+            assert_eq!(ProcessDrainReport::decode(&bad), None);
+            assert!(derive_kind_known(DERIVE_KIND_PROCESS_DRAIN));
+        }
+    }
+}

@@ -304,16 +304,23 @@ const _: () = {
         crate::lane::fiber::FIBER_WINDOW_BASE,
         crate::lane::fiber::FIBER_WINDOW_GRANULES as u64 * crate::stack_arena::GRANULE as u64,
     );
-    let mut all = [arena; 9];
+    // So does the guarded fiber-stack window (`fiber_stack`), whose
+    // stacks foreign fiber runtimes (Wasmtime's async) switch onto.
+    let guarded = Window::new(
+        crate::fiber_stack::WINDOW_BASE,
+        crate::fiber_stack::WINDOW_GRANULES as u64 * crate::stack_arena::GRANULE as u64,
+    );
+    let mut all = [arena; 10];
     all[1] = fibers;
+    all[2] = guarded;
     let mut i = 0;
     while i < spans.len() {
-        all[i + 2] = spans[i];
+        all[i + 3] = spans[i];
         i += 1;
     }
     assert!(
         Window::all_disjoint(&all),
-        "the SPMD stack window, the fiber window, and the thread bands overlap"
+        "the SPMD stack window, the fiber windows, and the thread bands overlap"
     );
 };
 
@@ -1659,24 +1666,6 @@ extern "C" fn thread_start(page: *const u8, start: *const ThreadStart) -> ! {
     exit(ExitCode::OK)
 }
 
-/// **End the calling thread** with `code` — the kernel exit verb, over
-/// the thread's own `role::SELF` handle.
-///
-/// The status is an [`ExitCode`], not a bare `i32`: the band it belongs to
-/// and the meaning it carries are named at the callsite, and a program's own
-/// codes are declared once through [`exit_codes!`](crate::exit_codes).
-///
-/// Does not return, and no code of this thread runs after the commit: the
-/// kernel marks the exit, wakes every joiner, and parks the task with
-/// nothing that can ever re-admit it.  The thread's memory stays mapped
-/// until someone [`join`]s it (or revokes its handle) — that is what lets
-/// a joiner arriving afterwards still read the status.
-///
-/// A thread that cannot present a SELF handle — thread 0, whose founding
-/// is the founder's rather than [`spawn`]'s — [`refuse`]s instead: an
-/// honest wedge rather than a silent fall-through.
-///
-/// [`refuse`]: crate::entry::refuse
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExitCommitAction {
     Retry,
@@ -1697,42 +1686,69 @@ fn exit_commit_action(committed: kore_abi::session::Committed) -> ExitCommitActi
     }
 }
 
+/// Commit one exit attempt in its own frame. The ordinary builder is sized
+/// for a full batch; keeping it out of the retry loop releases that storage
+/// before a WouldBlock sleep builds another session. Inlining both builders
+/// into `exit` consumed 18 KiB in the installed PTL input service.
+#[cfg(target_os = "none")]
+#[inline(never)]
+fn exit_attempt(
+    slot: kore_abi::session::SlotRef,
+    code: ExitCode,
+) -> Result<kore_abi::session::Committed, crate::transport::TrapUnavailable> {
+    let mut b = SessionBuilder::new();
+    b.exit(slot, code)
+        .map_err(|_| crate::transport::TrapUnavailable)?;
+    TrapTransport::new().commit_now(&b)
+}
+
+/// Keep the sleep descriptor out of both the terminal caller and the exit
+/// attempt. Its frame is reused after the unsuccessful exit commit returned.
+#[cfg(target_os = "none")]
+#[inline(never)]
+fn exit_backoff() {
+    if let Some(word) = crate::cap::verbs::sleep_until(1) {
+        let now_ms = word >> 32;
+        let _ = crate::cap::verbs::sleep_until((now_ms + 1) * 1_000_000);
+    }
+}
+
+/// **End the calling thread** with `code` — the kernel exit verb, over
+/// the thread's own `role::SELF` handle.
+///
+/// The status must be a standard [`ExitCode`] or a named application-reserved
+/// slot declared through [`exit_codes!`](crate::exit_codes). There is no
+/// conversion from an arbitrary integer.
+///
+/// Does not return, and no code of this thread runs after the commit: the
+/// kernel marks the exit, wakes every joiner, and parks the task with
+/// nothing that can ever re-admit it.  The thread's memory stays mapped
+/// until someone [`join`]s it (or revokes its handle) — that is what lets
+/// a joiner arriving afterwards still read the status.
+///
+/// A context that cannot present its own SELF handle [`refuse`]s instead;
+/// a fully founded task, including thread zero, receives that authority.
+///
+/// [`refuse`]: crate::entry::refuse
 #[cfg(target_os = "none")]
 pub fn exit(code: ExitCode) -> ! {
-    use crate::session::SessionBuilder;
-    use crate::transport::{Transport, TrapTransport};
-
     let Some(rt) = crate::entry::thread_context() else {
         crate::entry::refuse();
     };
     let Some(slot) = rt.bootstrap().handle(role::SELF, 0) else {
         crate::entry::refuse();
     };
-    let transport = TrapTransport::new();
     loop {
-        // A `Conflict` applied nothing and must re-run prepare against the
-        // now-monotone retired set. Rebuild even this one-op descriptor so
-        // that the retry boundary is the complete prepare+commit attempt.
-        let mut b = SessionBuilder::new();
-        if b.exit(slot, code.get()).is_err() {
-            crate::entry::refuse();
-        }
-        let Ok(committed) = transport.commit_now(&b) else {
+        // Each OCC retry rebuilds a complete descriptor. The previous
+        // attempt's builder no longer occupies this worker's stack.
+        let Ok(committed) = exit_attempt(slot, code) else {
             crate::entry::refuse();
         };
-        // The commit does not return on success. `Conflict` is the session
-        // engine's explicit OCC retry and cannot safely detour through a
-        // second session first. `WouldBlock` is the task-boundary transient
-        // and retains its paced retry. Every other refusal is terminal, and a
-        // thread that could not end must not fall off its entry frame.
+        // Success never returns. Conflict retries immediately; WouldBlock
+        // retains the existing paced retry. Other outcomes stay terminal.
         match exit_commit_action(committed) {
             ExitCommitAction::Retry => continue,
-            ExitCommitAction::Backoff => {
-                if let Some(word) = crate::cap::verbs::sleep_until(1) {
-                    let now_ms = word >> 32;
-                    let _ = crate::cap::verbs::sleep_until((now_ms + 1) * 1_000_000);
-                }
-            }
+            ExitCommitAction::Backoff => exit_backoff(),
             ExitCommitAction::Refuse => crate::entry::refuse(),
         }
     }
@@ -2142,35 +2158,15 @@ fn validate_task_completion(
     }
 }
 
-/// Decode only the canonical bind-inert exit-report record.
-///
-/// [`kore_abi::session::ExitReport::decode`] identifies the report family;
-/// this stronger boundary check additionally proves that every field which
-/// the canonical encoder leaves vacant is still vacant.  A stale capability
-/// or partially overwritten report therefore cannot be accepted as a process
-/// status.
+/// Preserve the full status after the shared ABI decoder validates the
+/// canonical report. Every lifecycle consumer uses that same decoder.
 #[cfg(any(target_os = "none", test))]
 fn decode_task_exit_report(
     rec: &kore_abi::cap::CapRecord,
 ) -> Result<i32, crate::cap::TaskWaitError> {
-    let report = kore_abi::session::ExitReport::decode(rec)
-        .ok_or(crate::cap::TaskWaitError::MalformedReport)?;
-    let canonical = report.encode();
-    let exact = rec.cid == canonical.cid
-        && rec.parent == canonical.parent
-        && rec.holder == canonical.holder
-        && rec.scope_rid == canonical.scope_rid
-        && rec.rights == canonical.rights
-        && rec.kind == canonical.kind
-        && rec.epoch == canonical.epoch
-        && rec.chain_len == canonical.chain_len
-        && rec.chain == canonical.chain
-        && rec.mac == canonical.mac;
-    if exact {
-        Ok(report.status)
-    } else {
-        Err(crate::cap::TaskWaitError::MalformedReport)
-    }
+    kore_abi::session::ExitReport::decode(rec)
+        .map(|report| report.status)
+        .ok_or(crate::cap::TaskWaitError::MalformedReport)
 }
 
 /// One decoded step of the blocking wait loop.  Kept pure so every status in
@@ -2363,6 +2359,24 @@ mod tests {
     }
 
     #[test]
+    fn task_join_and_poll_preserve_all_exit_status_bits() {
+        use kore_abi::session::{ExitReport, Status};
+        for status in [0, 255, 256, 257, 65536, -1, -256, i32::MIN, i32::MAX] {
+            let report = ExitReport { status }.encode();
+            assert_eq!(
+                classify_task_wait(Status::Exited, Some(&report)),
+                Ok(TaskWaitStep::Complete(crate::cap::TaskWaitOutcome::Exited(
+                    status
+                )))
+            );
+            assert_eq!(
+                classify_task_poll(Status::Exited, Some(&report)),
+                Ok(crate::cap::TaskPollOutcome::Exited(status))
+            );
+        }
+    }
+
+    #[test]
     fn task_exit_report_requires_the_exact_bind_inert_encoding() {
         let canonical = kore_abi::session::ExitReport { status: -37 }.encode();
         assert_eq!(decode_task_exit_report(&canonical), Ok(-37));
@@ -2372,9 +2386,8 @@ mod tests {
             Err(crate::cap::TaskWaitError::MalformedReport)
         );
 
-        // The ABI family decoder deliberately keys only the report markers.
-        // The lifecycle boundary is stronger: a stale capability-shaped field
-        // must not be accepted merely because those markers happen to match.
+        // A stale capability-shaped field must not be accepted merely because
+        // the report markers happen to match.
         let mut noncanonical = canonical;
         noncanonical.rights = kore_abi::cap::Rights::ACCESS;
         assert_eq!(

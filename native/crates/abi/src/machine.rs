@@ -62,8 +62,9 @@ pub struct MachineBlock {
     /// The **core-class census** of the whole machine, packed: `[7:0]`
     /// performance cores (Intel P / AMD Zen / Arm big), `[15:8]` efficiency
     /// cores (Intel E / AMD Zen-c / Arm LITTLE), `[23:16]` standard cores
-    /// (a homogeneous part reports all of them here), `[31:24]` reserved
-    /// (zero).  Machine-global like `logical_cpus`, and the answer to the
+    /// (a homogeneous part reports all of them here), `[31:24]` the LP-E
+    /// SUBSET of the efficiency count. Old readers still count every CPU;
+    /// new readers subtract that subset to display E and LP-E separately.  Machine-global like `logical_cpus`, and the answer to the
     /// question `res/SPMD.md` left open — "is the hybrid classification
     /// trustworthy?" — readable on a serial-less box through `status cpu`
     /// and eyeballed against the spec sheet.  Claimed additively from the
@@ -152,6 +153,19 @@ impl MachineBlock {
             (packed as u8, (packed >> 8) as u8, (packed >> 16) as u8)
         })
     }
+    /// Low-power subset of the efficiency count; zero on pre-island founders.
+    /// Clamp malformed input rather than underflowing a reader's E count.
+    pub fn low_power_cores(&self) -> Option<u8> {
+        self.class_census()
+            .map(|(_, efficient, _)| ((self.class_census.get() >> 24) as u8).min(efficient))
+    }
+}
+
+/// Extend the existing census additively. The legacy efficiency byte remains
+/// inclusive, so old readers do not lose CPUs when the reserved byte is used.
+pub const fn pack_class_census_with_island(p: usize, e: usize, standard: usize, lp: usize) -> u32 {
+    pack_class_census(p, e.saturating_add(lp), standard)
+        | ((if lp > 255 { 255 } else { lp }) as u32) << 24
 }
 
 /// Pack the three class counts into the [`MachineBlock::class_census`]
@@ -189,6 +203,15 @@ const _: () = assert!(
 mod tests {
     use super::*;
     use zerocopy::FromBytes;
+
+    #[test]
+    fn island_census_preserves_legacy_totals() {
+        let b = MachineBlock::new(16, 4, 0, 0, pack_class_census_with_island(4, 8, 0, 4));
+        assert_eq!(b.class_census(), Some((4, 12, 0)));
+        assert_eq!(b.low_power_cores(), Some(4));
+        let old = MachineBlock::new(8, 4, 0, 0, pack_class_census(4, 4, 0));
+        assert_eq!(old.low_power_cores(), Some(0));
+    }
 
     #[test]
     fn an_empty_block_validates_but_exposes_zero_facts() {

@@ -37,13 +37,13 @@ mod error;
 mod face;
 #[cfg(feature = "runtime")]
 mod fs;
+pub mod grant_receipt;
 #[cfg(feature = "runtime")]
 mod graph;
 mod ids;
-pub mod inventory;
-pub mod grant_receipt;
 #[cfg(feature = "index")]
 pub mod index;
+pub mod inventory;
 #[cfg(feature = "runtime")]
 mod io;
 mod name;
@@ -92,7 +92,8 @@ pub use search::{
 };
 #[cfg(feature = "runtime")]
 pub use walk::{
-    CloseFailure, View, WalkClient, open_path, WALK_MUTATE, WALK_READ, WALK_WRITE, rights_label, rights_parse,
+    CloseFailure, View, WALK_MUTATE, WALK_READ, WALK_WRITE, WalkClient, open_path, rights_label,
+    rights_parse,
 };
 
 #[cfg(feature = "runtime")]

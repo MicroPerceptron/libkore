@@ -51,6 +51,7 @@ extern crate std;
 
 pub mod apply;
 pub mod check;
+pub mod functions;
 pub mod late;
 pub mod link;
 pub mod parse;

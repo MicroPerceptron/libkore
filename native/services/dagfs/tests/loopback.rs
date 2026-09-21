@@ -389,6 +389,86 @@ fn structural_search_crosses_the_real_wire_and_window() {
     assert_eq!(hit.len, 8);
 }
 
+/// The deepest legal path crosses the wire whole.
+///
+/// `MAX_PATH_DEPTH` went 8 → 32 and the frozen hit spelling did not follow
+/// it, so the encoder wrote a ninth separator past its 263-byte field — an
+/// index past a fixed array, in the service. The field is now pinned to the
+/// depth at compile time; this is the boundary case end to end: a
+/// 32-component path of 32-byte names is exactly `FS_SEARCH_PATH_BYTES`
+/// long, lands in the window, and decodes back to the components.
+#[test]
+fn the_deepest_legal_path_crosses_the_search_wire_whole() {
+    use kore_abi::svc::FS_SEARCH_PATH_BYTES;
+    use kore_svc_dagfs::bounds::{MAX_NAME_LEN, MAX_PATH_DEPTH};
+
+    let (_svc, mut clients) = world(1);
+    let c = &mut clients[0];
+    let root = c.open_root(Rights::ALL).unwrap();
+    // Every name fills its whole field: the level number, zero-padded.
+    let level_name = |level: usize| name(&format!("{level:0>width$}", width = MAX_NAME_LEN));
+    let mut expected: Vec<String> = Vec::new();
+    // Directories at every level but the last, then the file: 32 components.
+    // A session holds at most `MAX_HANDLES_PER_SESSION` handles, which is the
+    // depth bound itself, so each intermediate is released as the chain grows
+    // — the walk is the chain, not the handle table.
+    let mut parent = root.handle;
+    let mut previous: Option<kore_svc_dagfs::Handle> = None;
+    for level in 0..MAX_PATH_DEPTH - 1 {
+        let made = c
+            .create(parent, &level_name(level), ObjectKind::Directory)
+            .unwrap();
+        if let Some(done) = previous.take() {
+            c.close(done).unwrap();
+        }
+        previous = Some(made.handle);
+        parent = made.handle;
+        expected.push(level_name(level).as_str().to_string());
+    }
+    let leaf = name(&format!("{:x>width$}", "leaf", width = MAX_NAME_LEN));
+    let made = c.create(parent, &leaf, ObjectKind::File).unwrap();
+    c.close(made.handle).unwrap();
+    if let Some(done) = previous.take() {
+        c.close(done).unwrap();
+    }
+    expected.push(leaf.as_str().to_string());
+
+    let page = c
+        .search(
+            root.handle,
+            SearchQuery {
+                name_contains: Some(name("leaf")),
+                kind: Some(ObjectKind::File),
+                min_len: 0,
+                max_len: 64,
+                content: None,
+                freshness: kore_svc_dagfs::FreshnessPolicy::StructuralOnly,
+                max_index_lag: 0,
+                max_work: 0,
+            },
+            None,
+            0,
+        )
+        .unwrap();
+    assert_eq!(page.hits, 1);
+    let hit = read_search_hit(&c.transport().window, 0, 0).unwrap();
+    assert_eq!(hit.path.len(), MAX_PATH_DEPTH);
+    let got: Vec<String> = hit
+        .path
+        .iter()
+        .map(|part| part.as_str().to_string())
+        .collect();
+    assert_eq!(got, expected);
+    let spelled = hit
+        .path
+        .iter()
+        .map(|part| part.as_bytes().len())
+        .sum::<usize>()
+        + hit.path.len()
+        - 1;
+    assert_eq!(spelled, FS_SEARCH_PATH_BYTES);
+}
+
 #[test]
 fn a_listing_page_that_would_not_fit_the_window_is_refused_not_truncated() {
     let (_svc, mut clients) = world(1);

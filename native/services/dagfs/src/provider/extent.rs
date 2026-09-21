@@ -20,7 +20,7 @@ use core::alloc::Allocator;
 
 use kore_collections::{PriorityIndex, PriorityLink, SlotArena, SlotId, UNINDEXED};
 
-use crate::{bounds::MAX_BLOCK_EXTENT_NODES, error::ProviderError};
+use crate::{ServiceAlloc, bounds::MAX_BLOCK_EXTENT_NODES, error::ProviderError};
 
 const NONE: u32 = u32::MAX;
 
@@ -82,8 +82,8 @@ impl PriorityLink for Node {
 /// One volume-local free-space index. Its owner already has exclusive access
 /// through `BlockProvider`'s task-local state, so it needs no second lock.
 pub(super) struct ExtentAllocator {
-    nodes: SlotArena<Node, dyn Allocator>,
-    free: PriorityIndex<dyn Allocator>,
+    nodes: SlotArena<Node, ServiceAlloc>,
+    free: PriorityIndex<ServiceAlloc>,
     last_phys: u32,
     free_blocks: u64,
     arena_start: u64,

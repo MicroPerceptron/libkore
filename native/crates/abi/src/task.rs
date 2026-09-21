@@ -426,16 +426,14 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
     DESKTOP_BOOTSTRAP_WINDOW_SLOTS + 2 * DESKTOP_CONTROLLER_CAPACITY;
 
 /// Live immutable image-generation peers the boot catalogue can hold at once:
-/// the 33-row bootstrap catalogue — the desktop's `editor` and `power-ui`
-/// beside the two native filesystem verbs `append` and `sync` — plus the
-/// shell, the graphical terminal, three extraction parsers, and the resident
-/// agent runner.  The runner sits outside the shell catalogue (init installs
-/// it for the resident broker, not for a terminal namespace) but it is a
-/// resident generation like the rest and consumes one loader face.  Named
+/// the 35-row bootstrap catalogue — the desktop's `editor` and `power-ui`
+/// beside the two native filesystem verbs `append` and `sync`, and the two
+/// WebAssembly rows, `wasm-witness` and `wasm` — plus the shell, the
+/// graphical terminal, three extraction parsers, and the resident agent runner.  Named
 /// separately from the interactive reservation below because the two grow for
 /// unrelated reasons: this one when a row joins the catalogue, that one when
 /// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 39;
+pub const BOOTSTRAP_IMAGE_PEERS: usize = 41;
 
 /// Bootstrap face-supply sizing. Image and runtime grow their face tables and
 /// rings on demand; this reserves enough initial memory for the boot catalogue
@@ -542,6 +540,17 @@ pub mod geom {
     /// spawned threads, where a BAR map then refuses fail-closed.  Fills the
     /// entry the v4 [`SURFACES`](Self::SURFACES) widening left spare (GEOM_ABI v5).
     pub const DEVICE: u16 = 9;
+    /// The task's **heap window** (GEOM_ABI v7) — where the process heap maps
+    /// the granules it carves off its own `role::HEAP` supply, at addresses it
+    /// places itself. The [`DEVICE`](Self::DEVICE) lesson for the heap: growth
+    /// on the receiver-map cursor spent the one 16 MiB stride every view on
+    /// that thread shares, so no heap could map more than 16 MiB however large
+    /// its supply (window launches refused larger heaps outright). Address
+    /// space, not authority — a reservation with no backing, mapped only by
+    /// leases the task already holds; task-level and stamped for founded
+    /// tasks, absent for spawned threads, whose growth stays on their stride
+    /// because their holdings die with them.
+    pub const HEAP: u16 = 10;
 }
 
 /// One startup handle: a delegated capability tagged by [`role`] (+ an instance
@@ -612,10 +621,18 @@ pub const BOOTSTRAP_ABI: u16 = 4;
 /// block honest.
 /// The bounded named-capability vocabulary carried in one task's boot page.
 ///
-/// Sixty-four accommodates the production shell's service faces plus its
-/// attenuated child-principal sources while keeping the complete block well below
-/// one 4 KiB boot page.
-pub const MAX_BOOT_HANDLES: usize = 64;
+/// Sixty-four accommodated the production shell's service faces plus its
+/// attenuated child-principal sources.  Eighty (from 64): exec's block
+/// carries five entries per resident provider face (request kick, pair
+/// ring, reply-grant receiver, retained-return sender and landing), and two
+/// growths met there at once — the seventh provider, the Xe row (the GPU
+/// face a `PROFILE_GPU` launch is admitted on), and the memory manager's
+/// return leg, the pair on which exec administers per-launch mm faces (one
+/// per engine launch). Each alone took the block past sixty-four at its
+/// loader grant bank. The page-budget pins below and in `kore_rt::entry`
+/// keep the grown block honest: every later block's offset is derived from
+/// this size, and the whole sequence must still fit one 4 KiB boot page.
+pub const MAX_BOOT_HANDLES: usize = 80;
 
 /// Literal startup values carried beside, but never confused with, arena
 /// handles.  Spawn records currently carry at most four; the eight-entry
@@ -626,7 +643,7 @@ pub const MAX_BOOT_DATA: usize = 8;
 /// capability endowment from (`.kore.boot` in the child image; the module
 /// docs tell the whole story).  The layout *is* the frozen ABI: 8-byte
 /// header + [`MAX_BOOT_HANDLES`] handle entries + [`MAX_BOOT_DATA`] datum
-/// entries = 584 bytes, every field
+/// entries = 712 bytes, every field
 /// little-endian and unaligned-safe, so the spawner writes it through any
 /// delegated mapping with plain `IntoBytes` and no serializer exists on
 /// either side.
@@ -746,20 +763,22 @@ impl Default for BootBlock {
 /// pool window (#578 slice 3) — stamped only for a row endowing
 /// [`role::SURFACE_POOL`].  v5 names the tenth (previously spare) entry: the
 /// task-level [`geom::DEVICE`] BAR window — stamped only for a row that claims
-/// a PCI function with a large BAR (the NPU's 16 MiB BAR0).
-pub const GEOM_ABI: u16 = 6;
+/// a PCI function with a large BAR (the NPU's 16 MiB BAR0).  v7 widens the
+/// table (10 → 12) and adds the task-level [`geom::HEAP`] window, leaving one
+/// entry spare as v4 did.
+pub const GEOM_ABI: u16 = 7;
 
 /// Window capacity of a [`GeomBlock`] — design-bounded like the handle table.
 /// A task learns at most a handful of founder-mapped windows (scratch, slots,
 /// map cursor, heap, ring); the v4 widening added a tenth entry, now named by
-/// [`geom::DEVICE`] (v5) — the table is full.
-pub const MAX_GEOM_WINDOWS: usize = 10;
-// Ten founder entries are now stampable (SCRATCH, SLOTS, MAP, LINK,
+/// [`geom::DEVICE`] (v5), and v7 widened to twelve for [`geom::HEAP`].
+pub const MAX_GEOM_WINDOWS: usize = 12;
+// Eleven founder entries are now stampable (SCRATCH, SLOTS, MAP, LINK,
 // THREAD_BLOCK, APERTURE, TRANSIENT, SLOTS_EXT, SURFACES — display row only —
-// and DEVICE — device-claiming rows only); the table is full.  An eleventh
-// window needs a `MAX_GEOM_WINDOWS` bump (a wire change, the GEOM_ABI v4/v5
-// precedent).
-const _: () = assert!(10 <= MAX_GEOM_WINDOWS);
+// DEVICE — device-claiming rows only — and HEAP); one entry is spare.  A
+// thirteenth window needs a `MAX_GEOM_WINDOWS` bump (a wire change, the
+// GEOM_ABI v4/v7 precedent).
+const _: () = assert!(11 <= MAX_GEOM_WINDOWS);
 
 /// One geometry window: a `(va, len)` the founder mapped, tagged by [`geom`]
 /// role (+ an `index` so a task could hold several of one kind).  24 bytes,
@@ -1567,7 +1586,7 @@ const _: () = {
     use core::mem::size_of;
     assert!(size_of::<HandleEntry>() == 8);
     assert!(size_of::<DatumEntry>() == 8);
-    assert!(size_of::<BootBlock>() == 8 + 8 * (MAX_BOOT_HANDLES + MAX_BOOT_DATA)); // 584
+    assert!(size_of::<BootBlock>() == 8 + 8 * (MAX_BOOT_HANDLES + MAX_BOOT_DATA)); // 712
     // Publication and movement are separate bounded vocabularies.  Neither
     // count dominates the other: vacant landing names cost only a boot entry;
     // arithmetic grant-bank members cost only delivery rows.  Each wire uses
@@ -1577,7 +1596,7 @@ const _: () = {
     assert!(crate::session::MAX_FOUND_DELIVERIES <= u16::MAX as usize);
     assert!(size_of::<SpawnReq>() == 24);
     assert!(size_of::<GeomEntry>() == 24);
-    assert!(size_of::<GeomBlock>() == 8 + 24 * MAX_GEOM_WINDOWS); // 200
+    assert!(size_of::<GeomBlock>() == 8 + 24 * MAX_GEOM_WINDOWS); // 296
 };
 
 #[cfg(test)]
@@ -2154,5 +2173,105 @@ mod tests {
         assert!(g.push_window(geom::SCRATCH, 0, scratch));
         assert_eq!(g.window_of(geom::SCRATCH), Some(scratch));
         assert_eq!(g.window_of(geom::MAP), None);
+    }
+}
+
+/// Opaque, per-boot task identity. An identifier is never authority.
+#[repr(transparent)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct TaskId([u8; 16]);
+impl TaskId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+    pub const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+impl core::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+impl core::fmt::Debug for TaskId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
+}
+/// Provenance, not a promise that the platform's seed was trustworthy.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskIdQuality {
+    Unverified = 0,
+    HardwareOrFirmware = 1,
+    TimingJitter = 2,
+    Degenerate = 3,
+}
+impl TaskIdQuality {
+    pub const fn decode(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unverified),
+            1 => Some(Self::HardwareOrFirmware),
+            2 => Some(Self::TimingJitter),
+            3 => Some(Self::Degenerate),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskIdentity {
+    pub id: TaskId,
+    pub quality: TaskIdQuality,
+}
+
+/// Owned diagnostic label. Empty means unspecified; labels convey no authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskName {
+    bytes: [u8; 63],
+    len: u8,
+}
+impl TaskName {
+    pub const EMPTY: Self = Self {
+        bytes: [0; 63],
+        len: 0,
+    };
+    pub const CAPACITY: usize = 63;
+    /// Reject oversized names instead of silently making distinct labels equal.
+    pub fn new(name: &str) -> Option<Self> {
+        if name.len() > Self::CAPACITY {
+            return None;
+        }
+        let mut value = Self::EMPTY;
+        value.bytes[..name.len()].copy_from_slice(name.as_bytes());
+        value.len = name.len() as u8;
+        Some(value)
+    }
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len as usize]).expect("validated task name")
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_name_tests {
+    use super::TaskName;
+    #[test]
+    fn names_are_owned_utf8_and_bounded_in_bytes() {
+        let mut source = *b"hello/worker-2";
+        let name = TaskName::new(core::str::from_utf8(&source).unwrap()).unwrap();
+        source.fill(0);
+        assert_eq!(name.as_str(), "hello/worker-2");
+        let ascii = [b'x'; 64];
+        let text = core::str::from_utf8(&ascii).unwrap();
+        assert!(TaskName::new(&text[..63]).is_some());
+        assert!(TaskName::new(text).is_none());
+        let utf8: [u8; 64] = core::array::from_fn(|i| if i % 2 == 0 { 0xc3 } else { 0xa9 });
+        let text = core::str::from_utf8(&utf8).unwrap();
+        assert!(TaskName::new(&text[..62]).is_some());
+        assert!(TaskName::new(text).is_none());
     }
 }
