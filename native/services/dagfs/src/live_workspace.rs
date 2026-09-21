@@ -4,6 +4,7 @@
 
 mod create;
 mod namespace;
+mod replacement;
 mod writeback;
 
 use alloc::boxed::Box;
@@ -350,6 +351,8 @@ impl<C: WorkspaceChannel> WorkspaceMount<C> {
                     | FsRequest::WriteAt { .. }
                     | FsRequest::Append { .. }
                     | FsRequest::Resize { .. }
+                    | FsRequest::BeginReplace { .. }
+                    | FsRequest::CommitReplace { .. }
                     | FsRequest::Rename { .. }
                     | FsRequest::Relocate { .. }
                     | FsRequest::Unlink { .. }
@@ -361,6 +364,22 @@ impl<C: WorkspaceChannel> WorkspaceMount<C> {
             if touches_host {
                 result?;
             }
+        }
+        if matches!(request, FsRequest::BeginReplace { .. }
+            | FsRequest::WriteReplacement { .. }
+            | FsRequest::CommitReplace { .. }
+            | FsRequest::AbortReplace { .. }) {
+            let mut window = fs.mapped_window_span(session).map(|span| {
+                // SAFETY: fs retains the affine mapping owner for this request.
+                DataWindow::new(unsafe {
+                    core::slice::from_raw_parts_mut(span.base.as_ptr(), span.len)
+                })
+            });
+            let response = self.replace_file(fs, session, request, window.as_mut()).await?;
+            if response.is_some() && self.reconcile_required {
+                self.refresh(fs).await?;
+            }
+            return Ok(response);
         }
         if matches!(request, FsRequest::Create { .. }) {
             let response = self.create(fs, session, request).await?;

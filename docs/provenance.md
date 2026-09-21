@@ -287,3 +287,26 @@ That image preceded the final source formatting and library-pin update. The fina
 committed guest/host compatibility tuple and fresh native UI acceptance are still
 pending; the previous tuple above does not certify this candidate. This is an
 in-review source integration, not an approved release baseline.
+
+## Atomic workspace replacement integration — 2026-09-21
+
+The native export now records Kore
+`3508e7b020edf26ae4340f9448e06e3cefcfe9dd` (31 packages, 414 files), which
+also incorporates main `8a92182d24a102e0cf82444516d3bd3d0cc1c702`.
+Actual vKore UI testing of the preceding image found that native atomic
+replacement changed guest bytes without writing them to the host workspace.
+Kore now composes the session-owned replacement commit with the existing
+journaled HostLink transaction, and refuses direct dispatch that would bypass
+that composition. Refusal retains the private placement for abort or teardown.
+The facade is unchanged; the native export is byte-exact from the owning source.
+
+Focused owner tests cover host acknowledgment, write-only authority, disabled
+writeback, empty and incomplete replacements, concurrent revision conflict,
+lost receipt reconciliation, abort and close cleanup. The local/Git composition
+check passes for this source, including its duplicate-owner negative control.
+Formatting, host tests, Clippy, documentation, owner checks and all three
+Kore target checks passed. The remaining symbol/link, Miri and binding checks
+are being rerun, as is corrected guest image/UI acceptance. The earlier
+production gate alone did not establish host writeback. This export also
+includes the HostLink test fixture's explicit 64-byte ring alignment; Linux CI
+caught the prior byte-aligned allocation assumption.

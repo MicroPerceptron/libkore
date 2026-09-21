@@ -177,7 +177,12 @@ mod tests {
         // view. Keep that headroom here so the obsolete generic 8/8 attach
         // fails because its ring header disagrees, not merely because a
         // minimally-sized test allocation ends too early.
-        let mut window = std::vec![0u8; 0x3000];
+        // A Vec<u8> guarantees only byte alignment; a coincidentally aligned
+        // allocator on one host must not hide an invalid ring test fixture.
+        #[repr(align(64))]
+        struct Window([u8; 0x3000]);
+        let mut storage = Window([0; 0x3000]);
+        let mut window = &mut storage.0[..];
         init_window::<HostLinkFront>(
             &mut window,
             HostLinkFront::REQUEST_CAPACITY,

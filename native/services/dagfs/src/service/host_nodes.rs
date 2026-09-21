@@ -367,6 +367,10 @@ impl<P: StorageProvider> FsService<P> {
             | FsRequest::WriteAt { handle, .. }
             | FsRequest::Append { handle, .. }
             | FsRequest::Resize { handle, .. }
+            | FsRequest::BeginReplace { handle, .. }
+            | FsRequest::WriteReplacement { handle, .. }
+            | FsRequest::CommitReplace { handle }
+            | FsRequest::AbortReplace { handle }
             | FsRequest::LendVersion { handle, .. }
             | FsRequest::LendExecutable { handle, .. }
             | FsRequest::DerivedInfo { handle, .. }
@@ -413,6 +417,10 @@ impl<P: StorageProvider> FsService<P> {
             | FsRequest::WriteAt { .. }
             | FsRequest::Append { .. }
             | FsRequest::Resize { .. }
+            | FsRequest::BeginReplace { .. }
+            | FsRequest::WriteReplacement { .. }
+            | FsRequest::CommitReplace { .. }
+            | FsRequest::AbortReplace { .. }
             | FsRequest::Rename { .. }
             | FsRequest::Relocate { .. }
             | FsRequest::Link { .. }

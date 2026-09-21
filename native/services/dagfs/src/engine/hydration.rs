@@ -15,6 +15,88 @@ pub(crate) struct Hydration {
 }
 
 impl<P: StorageProvider> Engine<P> {
+    /// Publish the caller's existing private replacement only after the host
+    /// acknowledges it. Keep the old placement until that point, including
+    /// when the host refuses or its receipt is lost. The session still owns
+    /// the stage on every refusal; existing abort/peer teardown reclaims it.
+    pub(crate) async fn commit_host_replacement<C>(
+        &self,
+        session: SessionId,
+        stage: &Replacement<P::Key>,
+        commit_host: C,
+    ) -> FsResult<Revision>
+    where
+        C: AsyncFnOnce(&[u8]) -> FsResult<()>,
+    {
+        let route = self.route(session, stage.handle)?;
+        route.rights.require(Rights::WRITE)?;
+        if route.object != stage.object {
+            return Err(FsError::AccessLost);
+        }
+        if stage.written != stage.length {
+            return Err(FsError::Range);
+        }
+        if stage.length > kore_workspace_sync::bounds::MAX_FILE_BYTES {
+            return Err(FsError::OutOfStorage);
+        }
+        let mut object = self.ns.object_mut(route.object)?;
+        if object.revision() != stage.revision {
+            return Err(FsError::Conflict);
+        }
+        let _quota = self.require_growth_with_claimed(
+            route,
+            &object,
+            0,
+            0,
+            stage.length.saturating_sub(object.len()),
+        )?;
+        // The bounded HostLink blob protocol consumes contiguous bytes. Read
+        // from the already-owned private placement, never from a namespace
+        // handle (which would require disclosing READ to a write-only caller).
+        let mut content = alloc::vec::Vec::new_in(crate::service_alloc());
+        content
+            .try_reserve_exact(stage.length as usize)
+            .map_err(|_| FsError::OutOfStorage)?;
+        content.resize(stage.length as usize, 0);
+        let limit = self.provider.limits().max_transfer.min(MAX_TRANSFER);
+        if limit == 0 {
+            return Err(FsError::Range);
+        }
+        for (index, chunk) in content.chunks_mut(limit).enumerate() {
+            let count = self
+                .provider
+                .read(stage.key, (index * limit) as u64, chunk)
+                .await?;
+            if count != chunk.len() {
+                return Err(FsError::ProviderFailure(ProviderError::Integrity));
+            }
+        }
+        self.provider.sync(stage.key).await?;
+        // Clear the reusable staging slot before host publication. The old
+        // selected placement will occupy it afterwards unless a lease owns it.
+        if let Some(unused) = object.staged_storage() {
+            self.provider.release(unused).await?;
+            object.set_staged_storage(None);
+        }
+        let old = object.storage();
+        let borrowed = match old {
+            Some(old) => self.extraction.storage_borrowers(old, None)? != 0,
+            None => false,
+        };
+        self.route(session, stage.handle)?
+            .rights
+            .require(Rights::WRITE)?;
+        commit_host(&content).await?;
+        self.route(session, stage.handle)?
+            .rights
+            .require(Rights::WRITE)?;
+        object.set_storage(stage.key);
+        object.set_staged_storage(if borrowed { None } else { old });
+        Ok(self
+            .ns
+            .commit_file_len(route.object, &mut object, stage.length))
+    }
+
     /// Fill an unpublished placement and select it only after the complete
     /// digest is verified. Filling a placeholder or fetching identical bytes
     /// preserves the native revision. Replacing an already selected, different
