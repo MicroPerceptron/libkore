@@ -310,3 +310,20 @@ are being rerun, as is corrected guest image/UI acceptance. The earlier
 production gate alone did not establish host writeback. This export also
 includes the HostLink test fixture's explicit 64-byte ring alignment; Linux CI
 caught the prior byte-aligned allocation assumption.
+
+## Lifecycle delegation reconciliation — 2026-09-21
+
+The export advances to Kore `cce0f31670773eab781bf542b783c37f67a6921f`.
+The only exported source difference from the preceding snapshot is the
+SpawnSpec comment: an explicit delegable parent handle applies to any
+authorized spawn, matching current main and the existing native client.
+The owning Kore service had retained the old window-only restriction during
+integration; it now restores main's policy and rights regression. That server
+is not part of this native export. The facade and all exported implementation
+bytes are unchanged. The preceding atomic export completed its full local
+matrix and all seven remote checks. The refreshed full local matrix passed (505 host tests, 39 Miri tests,
+all three target and C/Zig checks), as did local/Git composition with its
+duplicate-owner negative control. The owning guest's two-terminal startup and
+Lua REPL witnesses pass after the policy correction, but its durable store
+still seeded only 33/35 applications with a resize failure. Guest acceptance
+and fresh companion UI acceptance remain incomplete.

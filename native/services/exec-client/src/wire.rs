@@ -858,9 +858,9 @@ pub struct SpawnSpec {
     /// (a task nobody holds a handle to is unreapable), so a cleared bit
     /// refuses [`Denied`](TaskRefusal::Denied) before validation.
     pub return_handle: bool,
-    /// Preserve `DERIVE` on the returned parent handle. This is an explicit
-    /// controller contract, not the default exec-client authority, and the
-    /// service accepts it only for the authenticated window-runtime profile.
+    /// Preserve `DERIVE` on the returned parent handle so its owner can
+    /// attenuate lifecycle observers into sibling workers. This opt-in applies
+    /// to any authorized spawn; ordinary invocation remains non-delegable.
     pub delegable_handle: bool,
     /// Return the window compositor's response-send sibling as grant 0.
     /// This bit is meaningful only for the exact [`kore_app::FilesWindow`]

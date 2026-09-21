@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/MicroPerceptron/kore",
-  "revision": "3508e7b020edf26ae4340f9448e06e3cefcfe9dd",
+  "revision": "cce0f31670773eab781bf542b783c37f67a6921f",
   "packages": {
     "crates/abi": "kore-abi",
     "crates/app": "kore-app",
@@ -374,7 +374,7 @@
     "services/exec-client/src/client.rs": "1856e55bba0e0195f548c0162ba3da05e22388bedc1514ad23e75c1ac69705e5",
     "services/exec-client/src/client/mint.rs": "68dcc733c362d420da092787a6946b466726bf35c514bc1948593b2b19c44db3",
     "services/exec-client/src/lib.rs": "e456d9a04fc781ebc71d0e9a6a3bc4f84c97d8224d8007988bec7e12fc92ff3d",
-    "services/exec-client/src/wire.rs": "a836961557275d7df5b17ca590974c9d6ad31d145ffb847b478be2acb23461fc",
+    "services/exec-client/src/wire.rs": "4bebecd044d8571120db48a8ea7aa91b8d21a1273de2e27a469b13a9343fbe0d",
     "services/exec-client/tests/standalone_consumer.rs": "4ac1088be64468839788e694dd89cd76dab610c9722640d2c11600cd73c15f36",
     "services/extract-worker-c/Cargo.toml": "0a84769f520d5f2735711a21efebfc93380d91724ba2ed690cfe0fe1529e1513",
     "services/extract-worker-c/build.rs": "66b66d671df56f116176896f7f6c9aaba008ada2d51d0b3dc1f6ca4db08e74bd",
