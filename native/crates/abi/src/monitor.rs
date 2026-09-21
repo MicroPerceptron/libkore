@@ -47,6 +47,43 @@ pub struct SystemSnapshot {
     /// (`SystemMetric::TimerArms` auxiliary).  A timer that loses arms in
     /// steady state is otherwise invisible on a machine with no serial.
     timer_arm_faults: U64,
+    /// The boot frame-class partition (`res/ACCEL_MEMORY_SCALE.md` §1),
+    /// indexed base / 2 MiB / 1 GiB: bytes carved into each class in
+    /// [`CLASS_UNIT_BYTES`] units (8 MiB, so 512 GiB per class).  Sixteen
+    /// bytes in all, paid out of the process page's argument reservoir like
+    /// the timer census before it — the output budget has no room.
+    class_carved: [U16; 3],
+    /// Units free in each class now.
+    class_free: [U16; 3],
+    /// Reservation misses per class, saturated to a byte; the fourth byte is
+    /// reserved and keeps the record 8-byte shaped.
+    class_misses: [u8; 4],
+    /// The boot DRAM stream measurement (`SystemMetric::MemoryStream`), in
+    /// [`STREAM_UNIT_BPS`] units (100 MB/s, so 6.5 TB/s per word): one CPU
+    /// of each core class alone (`[class][write, copy]`, class = the
+    /// `CoreClass` discriminant), then every CPU at once with how many
+    /// took part.  Zero rows are unmeasured.  Twenty-four bytes, paid from
+    /// the argument reservoir like the census before it.
+    stream_class: [[U16; 2]; 4],
+    stream_all: [U16; 2],
+    stream_all_cpus: U16,
+    /// The all-CPU run's fill rate through the kernel's scrub fill
+    /// (streaming stores), same units — the number a scrub actually gets.
+    stream_all_scrub: U16,
+}
+
+/// Bytes per unit of the class-census fields.
+const CLASS_UNIT_BYTES: u64 = 8 << 20;
+/// Bytes per second per unit of the stream fields.
+const STREAM_UNIT_BPS: u64 = 100_000_000;
+
+const fn stream_unit(bps: u64) -> U16 {
+    let units = bps / STREAM_UNIT_BPS;
+    U16::new(if units > u16::MAX as u64 {
+        u16::MAX
+    } else {
+        units as u16
+    })
 }
 
 impl SystemSnapshot {
@@ -66,6 +103,13 @@ impl SystemSnapshot {
         iommu_last: U64::new(0),
         timer_arms: U64::new(0),
         timer_arm_faults: U64::new(0),
+        class_carved: [U16::new(0); 3],
+        class_free: [U16::new(0); 3],
+        class_misses: [0; 4],
+        stream_class: [[U16::new(0); 2]; 4],
+        stream_all: [U16::new(0); 2],
+        stream_all_cpus: U16::new(0),
+        stream_all_scrub: U16::new(0),
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -105,6 +149,13 @@ impl SystemSnapshot {
             iommu_last: U64::new(iommu_last),
             timer_arms: U64::new(timer_arms),
             timer_arm_faults: U64::new(timer_arm_faults),
+            class_carved: [U16::new(0); 3],
+            class_free: [U16::new(0); 3],
+            class_misses: [0; 4],
+            stream_class: [[U16::new(0); 2]; 4],
+            stream_all: [U16::new(0); 2],
+            stream_all_cpus: U16::new(0),
+            stream_all_scrub: U16::new(0),
         }
     }
 
@@ -120,6 +171,121 @@ impl SystemSnapshot {
         (capacity == 0 || domains <= capacity)
             && self.fabric_lendable_domains() <= domains
             && self.fabric_fence_required_domains() <= domains
+            && self.class_misses[3] == 0
+            && (0..3).all(|c| self.class_free[c].get() <= self.class_carved[c].get())
+            && (self.stream_all[0].get() == 0) == (self.stream_all_cpus.get() == 0)
+            && (self.stream_all_cpus.get() != 0 || self.stream_all_scrub.get() == 0)
+    }
+
+    /// Attach one class of the boot frame-size partition (`class` 0 = 4 KiB,
+    /// 1 = 2 MiB, 2 = 1 GiB); an out-of-range class is ignored.  Bytes are
+    /// kept in 8 MiB units, saturating, and free is clamped to carved so a
+    /// torn sample cannot render as more free than exists.
+    pub const fn with_class(mut self, class: usize, carved: u64, free: u64, misses: u64) -> Self {
+        if class >= 3 {
+            return self;
+        }
+        let carved_units = carved / CLASS_UNIT_BYTES;
+        let carved_units = if carved_units > u16::MAX as u64 {
+            u16::MAX
+        } else {
+            carved_units as u16
+        };
+        let free_units = free / CLASS_UNIT_BYTES;
+        let free_units = if free_units > carved_units as u64 {
+            carved_units
+        } else {
+            free_units as u16
+        };
+        let misses = if misses > u8::MAX as u64 {
+            u8::MAX
+        } else {
+            misses as u8
+        };
+        self.class_carved[class] = U16::new(carved_units);
+        self.class_free[class] = U16::new(free_units);
+        self.class_misses[class] = misses;
+        self
+    }
+
+    /// Bytes carved into `class` (0 = 4 KiB, 1 = 2 MiB, 2 = 1 GiB).
+    pub fn class_carved(self, class: usize) -> u64 {
+        self.class_carved
+            .get(class)
+            .map_or(0, |v| u64::from(v.get()) * CLASS_UNIT_BYTES)
+    }
+    /// Bytes free in `class`.
+    pub fn class_free(self, class: usize) -> u64 {
+        self.class_free
+            .get(class)
+            .map_or(0, |v| u64::from(v.get()) * CLASS_UNIT_BYTES)
+    }
+    /// Reservation misses in `class` (saturated at 255).
+    pub fn class_misses(self, class: usize) -> u32 {
+        if class >= 3 {
+            return 0;
+        }
+        u32::from(self.class_misses[class])
+    }
+    /// Attach one core class's solo stream measurement (bytes per second,
+    /// kept in 100 MB/s units, saturating); an out-of-range class is ignored.
+    pub const fn with_stream_class(mut self, class: usize, write_bps: u64, copy_bps: u64) -> Self {
+        if class >= 4 {
+            return self;
+        }
+        self.stream_class[class] = [stream_unit(write_bps), stream_unit(copy_bps)];
+        self
+    }
+    /// Attach the all-CPUs concurrent measurement (`scrub_bps` = the same
+    /// run through the kernel's scrub fill).
+    pub const fn with_stream_all(
+        mut self,
+        cpus: u32,
+        write_bps: u64,
+        copy_bps: u64,
+        scrub_bps: u64,
+    ) -> Self {
+        if cpus == 0 || write_bps == 0 {
+            return self;
+        }
+        self.stream_all = [stream_unit(write_bps), stream_unit(copy_bps)];
+        self.stream_all_scrub = stream_unit(scrub_bps);
+        self.stream_all_cpus = U16::new(if cpus > u16::MAX as u32 {
+            u16::MAX
+        } else {
+            cpus as u16
+        });
+        self
+    }
+    /// One CPU of `class` alone: `(write, copy)` bytes per second, `(0, 0)`
+    /// when unmeasured.
+    pub fn stream_class(self, class: usize) -> (u64, u64) {
+        match self.stream_class.get(class) {
+            Some([w, c]) => (
+                u64::from(w.get()) * STREAM_UNIT_BPS,
+                u64::from(c.get()) * STREAM_UNIT_BPS,
+            ),
+            None => (0, 0),
+        }
+    }
+    /// Every CPU at once: `(cpus, write, copy, scrub fill)`; `cpus == 0`
+    /// when unmeasured.
+    pub fn stream_all(self) -> (u32, u64, u64, u64) {
+        (
+            u32::from(self.stream_all_cpus.get()),
+            u64::from(self.stream_all[0].get()) * STREAM_UNIT_BPS,
+            u64::from(self.stream_all[1].get()) * STREAM_UNIT_BPS,
+            u64::from(self.stream_all_scrub.get()) * STREAM_UNIT_BPS,
+        )
+    }
+    /// Whether the kernel measured any stream at all.
+    pub fn has_stream(self) -> bool {
+        self.stream_all_cpus.get() != 0 || self.stream_class.iter().any(|[w, _]| w.get() != 0)
+    }
+    /// Whether any class was carved at all — false on a snapshot from a
+    /// kernel without the partition, so the renderer can stay quiet.
+    pub fn has_classes(self) -> bool {
+        self.class_carved.iter().any(|v| v.get() != 0)
     }
     pub fn cpu_count(self) -> u32 {
         self.cpu_count.get()
@@ -1536,7 +1702,9 @@ impl TelemetrySnapshot {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<SystemSnapshot>() == 104);
+    // 104 through `timer_arm_faults`, then the three-class census (2 × 3 × 2
+    // + 4 = 16), then the DRAM stream table (4 × 2 × 2 + 2 × 2 + 2 + 2 = 24).
+    assert!(core::mem::size_of::<SystemSnapshot>() == 144);
     assert!(core::mem::size_of::<MemorySnapshot>() == 64);
     assert!(core::mem::size_of::<FilesystemHealthSnapshot>() == 40);
     assert!(core::mem::size_of::<FilesystemStorageSnapshot>() == 80);
@@ -1547,7 +1715,7 @@ const _: () = {
     // 16-byte link head (2 reserved) ‖ 24-byte counters ‖ 36-byte radio block.
     assert!(core::mem::size_of::<NetSnapshot>() == 76);
     assert!(core::mem::size_of::<ManifoldSnapshot>() == 40);
-    assert!(core::mem::size_of::<TelemetrySnapshot>() == 240);
+    assert!(core::mem::size_of::<TelemetrySnapshot>() == 280);
 };
 
 #[cfg(test)]

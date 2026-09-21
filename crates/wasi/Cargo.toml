@@ -1,0 +1,30 @@
+[package]
+name = "kore-wasi"
+version = "0.1.0-alpha.1"
+edition = "2024"
+publish = false
+description = "WASI 0.2 for WebAssembly components on Kore: the command world's interfaces on native owners, with async imports on Wasmtime's fibers"
+build = "build.rs"
+
+[features]
+# `fixture::HELLO` for a witness: the stock wasm32-wasip2 guest (`guests/hello`).
+fixture = []
+
+[dependencies]
+kore = { package = "kore-std", path = "../..", features = ["heap"] }
+# Components, and async host imports: a guest's call into WASI suspends its
+# fiber and the Kore executor runs until the import's future is ready. The
+# engine's platform (memory, fibers, ISA) is the embedding program's choice.
+wasmtime = { version = "47", default-features = false, features = [
+    "runtime",
+    "component-model",
+    "async",
+] }
+# WASI 0.2's `wasi:io` (pollables, input and output streams) as traits the
+# native process stream implements; `no_std` by design.
+wasmtime-wasi-io = { version = "47", default-features = false }
+
+# Host tests resolve the guest fixture against the linker with a std
+# Wasmtime: the Kore-side engine has no host to run on.
+[dev-dependencies]
+wasmtime = { version = "47", features = ["std", "cranelift", "component-model"] }

@@ -3039,11 +3039,26 @@ mod metal {
         /// The device-publish session refused (status; `0` = build) —
         /// the IOVA leg: domain attach, window registration, the map.
         Publish(u8),
-        /// Fabric registration (1), observation (2), or route admission (3) refused.
+        /// Fabric registration (1), observation (2), or route admission (3)
+        /// refused.  The payload is `stage[1:0] | status << 2`, where
+        /// `status` is the refusing session's wire status (1..=6) or 7 for
+        /// a local refusal (no slot, malformed report, busy, quarantined) —
+        /// see [`fabric`](Self::fabric).  Every kernel-side route refusal
+        /// reaches ring 3 as `Status::Denied`, so the stage is the finer
+        /// signal until a fault-detail channel exists.
         Fabric(u8),
     }
 
     impl DmaMapFault {
+        /// The fabric arm with its stage and the fault that stopped it.
+        pub fn fabric(stage: u8, fault: FabricRouteFault) -> Self {
+            let status = match fault {
+                FabricRouteFault::Commit(status) => status.min(6),
+                _ => 7,
+            };
+            Self::Fabric((stage & 3) | (status << 2))
+        }
+
         /// Pack as `stage[2:0] | status << 3` — the note-detail byte.
         pub fn code(self) -> u8 {
             match self {
@@ -3239,31 +3254,25 @@ mod metal {
 
         // Admit the whole window before creating aliases. Pool allocations and
         // imported storage share this custody chain; only initialization differs.
-        let registration =
-            register_fabric_lease(window_slot).map_err(|_| DmaMapFault::Fabric(1))?;
-        let facts = registration
-            .describe()
-            .map_err(|_| DmaMapFault::Fabric(2))?;
-        let request = kore_abi::session::FabricRouteReq {
-            destination: facts.domain.into(),
-            offset: 0.into(),
-            bytes: len.into(),
-            source_reset: facts.reset.into(),
-            source_power: facts.power.into(),
-            source_allocation: facts.allocation.into(),
-            destination_reset: facts.reset.into(),
-            destination_power: facts.power.into(),
-            destination_allocation: facts.allocation.into(),
-            access: 7,
-            operation: 1,
-            // Fresh pool storage or CPU-produced import protocol handoff;
-            // this does not attest a foreign device's fence.
-            synchronization: 1,
-            reserved: [0; 5],
-        };
+        let registration = register_fabric_lease(window_slot).map_err(|fault| {
+            DmaMapFault::fabric(
+                1,
+                match fault {
+                    FabricRegistrationFault::Commit(status) => FabricRouteFault::Commit(status),
+                    _ => FabricRouteFault::Build,
+                },
+            )
+        })?;
+        // Fresh pool storage or CPU-produced import protocol handoff; the
+        // declared fence does not attest a foreign device's fence.
         let route = registration
-            .open_route(&request)
-            .map_err(|_| DmaMapFault::Fabric(3))?;
+            .open_self_route(
+                len,
+                kore_abi::session::FabricOp::IommuMap,
+                kore_abi::session::FabricAccess::all(),
+                kore_abi::session::FabricSync::Fenced,
+            )
+            .map_err(|fault| DmaMapFault::fabric(3, fault))?;
         let (cpu_view, device_owner) =
             map_route_dma_views(&route, device, iova, len, contents, device_write)?;
         let geom = GeomReport {
@@ -3391,7 +3400,9 @@ mod metal {
             if len == 0 || len % 4096 != 0 || iova % 4096 != 0 || iova.checked_add(len).is_none() {
                 return Err(DmaMapFault::Bounds);
             }
-            let info = route.describe().map_err(|_| DmaMapFault::Fabric(2))?;
+            let info = route
+                .describe()
+                .map_err(|_| DmaMapFault::fabric(2, FabricRouteFault::MalformedReport))?;
             if info.bytes != len || info.operation != 1 || info.access & 3 != 3 {
                 return Err(DmaMapFault::Bounds);
             }
@@ -3641,6 +3652,21 @@ mod metal {
     pub fn reclaim_extent(_view: SlotRef, _supply: &SupplyToken) -> Option<(u64, u64)> {
         None
     }
+
+    /// [`reclaim_extent`] for a view that arrived on a **retained** return
+    /// leg ([`ReturnMode::RetainedAny`](crate::service::ReturnMode)): the
+    /// return retires the record out of its runtime-owned landing, so the
+    /// owner's reservation is released without the revoke its drop would
+    /// otherwise attempt on the now-vacant slot. A refused return keeps
+    /// the owner, whose drop revokes the record as usual.
+    pub fn reclaim_returned_extent(
+        view: crate::cap::ReturnedCapability,
+        supply: &SupplyToken,
+    ) -> Option<(u64, u64)> {
+        let reclaimed = reclaim_extent(view.slot()?, supply)?;
+        view.release_after_proven_move();
+        Some(reclaimed)
+    }
     /// Possess a delivered **`MemLease`** — the shape an image-service
     /// `Acquire` grant arrives in, and the one [`take_view`] refuses.
     ///
@@ -3849,6 +3875,9 @@ mod metal {
             kore_abi::session::ViewMapWindow::Surfaces => {
                 map_stashed_view_request(view, Some(kore_abi::session::SurfaceMapLane::First))
             }
+            // The heap window places the task's own heap-supply carves
+            // (`heap::source`), never a peer's view.
+            kore_abi::session::ViewMapWindow::Heap => None,
         }
     }
 

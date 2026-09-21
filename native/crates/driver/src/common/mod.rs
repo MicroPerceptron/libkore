@@ -22,6 +22,8 @@
 //! The library is arch-neutral — pure data + algorithm, no `#[cfg(target_arch)]`
 //! — so it compiles identically on x86_64, aarch64, and riscv64.
 
+#[cfg(feature = "alloc")]
+pub mod aperture;
 pub mod flags;
 pub mod pagetable;
 pub mod smmuv3;

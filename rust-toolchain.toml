@@ -3,8 +3,11 @@ channel = "nightly-2026-07-13"
 profile = "minimal"
 components = ["rust-src", "rustfmt", "clippy", "miri"]
 
+# `wasm32-wasip2`: the WASI host's guest fixture (`crates/wasi`, feature
+# `fixture`). Tier 2, so its `rust-std` ships with every nightly.
 targets = [
     "x86_64-unknown-none",
     "aarch64-unknown-none",
     "riscv64gc-unknown-none-elf",
+    "wasm32-wasip2",
 ]

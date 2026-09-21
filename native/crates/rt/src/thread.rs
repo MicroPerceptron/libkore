@@ -304,16 +304,23 @@ const _: () = {
         crate::lane::fiber::FIBER_WINDOW_BASE,
         crate::lane::fiber::FIBER_WINDOW_GRANULES as u64 * crate::stack_arena::GRANULE as u64,
     );
-    let mut all = [arena; 9];
+    // So does the guarded fiber-stack window (`fiber_stack`), whose
+    // stacks foreign fiber runtimes (Wasmtime's async) switch onto.
+    let guarded = Window::new(
+        crate::fiber_stack::WINDOW_BASE,
+        crate::fiber_stack::WINDOW_GRANULES as u64 * crate::stack_arena::GRANULE as u64,
+    );
+    let mut all = [arena; 10];
     all[1] = fibers;
+    all[2] = guarded;
     let mut i = 0;
     while i < spans.len() {
-        all[i + 2] = spans[i];
+        all[i + 3] = spans[i];
         i += 1;
     }
     assert!(
         Window::all_disjoint(&all),
-        "the SPMD stack window, the fiber window, and the thread bands overlap"
+        "the SPMD stack window, the fiber windows, and the thread bands overlap"
     );
 };
 

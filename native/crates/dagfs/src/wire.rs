@@ -1471,91 +1471,71 @@ pub fn decode_rep_unambiguous(w: &FsRepWire) -> Option<(FsResponse, u8)> {
 ///
 /// The request/reply rings are uncorrelated SPSC pairs, so this is the check
 /// that a reply belongs to the call in flight rather than to the previous one.
+///
+/// A `match` on the request, not one `matches!` over the pair: the compiler
+/// then refuses to build until a new [`FsRequest`] variant names the reply it
+/// answers with. Under a single `matches!` an unpaired verb evaluates to
+/// `false` instead, and [`FsClient::call`](crate::client::FsClient::call)
+/// reads its every successful reply as a desynchronized ring — a phantom
+/// transport fault that would hold for the life of the verb, with nothing in
+/// the host tests to see it.
 pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
     if matches!(response, FsResponse::Refused(_)) {
         // Any request may be refused.
         return true;
     }
-    matches!(
-        (request, response),
-        (
-            FsRequest::OpenRoot { .. }
-                | FsRequest::OpenAt { .. }
-                | FsRequest::OpenGrant { .. }
-                | FsRequest::Create { .. },
-            FsResponse::Opened { .. }
-        ) | (FsRequest::Stat { .. }, FsResponse::Stat { .. })
-            | (FsRequest::List { .. }, FsResponse::Listed { .. })
-            | (
-                FsRequest::ListGrants { .. },
-                FsResponse::GrantsListed { .. }
-            )
-            | (
-                FsRequest::SystemStatus { .. },
-                FsResponse::SystemStatusReported { .. }
-            )
-            | (
-                FsRequest::Read { .. } | FsRequest::ReadVersion { .. },
-                FsResponse::Transferred { .. }
-            )
-            | (
-                FsRequest::WriteAt { .. }
-                    | FsRequest::Resize { .. }
-                    | FsRequest::CommitReplace { .. },
-                FsResponse::Committed { .. }
-            )
-            | (FsRequest::Append { .. }, FsResponse::Appended { .. })
-            | (
-                FsRequest::Grant { .. }
-                    | FsRequest::GrantScoped { .. }
-                    | FsRequest::GrantView { .. },
-                FsResponse::Granted { .. }
-            )
-            | (
-                FsRequest::LendVersion { .. } | FsRequest::LendExecutable { .. },
-                FsResponse::VersionLent { .. }
-            )
-            | (
-                FsRequest::CommitDerived { .. },
-                FsResponse::DerivedCommitted { .. }
-            )
-            | (
-                FsRequest::DerivedInfo { .. },
-                FsResponse::DerivedInfo { .. }
-            )
-            | (FsRequest::Search { .. }, FsResponse::Searched { .. })
-            | (FsRequest::TakeAdmission, FsResponse::PeerAdmitted { .. })
-            | (
-                FsRequest::AttachWindow { .. },
-                FsResponse::WindowAttached { .. }
-            )
-            | (
-                FsRequest::RegisterSystemView { .. }
-                    | FsRequest::RegisterPrivateView { .. }
-                    | FsRequest::RegisterPrivateView { .. }
-                    | FsRequest::ApplyView { .. }
-                    | FsRequest::BindView { .. }
-                    | FsRequest::Close { .. }
-                    | FsRequest::Rename { .. }
-                    | FsRequest::Relocate { .. }
-                    | FsRequest::Link { .. }
-                    | FsRequest::Unlink { .. }
-                    | FsRequest::DetachEdge { .. }
-                    | FsRequest::Revoke { .. }
-                    | FsRequest::Sync { .. }
-                    | FsRequest::BeginReplace { .. }
-                    | FsRequest::WriteReplacement { .. }
-                    | FsRequest::AbortReplace { .. }
-                    | FsRequest::DeferCommits { .. }
-                    | FsRequest::SetSystemSeed { .. }
-                    | FsRequest::ReleaseVersion { .. }
-                    | FsRequest::AdmitPeer { .. }
-                    | FsRequest::RetirePeer { .. }
-                    | FsRequest::ConfirmRetired { .. }
-                    | FsRequest::ClosePeer,
-                FsResponse::Done
-            )
-    )
+    match request {
+        FsRequest::OpenRoot { .. }
+        | FsRequest::OpenAt { .. }
+        | FsRequest::OpenGrant { .. }
+        | FsRequest::Create { .. } => matches!(response, FsResponse::Opened { .. }),
+        FsRequest::Stat { .. } => matches!(response, FsResponse::Stat { .. }),
+        FsRequest::List { .. } => matches!(response, FsResponse::Listed { .. }),
+        FsRequest::ListGrants { .. } => matches!(response, FsResponse::GrantsListed { .. }),
+        FsRequest::SystemStatus { .. } => {
+            matches!(response, FsResponse::SystemStatusReported { .. })
+        }
+        FsRequest::Read { .. } | FsRequest::ReadVersion { .. } => {
+            matches!(response, FsResponse::Transferred { .. })
+        }
+        FsRequest::WriteAt { .. } | FsRequest::Resize { .. } | FsRequest::CommitReplace { .. } => {
+            matches!(response, FsResponse::Committed { .. })
+        }
+        FsRequest::Append { .. } => matches!(response, FsResponse::Appended { .. }),
+        FsRequest::Grant { .. } | FsRequest::GrantScoped { .. } | FsRequest::GrantView { .. } => {
+            matches!(response, FsResponse::Granted { .. })
+        }
+        FsRequest::LendVersion { .. } | FsRequest::LendExecutable { .. } => {
+            matches!(response, FsResponse::VersionLent { .. })
+        }
+        FsRequest::CommitDerived { .. } => matches!(response, FsResponse::DerivedCommitted { .. }),
+        FsRequest::DerivedInfo { .. } => matches!(response, FsResponse::DerivedInfo { .. }),
+        FsRequest::Search { .. } => matches!(response, FsResponse::Searched { .. }),
+        FsRequest::TakeAdmission => matches!(response, FsResponse::PeerAdmitted { .. }),
+        FsRequest::AttachWindow { .. } => matches!(response, FsResponse::WindowAttached { .. }),
+        FsRequest::RegisterSystemView { .. }
+        | FsRequest::RegisterPrivateView { .. }
+        | FsRequest::ApplyView { .. }
+        | FsRequest::BindView { .. }
+        | FsRequest::Close { .. }
+        | FsRequest::Rename { .. }
+        | FsRequest::Relocate { .. }
+        | FsRequest::Link { .. }
+        | FsRequest::Unlink { .. }
+        | FsRequest::DetachEdge { .. }
+        | FsRequest::Revoke { .. }
+        | FsRequest::Sync { .. }
+        | FsRequest::BeginReplace { .. }
+        | FsRequest::WriteReplacement { .. }
+        | FsRequest::AbortReplace { .. }
+        | FsRequest::DeferCommits { .. }
+        | FsRequest::SetSystemSeed { .. }
+        | FsRequest::ReleaseVersion { .. }
+        | FsRequest::AdmitPeer { .. }
+        | FsRequest::RetirePeer { .. }
+        | FsRequest::ConfirmRetired { .. }
+        | FsRequest::ClosePeer => matches!(response, FsResponse::Done),
+    }
 }
 
 #[cfg(test)]

@@ -95,6 +95,24 @@ impl MmReqWire {
     /// Read the lessor's bounded, provider-owned allocator snapshot.
     /// Every argument field must remain zero.
     pub const OP_STATS: u8 = 4;
+    /// Exec's administration pair only: one component of a per-launch
+    /// client face (a recyclable peer). `contiguous` carries the part code
+    /// (`0` ring, `1` kick, `2` return receive, `0x80 | n` grant `n`),
+    /// `slot` the announced return landing; every other field is zero.
+    pub const OP_ADMIT_PEER: u8 = 5;
+    /// Exec's administration pair only: consume the verdict of the
+    /// preceding admission. Every argument field is zero.
+    pub const OP_TAKE_ADMISSION: u8 = 6;
+    /// Exec's administration pair only: retire one exact face generation.
+    /// `numa` carries its arrival; every other field is zero.
+    pub const OP_RETIRE_PEER: u8 = 7;
+    /// Exec's administration pair only: fence retirement. Accepted only
+    /// once the face is closed **and** every supply it minted has returned,
+    /// so exec reclaims the face's local backing no earlier. `numa` carries
+    /// its arrival; every other field is zero.
+    pub const OP_CONFIRM_RETIRED: u8 = 8;
+    /// A per-launch face retires itself. Every argument field is zero.
+    pub const OP_CLOSE_PEER: u8 = 9;
 }
 
 /// The memory-manager reply wire form (`MmResponse`'s crossing shape).
@@ -133,6 +151,11 @@ impl MmRepWire {
     pub const TAG_REFUSED: u8 = 3;
     /// `MmResponse::Stats` — no capability grant accompanies the sample.
     pub const TAG_STATS: u8 = 4;
+    /// `MmResponse::Accepted` — an administration step took effect.
+    pub const TAG_ACCEPTED: u8 = 5;
+    /// `MmResponse::PeerAdmitted` — `reserved[0..2]` carries the admitted
+    /// face's arrival (little-endian); the rest stays zero.
+    pub const TAG_PEER_ADMITTED: u8 = 6;
 
     /// `MmRefusal::BadProps`.
     pub const REFUSE_BAD_PROPS: u8 = 1;
@@ -147,6 +170,10 @@ impl MmRepWire {
     /// `TableFull` discipline: a loud wire refusal, never a silent
     /// clamp).
     pub const REFUSE_QUOTA: u8 = 5;
+    /// `MmRefusal::Pending` — the administration step cannot complete yet
+    /// (an admission in flight, or a retired face whose supplies have not
+    /// all returned); ask again.
+    pub const REFUSE_PENDING: u8 = 6;
 }
 
 // ─── monitor — federated telemetry assembly ───────────────────────
@@ -1661,41 +1688,56 @@ impl TaskRepWire {
     /// this request; every in-flight admission was retired and the caller
     /// re-derives and retries.
     pub const REFUSE_CONTENDED: u8 = 11;
-    /// `TaskRefusal::PeerAdmissionPending` — the filesystem accepted the
+    /// `TaskRefusal::PeerAdmissionPending` — the face's service accepted the
     /// child's peer bundle but had not yet published the admission verdict
     /// within the bounded re-ask, so no peer identity could be taken.
     /// Nothing is wrong and nothing is lost; the launch is re-issuable.
+    ///
+    /// Every launch-time face raises this — filesystem, power, accelerator
+    /// and memory — so the code names the stage, never the service.  The
+    /// caller learns *which* only from what the launch asked for.
     pub const REFUSE_PEER_ADMISSION_PENDING: u8 = 12;
-    /// `TaskRefusal::PeerRefused` — the filesystem refused the child's peer
-    /// admission for a reason that is neither capacity nor a pending
+    /// `TaskRefusal::PeerRefused` — the face's service refused the child's
+    /// peer admission for a reason that is neither capacity nor a pending
     /// verdict. The remote side is closed; the refusal is terminal.
     pub const REFUSE_PEER_REFUSED: u8 = 13;
     /// `TaskRefusal::PeerAdmissionLost` — the admission verdict could not be
     /// observed at all (a malformed reply or a transport boundary), so
-    /// whether the filesystem admitted the peer is UNKNOWN and its remote
+    /// whether the service admitted the peer is UNKNOWN and its remote
     /// state is reconciled lazily rather than assumed closed.
     pub const REFUSE_PEER_ADMISSION_LOST: u8 = 14;
-    /// `TaskRefusal::PeerServiceUnwired` — a filesystem-profile launch
-    /// reached peer construction without an attached filesystem service.
+    /// `TaskRefusal::PeerServiceUnwired` — a launch whose profile asks for a
+    /// face reached peer construction without that face's service attached.
     pub const REFUSE_PEER_SERVICE_UNWIRED: u8 = 15;
     /// `TaskRefusal::PeerRingTransfer` — the peer's shared ring could not be
-    /// transferred to the filesystem service.
+    /// transferred to the face's service.
     pub const REFUSE_PEER_RING_TRANSFER: u8 = 16;
     /// `TaskRefusal::PeerKickTransfer` — the peer's response-send endpoint
-    /// could not be transferred to the filesystem service.
+    /// could not be transferred to the face's service.
     pub const REFUSE_PEER_KICK_TRANSFER: u8 = 17;
     /// `TaskRefusal::PeerReturnTransfer` — the peer's return-receive endpoint
-    /// could not be transferred to the filesystem service.
+    /// could not be transferred to the face's service.
     pub const REFUSE_PEER_RETURN_TRANSFER: u8 = 18;
     /// `TaskRefusal::PeerTransientUnwired` — exec had no transient mapping
-    /// aperture with which to format the child's private filesystem ring.
+    /// aperture with which to format the child's private ring.
     pub const REFUSE_PEER_TRANSIENT_UNWIRED: u8 = 19;
     /// `TaskRefusal::PeerMemoryUnwired` — exec had no memory-service face
-    /// from which to allocate the child's private filesystem ring.
+    /// from which to allocate the child's private ring.
     pub const REFUSE_PEER_MEMORY_UNWIRED: u8 = 20;
     /// `TaskRefusal::PeerGrantTransfer` — the accelerator peer's reply-grant
     /// sender could not be transferred to the service.
     pub const REFUSE_PEER_GRANT_TRANSFER: u8 = 21;
+    /// `TaskRefusal::PeerAdmissionWedged` — an EARLIER launch left a face
+    /// whose admission verdict was never published, and this launch was
+    /// refused before it asked for anything of its own.
+    ///
+    /// Distinct from [`REFUSE_PEER_ADMISSION_PENDING`](Self::REFUSE_PEER_ADMISSION_PENDING)
+    /// because the two say opposite things about a retry: a pending verdict
+    /// is an ordinary schedule and the next attempt usually lands, while a
+    /// wedged one repeats until the stale face is settled.  Reading one as
+    /// the other is what makes a launch look intermittently slow when it is
+    /// in fact permanently refused.
+    pub const REFUSE_PEER_ADMISSION_WEDGED: u8 = 22;
 }
 
 // Live task discriminants stay disjoint from the frozen retired band on
@@ -3187,9 +3229,11 @@ const _: () = {
     assert!(size_of::<MmReqWire>() == 32);
     assert!(size_of::<MmRepWire>() == 72);
     assert!(size_of::<MonitorReqWire>() == 104);
+    // 8-byte head ‖ 280-byte telemetry (240 + the 16-byte frame-class census
+    // + the 24-byte DRAM stream table).
     assert!(
         size_of::<MonitorRepWire>()
-            == 248
+            == 8 + 280
                 + size_of::<crate::processor_status::ProcessorPage>()
                 + size_of::<crate::device::DeviceCensusPage>()
     );
@@ -3222,7 +3266,7 @@ const _: () = {
                 + size_of::<ImageName>()
     ); // 864
     assert!(size_of::<TaskReqWire>() == 864);
-    // 16-byte head ‖ 224 telemetry ‖ 236 filesystem (with the derived
+    // 16-byte head ‖ 256 telemetry ‖ 236 filesystem (with the derived
     // completion-latency moments) ‖ the 76-byte NetSnapshot ‖ the two pages.
     assert!(
         size_of::<TaskRepWire>()

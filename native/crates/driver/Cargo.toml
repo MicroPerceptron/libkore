@@ -10,8 +10,10 @@ publish = false
 # generic over it. Production userland, kernel-internal first-light, and
 # cfg(test) hardware doubles are distinct compositions over that seam.
 [dependencies]
-virtio-accel-core = { version = "=0.3.7", default-features = false, optional = true }
+virtio-accel-core = { version = "=0.3.10", default-features = false, optional = true }
 kore-abi = { path = "../abi" }
+# The one memory fill the DMA-pool scrub-once uses (streaming stores, fenced).
+kore-scrub = { path = "../scrub" }
 # Bitflag sets for the device-MMU common layer's neutral permission/attribute
 # types (`common::flags`) — the same crate + major line kore-abi already uses,
 # so a format impl's `AccessFlags` reads identically on both sides of the seam.

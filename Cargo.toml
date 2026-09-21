@@ -8,7 +8,7 @@ repository = "https://github.com/MicroPerceptron/libkore"
 
 [workspace]
 resolver = "3"
-members = ["tests/consumer", "crates/ffi", "crates/entry"]
+members = ["tests/consumer", "crates/ffi", "crates/entry", "crates/wasi"]
 exclude = ["native"]
 
 [features]

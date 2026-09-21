@@ -386,7 +386,7 @@ const _: () = {
 pub const PROCESS_IO_BYTES: usize = 4096;
 /// Maximum raw command-tail bytes.  Arguments remain opaque to the launcher;
 /// each executable owns its own parser.
-/// Argument bytes. **312, sized to what a launcher can compose**: the
+/// Argument bytes. **296, sized to what a launcher can compose**: the
 /// shell's whole command line is 256 bytes (`LINE_CAP`, asserted against
 /// this constant in the shell), the files app bounds a path word at 255, and
 /// init's launches pass short constants. The 200 bytes above that which the
@@ -397,9 +397,10 @@ pub const PROCESS_IO_BYTES: usize = 4096;
 /// — 16 for the census itself and 96 so the widest bounded report could
 /// grow its `timer arms` row without giving up another. Each joined the
 /// page without taking a byte from command output, which every status view
-/// already fills to within a few bytes at its maximum topology; 56 bytes
-/// remain above the longest command line.
-pub const PROCESS_ARG_BYTES: usize = 312;
+/// already fills to within a few bytes at its maximum topology; 16 went to
+/// the frame-class census and 24 to the DRAM stream table the same way, and
+/// 16 bytes remain above the longest command line.
+pub const PROCESS_ARG_BYTES: usize = 272;
 /// Maximum immutable launcher context bytes. Context and child output reuse
 /// the payload at opposite sides of the task-lifecycle handoff; they are never
 /// simultaneously live.
@@ -409,12 +410,13 @@ pub const PROCESS_ARG_BYTES: usize = 312;
 /// growing the page or touching the wire. What sets the number is the
 /// largest context anyone builds, which is the bootstrap command catalogue
 /// `help` reads — [`MAX_COMMAND_SNAPSHOT_ENTRIES`](crate::command::MAX_COMMAND_SNAPSHOT_ENTRIES)
-/// rows of name, usage and summary plus four framing bytes each. At the
-/// catalogue's present verbosity a full table needs a little over 1.8 KiB,
-/// and the old 1536 left no room to add a command without deleting another
-/// one's documentation. This keeps a margin over that while staying well
-/// under the payload it borrows.
-pub const PROCESS_CONTEXT_BYTES: usize = 2048;
+/// rows of name, usage and summary plus four framing bytes each. The
+/// catalogue's 35 rows need 2078 bytes at their present verbosity, which
+/// 2048 refused — `wasm` could not join without deleting another command's
+/// documentation. 2560 carries them with room for several more rows, and
+/// still leaves the payload it borrows (3208) most of its width for the
+/// output a command writes back.
+pub const PROCESS_CONTEXT_BYTES: usize = 2560;
 const _: () = assert!(
     PROCESS_CONTEXT_BYTES <= PROCESS_OUTPUT_BYTES,
     "context borrows the output payload and cannot outgrow it"
@@ -435,13 +437,17 @@ const _: () = assert!(
 /// latency moments; 13 remain, and the next byte past them costs that report
 /// a row.  ABI 13's timer census therefore came out of the argument buffer,
 /// not the output — and so did the 96 bytes its `status` row needs, which
-/// takes the output to 3208 with 19 bytes under the widest report.
+/// takes the output to 3208 with 19 bytes under the widest report.  ABI 13's
+/// frame-class census (16 bytes in the system snapshot) likewise comes out
+/// of the argument buffer: 312 → 296, still clearing the shell's 256-byte
+/// line and the files app's 255-byte path word, and the output stays 3208.
+/// The DRAM stream table took 24 more the same way (296 → 272).
 ///
 /// The page is a fixed [`PROCESS_IO_BYTES`], so this constant and
 /// [`PROCESS_OUTPUT_BYTES`] move together: every byte the header gains is a
 /// byte of command output given up, and `size_of::<ProcessIo>()` asserts the
 /// two stay in step.
-const HEADER_BYTES: usize = 576;
+const HEADER_BYTES: usize = 616;
 /// Maximum bytes a foreground command can return to its launcher.
 pub const PROCESS_OUTPUT_BYTES: usize = PROCESS_IO_BYTES - HEADER_BYTES - PROCESS_ARG_BYTES;
 /// Layout version.  Zeroed/uninitialized pages fail closed.
@@ -953,6 +959,9 @@ mod tests {
         // clearing the shell's 256-byte line and the files app's 255-byte
         // path word) paying both the timer census's 16 header bytes and the
         // 96 its `timer arms` row adds to that widest report, now 3189.
+        // The frame-class census (16 header bytes) came out of the argument
+        // buffer too (312 -> 296, then 296 -> 272 for the DRAM stream
+        // table), so the output still holds at 3208.
         assert_eq!(PROCESS_OUTPUT_BYTES, 3208);
     }
 
