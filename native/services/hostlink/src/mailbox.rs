@@ -44,6 +44,7 @@ const MAILBOX_ROWS: usize = MAX_DYNAMIC_AGENT_ROUTES + 2;
 /// `via` chooses an installed generation-bound row.
 pub struct MailboxBank {
     rows: [EndpointMailbox; MAILBOX_ROWS],
+    broker_active: bool,
     agents: [Option<TaskGeneration>; MAX_DYNAMIC_AGENT_ROUTES],
 }
 
@@ -57,6 +58,7 @@ impl MailboxBank {
     pub const fn new() -> Self {
         Self {
             rows: [const { EndpointMailbox::new() }; MAILBOX_ROWS],
+            broker_active: true,
             agents: [None; MAX_DYNAMIC_AGENT_ROUTES],
         }
     }
@@ -69,12 +71,13 @@ impl MailboxBank {
             1 => Endpoint::Agent(0),
             2 => Endpoint::Agent(1),
             3 => Endpoint::Workspace,
-            _ if via >= 4 && usize::from(via - 2) < MAX_DYNAMIC_AGENT_ROUTES => {
-                Endpoint::Agent((via - 2) as u8)
+            _ if via >= 5 && usize::from(via - 3) < MAX_DYNAMIC_AGENT_ROUTES => {
+                Endpoint::Agent((via - 3) as u8)
             }
             _ => return None,
         };
         match endpoint {
+            Endpoint::Broker if !self.broker_active => None,
             Endpoint::Agent(slot) if self.agents[slot as usize].is_none() => None,
             _ => Some(endpoint),
         }
@@ -151,6 +154,19 @@ impl MailboxBank {
 }
 
 impl MailboxDelivery for MailboxBank {
+    fn install_broker(&mut self) -> Result<(), DeliveryError> {
+        if self.broker_active {
+            return Err(DeliveryError::Refused);
+        }
+        self.broker_active = true;
+        Ok(())
+    }
+    fn close_broker(&mut self) -> bool {
+        self.rows[index(Endpoint::Broker)] = EndpointMailbox::new();
+        self.broker_active = false;
+        true
+    }
+
     fn install_agent(&mut self, slot: u8, generation: TaskGeneration) -> Result<(), DeliveryError> {
         let row = self
             .agents
@@ -339,19 +355,32 @@ mod tests {
     }
 
     #[test]
+    fn broker_close_clears_only_broker_delivery_and_requires_explicit_reopen() {
+        let mut bank = MailboxBank::new();
+        assert_eq!(bank.endpoint_for_via(0), Some(Endpoint::Broker));
+        assert_eq!(bank.endpoint_for_via(3), Some(Endpoint::Workspace));
+        assert!(bank.close_broker());
+        assert_eq!(bank.endpoint_for_via(0), None);
+        assert_eq!(bank.endpoint_for_via(3), Some(Endpoint::Workspace));
+        assert_eq!(bank.install_broker(), Ok(()));
+        assert_eq!(bank.endpoint_for_via(0), Some(Endpoint::Broker));
+        assert_eq!(bank.install_broker(), Err(DeliveryError::Refused));
+    }
+
+    #[test]
     fn dynamic_row_closes_generation_before_reuse_and_stale_close_fails() {
         let mut bank = MailboxBank::new();
         let first = TaskGeneration::new(7).unwrap();
         let replacement = TaskGeneration::new(8).unwrap();
         bank.install_agent(2, first).unwrap();
-        assert_eq!(bank.endpoint_for_via(4), Some(Endpoint::Agent(2)));
+        assert_eq!(bank.endpoint_for_via(5), Some(Endpoint::Agent(2)));
         bank.control(Endpoint::Agent(2), 9, RequestId(id(1)), b"old")
             .unwrap();
         assert!(bank.close_agent(2, first));
-        assert_eq!(bank.endpoint_for_via(4), None);
+        assert_eq!(bank.endpoint_for_via(5), None);
         bank.install_agent(2, replacement).unwrap();
         assert!(!bank.close_agent(2, first));
-        assert_eq!(bank.poll_via(4), Ok(None));
+        assert_eq!(bank.poll_via(5), Ok(None));
         assert!(bank.close_agent(2, replacement));
     }
 
@@ -362,7 +391,7 @@ mod tests {
         for slot in 0..MAX_DYNAMIC_AGENT_ROUTES {
             bank.install_agent(u8::try_from(slot).unwrap(), generation)
                 .unwrap();
-            let via = if slot < 2 { slot + 1 } else { slot + 2 } as u16;
+            let via = if slot < 2 { slot + 1 } else { slot + 3 } as u16;
             assert_eq!(
                 bank.endpoint_for_via(via),
                 Some(Endpoint::Agent(slot as u8))
@@ -378,13 +407,13 @@ mod tests {
         assert_eq!(bank.poll_via(0), Ok(None));
         assert_eq!(bank.poll_via(3), Ok(None));
         for slot in 0..MAX_DYNAMIC_AGENT_ROUTES {
-            let via = if slot < 2 { slot + 1 } else { slot + 2 } as u16;
+            let via = if slot < 2 { slot + 1 } else { slot + 3 } as u16;
             assert!(
                 matches!(bank.poll_via(via), Ok(Some(ClientEvent::Control { request, .. })) if request == RequestId(id(slot as u8)))
             );
         }
         assert_eq!(
-            bank.endpoint_for_via((MAX_DYNAMIC_AGENT_ROUTES + 2) as u16),
+            bank.endpoint_for_via((MAX_DYNAMIC_AGENT_ROUTES + 3) as u16),
             None
         );
         assert_eq!(bank.endpoint_for_via(u16::MAX), None);

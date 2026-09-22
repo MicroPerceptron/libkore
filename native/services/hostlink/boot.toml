@@ -4,12 +4,13 @@
 # and opportunistically claims exact QEMU ivshmem-plain BAR2 for bulk. The
 # latter is coherent CPU-shared RAM and requests neither DMA nor interrupts;
 # the founder still supplies only the console's class-agnostic DMA pool and
-# four capability-distinct serving pairs.
+# explicitly declared capability-distinct serving pairs; optional supervisor
+# clients are absent from the disabled founder graph.
 
 [service]
 image        = "kore-svc-hostlink"
-digest_x86_64 = "blake3:80bba98cf8e06415c7a9d3f404fb2db4d11b1955b48cc41ea0292e7c1524e4bc"
-digest_aarch64 = "blake3:537ac8ddf7ae10a479997767a9352ada5ec1908b2567aec5cd1a38f823924229"
+digest_x86_64 = "blake3:b5baa605380e22cf6b654babcdcdc177da9f77bdddb3887318ff7c80389deb97"
+digest_aarch64 = "blake3:0d0d7f5a7bff13c113791e90ce19f03ec415a0ac478c69f3b7ad22ef255a6322"
 chain        = true
 endowment    = "kore_svc_hostlink::HostLinkEndowment"
 protocol     = "kore_svc_hostlink::HostLinkFront"

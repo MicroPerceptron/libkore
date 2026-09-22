@@ -20,7 +20,46 @@ pub const CLIENT_CHUNK_MAX: usize = 512;
 pub use kore_hostlink::FOUNDED_BULK_WIRE_CHUNK;
 pub const HOSTLINK_REQUEST_CAPACITY: u32 = 2;
 pub const HOSTLINK_RESPONSE_CAPACITY: u32 = 2;
-pub const HOSTLINK_SERVE_PAIRS: usize = 4;
+/// Trusted image-build selection, never controlled by a host/model message.
+/// Keeping it in the native owner makes the founder and every user image use
+/// the same environment-tracked dependency. The default is ordinary boot.
+pub const SUPERVISOR_AUTOSTART: bool = match option_env!("KORE_AGENT_SUPERVISOR") {
+    None => false,
+    Some(value) => match value.as_bytes() {
+        [b'0'] => false,
+        [b'1'] => true,
+        _ => panic!("KORE_AGENT_SUPERVISOR must be 0 or 1"),
+    },
+};
+
+pub const HOSTLINK_OWNER_PAIR: usize = 4;
+pub const HOSTLINK_SUPERVISOR_WORKERS: usize = 2;
+pub const HOSTLINK_SERVE_PAIRS: usize = 5;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum SupervisorOperation {
+    Observe = 1,
+    Close = 2,
+    Open = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum SupervisorPhase {
+    Available = 1,
+    Closing = 2,
+    Closed = 3,
+    Opening = 4,
+    RestartRequested = 5,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SupervisorState {
+    pub phase: SupervisorPhase,
+    pub incarnation: TaskGeneration,
+    pub workers: [TaskGeneration; HOSTLINK_SUPERVISOR_WORKERS],
+}
 
 /// One bounded inline fragment. Larger values must use repeated bulk chunks.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,6 +85,13 @@ impl Payload {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientRequest {
+    /// Available only on the separately endowed surviving owner's pair.
+    /// Observe uses generation zero; Close/Open name an exact incarnation.
+    Supervisor {
+        request: RequestId,
+        operation: SupervisorOperation,
+        generation: u64,
+    },
     Send {
         kind: u16,
         request: RequestId,
@@ -96,7 +142,8 @@ pub enum ClientRequest {
 impl ClientRequest {
     pub const fn request_id(&self) -> RequestId {
         match self {
-            Self::Send { request, .. }
+            Self::Supervisor { request, .. }
+            | Self::Send { request, .. }
             | Self::Cancel { request }
             | Self::BulkBegin { request, .. }
             | Self::BulkChunk { request, .. }
@@ -201,6 +248,10 @@ pub enum ClientEvent {
 // turn a bounded wire event into hidden global-allocation authority.
 #[allow(clippy::large_enum_variant)]
 pub enum ClientResponse {
+    Supervisor {
+        request: RequestId,
+        state: SupervisorState,
+    },
     Accepted {
         request: RequestId,
     },
@@ -243,6 +294,7 @@ impl ReqWire {
     pub const OP_BULK_ABORT: u8 = 8;
     pub const OP_ROTATE_AGENT: u8 = 9;
     pub const OP_CLOSE_AGENT: u8 = 10;
+    pub const OP_SUPERVISOR: u8 = 11;
 }
 
 /// Fixed reply record. The arrival pair remains the sole endpoint identity.
@@ -270,6 +322,7 @@ impl RepWire {
     pub const TAG_EVENT: u8 = 3;
     pub const TAG_STATUS: u8 = 4;
     pub const TAG_REFUSED: u8 = 5;
+    pub const TAG_SUPERVISOR: u8 = 6;
 
     pub const EVENT_CONTROL: u8 = 1;
     pub const EVENT_CANCEL: u8 = 2;
@@ -309,7 +362,7 @@ const _: () = {
     assert!(HOSTLINK_REQUEST_CAPACITY.is_power_of_two());
     assert!(HOSTLINK_RESPONSE_CAPACITY.is_power_of_two());
     assert!(HOSTLINK_PAIR_WINDOW_BYTES <= 4096);
-    assert!(HOSTLINK_SERVE_PAIRS == 4);
+    assert!(HOSTLINK_SERVE_PAIRS == 5);
 };
 
 fn empty_req(op: u8) -> ReqWire {
@@ -355,6 +408,7 @@ fn put_payload(dst: &mut [u8; CLIENT_CHUNK_MAX], len: &mut U16, payload: &Payloa
 
 pub fn encode_req(request: &ClientRequest) -> ReqWire {
     let mut wire = match request {
+        ClientRequest::Supervisor { .. } => empty_req(ReqWire::OP_SUPERVISOR),
         ClientRequest::Send { .. } => empty_req(ReqWire::OP_SEND),
         ClientRequest::Cancel { .. } => empty_req(ReqWire::OP_CANCEL),
         ClientRequest::Poll => empty_req(ReqWire::OP_POLL),
@@ -367,6 +421,16 @@ pub fn encode_req(request: &ClientRequest) -> ReqWire {
         ClientRequest::CloseAgent { .. } => empty_req(ReqWire::OP_CLOSE_AGENT),
     };
     match request {
+        ClientRequest::Supervisor {
+            request,
+            operation,
+            generation,
+        } => {
+            wire.request = *request;
+            wire.kind = U16::new(*operation as u16);
+            wire.offset = U32::new(*generation as u32);
+            wire.total_len = U32::new((*generation >> 32) as u32);
+        }
         ClientRequest::Send {
             kind,
             request,
@@ -442,6 +506,23 @@ pub fn decode_req(wire: &ReqWire) -> Option<ClientRequest> {
     }
     let payload = || Payload::copy_from(&wire.data[..len]);
     let request = match wire.op {
+        ReqWire::OP_SUPERVISOR => {
+            let operation = match wire.kind.get() {
+                1 => SupervisorOperation::Observe,
+                2 => SupervisorOperation::Close,
+                3 => SupervisorOperation::Open,
+                _ => return None,
+            };
+            let generation = u64::from(wire.offset.get()) | (u64::from(wire.total_len.get()) << 32);
+            if (operation == SupervisorOperation::Observe) != (generation == 0) {
+                return None;
+            }
+            ClientRequest::Supervisor {
+                request: wire.request,
+                operation,
+                generation,
+            }
+        }
         ReqWire::OP_SEND => ClientRequest::Send {
             kind: wire.kind.get(),
             request: wire.request,
@@ -534,6 +615,7 @@ fn decode_status_meta(meta: u16) -> Option<BulkTransport> {
 
 pub fn encode_rep(response: &ClientResponse) -> RepWire {
     let mut wire = match response {
+        ClientResponse::Supervisor { .. } => empty_rep(RepWire::TAG_SUPERVISOR),
         ClientResponse::Accepted { .. } => empty_rep(RepWire::TAG_ACCEPTED),
         ClientResponse::Empty => empty_rep(RepWire::TAG_EMPTY),
         ClientResponse::Event(_) => empty_rep(RepWire::TAG_EVENT),
@@ -541,6 +623,19 @@ pub fn encode_rep(response: &ClientResponse) -> RepWire {
         ClientResponse::Refused { .. } => empty_rep(RepWire::TAG_REFUSED),
     };
     match response {
+        ClientResponse::Supervisor { request, state } => {
+            wire.request = *request;
+            wire.variant = state.phase as u8;
+            wire.kind = U16::new(1); // supervisor protocol version
+            wire.len = U16::new((8 * (1 + HOSTLINK_SUPERVISOR_WORKERS)) as u16);
+            wire.data[..8].copy_from_slice(&state.incarnation.get().to_le_bytes());
+            for (row, generation) in wire.data[8..usize::from(wire.len.get())]
+                .chunks_exact_mut(8)
+                .zip(state.workers)
+            {
+                row.copy_from_slice(&generation.get().to_le_bytes());
+            }
+        }
         ClientResponse::Accepted { request } => wire.request = *request,
         ClientResponse::Empty => {}
         ClientResponse::Status(status) => {
@@ -624,6 +719,33 @@ pub fn decode_rep(wire: &RepWire) -> Option<ClientResponse> {
     }
     let payload = || Payload::copy_from(&wire.data[..len]);
     let response = match wire.tag {
+        RepWire::TAG_SUPERVISOR => {
+            if wire.kind.get() != 1 || len != 8 * (1 + HOSTLINK_SUPERVISOR_WORKERS) {
+                return None;
+            }
+            let phase = match wire.variant {
+                1 => SupervisorPhase::Available,
+                2 => SupervisorPhase::Closing,
+                3 => SupervisorPhase::Closed,
+                4 => SupervisorPhase::Opening,
+                5 => SupervisorPhase::RestartRequested,
+                _ => return None,
+            };
+            let incarnation =
+                TaskGeneration::new(u64::from_le_bytes(wire.data[..8].try_into().ok()?))?;
+            let mut workers = [incarnation; HOSTLINK_SUPERVISOR_WORKERS];
+            for (generation, row) in workers.iter_mut().zip(wire.data[8..len].chunks_exact(8)) {
+                *generation = TaskGeneration::new(u64::from_le_bytes(row.try_into().ok()?))?;
+            }
+            ClientResponse::Supervisor {
+                request: wire.request,
+                state: SupervisorState {
+                    phase,
+                    incarnation,
+                    workers,
+                },
+            }
+        }
         RepWire::TAG_ACCEPTED => ClientResponse::Accepted {
             request: wire.request,
         },
@@ -719,6 +841,13 @@ impl SvcProtocol for HostLinkWire {
         match (decode_req(request), response) {
             (Some(ClientRequest::Poll), ClientResponse::Event(_) | ClientResponse::Empty) => true,
             (Some(ClientRequest::Status), ClientResponse::Status(_)) => true,
+            (
+                Some(ClientRequest::Supervisor {
+                    request: expected, ..
+                }),
+                ClientResponse::Supervisor { request, .. },
+            ) => expected == *request,
+            (Some(ClientRequest::Supervisor { .. }), ClientResponse::Accepted { .. }) => false,
             (Some(req), ClientResponse::Accepted { request }) => req.request_id() == *request,
             (Some(req), ClientResponse::Refused { request, .. }) => req.request_id() == *request,
             _ => false,
@@ -769,6 +898,54 @@ mod tests {
 
     fn id(byte: u8) -> [u8; 16] {
         [byte; 16]
+    }
+
+    #[test]
+    fn supervisor_control_has_exact_version_identity_and_reply_correlation() {
+        for (operation, generation) in [
+            (SupervisorOperation::Observe, 0),
+            (SupervisorOperation::Close, u64::MAX),
+            (SupervisorOperation::Open, 9),
+        ] {
+            let request = ClientRequest::Supervisor {
+                request: RequestId(id(7)),
+                operation,
+                generation,
+            };
+            let wire = encode_req(&request);
+            assert_eq!(decode_req(&wire), Some(request));
+            let state = SupervisorState {
+                phase: SupervisorPhase::Closed,
+                incarnation: TaskGeneration::new(8).unwrap(),
+                workers: [TaskGeneration::new(u64::MAX).unwrap(); HOSTLINK_SUPERVISOR_WORKERS],
+            };
+            let reply = ClientResponse::Supervisor {
+                request: RequestId(id(7)),
+                state,
+            };
+            let mut encoded = encode_rep(&reply);
+            assert_eq!(decode_rep(&encoded), Some(reply.clone()));
+            assert!(HostLinkWire::reply_matches(&wire, &reply, 0));
+            assert!(!HostLinkWire::reply_matches(
+                &wire,
+                &ClientResponse::Supervisor {
+                    request: RequestId(id(8)),
+                    state
+                },
+                0
+            ));
+            encoded.kind = U16::new(2);
+            assert!(decode_rep(&encoded).is_none());
+            let mut bad = wire;
+            bad.flags = 1;
+            assert!(decode_req(&bad).is_none());
+        }
+        let request = ClientRequest::Supervisor {
+            request: RequestId(id(7)),
+            operation: SupervisorOperation::Close,
+            generation: 0,
+        };
+        assert!(decode_req(&encode_req(&request)).is_none());
     }
 
     #[test]
@@ -852,7 +1029,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<ReqWire>(), 596);
         assert_eq!(core::mem::size_of::<RepWire>(), 596);
         assert_eq!(HOSTLINK_PAIR_WINDOW_BYTES, 2816);
-        assert_eq!(HostLinkWire::SERVE_PAIRS, 4);
+        assert_eq!(HostLinkWire::SERVE_PAIRS, 5);
         assert_eq!(encode_req(&ClientRequest::Poll).as_bytes().len(), 596);
     }
 

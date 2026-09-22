@@ -19,6 +19,7 @@ mod mailbox;
 mod retirement;
 mod service;
 pub mod shmem;
+mod supervisor;
 pub mod virtio;
 mod wire;
 
@@ -30,4 +31,5 @@ pub use frontend::*;
 pub use mailbox::*;
 pub use retirement::*;
 pub use service::*;
+pub use supervisor::*;
 pub use wire::*;

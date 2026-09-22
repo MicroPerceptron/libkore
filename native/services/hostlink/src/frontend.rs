@@ -116,9 +116,9 @@ impl FrontendCall {
             .encode(&mut inner)
             .ok_or(FrontendError::InvalidRequest)?;
         let expected = match poll.phase {
-            FrontendPollPhase::BrokerNext | FrontendPollPhase::BrokerReadyNext => {
-                Expected::Intent(None)
-            }
+            FrontendPollPhase::BrokerNext
+            | FrontendPollPhase::SupervisorNextV1
+            | FrontendPollPhase::BrokerReadyNext => Expected::Intent(None),
             FrontendPollPhase::AgentClaim => Expected::Intent(Some(poll.intent_id)),
             FrontendPollPhase::BrokerRetired => Expected::Receipt,
             FrontendPollPhase::BrokerControl => Expected::Control(poll.intent_id),

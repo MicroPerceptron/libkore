@@ -13,7 +13,7 @@ pub const fn agent_pair_index(slot: u8) -> Option<usize> {
         Some(match slot {
             0 => 1,
             1 => 2,
-            _ => slot as usize + 2,
+            _ => slot as usize + 3,
         })
     }
 }
@@ -134,10 +134,10 @@ mod tests {
 
     #[test]
     fn all_agent_pairs_are_distinct_and_skip_broker_and_workspace() {
-        let mut seen = [false; crate::MAX_DYNAMIC_AGENT_ROUTES + 2];
+        let mut seen = [false; crate::MAX_DYNAMIC_AGENT_ROUTES + 3];
         for slot in 0..crate::MAX_DYNAMIC_AGENT_ROUTES {
             let pair = agent_pair_index(slot as u8).unwrap();
-            assert!(pair != 0 && pair != 3);
+            assert!(pair != 0 && pair != 3 && pair != crate::HOSTLINK_OWNER_PAIR);
             assert!(!seen[pair]);
             seen[pair] = true;
         }

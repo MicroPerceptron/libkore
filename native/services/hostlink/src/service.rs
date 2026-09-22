@@ -30,6 +30,7 @@ pub struct LocalRoute {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Bindings {
     pub broker: LocalRoute,
+    broker_active: bool,
     pub workspace: LocalRoute,
     agents: [Option<LocalRoute>; MAX_DYNAMIC_AGENT_ROUTES],
 }
@@ -41,10 +42,16 @@ impl Bindings {
         } else {
             Some(Self {
                 broker,
+                broker_active: true,
                 workspace,
                 agents: [None; MAX_DYNAMIC_AGENT_ROUTES],
             })
         }
+    }
+
+    pub fn without_broker(mut self) -> Self {
+        self.broker_active = false;
+        self
     }
 
     pub fn install_agent(&mut self, slot: usize, local: LocalRoute) -> bool {
@@ -73,8 +80,10 @@ impl Bindings {
 
     fn rows(&self) -> Vec<(Endpoint, LocalRoute, RouteRole, u8, u8), ROUTES> {
         let mut rows = Vec::new();
-        rows.push((Endpoint::Broker, self.broker, RouteRole::Broker, 0, 0))
-            .expect("structural broker route fits");
+        if self.broker_active {
+            rows.push((Endpoint::Broker, self.broker, RouteRole::Broker, 0, 0))
+                .expect("structural broker route fits");
+        }
         for (slot, local) in self.agents.iter().copied().enumerate() {
             if let Some(local) = local {
                 rows.push((
@@ -100,7 +109,7 @@ impl Bindings {
 
     fn for_endpoint(&self, endpoint: Endpoint) -> Option<LocalRoute> {
         match endpoint {
-            Endpoint::Broker => Some(self.broker),
+            Endpoint::Broker => self.broker_active.then_some(self.broker),
             Endpoint::Agent(slot) => self.agents.get(slot as usize).copied().flatten(),
             Endpoint::Workspace => Some(self.workspace),
         }
@@ -115,6 +124,13 @@ pub enum DeliveryError {
 }
 
 pub trait MailboxDelivery {
+    fn install_broker(&mut self) -> Result<(), DeliveryError> {
+        Ok(())
+    }
+    fn close_broker(&mut self) -> bool {
+        true
+    }
+
     fn install_agent(
         &mut self,
         _slot: u8,
@@ -283,6 +299,9 @@ pub struct HostLinkService<T, M> {
     bindings: Bindings,
     routes: RouteTable<Endpoint, ROUTES>,
     opened: [bool; ROUTES],
+    closing_broker: Option<ClosingRoute>,
+    closed_broker: Option<TaskGeneration>,
+    restart_broker: Option<TaskGeneration>,
     closing_agents: [Option<ClosingRoute>; MAX_DYNAMIC_AGENT_ROUTES],
     closed_agents: [Option<TaskGeneration>; MAX_DYNAMIC_AGENT_ROUTES],
     phase: LinkPhase,
@@ -313,6 +332,9 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
             bindings,
             routes: RouteTable::new(),
             opened: [false; ROUTES],
+            closing_broker: None,
+            closed_broker: None,
+            restart_broker: None,
             closing_agents: [None; MAX_DYNAMIC_AGENT_ROUTES],
             closed_agents: [None; MAX_DYNAMIC_AGENT_ROUTES],
             phase: LinkPhase::Disconnected,
@@ -355,6 +377,22 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
     }
     pub fn pop_status(&mut self) -> Option<EndpointStatus> {
         self.statuses.pop_front()
+    }
+
+    pub fn supervisor_restart_requested(&self, generation: TaskGeneration) -> bool {
+        self.restart_broker == Some(generation)
+    }
+
+    /// Inert identity of a live or most recently closed local route.
+    pub fn generation(&self, endpoint: Endpoint) -> Option<TaskGeneration> {
+        self.bindings
+            .for_endpoint(endpoint)
+            .map(|local| local.generation)
+            .or_else(|| match endpoint {
+                Endpoint::Broker => self.closed_broker,
+                Endpoint::Agent(slot) => self.closed_agents.get(slot as usize).copied().flatten(),
+                Endpoint::Workspace => None,
+            })
     }
 
     /// Install one generation-bound dynamic agent route. The service owns the
@@ -450,9 +488,42 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
         slot: u8,
         generation: TaskGeneration,
     ) -> Result<(), ServiceError> {
-        let index = slot as usize;
-        let endpoint = Endpoint::Agent(slot);
-        if self.closed_agents.get(index).copied().flatten() == Some(generation) {
+        self.close_endpoint(Endpoint::Agent(slot), generation)
+    }
+
+    /// The surviving local connection owner invokes this only after reaping
+    /// the broker process. The workspace route is independent and stays live.
+    pub fn close_broker_route(&mut self, generation: TaskGeneration) -> Result<(), ServiceError> {
+        self.close_endpoint(Endpoint::Broker, generation)
+    }
+
+    fn closing(&self, endpoint: Endpoint) -> Option<ClosingRoute> {
+        match endpoint {
+            Endpoint::Broker => self.closing_broker,
+            Endpoint::Agent(slot) => self.closing_agents.get(slot as usize).copied().flatten(),
+            Endpoint::Workspace => None,
+        }
+    }
+
+    fn set_closing(&mut self, endpoint: Endpoint, closing: Option<ClosingRoute>) {
+        match endpoint {
+            Endpoint::Broker => self.closing_broker = closing,
+            Endpoint::Agent(slot) => self.closing_agents[slot as usize] = closing,
+            Endpoint::Workspace => unreachable!("workspace is not supervisor owned"),
+        }
+    }
+
+    fn close_endpoint(
+        &mut self,
+        endpoint: Endpoint,
+        generation: TaskGeneration,
+    ) -> Result<(), ServiceError> {
+        let closed = match endpoint {
+            Endpoint::Broker => self.closed_broker,
+            Endpoint::Agent(slot) => self.closed_agents.get(slot as usize).copied().flatten(),
+            Endpoint::Workspace => return Err(ServiceError::Route),
+        };
+        if closed == Some(generation) {
             return Ok(());
         }
         let local = self
@@ -460,11 +531,11 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
             .for_endpoint(endpoint)
             .filter(|local| local.generation == generation)
             .ok_or(ServiceError::Route)?;
-        if let Some(closing) = self.closing_agents[index] {
+        if let Some(closing) = self.closing(endpoint) {
             if closing.local != local {
                 return Err(ServiceError::Route);
             }
-            return if self.finish_agent_close(slot) {
+            return if self.finish_route_close(endpoint) {
                 Ok(())
             } else {
                 Err(ServiceError::Backpressure)
@@ -472,46 +543,66 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
         }
         if self.epoch.is_some() {
             self.send_small_routed(endpoint, ROUTE_CLOSE, RequestId::ZERO, &[])?;
-            self.closing_agents[index] = Some(ClosingRoute {
-                local,
-                acknowledged: false,
-            });
+            self.set_closing(
+                endpoint,
+                Some(ClosingRoute {
+                    local,
+                    acknowledged: false,
+                }),
+            );
             return Err(ServiceError::Backpressure);
         }
-        self.closing_agents[index] = Some(ClosingRoute {
-            local,
-            acknowledged: true,
-        });
-        if self.finish_agent_close(slot) {
+        self.set_closing(
+            endpoint,
+            Some(ClosingRoute {
+                local,
+                acknowledged: true,
+            }),
+        );
+        if self.finish_route_close(endpoint) {
             Ok(())
         } else {
             Err(ServiceError::Backpressure)
         }
     }
 
-    /// Complete an acknowledged close only after the mailbox owner has
-    /// drained the old generation. A false delivery result preserves every
-    /// route/binding owner so the next service pass can retry exactly.
     fn finish_agent_close(&mut self, slot: u8) -> bool {
-        let index = slot as usize;
-        let Some(closing) = self.closing_agents.get(index).copied().flatten() else {
+        self.finish_route_close(Endpoint::Agent(slot))
+    }
+
+    /// Acknowledgment precedes mailbox disposal and route reuse. Missing ACKs
+    /// retain all old-generation work and cannot authorize a replacement.
+    fn finish_route_close(&mut self, endpoint: Endpoint) -> bool {
+        let Some(closing) = self.closing(endpoint) else {
             return false;
         };
-        if !closing.acknowledged || !self.delivery.close_agent(slot, closing.local.generation) {
+        if !closing.acknowledged {
             return false;
+        }
+        match endpoint {
+            Endpoint::Broker => {
+                if !self.delivery.close_broker() {
+                    return false;
+                }
+                self.bindings.broker_active = false;
+                self.closed_broker = Some(closing.local.generation);
+            }
+            Endpoint::Agent(slot) => {
+                if !self.delivery.close_agent(slot, closing.local.generation) {
+                    return false;
+                }
+                if self
+                    .bindings
+                    .remove_agent(slot as usize, closing.local.generation)
+                    .is_none()
+                {
+                    return false;
+                }
+                self.closed_agents[slot as usize] = Some(closing.local.generation);
+            }
+            Endpoint::Workspace => return false,
         }
         let _ = self.routes.unbind(closing.local.route);
-        if self
-            .bindings
-            .remove_agent(index, closing.local.generation)
-            .is_none()
-        {
-            return false;
-        }
-        // All of these records belong to the generation being closed. In
-        // particular statuses carry only an endpoint, so retaining one would
-        // deliver the predecessor's disconnect/refusal to its successor.
-        let endpoint = Endpoint::Agent(slot);
         self.inbound
             .retain(|bulk| bulk.route != closing.local.route);
         self.outbound.retain(|bulk| bulk.endpoint != endpoint);
@@ -522,13 +613,67 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
                 }
             }
         }
-        self.opened[endpoint_index(Endpoint::Agent(slot))] = false;
-        self.closing_agents[index] = None;
-        self.closed_agents[index] = Some(closing.local.generation);
+        self.opened[endpoint_index(endpoint)] = false;
+        self.set_closing(endpoint, None);
         true
     }
 
+    /// Install only the exact successor after acknowledged closure. The route
+    /// identity is derived from the service's boot secret, never caller bytes.
+    pub fn rotate_broker_route(&mut self, generation: TaskGeneration) -> Result<(), ServiceError> {
+        if self.bindings.broker_active
+            || self.closed_broker.and_then(|g| g.get().checked_add(1)) != Some(generation.get())
+        {
+            return Err(ServiceError::Route);
+        }
+        let mut hash = blake3::Hasher::new_keyed(&self.boot);
+        hash.update(b"broker-route-v1");
+        hash.update(&generation.get().to_le_bytes());
+        let route = RouteId(hash.finalize().as_bytes()[..16].try_into().unwrap());
+        if route.is_zero()
+            || self
+                .bindings
+                .rows()
+                .iter()
+                .any(|(_, local, _, _, _)| local.route == route)
+        {
+            return Err(ServiceError::Route);
+        }
+        self.delivery
+            .install_broker()
+            .map_err(|_| ServiceError::Backpressure)?;
+        if let Some(epoch) = self.epoch {
+            let state = RouteState::new(
+                epoch,
+                route,
+                generation,
+                RouteRole::Broker,
+                16,
+                16 * 1024 * 1024,
+                64,
+            )
+            .ok_or(ServiceError::Route)?;
+            if self.routes.bind(state, Endpoint::Broker).is_err() {
+                let _ = self.delivery.close_broker();
+                return Err(ServiceError::Route);
+            }
+            self.open_cursor = 0;
+            self.phase = LinkPhase::Opening;
+        }
+        self.bindings.broker = LocalRoute { route, generation };
+        self.bindings.broker_active = true;
+        self.closed_broker = None;
+        self.restart_broker = None;
+        Ok(())
+    }
+
     fn retry_agent_closes(&mut self) {
+        if self
+            .closing_broker
+            .is_some_and(|closing| closing.acknowledged)
+        {
+            let _ = self.finish_route_close(Endpoint::Broker);
+        }
         for slot in 0..MAX_DYNAMIC_AGENT_ROUTES {
             if self.closing_agents[slot].is_some_and(|closing| closing.acknowledged) {
                 let _ = self.finish_agent_close(slot as u8);
@@ -809,6 +954,25 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
         if self.phase != LinkPhase::Active {
             return self.refuse(&envelope, RefusalCode::RouteClosed);
         }
+        if envelope.kind.get() == SUPERVISOR_STOP {
+            if !payload.is_empty() || !envelope.request_id.is_zero() {
+                return self.refuse(&envelope, RefusalCode::Malformed);
+            }
+            // Route admission authenticates epoch, generation and sequence.
+            // A worker or importer cannot request another process's teardown.
+            match self.routes.process_received(&envelope, |bound| {
+                (*bound.mailbox() == Endpoint::Broker)
+                    .then_some(())
+                    .ok_or(DeliveryError::Refused)
+            }) {
+                Ok(()) => self.restart_broker = Some(self.bindings.broker.generation),
+                Err(ProcessError::Admit(error)) => {
+                    return self.refuse(&envelope, admit_code(error));
+                }
+                Err(_) => return self.refuse(&envelope, RefusalCode::PolicyDenied),
+            }
+            return Ok(());
+        }
         if matches!(
             envelope.kind.get(),
             BULK_ACCEPTED | BULK_READY | BULK_ABORTED
@@ -1062,10 +1226,7 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
         let endpoint = self
             .endpoint_for_route(envelope.route_id)
             .ok_or(ServiceError::Route)?;
-        let Endpoint::Agent(slot) = endpoint else {
-            return self.refuse(&envelope, RefusalCode::RouteClosed);
-        };
-        let Some(closing) = self.closing_agents[slot as usize] else {
+        let Some(closing) = self.closing(endpoint) else {
             return self.refuse(&envelope, RefusalCode::RouteClosed);
         };
         if closing.local.route != envelope.route_id
@@ -1076,11 +1237,14 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
         self.routes
             .process_received(&envelope, |_| Ok::<(), DeliveryError>(()))
             .map_err(|_| ServiceError::Route)?;
-        self.closing_agents[slot as usize] = Some(ClosingRoute {
-            acknowledged: true,
-            ..closing
-        });
-        let _ = self.finish_agent_close(slot);
+        self.set_closing(
+            endpoint,
+            Some(ClosingRoute {
+                acknowledged: true,
+                ..closing
+            }),
+        );
+        let _ = self.finish_route_close(endpoint);
         Ok(())
     }
 
@@ -1638,14 +1802,8 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
         payload: &[u8],
         output: &mut [u8],
     ) -> Result<(), ServiceError> {
-        if let Endpoint::Agent(slot) = endpoint {
-            if self
-                .closing_agents
-                .get(slot as usize)
-                .is_some_and(Option::is_some)
-            {
-                return Err(ServiceError::Route);
-            }
+        if self.closing(endpoint).is_some() {
+            return Err(ServiceError::Route);
         }
         let local = self
             .bindings
@@ -1757,6 +1915,11 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
     }
 
     fn disconnect(&mut self) {
+        if self.epoch.is_some() && self.bindings.broker_active {
+            // Loss of the host does not kill the desktop. The surviving owner
+            // contains the old supervisor before a new incarnation is issued.
+            self.restart_broker = Some(self.bindings.broker.generation);
+        }
         for (endpoint, local, _, _, _) in self.bindings.rows() {
             if let Some(bound) = self.routes.unbind(local.route) {
                 let (mut state, _) = bound.into_parts();
@@ -1776,6 +1939,12 @@ impl<T: HostLinkTransport, M: MailboxDelivery> HostLinkService<T, M> {
                     });
                 }
             }
+        }
+        if let Some(closing) = self.closing_broker {
+            self.closing_broker = Some(ClosingRoute {
+                acknowledged: true,
+                ..closing
+            });
         }
         for slot in 0..MAX_DYNAMIC_AGENT_ROUTES {
             if let Some(closing) = self.closing_agents[slot] {
@@ -2866,6 +3035,176 @@ mod tests {
         assert_eq!(service.outbound[0].endpoint, Endpoint::Broker);
         assert_eq!(service.pop_status().unwrap().endpoint, Endpoint::Broker);
         assert_eq!(service.pop_status(), None);
+    }
+
+    #[test]
+    fn supervisor_stop_is_exact_broker_control_and_disconnect_requests_containment() {
+        for endpoint in [Endpoint::Broker, Endpoint::Agent(0), Endpoint::Workspace] {
+            let mut service = activate(58);
+            let local = service.bindings.for_endpoint(endpoint).unwrap();
+            let broker = service.bindings.for_endpoint(Endpoint::Broker).unwrap();
+            let envelope = link_envelope(
+                SUPERVISOR_STOP,
+                service.epoch().unwrap(),
+                local.route,
+                local.generation.get(),
+                0,
+                RequestId::ZERO,
+                0,
+            );
+            let _ = service.handle_control(envelope, &[]);
+            assert_eq!(
+                service.supervisor_restart_requested(broker.generation),
+                endpoint == Endpoint::Broker
+            );
+            assert!(service.bindings.for_endpoint(Endpoint::Workspace).is_some());
+        }
+        let mut service = activate(58);
+        let local = service.bindings.for_endpoint(Endpoint::Broker).unwrap();
+        let stale = link_envelope(
+            SUPERVISOR_STOP,
+            service.epoch().unwrap(),
+            local.route,
+            local.generation.get() + 1,
+            0,
+            RequestId::ZERO,
+            0,
+        );
+        let _ = service.handle_control(stale, &[]);
+        assert!(!service.supervisor_restart_requested(local.generation));
+        service.disconnect();
+        assert!(service.supervisor_restart_requested(local.generation));
+    }
+
+    #[test]
+    fn supervisor_owner_requires_request_drain_and_reuses_only_successor_generations() {
+        use crate::{SupervisorOperation as Op, SupervisorOwner, SupervisorPhase as Phase};
+        let first = TaskGeneration::new(1).unwrap();
+        let bindings = Bindings::new(
+            LocalRoute {
+                route: RouteId(id(1)),
+                generation: first,
+            },
+            LocalRoute {
+                route: RouteId(id(2)),
+                generation: first,
+            },
+        )
+        .unwrap();
+        let mut service = HostLinkService::new(
+            MockTransport::default(),
+            crate::MailboxBank::new(),
+            [59; 32],
+            bindings,
+        );
+        for slot in 0..2 {
+            service
+                .install_agent_route(
+                    slot,
+                    LocalRoute {
+                        route: RouteId(id(60 + slot)),
+                        generation: first,
+                    },
+                )
+                .unwrap();
+        }
+        let initial = service.generation(Endpoint::Broker).unwrap();
+        let mut owner = SupervisorOwner::new(initial);
+        let workspace = service.generation(Endpoint::Workspace);
+        for _ in 0..3 {
+            let old = owner.state();
+            assert_eq!(
+                owner.operate(&mut service, Op::Open, old.incarnation.get() + 1),
+                Err(ServiceError::Route)
+            );
+            assert_eq!(
+                owner
+                    .operate(&mut service, Op::Close, old.incarnation.get())
+                    .unwrap()
+                    .phase,
+                Phase::Closing
+            );
+            assert!(!owner.client_active());
+            assert!(owner.needs_request_drain());
+            assert_eq!(
+                owner.operate(&mut service, Op::Open, old.incarnation.get() + 1),
+                Err(ServiceError::Route)
+            );
+            assert!(owner.confirm_request_drain());
+            assert!(!owner.confirm_request_drain());
+            let next = owner
+                .operate(&mut service, Op::Open, old.incarnation.get() + 1)
+                .unwrap();
+            assert_eq!(next.phase, Phase::Available);
+            for (next, old) in next.workers.iter().zip(old.workers) {
+                assert_eq!(next.get(), old.get() + 1);
+            }
+            assert_eq!(
+                owner.operate(&mut service, Op::Open, next.incarnation.get()),
+                Ok(next)
+            );
+            assert_eq!(
+                owner.operate(&mut service, Op::Close, old.incarnation.get()),
+                Err(ServiceError::Route)
+            );
+            assert_eq!(service.generation(Endpoint::Workspace), workspace);
+        }
+    }
+
+    #[test]
+    fn supervisor_broker_replacement_waits_for_close_ack_and_preserves_workspace() {
+        let mut service = activate(59);
+        let old = service.bindings.for_endpoint(Endpoint::Broker).unwrap();
+        let workspace = service.bindings.for_endpoint(Endpoint::Workspace).unwrap();
+        let next = TaskGeneration::new(old.generation.get() + 1).unwrap();
+        let epoch = service.epoch().unwrap();
+        assert_eq!(service.rotate_broker_route(next), Err(ServiceError::Route));
+        assert_eq!(
+            service.close_broker_route(old.generation),
+            Err(ServiceError::Backpressure)
+        );
+        assert_eq!(service.rotate_broker_route(next), Err(ServiceError::Route));
+        let mut output = [0; 4096];
+        let mut bulk = [0; 4096];
+        assert_eq!(
+            service.send_infer_request(Endpoint::Broker, RequestId(id(91)), b"late", &mut output),
+            Err(ServiceError::Route)
+        );
+        service.transport_mut().control_in.push_back(bytes(
+            link_envelope(
+                ROUTE_CLOSED,
+                epoch,
+                old.route,
+                old.generation.get(),
+                0,
+                RequestId::ZERO,
+                0,
+            ),
+            &[],
+        ));
+        service.drain(&mut output, &mut bulk);
+        assert_eq!(service.close_broker_route(old.generation), Ok(()));
+        assert_eq!(service.bindings.for_endpoint(Endpoint::Broker), None);
+        assert_eq!(
+            service.bindings.for_endpoint(Endpoint::Workspace),
+            Some(workspace)
+        );
+        assert_eq!(
+            service.rotate_broker_route(old.generation),
+            Err(ServiceError::Route)
+        );
+        assert_eq!(service.rotate_broker_route(next), Ok(()));
+        let replacement = service.bindings.for_endpoint(Endpoint::Broker).unwrap();
+        assert_ne!(replacement.route, old.route);
+        assert_eq!(replacement.generation, next);
+        assert_eq!(
+            service.close_broker_route(old.generation),
+            Err(ServiceError::Route)
+        );
+        assert_eq!(
+            service.bindings.for_endpoint(Endpoint::Workspace),
+            Some(workspace)
+        );
     }
 
     #[test]

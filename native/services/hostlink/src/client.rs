@@ -5,7 +5,9 @@ use kore_hostlink::{
     AUTHORITY_REPORT, AuthorityReportView, BulkId, BulkRefV1, INFER_REQUEST,
     INFERENCE_REQUEST_CONTENT, RefusalCode, RequestId, TaskGeneration, WORKSPACE_REQUEST,
 };
-use kore_rt::cap::{HeldChanSendToken, LeaseToken, MappedLeaseView, verbs};
+use kore_rt::cap::{
+    ChanSendToken, HeldChanSendToken, LeaseToken, MappedLeaseView, StashedLease, verbs,
+};
 use kore_rt::svc::{CallError, ClientEndpoints, ClientRings, SvcClient};
 use kore_rt::transport::Transport;
 use zerocopy::byteorder::little_endian::{U16, U32};
@@ -441,10 +443,37 @@ pub struct RingHostLink<'w, 't, T: Transport> {
 
 // Drop the client before its exact-unshare mapping owner, and the mapping
 // before its lessor. No method exposes an extractable static SvcClient.
+/// Sole client custody, either received at founding or over a capability
+/// channel. Both forms retain their real affine owners; neither mints a face.
+pub enum ClientFace {
+    Founded {
+        ring: LeaseToken,
+        kick: HeldChanSendToken,
+    },
+    Delegated {
+        ring: StashedLease,
+        kick: ChanSendToken,
+    },
+}
+
+impl ClientFace {
+    pub fn ring_slot(&self) -> Option<kore_abi::session::SlotRef> {
+        match self {
+            Self::Founded { ring, .. } => Some(ring.slot()),
+            Self::Delegated { ring, .. } => ring.slot(),
+        }
+    }
+    pub fn kick_slot(&self) -> kore_abi::session::SlotRef {
+        match self {
+            Self::Founded { kick, .. } => kick.slot(),
+            Self::Delegated { kick, .. } => kick.slot(),
+        }
+    }
+}
+
 struct OwnedClientFace {
     _mapping: MappedLeaseView,
-    _ring: LeaseToken,
-    _kick: HeldChanSendToken,
+    _face: ClientFace,
 }
 
 impl<'w, 't, T: Transport> RingHostLink<'w, 't, T> {
@@ -476,13 +505,28 @@ impl<'w, 't, T: Transport> RingHostLink<'w, 't, T> {
         kick: HeldChanSendToken,
         window: Window,
     ) -> Option<RingHostLink<'static, 't, T>> {
+        // SAFETY: the caller transfers the same exclusive pair/window contract.
+        unsafe { Self::from_face(transport, ClientFace::Founded { ring, kick }, window) }
+    }
+
+    /// Attach one explicitly delegated or founded client face.
+    ///
+    /// # Safety
+    /// The caller must own the sole SPSC producer/consumer and exclusively
+    /// reserve the supplied VA window, as for `from_owned`.
+    pub unsafe fn from_face(
+        transport: &'t T,
+        face: ClientFace,
+        window: Window,
+    ) -> Option<RingHostLink<'static, 't, T>> {
         if window.base() & 0xfff != 0
             || window.len() & 0xfff != 0
             || window.len() < crate::HOSTLINK_PAIR_WINDOW_BYTES as u64
         {
             return None;
         }
-        let mut mapping = verbs::map_owned_lease_at_rw(ring.slot(), window.base(), window.len())?;
+        let mut mapping =
+            verbs::map_owned_lease_at_rw(face.ring_slot()?, window.base(), window.len())?;
         let (base, len) = {
             // SAFETY: the caller established exclusive client ownership.
             let bytes = unsafe { mapping.as_mut() };
@@ -502,14 +546,13 @@ impl<'w, 't, T: Transport> RingHostLink<'w, 't, T> {
                 transport,
                 rings,
                 ClientEndpoints {
-                    kick: kick.slot(),
+                    kick: face.kick_slot(),
                     grants: [None; kore_rt::service::MAX_GRANTS],
                 },
             ),
             _owned: Some(OwnedClientFace {
                 _mapping: mapping,
-                _ring: ring,
-                _kick: kick,
+                _face: face,
             }),
         })
     }
@@ -956,6 +999,34 @@ impl<'w, 't, T: Transport> RingHostLink<'w, 't, T> {
         }
         .map_err(ClientError::Call)?;
         Ok(reply.response)
+    }
+
+    /// Observe the surviving owner's exact operation without replaying an
+    /// uncertain publication. Supervisor/worker pairs are refused by the
+    /// provider; only the separately endowed owner pair can use this API.
+    pub async fn observe_supervisor(
+        &mut self,
+        request: RequestId,
+        operation: crate::SupervisorOperation,
+        generation: u64,
+        resume: bool,
+        budget_ns: u64,
+    ) -> Result<crate::SupervisorState, ClientError> {
+        let command = ClientRequest::Supervisor {
+            request,
+            operation,
+            generation,
+        };
+        match self.observe_call(&command, resume, Some(budget_ns)).await? {
+            ClientResponse::Supervisor {
+                request: got,
+                state,
+            } if got == request => Ok(state),
+            ClientResponse::Refused { request: got, code } if got == request => {
+                Err(ClientError::Refused(code))
+            }
+            _ => Err(ClientError::UnexpectedReply),
+        }
     }
 
     /// One observation slice of a retained route-close operation. `resume`

@@ -40,5 +40,5 @@ exec_client = true
 # recovery transients and the heap's growth granularity; the fs-dual gate is
 # the witness that keeps it honest.
 heap_supply_bytes = 0x0080_0000
-digest_x86_64  = "blake3:832d7f35dd6af34388f0689d2c6ff8a65dfc73adb6290bf5e16cf061de604742"
-digest_aarch64 = "blake3:162c90829efe04d443b82c2ebdbb5fbe121ce9f7a0afa69aacf5b840b2e14f93"
+digest_x86_64  = "blake3:c459886b8f4144a79b97599750388d6ad7c2fc4f920b3e35f95eb9d16874b0d5"
+digest_aarch64 = "blake3:ae40d5256e092cdbd065b9e4ffbee00c0b94bf512276451f7a5f0081e1e1de5f"

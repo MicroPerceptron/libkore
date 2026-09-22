@@ -24,6 +24,10 @@ pub const WORKSPACE_REQUEST: u16 = 12;
 pub const WORKSPACE_REPLY: u16 = 13;
 /// Broker-route-only post-commit authority observation for the host UI.
 pub const AUTHORITY_REPORT: u16 = 14;
+/// Stop the exact broker incarnation through its surviving guest owner.
+/// Empty payload, zero request ID. ROUTE_CLOSE follows only after native reap;
+/// sending this message is not itself a reclamation acknowledgment.
+pub const SUPERVISOR_STOP: u16 = 15;
 /// A complete KIR1 request carried through the existing credited bulk lane
 /// when it exceeds the founded client's 512-byte inline record.
 pub const INFERENCE_REQUEST_CONTENT: u16 = 0x4b49;

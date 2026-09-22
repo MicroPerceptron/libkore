@@ -69,6 +69,13 @@ def check(tree: Path):
         (work / "Cargo.lock").write_bytes((ROOT / "Cargo.lock").read_bytes())
         (work / "src/lib.rs").write_text('''
 pub fn exec_identity(cap: kore_exec_client::ExecutableCapability) -> sdk::exec::ExecutableCapability { cap }
+pub async fn delegate_executable<T: sdk::runtime::transport::Transport>(
+    cap: &sdk::exec::ExecutableCapability,
+    tx: &kore_rt::chan::ChanTx<'_, T>,
+    rights: kore_abi::cap::Rights,
+) -> Result<(), sdk::runtime::chan::SendError> {
+    cap.transfer_derived(tx, rights).await
+}
 pub fn crash_identity(record: kore_abi::crash::CrashRecord) -> sdk::crash::CrashRecord { record }
 pub fn task_identity(id: kore_abi::task::TaskIdentity) -> sdk::abi::task::TaskIdentity { id }
 pub fn abi_identity(slot: kore_abi::session::SlotRef) -> sdk::abi::session::SlotRef { slot }

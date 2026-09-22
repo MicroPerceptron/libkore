@@ -2959,6 +2959,14 @@ mod tests {
             ) {
                 assert_eq!(entry.profile.get(), kore_abi::image::PROFILE_FILESYSTEM);
                 profiled += 1;
+            } else if name == "boot:kore-agent-supervisor" {
+                assert_eq!(
+                    entry.profile.get(),
+                    kore_abi::image::PROFILE_HEAP
+                        | kore_abi::image::PROFILE_ENGINE
+                        | kore_abi::image::PROFILE_CHANNELS
+                );
+                profiled += 1;
             } else if name == "wasm-witness" {
                 // `engine`: the founder lays the ENGINE plan (a 128 KiB link
                 // window, a 16 MiB heap) so the native AOT guest's mappings
@@ -3003,7 +3011,7 @@ mod tests {
         // caller names (`user/apps/utils/wasm`).
         // 47: plus the first two DATA members, the stock `wasm32-wasip2`
         // programs `user/wasm` builds (seeded to `shared/wasm/`).
-        assert_eq!(entries.len(), 48);
+        assert_eq!(entries.len(), 49);
         assert_eq!(data, ["hello.wasm", "echo.wasm"]);
         // 178: one persistent final lease per admitted carve (data members
         // carve nothing, so they leave this pin alone). `lua_demo.so`
@@ -3015,7 +3023,9 @@ mod tests {
         // TLS slots `#[thread_local]` (`res/WASM_PLATFORM.md` §5), the first
         // archive member to do so.  `wasm` carries the same five, for the
         // same reasons: it links the same engine.
-        assert_eq!(slots, 187);
+        // The optional supervisor is an available package even on ordinary
+        // boot; its four PT_LOAD carves grant no running task by themselves.
+        assert_eq!(slots, 191);
         // The resident agent runner adds one entry and four PT_LOAD carves.
         // 27: `window` carries its authenticated controller-broker selector,
         // `pwctl` the power face, `power-ui` a window, `aftershock` a window
@@ -3025,7 +3035,7 @@ mod tests {
         // `wasm-witness` carries heap and the engine plan, and `wasm` those
         // plus the filesystem it reads a program from and the GPU face it
         // hands that program: 29.
-        assert_eq!(profiled, 29);
+        assert_eq!(profiled, 30);
     }
 
     /// A synthetic one-member archive: `payload` at the first page past the

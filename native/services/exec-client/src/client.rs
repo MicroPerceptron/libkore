@@ -19,8 +19,8 @@ use kore_rt::svc::{
 };
 use kore_rt::transport::Transport;
 
-use crate::wire::{SHARED_WAKE_RIGHTS, SpawnSpec, TaskRefusal, TaskRequest, TaskResponse};
 use crate::wire::ExecProtocol;
+use crate::wire::{SHARED_WAKE_RIGHTS, SpawnSpec, TaskRefusal, TaskRequest, TaskResponse};
 
 mod mint;
 pub use mint::ExecClientMint;
@@ -691,6 +691,25 @@ impl ExecutableCapability {
             .await
     }
 
+    /// Transfer an explicitly attenuated executable descendant. The source
+    /// stays held through a retry; the atomic native derive/send decides
+    /// whether any authority crossed the boundary.
+    pub async fn transfer_derived<T: Transport>(
+        &self,
+        tx: &kore_rt::chan::ChanTx<'_, T>,
+        rights: Rights,
+    ) -> Result<(), kore_rt::chan::SendError> {
+        if !rights.contains(Rights::ACCESS)
+            || !kore_rt::cap::CHANNEL_ENDPOINT_RIGHTS.contains(rights)
+            || !self.rights().contains(rights | Rights::DERIVE)
+        {
+            return Err(kore_rt::chan::SendError::Refused(
+                kore_abi::session::Status::Denied,
+            ));
+        }
+        tx.transfer_derived_send(self.endpoint.slot(), rights).await
+    }
+
     /// Explicitly revoke/retire this local executable-authority subtree.
     pub fn try_retire(self) -> Result<kore_rt::cap::RetireOutcome, Self> {
         let Self {
@@ -1201,9 +1220,12 @@ impl<'w, 't, T: Transport> RingExec<'w, 't, T> {
     pub fn derive_filesystem_invocation_outcome(
         &self,
     ) -> Result<ChanSendToken, verbs::EndpointDeriveError> {
-        let fs_view = self.fs_view_tx.as_ref().ok_or(
-            verbs::EndpointDeriveError::Refused(verbs::EndpointDeriveRefusal::Unavailable),
-        )?;
+        let fs_view = self
+            .fs_view_tx
+            .as_ref()
+            .ok_or(verbs::EndpointDeriveError::Refused(
+                verbs::EndpointDeriveRefusal::Unavailable,
+            ))?;
         verbs::derive_owned_chan_send_outcome(
             fs_view.slot(),
             kore_svc_dagfs::FsViewCapability::INVOCATION_DELEGATE_RIGHTS,
@@ -2463,8 +2485,13 @@ mod tests {
             ),
             Err(InstallError::Call(CallError::Timeout))
         ));
-        let reply =
-            <ExecProtocol as SvcProtocol>::encode_rep(&TaskResponse::AppSeeded { seeded: true, failure: 0 }, 0);
+        let reply = <ExecProtocol as SvcProtocol>::encode_rep(
+            &TaskResponse::AppSeeded {
+                seeded: true,
+                failure: 0,
+            },
+            0,
+        );
         assert!(serve.rep.push(reply).is_ok());
 
         assert_eq!(
@@ -2484,7 +2511,10 @@ mod tests {
         transport.succeed.set(true);
         assert_eq!(
             run(exec.resume_seed_app(hello)),
-            Ok(AppSeedOutcome { seeded: true, failure: 0 })
+            Ok(AppSeedOutcome {
+                seeded: true,
+                failure: 0
+            })
         );
         assert_eq!(transport.commits.get(), 2);
         assert!(exec.timed_out_bootstrap.is_none());
@@ -2509,7 +2539,10 @@ mod tests {
         serve
             .rep
             .push(ExecProtocol::encode_rep(
-                &TaskResponse::AppSeeded { seeded: true, failure: 0 },
+                &TaskResponse::AppSeeded {
+                    seeded: true,
+                    failure: 0,
+                },
                 0,
             ))
             .unwrap();
@@ -2531,7 +2564,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             reply.response,
-            TaskResponse::AppSeeded { seeded: true, failure: 0 }
+            TaskResponse::AppSeeded {
+                seeded: true,
+                failure: 0
+            }
         ));
         assert!(exec.is_idle());
         assert!(serve.req.pop().is_none());
@@ -2583,14 +2619,22 @@ mod tests {
             );
         }
 
-        let reply =
-            <ExecProtocol as SvcProtocol>::encode_rep(&TaskResponse::AppSeeded { seeded: true, failure: 0 }, 0);
+        let reply = <ExecProtocol as SvcProtocol>::encode_rep(
+            &TaskResponse::AppSeeded {
+                seeded: true,
+                failure: 0,
+            },
+            0,
+        );
         assert!(serve.rep.push(reply).is_ok());
         transport.succeed.set(true);
 
         assert_eq!(
             run(exec.resume_seed_app(hello)),
-            Ok(AppSeedOutcome { seeded: true, failure: 0 })
+            Ok(AppSeedOutcome {
+                seeded: true,
+                failure: 0
+            })
         );
         assert_eq!(transport.commits.get(), 2);
         assert!(serve.req.pop().is_none());
@@ -2761,5 +2805,4 @@ mod tests {
             "a privileged parent may explicitly retain the distinct delegation right"
         );
     }
-
 }

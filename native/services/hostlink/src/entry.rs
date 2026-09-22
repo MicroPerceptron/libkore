@@ -92,8 +92,9 @@ struct Pair<'w> {
 
 struct Router<'w, 't> {
     core: Core,
+    supervisor: crate::SupervisorOwner,
     transport: &'t kore_rt::transport::TrapTransport,
-    pairs: [Pair<'w>; HOSTLINK_SERVE_PAIRS],
+    pairs: [Option<Pair<'w>>; HOSTLINK_SERVE_PAIRS],
     retired_pairs: [Option<kore_hostlink::TaskGeneration>; crate::MAX_DYNAMIC_AGENT_ROUTES],
     control_work: Box<[u8]>,
     bulk_work: Box<[u8]>,
@@ -107,7 +108,13 @@ impl Router<'_, '_> {
         for _ in 0..(3 * HOSTLINK_SERVE_PAIRS) {
             let mut found = None;
             for via in 0..self.pairs.len() {
-                if let Some(wire) = self.pairs[via].rings.req.pop() {
+                if !self.supervisor.client_active() && matches!(via, 0 | 1 | 2) {
+                    continue;
+                }
+                if let Some(wire) = self.pairs[via]
+                    .as_mut()
+                    .and_then(|pair| pair.rings.req.pop())
+                {
                     found = Some((via, wire));
                     break;
                 }
@@ -121,13 +128,16 @@ impl Router<'_, '_> {
                     request: kore_hostlink::RequestId::ZERO,
                     code: RefusalCode::Malformed,
                 });
-            if self.pairs[via]
+            let pair = self.pairs[via]
+                .as_mut()
+                .expect("request arrived on an attached pair");
+            if pair
                 .rings
                 .rep
                 .push(HostLinkWire::encode_rep(&response, 0))
                 .is_ok()
             {
-                let _ = ChanTx::new(self.transport, self.pairs[via].kick)
+                let _ = ChanTx::new(self.transport, pair.kick)
                     .send(Notice {
                         cookie: COOKIE_REPLY,
                         payload: 0,
@@ -138,11 +148,49 @@ impl Router<'_, '_> {
     }
 
     fn handle(&mut self, via: u16, request: ClientRequest) -> ClientResponse {
+        if let ClientRequest::Supervisor {
+            request: request_id,
+            operation,
+            generation,
+        } = request
+        {
+            if usize::from(via) != crate::HOSTLINK_OWNER_PAIR {
+                return refused(&request, RefusalCode::PolicyDenied);
+            }
+            return match self
+                .supervisor
+                .operate(&mut self.core, operation, generation)
+            {
+                Ok(_) => {
+                    if self.supervisor.needs_request_drain() {
+                        for index in [0, 1, 2] {
+                            let Some(pair) = self.pairs[index].as_mut() else {
+                                return refused(&request, RefusalCode::PolicyDenied);
+                            };
+                            if !crate::drain_retired_requests(&mut pair.rings) {
+                                return refused(&request, RefusalCode::Malformed);
+                            }
+                        }
+                        self.supervisor.confirm_request_drain();
+                        self.retired_pairs[..crate::HOSTLINK_SUPERVISOR_WORKERS].fill(None);
+                    }
+                    ClientResponse::Supervisor {
+                        request: request_id,
+                        state: self.supervisor.state(),
+                    }
+                }
+                Err(error) => refused(&request, service_code(error)),
+            };
+        }
+        if usize::from(via) == crate::HOSTLINK_OWNER_PAIR {
+            return refused(&request, RefusalCode::PolicyDenied);
+        }
         let Some(endpoint) = self.core.delivery().endpoint_for_via(via) else {
             return refused(&request, RefusalCode::PolicyDenied);
         };
         let request_id = request.request_id();
         let result = match request {
+            ClientRequest::Supervisor { .. } => unreachable!(),
             ClientRequest::Send {
                 kind,
                 request,
@@ -254,8 +302,9 @@ impl Router<'_, '_> {
                 if endpoint != Endpoint::Broker {
                     return refused(&request, RefusalCode::PolicyDenied);
                 }
-                let Some(pair) =
-                    crate::agent_pair_index(slot).and_then(|index| self.pairs.get_mut(index))
+                let Some(pair) = crate::agent_pair_index(slot)
+                    .and_then(|index| self.pairs.get_mut(index))
+                    .and_then(Option::as_mut)
                 else {
                     return refused(&request, RefusalCode::RouteClosed);
                 };
@@ -428,19 +477,26 @@ pub async fn run(rt: kore_rt::entry::Rt) -> ! {
         adapter,
         MailboxBank::new(),
         seed[..32].try_into().unwrap(),
-        bindings,
+        if crate::SUPERVISOR_AUTOSTART {
+            bindings
+        } else {
+            bindings.without_broker()
+        },
     );
-    for (slot, range) in [(0, 48..64), (1, 64..80)] {
-        let local = LocalRoute {
-            route: RouteId(seed[range].try_into().expect("fixed route slice")),
-            generation,
-        };
-        if core.install_agent_route(slot, local).is_err() {
-            refuse_with(&rt, rung::ENTROPY);
+    if crate::SUPERVISOR_AUTOSTART {
+        for (slot, range) in [(0, 48..64), (1, 64..80)] {
+            let local = LocalRoute {
+                route: RouteId(seed[range].try_into().expect("fixed route slice")),
+                generation,
+            };
+            if core.install_agent_route(slot, local).is_err() {
+                refuse_with(&rt, rung::ENTROPY);
+            }
         }
     }
     let mut router = Router {
         core,
+        supervisor: crate::SupervisorOwner::new(generation),
         transport: kore_rt::entry::transport(),
         pairs,
         retired_pairs: [None; crate::MAX_DYNAMIC_AGENT_ROUTES],
@@ -513,7 +569,7 @@ async fn serve_disconnected(rt: &kore_rt::entry::Rt) -> ! {
                 kore_rt::executor::next_wake().await;
             }
         }
-        for pair in &mut pairs {
+        for pair in pairs.iter_mut().flatten() {
             for _ in 0..HostLinkWire::REQUEST_CAPACITY {
                 let Some(wire) = pair.rings.req.pop() else {
                     break;
@@ -593,10 +649,15 @@ async fn claim_optional_bulk(
         .map_err(|_| ShmemClaimError::MapRefused)
 }
 
-fn attach_pairs(boot: &Bootstrap<'_>) -> Option<[Pair<'static>; HOSTLINK_SERVE_PAIRS]> {
+fn attach_pairs(boot: &Bootstrap<'_>) -> Option<[Option<Pair<'static>>; HOSTLINK_SERVE_PAIRS]> {
     let mut pairs = [const { None }; HOSTLINK_SERVE_PAIRS];
     for (index, slot) in pairs.iter_mut().enumerate() {
-        let view = boot.handle(role::SVC_RING, index as u16)?;
+        let Some(view) = boot.handle(role::SVC_RING, index as u16) else {
+            if crate::SUPERVISOR_AUTOSTART || index == 0 || index == 3 {
+                return None;
+            }
+            continue;
+        };
         let leased = kore_rt::cap::verbs::take_view(view)?;
         let window = kore_rt::cap::verbs::map_view(leased)?;
         // SAFETY: each index is a distinct founder-minted pair extent; this
@@ -614,10 +675,7 @@ fn attach_pairs(boot: &Bootstrap<'_>) -> Option<[Pair<'static>; HOSTLINK_SERVE_P
             kick: boot.handle(role::SVC_SEND, index as u16)?,
         });
     }
-    let [Some(a), Some(b), Some(c), Some(d)] = pairs else {
-        return None;
-    };
-    Some([a, b, c, d])
+    Some(pairs)
 }
 
 fn refused(request: &ClientRequest, code: RefusalCode) -> ClientResponse {

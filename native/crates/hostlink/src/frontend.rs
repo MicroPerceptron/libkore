@@ -55,6 +55,9 @@ pub enum FrontendPollPhase {
     /// receipt for intent_id, and may claim its next intent. Other lanes'
     /// completions are unaffected by this acknowledgement.
     BrokerReadyNext = 5,
+    /// Initial/idle poll from the separately founded supervisor contract v1.
+    /// Its authenticated route generation identifies the supervisor incarnation.
+    SupervisorNextV1 = 6,
 }
 
 impl FrontendPollPhase {
@@ -65,6 +68,7 @@ impl FrontendPollPhase {
             3 => Some(Self::BrokerRetired),
             4 => Some(Self::BrokerControl),
             5 => Some(Self::BrokerReadyNext),
+            6 => Some(Self::SupervisorNextV1),
             _ => None,
         }
     }
@@ -92,7 +96,9 @@ pub struct FrontendPoll {
 impl FrontendPoll {
     pub fn encode(self, output: &mut [u8]) -> Option<usize> {
         let valid_id = match self.phase {
-            FrontendPollPhase::BrokerNext => self.intent_id.is_zero(),
+            FrontendPollPhase::BrokerNext | FrontendPollPhase::SupervisorNextV1 => {
+                self.intent_id.is_zero()
+            }
             FrontendPollPhase::AgentClaim
             | FrontendPollPhase::BrokerReadyNext
             | FrontendPollPhase::BrokerRetired
@@ -132,7 +138,11 @@ pub fn decode_frontend_poll(input: &[u8]) -> Option<FrontendPoll> {
         intent_id: FrontendIntentId(record.intent_id),
     };
     match poll.phase {
-        FrontendPollPhase::BrokerNext if poll.intent_id.is_zero() => Some(poll),
+        FrontendPollPhase::BrokerNext | FrontendPollPhase::SupervisorNextV1
+            if poll.intent_id.is_zero() =>
+        {
+            Some(poll)
+        }
         FrontendPollPhase::AgentClaim
         | FrontendPollPhase::BrokerReadyNext
         | FrontendPollPhase::BrokerRetired
@@ -316,6 +326,20 @@ fn decode_text_record(magic: u32, input: &[u8]) -> Option<(u8, FrontendIntentId,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_v1_readiness_is_distinct_from_legacy_broker_poll() {
+        let mut bytes = [0; FRONTEND_RECORD_HEADER_LEN];
+        let poll = FrontendPoll {
+            phase: FrontendPollPhase::SupervisorNextV1,
+            intent_id: FrontendIntentId::ZERO,
+        };
+        assert_eq!(poll.encode(&mut bytes), Some(bytes.len()));
+        assert_eq!(decode_frontend_poll(&bytes), Some(poll));
+        assert_ne!(bytes[6], FrontendPollPhase::BrokerNext as u8);
+        bytes[8] = 1;
+        assert!(decode_frontend_poll(&bytes).is_none());
+    }
 
     #[test]
     fn concurrent_lane_readiness_names_exactly_one_prior_intent() {
