@@ -317,6 +317,9 @@ pub struct WindowClient<'w, 't, T: Transport> {
     surface_lanes: SurfaceLanes,
     configuration: Option<Configure>,
     needs_configuration: bool,
+    // One observed keyboard snapshot waits here for its configure. Later
+    // snapshots stay in the ordered ring, so a release cannot overtake a press.
+    pending_keyboard: Option<(u64, Event)>,
     focused: bool,
     visible: bool,
     observed_scheme: Option<crate::appearance::ColorScheme>,
@@ -356,6 +359,7 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
             surface_lanes: SurfaceLanes::default(),
             configuration: None,
             needs_configuration: true,
+            pending_keyboard: None,
             focused: false,
             visible: true,
             observed_scheme: None,
@@ -389,6 +393,7 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
     pub async fn wait_change(&mut self, bound: core::time::Duration) {
         let seen = self.channel.seq();
         if self.sync_status().is_err()
+            || self.pending_keyboard.is_some()
             || self.channel.outstanding() != 0
             || self.channel.state().is_some_and(|state| {
                 self.observed_scheme
@@ -458,9 +463,30 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
     }
 
     /// Consume all event types. Old-coordinate input is discarded; newer input
-    /// first requests a configure and resets held keys/buttons. Close and reset
-    /// remain actionable regardless of a superseded geometry serial.
+    /// first requests a configure and resets held keys/buttons. A keyboard
+    /// snapshot for that configure is retained until it can be delivered;
+    /// pointer coordinates are never applied to an unmatched aperture. Close
+    /// and reset remain actionable regardless of a superseded geometry serial.
     pub fn pop_event(&mut self) -> Result<EventPoll, ClientError> {
+        if let Some((serial, event)) = self.pending_keyboard {
+            let current = self.configuration.map_or(0, |config| config.serial);
+            if serial > current {
+                self.needs_configuration = true;
+                return Ok(EventPoll {
+                    event: None,
+                    advanced: false,
+                });
+            }
+            self.pending_keyboard = None;
+            if serial == current {
+                return Ok(EventPoll {
+                    event: Some(event),
+                    advanced: false,
+                });
+            }
+            // A later configure superseded this snapshot. Apply the same
+            // stale-input rule as records still in the ring.
+        }
         let mut advanced = false;
         for _ in 0..crate::event::EVENT_CAP {
             let Some(wire) = self.channel.pop() else {
@@ -472,6 +498,14 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
             advanced = true;
             let (serial, event) = wire.decode().ok_or(ClientError::EventMalformed)?;
             let current = self.configuration.map_or(0, |config| config.serial);
+            if serial > current && matches!(event, Event::Keyboard { .. }) {
+                self.pending_keyboard = Some((serial, event));
+                self.needs_configuration = true;
+                return Ok(EventPoll {
+                    event: Some(Event::Reset),
+                    advanced,
+                });
+            }
             let Some(event) = scoped_event(current, serial, event) else {
                 continue;
             };
@@ -720,6 +754,7 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
     /// the affected owner here; no successful ring enqueue counts as retirement.
     pub async fn close(&mut self) -> Result<(), ClientError> {
         self.needs_configuration = true;
+        self.pending_keyboard = None;
         self.retire_backing(BackingSlot::Current).await?;
         self.retire_backing(BackingSlot::Previous).await?;
         self.retire_tombstone().await?;
@@ -1160,6 +1195,83 @@ mod tests {
         assert_eq!(
             state.flags & (WindowState::FOCUSED | WindowState::VISIBLE | WindowState::LIGHT),
             original_flags
+        );
+    }
+
+    #[test]
+    fn keyboard_waiting_for_configuration_keeps_press_and_release_in_order() {
+        use kore_rt::svc::SvcProtocol;
+        #[repr(align(64))]
+        struct Buffer<const N: usize>([u8; N]);
+        let mut pair = Buffer([0; wire::SURFACE_PAIR_BYTES]);
+        let mut event_memory = Buffer([0; 4096]);
+        WindowWire::init_pair_window(&mut pair.0, REQ_CAP, REP_CAP).unwrap();
+        let transport = kore_rt::transport::TrapTransport::new();
+        let mut client = WindowClient::from_memory(
+            &transport,
+            &mut pair.0,
+            ClientEndpoints {
+                kick: SlotRef::from_wire(1),
+                grants: [const { None }; MAX_GRANTS],
+            },
+        )
+        .unwrap();
+        let (mut producer, channel) = kore_ring::event::split::<
+            crate::channel::WindowState,
+            EventWire,
+        >(&mut event_memory.0, crate::event::EVENT_CAP)
+        .unwrap();
+        client.channel = channel;
+        client.configuration = Some(Configure {
+            window: 1,
+            serial: 2,
+            bounds: crate::configure::Bounds {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            focused: true,
+        });
+        client.needs_configuration = false;
+        let press = Event::Keyboard {
+            source: 1,
+            modifiers: 2,
+            keys: [30, 0, 0, 0, 0, 0],
+        };
+        let release = Event::Keyboard {
+            source: 1,
+            modifiers: 0,
+            keys: [0; 6],
+        };
+        producer.push(EventWire::encode(1, press)).unwrap();
+        producer.push(EventWire::encode(3, press)).unwrap();
+        producer.push(EventWire::encode(3, release)).unwrap();
+        assert_eq!(client.pop_event().unwrap().event, Some(Event::Reset));
+        assert!(client.configuration_needed());
+        assert_eq!(
+            client.pop_event().unwrap(),
+            EventPoll {
+                event: None,
+                advanced: false
+            },
+            "do not drain the release before its retained press can be delivered"
+        );
+        // Model the completed configure boundary. The real queue still owns
+        // the release; the client must retain the already-observed press.
+        client.configuration.as_mut().unwrap().serial = 3;
+        client.needs_configuration = false;
+        assert_eq!(client.pop_event().unwrap().event, Some(press));
+        assert_eq!(client.pop_event().unwrap().event, Some(release));
+        assert_eq!(client.pop_event().unwrap().event, None);
+        producer.push(EventWire::encode(4, press)).unwrap();
+        assert_eq!(client.pop_event().unwrap().event, Some(Event::Reset));
+        client.configuration.as_mut().unwrap().serial = 5;
+        client.needs_configuration = false;
+        assert_eq!(
+            client.pop_event().unwrap().event,
+            None,
+            "superseded input stays stale"
         );
     }
 

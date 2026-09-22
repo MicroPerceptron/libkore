@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/MicroPerceptron/kore",
-  "revision": "3ca0edd4120903414aac7d6766bb7093a2a9a9eb",
+  "revision": "ed515b61d9d1853b04271c3e2bed11b6d19be88e",
   "packages": {
     "crates/abi": "kore-abi",
     "crates/app": "kore-app",
@@ -266,7 +266,7 @@
     "crates/window/Cargo.toml": "96c2d4c89e179c3718d4b4e897bb0a44c55ac7ad66341529da4bfd35e203592e",
     "crates/window/src/appearance.rs": "b22e65286b94215bc4265a09ef280a5118f368ac45120311b870a56f7cc40a81",
     "crates/window/src/channel.rs": "256a40e48eaf0a5c96abe4d88edb49767b8bd3da3c74ef647ca5f0f56a94ff46",
-    "crates/window/src/client.rs": "e433b2d634bffdd1dfd0351df34b939478a3c47bd4d21845d982e5a81baccdc5",
+    "crates/window/src/client.rs": "cdd685e47d9f3ed30c487d2664aec84a945424ae1bec478fe0492f3153dbeab2",
     "crates/window/src/command.rs": "3ad4867ce62f3a430a68e4d105991229938e131e8cfde8afbbb0f522f99355d3",
     "crates/window/src/configure.rs": "5731662e919827aa6c9b189dce1d4ae06ebc7f7940c57fafd8662fc33bc46154",
     "crates/window/src/control.rs": "bf482439516c5d0334acfe764cc3ae4c838743cb2082da5e6476286acdf5d922",
@@ -317,7 +317,7 @@
     "services/block/src/service.rs": "191e9d887d3f3267d6e2aa96e81996f01321bb2febb85e68581159f6e098b4b5",
     "services/block/src/wire.rs": "a9d64aef9ec3d58d37ca55b841933fc51b76ab94e18b245278b4519e96c65939",
     "services/dagfs/Cargo.toml": "c41b4174a30c868fc6c48874e6f656e8f959002400e97ce933a50cb7d31d364a",
-    "services/dagfs/boot.toml": "22ef3b1d7195793c4f43be0fefd2dc4032d2a0fb88f4223ec7192cffb324b621",
+    "services/dagfs/boot.toml": "70aee8bbfb005d19bd066004667742bd617ef34df11f0dbdccb9299083963c1c",
     "services/dagfs/examples/fsdemo.rs": "1666a14ef62fd4fc46f7f9efa2eaa5021ed79823f273a77f53758307f884e7d0",
     "services/dagfs/examples/fswire.rs": "994b97d699796b317741e2c87cbe812cc1776ddcd01173323e72a5f74c8ac267",
     "services/dagfs/src/authority.rs": "80f42a3d1256b8967cefca5ab423f636d4484fbcc6f4fe9e6cd30160e166fc69",

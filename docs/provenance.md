@@ -353,3 +353,26 @@ passed using the existing pinned 0.29.4 binary. Kore's current source passed
 checks and an Intel TCG 4k48 two-terminal keyboard gate with all 35 apps seeded.
 Hardware CI and native UI acceptance remain outstanding; these local results
 do not replace them.
+
+## Keyboard preservation across backing replacement — 2026-09-21
+
+The export advances to committed Kore
+`ed515b61d9d1853b04271c3e2bed11b6d19be88e` (31 packages, 414 files).
+The window client preserves pending keyboard input while adopting replacement
+backing. The other exported change is the committed DagFS boot digest. There
+is no facade API or dependency-configuration change; both lockfiles remain
+unchanged and pass locked validation.
+
+The full matrix passed: 505 Rust host tests (six ignored), seven tooling tests,
+39 Miri tests, formatting, Clippy, documentation, owner checks, all three custom
+targets, actual executable links and negative controls, and C/Zig bindings.
+Exact upstream export verification and actual-Kore local/Git composition passed,
+including the duplicate-owner negative control.
+
+The matching Kore candidate passed 6,356 host tests, architecture/build checks,
+the separate boot-test image and production guest with all 35 apps seeded.
+Two-terminal provisioning still failed with projection-link code 74. The full
+desktop test failed to reopen Power after ten recycle rounds despite a correctly
+positioned click. Fresh hardware CI and companion real-stack/native UI acceptance
+remain pending. This SDK validation does not clear those guest failures or
+establish a sealed companion artifact; no ABI-stability or release claim is made.
