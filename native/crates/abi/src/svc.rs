@@ -1494,6 +1494,16 @@ impl LibraryFailure {
     pub const APP_OPEN: u8 = 69;
     /// App stage: the export copy into the store did not complete.
     pub const APP_COPY: u8 = 70;
+    /// Projection stage: a preceding source owner did not finish cleanup.
+    pub const APP_PROJECTION_CLEANUP: u8 = 71;
+    /// Projection stage: opening the seeded source file did not complete.
+    pub const APP_PROJECTION_SOURCE: u8 = 72;
+    /// Projection stage: opening or creating the directory chain failed.
+    pub const APP_PROJECTION_DIRECTORY: u8 = 73;
+    /// Projection stage: linking or validating an existing edge failed.
+    pub const APP_PROJECTION_LINK: u8 = 74;
+    /// Projection stage: retiring an acquired source/directory handle failed.
+    pub const APP_PROJECTION_CLOSE: u8 = 75;
 }
 
 impl TaskReqWire {

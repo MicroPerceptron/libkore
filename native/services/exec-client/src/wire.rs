@@ -1749,6 +1749,13 @@ mod tests {
                 0,
             ),
             (
+                TaskResponse::AppSeeded {
+                    seeded: false,
+                    failure: kore_abi::svc::LibraryFailure::APP_PROJECTION_CLOSE,
+                },
+                0,
+            ),
+            (
                 TaskResponse::LibrarySeeded {
                     seeded: true,
                     manifest: false,

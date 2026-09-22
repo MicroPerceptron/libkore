@@ -327,3 +327,29 @@ duplicate-owner negative control. The owning guest's two-terminal startup and
 Lua REPL witnesses pass after the policy correction, but its durable store
 still seeded only 33/35 applications with a resize failure. Guest acceptance
 and fresh companion UI acceptance remain incomplete.
+
+## Native I/O isolation — 2026-09-21
+
+The export advances to committed Kore source
+`3ca0edd4120903414aac7d6766bb7093a2a9a9eb` (31 packages, 414 files).
+Native file-handle I/O no longer waits for an unrelated HostLink attachment
+or workspace delta. Host-backed handles retain refresh, and native dispatch
+still checks authority and revision. The upstream serving-path regression
+proves native resize completes with host attachment or delta paused, denied
+write authority remains denied, and host operations still await refresh.
+
+The snapshot also includes application-projection failure codes and their
+existing seven-bit wire representation test. It changes no facade API or
+ownership boundary. The upstream privileged-install provider settlement fix
+belongs to the exec server and is outside this export.
+
+The full refreshed matrix passed: 505 host tests, 39 Miri tests, formatting,
+Clippy, documentation, owner checks, all three custom targets, actual executable
+links and negative controls, and C/Zig bindings. Actual-Kore local/Git composition
+also passed, including the duplicate-owner negative control. Binding verification
+initially stopped because `cbindgen` was absent from PATH; the remaining checks
+passed using the existing pinned 0.29.4 binary. Kore's current source passed
+6,354 host tests, architecture
+checks and an Intel TCG 4k48 two-terminal keyboard gate with all 35 apps seeded.
+Hardware CI and native UI acceptance remain outstanding; these local results
+do not replace them.

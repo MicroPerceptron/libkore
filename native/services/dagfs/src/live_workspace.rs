@@ -336,6 +336,23 @@ impl<C: WorkspaceChannel> WorkspaceMount<C> {
             }
         }
         let touches_host = fs.request_touches_host(session, request)?;
+        // Existing native file handles do not depend on workspace discovery.
+        // In particular, boot seeding must not await a host attachment or delta
+        // for every data chunk. Native dispatch still checks the handle's
+        // authority and revision; host handles retain the refresh below.
+        if !touches_host
+            && matches!(
+                request,
+                FsRequest::Read { .. }
+                    | FsRequest::WriteAt { .. }
+                    | FsRequest::Append { .. }
+                    | FsRequest::Resize { .. }
+                    | FsRequest::LendVersion { .. }
+                    | FsRequest::LendExecutable { .. }
+            )
+        {
+            return Ok(None);
+        }
         if self.reconcile_required
             || matches!(
                 request,
@@ -575,6 +592,93 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn native_resize_does_not_wait_for_host_attachment_or_delta() {
+        use core::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+
+        for attached in [false, true] {
+            with_mount(move |mut mount, mut fs, host_session, host_file| {
+                let mut channel = mount.live.take().unwrap().into_channel().applying_writes();
+                channel.pause_attach = !attached;
+                channel.pause_delta = true;
+                mount.channel = Some(channel);
+                if attached {
+                    block_on(mount.refresh(&mut fs)).unwrap();
+                } else {
+                    // A cancelled host mutation must not stall native data I/O.
+                    mount.reconcile_required = true;
+                }
+
+                let session = SessionId::new(2);
+                assert!(fs.ensure_session(session));
+                let root = fs.engine_ref().open_root(session, Rights::HOME).unwrap();
+                let file = block_on(fs.engine_ref().create(
+                    session,
+                    root.handle,
+                    &Name::new("native-seed").unwrap(),
+                    ObjectKind::File,
+                ))
+                .unwrap();
+                let request = FsRequest::Resize {
+                    handle: file.handle,
+                    length: 16,
+                    expected: file.revision,
+                };
+                {
+                    let mut future =
+                        core::pin::pin!(mount.before_request(&mut fs, session, &request));
+                    let mut cx = Context::from_waker(Waker::noop());
+                    assert!(matches!(
+                        future.as_mut().poll(&mut cx),
+                        Poll::Ready(Ok(None))
+                    ));
+                }
+                assert!(matches!(
+                    fs.dispatch(session, &request, None),
+                    FsResponse::Committed { .. }
+                ));
+                assert_eq!(fs.engine_ref().stat(session, file.handle).unwrap().len, 16);
+
+                let read_only = fs
+                    .engine_ref()
+                    .open_at(
+                        session,
+                        root.handle,
+                        &Name::new("native-seed").unwrap(),
+                        Rights::READ,
+                    )
+                    .unwrap();
+                let forbidden = FsRequest::Resize {
+                    handle: read_only.handle,
+                    length: 0,
+                    expected: read_only.revision,
+                };
+                assert_eq!(
+                    block_on(mount.before_request(&mut fs, session, &forbidden)),
+                    Ok(None)
+                );
+                assert_eq!(
+                    fs.dispatch(session, &forbidden, None),
+                    FsResponse::Refused(FsError::AccessDenied)
+                );
+                assert_eq!(fs.engine_ref().stat(session, file.handle).unwrap().len, 16);
+
+                // A host handle still has to refresh; never expose its stale
+                // placeholder just because native operations may proceed.
+                let host_request = FsRequest::Stat {
+                    handle: host_file.handle,
+                };
+                let mut future =
+                    core::pin::pin!(mount.before_request(&mut fs, host_session, &host_request));
+                let mut cx = Context::from_waker(Waker::noop());
+                assert!(future.as_mut().poll(&mut cx).is_pending());
+            });
+        }
     }
 
     #[test]
