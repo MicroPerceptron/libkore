@@ -621,7 +621,16 @@ impl IdentifyNamespace {
             (
                 u32::from(self.npwg) + 1,
                 u32::from(self.npwa) + 1,
-                u32::from(self.nows) + 1,
+                // A zero NOWS decodes to one LBA but carries no useful bulk
+                // sizing advice. QEMU advertises this with OPTPERF set;
+                // propagating it caps every filesystem write at one sector.
+                // Match Linux's NVMe normalization: retain real hints, but
+                // report this degenerate hint as absent. MDTS is independent.
+                if self.nows == 0 {
+                    0
+                } else {
+                    u32::from(self.nows) + 1
+                },
             )
         } else {
             (0, 0, 0)
@@ -763,5 +772,25 @@ mod tests {
         assert_eq!(ns.io_performance(), (0, 0, 0, 256));
         ns.nsfeat = 1 << 5; // reserved, not OPTPERF
         assert_eq!(ns.io_performance(), (0, 0, 0, 256));
+    }
+
+    #[test]
+    fn single_lba_optimal_hint_does_not_throttle_bulk_transfers() {
+        let mut ns: IdentifyNamespace = unsafe { core::mem::zeroed() };
+        ns.nsfeat = 1 << 4;
+        // QEMU's default: valid optimization fields, all zero-based fields
+        // zero. Keep its one-block granularity/alignment, not a transfer cap.
+        assert_eq!(ns.io_performance(), (1, 1, 0, 0));
+
+        // Suppressing the degenerate size must neither suppress the other
+        // hints nor wrap the largest valid zero-based optimal size.
+        ns.npwg = 7;
+        ns.npwa = 3;
+        ns.noiob = 256;
+        assert_eq!(ns.io_performance(), (8, 4, 0, 256));
+        ns.nows = 1;
+        assert_eq!(ns.io_performance(), (8, 4, 2, 256));
+        ns.nows = u16::MAX;
+        assert_eq!(ns.io_performance(), (8, 4, 65_536, 256));
     }
 }

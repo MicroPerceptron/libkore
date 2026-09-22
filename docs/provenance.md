@@ -376,3 +376,32 @@ desktop test failed to reopen Power after ten recycle rounds despite a correctly
 positioned click. Fresh hardware CI and companion real-stack/native UI acceptance
 remain pending. This SDK validation does not clear those guest failures or
 establish a sealed companion artifact; no ABI-stability or release claim is made.
+
+## Resize diagnostics and NVMe write sizing — 2026-09-22
+
+The export advances to committed Kore
+`68dda5a411d4d1ba0d015b5f341e2b5bfa0a5daf` (31 packages, 414 files).
+Application seed replies preserve resize failure categories in their existing
+seven-bit field; library replies keep the existing six-bit representation.
+NVMe treats a zero NOWS value as an absent optimal-write hint, preserving actual
+transfer limits and nonzero hints. This follows the Linux NVMe treatment of a
+decoded one-block hint and prevents QEMU's default from capping bulk writes at
+one sector. No facade API or dependency configuration changes are introduced.
+
+The full required SDK matrix passed: 505 Rust host tests (six ignored), seven
+tooling tests, 39 Miri tests, formatting, Clippy, documentation, owner checks,
+three custom targets, executable links and negative controls, and C/Zig bindings.
+Exact export verification and actual-Kore local/Git composition passed, including
+the duplicate-owner negative control. Both lockfiles remain unchanged and valid
+under locked checks.
+
+The matching Kore source passed 6,359 host tests, architecture and image builds,
+its separate boot-test image, production guest provisioning (35/35 apps), and
+the two-terminal keyboard gate. The production ISO SHA-256 was
+`0cb86fe87ef01114d6af296531a741618f8c8aa599359194849792b187595521`.
+The extended desktop test still failed to reopen Power on recycle round eight.
+Fresh hardware evidence includes passing Intel production and both boot tests,
+but AMD production seeded only 34/35 apps (projection directory-chain code 73),
+and some AMD interactive jobs failed during startup before their named tests.
+These results do not establish complete hardware or native vKore UI acceptance,
+and no companion artifact or release acceptance is claimed by this SDK refresh.

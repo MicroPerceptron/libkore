@@ -1504,6 +1504,57 @@ impl LibraryFailure {
     pub const APP_PROJECTION_LINK: u8 = 74;
     /// Projection stage: retiring an acquired source/directory handle failed.
     pub const APP_PROJECTION_CLOSE: u8 = 75;
+    /// App body resize: the exact outstanding request exhausted its observations.
+    pub const APP_RESIZE_TIMEOUT: u8 = 76;
+    /// App body resize: another retained request already owns the client.
+    pub const APP_RESIZE_OUTSTANDING: u8 = 77;
+    /// App body resize: another infrastructure failure prevented completion.
+    pub const APP_RESIZE_CALL: u8 = 78;
+    /// App body resize: the filesystem reply violated the wire protocol.
+    pub const APP_RESIZE_WIRE: u8 = 79;
+    /// App body resize: the medium has no room for the requested bytes.
+    pub const APP_RESIZE_STORAGE: u8 = 80;
+    /// App body resize: the bounded placement table is full.
+    pub const APP_RESIZE_PLACEMENTS: u8 = 81;
+    /// App body resize: the filesystem's work budget was exhausted.
+    pub const APP_RESIZE_BUDGET: u8 = 82;
+    /// App body resize: another request holds an exact filesystem claim.
+    pub const APP_RESIZE_BUSY: u8 = 83;
+    /// App body resize: the storage provider reported a failure.
+    pub const APP_RESIZE_PROVIDER: u8 = 84;
+    /// App body resize: the expected revision was stale.
+    pub const APP_RESIZE_CONFLICT: u8 = 85;
+    /// App body resize: filesystem authority was denied or lost.
+    pub const APP_RESIZE_ACCESS: u8 = 86;
+    /// App body resize: another filesystem refusal prevented completion.
+    pub const APP_RESIZE_OTHER: u8 = 87;
+    /// App body resize: the write owner has no retained file/request.
+    pub const APP_RESIZE_NO_OWNER: u8 = 88;
+    /// App body resize: the service client is poisoned.
+    pub const APP_RESIZE_POISONED: u8 = 89;
+    /// App body resize: the request ring is full.
+    pub const APP_RESIZE_RING_FULL: u8 = 90;
+    /// App body resize: the bounded client has invalid endpoint/timer wiring.
+    pub const APP_RESIZE_WIRING: u8 = 91;
+    /// App body resize: the transport could not commit.
+    pub const APP_RESIZE_TRANSPORT: u8 = 92;
+    /// App body resize: runtime-owned landing capacity did not become available.
+    pub const APP_RESIZE_BACKPRESSURE: u8 = 93;
+    /// App body resize: the request session returned WouldBlock.
+    pub const APP_RESIZE_CALL_BUSY: u8 = 94;
+    /// App body resize: the request session returned Conflict.
+    pub const APP_RESIZE_CALL_CONFLICT: u8 = 95;
+
+    /// Shared member-copy code retains detailed resize causes internally.
+    /// Only application replies have room for them: a library/data verdict
+    /// preserves the existing six-bit BODY_RESIZE value instead of truncating
+    /// a seven-bit application diagnostic into an unrelated library cause.
+    pub const fn for_library_reply(failure: u8) -> u8 {
+        match failure {
+            Self::APP_RESIZE_TIMEOUT..=Self::APP_RESIZE_CALL_CONFLICT => Self::BODY_RESIZE,
+            _ => failure,
+        }
+    }
 }
 
 impl TaskReqWire {

@@ -1756,6 +1756,20 @@ mod tests {
                 0,
             ),
             (
+                TaskResponse::AppSeeded {
+                    seeded: false,
+                    failure: kore_abi::svc::LibraryFailure::APP_RESIZE_TIMEOUT,
+                },
+                0,
+            ),
+            (
+                TaskResponse::AppSeeded {
+                    seeded: false,
+                    failure: kore_abi::svc::LibraryFailure::APP_RESIZE_CALL_CONFLICT,
+                },
+                0,
+            ),
+            (
                 TaskResponse::LibrarySeeded {
                     seeded: true,
                     manifest: false,
