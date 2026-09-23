@@ -31,9 +31,48 @@ const RANGE_BULK_MAX: usize = RANGE_BYTES + size_of::<RangeResponseV1>();
 const DELTA_PAGE_MAX: usize = 1024;
 const OBJECT_DOMAIN: &[u8] = b"kore.fs.host-workspace.object.v1\0";
 
+/// Correlation belongs to the affine channel, not a replaceable manifest cache.
+/// Reserve before publishing, so failed/cancelled attachment never reuses an ID.
+pub struct RequestSequence {
+    next: u64,
+}
+
+impl RequestSequence {
+    pub const fn new() -> Self {
+        Self { next: 1 }
+    }
+    fn reserve(&mut self) -> Option<RequestId> {
+        let next = self.next;
+        self.next = next.checked_add(1)?;
+        request_id(next)
+    }
+}
+
+impl Default for RequestSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Sole native workspace connection and its lifetime-long request sequence.
+pub struct WorkspaceConnection<C> {
+    channel: C,
+    requests: RequestSequence,
+}
+
+impl<C> WorkspaceConnection<C> {
+    pub const fn new(channel: C) -> Self {
+        Self {
+            channel,
+            requests: RequestSequence::new(),
+        }
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait WorkspaceChannel {
     type Error;
+    fn request_sequence(&mut self) -> &mut RequestSequence;
 
     async fn send_workspace(
         &mut self,
@@ -52,6 +91,9 @@ pub trait WorkspaceChannel {
 
 impl<C: WorkspaceChannel + ?Sized> WorkspaceChannel for &mut C {
     type Error = C::Error;
+    fn request_sequence(&mut self) -> &mut RequestSequence {
+        (**self).request_sequence()
+    }
 
     async fn send_workspace(
         &mut self,
@@ -78,19 +120,22 @@ impl<C: WorkspaceChannel + ?Sized> WorkspaceChannel for &mut C {
     }
 }
 
-impl<T: Transport> WorkspaceChannel for RingHostLink<'_, '_, T> {
+impl<T: Transport> WorkspaceChannel for WorkspaceConnection<RingHostLink<'_, '_, T>> {
     type Error = kore_svc_hostlink::ClientError;
+    fn request_sequence(&mut self) -> &mut RequestSequence {
+        &mut self.requests
+    }
 
     async fn send_workspace(
         &mut self,
         request: RequestId,
         payload: &[u8],
     ) -> Result<(), Self::Error> {
-        RingHostLink::send_workspace(self, request, payload).await
+        RingHostLink::send_workspace(&mut self.channel, request, payload).await
     }
 
     async fn poll_workspace(&mut self) -> Result<Option<ClientEvent>, Self::Error> {
-        self.poll().await
+        self.channel.poll().await
     }
 
     async fn upload_workspace(
@@ -111,11 +156,11 @@ impl<T: Transport> WorkspaceChannel for RingHostLink<'_, '_, T> {
             content_kind: U16::new(content_kind),
             digest_blake3: *blake3::hash(bytes).as_bytes(),
         };
-        let mut upload = self.begin_bulk(request, reference).await?;
+        let mut upload = self.channel.begin_bulk(request, reference).await?;
         for fragment in bytes.chunks(kore_svc_hostlink::CLIENT_CHUNK_MAX) {
-            self.send_bulk_chunk(&mut upload, fragment).await?;
+            self.channel.send_bulk_chunk(&mut upload, fragment).await?;
         }
-        self.finish_bulk(&mut upload).await
+        self.channel.finish_bulk(&mut upload).await
     }
 }
 
@@ -139,7 +184,6 @@ pub struct HostWorkspace<C: WorkspaceChannel> {
     topology: TopologyState,
     live: LiveWorkspace,
     write_grant: Option<[u8; 16]>,
-    next_request: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,7 +210,6 @@ impl<C: WorkspaceChannel> HostWorkspace<C> {
             topology,
             live,
             write_grant,
-            next_request,
         } = attached;
         Ok(Self {
             channel: slot
@@ -176,7 +219,6 @@ impl<C: WorkspaceChannel> HostWorkspace<C> {
             topology,
             live,
             write_grant,
-            next_request,
         })
     }
 
@@ -195,7 +237,6 @@ impl<C: WorkspaceChannel> HostWorkspace<C> {
                     topology,
                     live,
                     write_grant,
-                    next_request,
                 } = attached;
                 Ok(Self {
                     channel,
@@ -203,7 +244,6 @@ impl<C: WorkspaceChannel> HostWorkspace<C> {
                     topology,
                     live,
                     write_grant,
-                    next_request,
                 })
             }
             Err(error) => Err((channel, error)),
@@ -214,7 +254,10 @@ impl<C: WorkspaceChannel> HostWorkspace<C> {
         mut channel: C,
         policy: Policy,
     ) -> Result<Self, HostWorkspaceError<C::Error>> {
-        let request = request_id(1).ok_or(HostWorkspaceError::Bounds)?;
+        let request = channel
+            .request_sequence()
+            .reserve()
+            .ok_or(HostWorkspaceError::Bounds)?;
         let attach = AttachRequestV1 {
             magic: ATTACH_MAGIC,
             version: U16::new(FORMAT_VERSION),
@@ -240,10 +283,11 @@ impl<C: WorkspaceChannel> HostWorkspace<C> {
         }
 
         let mut builder = ManifestBuilder::new(response.parent_snapshot, policy);
-        let mut counter = 2u64;
         for index in 0..response.entry_count.get() {
-            let id = request_id(counter).ok_or(HostWorkspaceError::Bounds)?;
-            counter = counter.checked_add(1).ok_or(HostWorkspaceError::Bounds)?;
+            let id = channel
+                .request_sequence()
+                .reserve()
+                .ok_or(HostWorkspaceError::Bounds)?;
             let entry_request = ManifestEntryRequestV1 {
                 magic: ENTRY_REQUEST_MAGIC,
                 version: U16::new(FORMAT_VERSION),
@@ -288,7 +332,6 @@ impl<C: WorkspaceChannel> HostWorkspace<C> {
             topology,
             live,
             write_grant,
-            next_request: counter,
         })
     }
 
@@ -350,7 +393,11 @@ impl<C: WorkspaceChannel> HostWorkspace<C> {
                 return Err(HostWorkspaceError::Integrity);
             }
         }
-        let transaction = transaction_id(changes.base, changes.id, self.next_request);
+        let transaction = transaction_id(
+            changes.base,
+            changes.id,
+            self.channel.request_sequence().next,
+        );
 
         if let Some(bytes) = content.filter(|bytes| !bytes.is_empty()) {
             let request = self.request_id()?;
@@ -663,9 +710,10 @@ impl<C: WorkspaceChannel> HostWorkspace<C> {
     }
 
     fn request_id(&mut self) -> Result<RequestId, HostWorkspaceError<C::Error>> {
-        let counter = self.next_request;
-        self.next_request = counter.checked_add(1).ok_or(HostWorkspaceError::Bounds)?;
-        request_id(counter).ok_or(HostWorkspaceError::Bounds)
+        self.channel
+            .request_sequence()
+            .reserve()
+            .ok_or(HostWorkspaceError::Bounds)
     }
 }
 
@@ -717,6 +765,17 @@ async fn wait_control<C: WorkspaceChannel>(
             }) if found == request && kind == WORKSPACE_REPLY => {
                 return Vec::from_slice(payload.as_slice()).map_err(|_| HostWorkspaceError::Bounds);
             }
+            // A reconnect or cancelled read-only attachment can leave its
+            // terminal control reply queued. IDs never repeat on this channel;
+            // an older reply cannot satisfy this request. Future/foreign IDs
+            // and other event kinds still refuse. This never replays a write.
+            Some(ClientEvent::Control {
+                kind,
+                request: found,
+                ..
+            }) if kind == WORKSPACE_REPLY
+                && request_id(request_counter(found)) == Some(found)
+                && request_counter(found) < request_counter(request) => {}
             Some(ClientEvent::Status(_)) => return Err(HostWorkspaceError::Unavailable),
             Some(_) => return Err(HostWorkspaceError::Protocol),
         }
@@ -942,6 +1001,7 @@ pub(crate) mod tests {
     };
 
     pub(crate) struct FakeChannel {
+        requests: RequestSequence,
         manifest: Manifest,
         content: std::vec::Vec<u8>,
         extra_contents: std::collections::BTreeMap<[u8; 16], std::vec::Vec<u8>>,
@@ -986,6 +1046,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             Self {
+                requests: RequestSequence::new(),
                 manifest: builder.finish().unwrap(),
                 content,
                 extra_contents: std::collections::BTreeMap::new(),
@@ -1039,6 +1100,9 @@ pub(crate) mod tests {
 
     impl WorkspaceChannel for FakeChannel {
         type Error = ();
+        fn request_sequence(&mut self) -> &mut RequestSequence {
+            &mut self.requests
+        }
 
         async fn send_workspace(
             &mut self,
@@ -1425,6 +1489,11 @@ pub(crate) mod tests {
                 let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
                 assert!(future.as_mut().poll(&mut cx).is_pending());
                 drop(future);
+                assert_eq!(
+                    slot.as_ref().unwrap().requests.next,
+                    2,
+                    "cancelled send consumes its reserved identity"
+                );
                 slot.as_mut()
                     .expect("cancelled handshake retains ownership")
                     .pause_attach = false;
@@ -1437,6 +1506,52 @@ pub(crate) mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn reattachment_skips_old_replies_without_reusing_request_identity() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let live =
+                    crate::block_on(HostWorkspace::attach(FakeChannel::new(), Policy::default()))
+                        .unwrap();
+                let mut channel = live.into_channel();
+                let next = channel.requests.next;
+                // The old request completed after its caller abandoned the
+                // observation. Its malformed payload must never be interpreted
+                // as the new attach response, even across repeated reattach.
+                channel.control(request_id(next - 1).unwrap(), b"late old reply");
+                let live = crate::block_on(HostWorkspace::attach_recoverable(
+                    channel,
+                    Policy::default(),
+                ))
+                .ok()
+                .unwrap();
+                assert_eq!(live.manifest().entries().len(), 2);
+                assert_eq!(live.channel.requests.next, next + 3);
+                let mut channel = live.into_channel();
+                let next = channel.requests.next;
+                channel.control(request_id(next + 1).unwrap(), b"future reply");
+                assert!(matches!(
+                    crate::block_on(HostWorkspace::attach_recoverable(
+                        channel,
+                        Policy::default()
+                    )),
+                    Err((_, HostWorkspaceError::Protocol))
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn request_sequence_exhaustion_does_not_wrap_or_reuse() {
+        let mut sequence = RequestSequence { next: u64::MAX - 1 };
+        assert_eq!(sequence.reserve(), request_id(u64::MAX - 1));
+        assert_eq!(sequence.reserve(), None);
+        assert_eq!(sequence.reserve(), None);
     }
 
     #[test]

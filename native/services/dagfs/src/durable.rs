@@ -845,8 +845,9 @@ impl MountedEngine {
     }
 }
 
-type LiveChannel =
-    kore_svc_hostlink::RingHostLink<'static, 'static, kore_rt::transport::TrapTransport>;
+type LiveChannel = crate::host_workspace::WorkspaceConnection<
+    kore_svc_hostlink::RingHostLink<'static, 'static, kore_rt::transport::TrapTransport>,
+>;
 
 /// One client-visible filesystem row over a conservative user engine and an
 /// optional rebuildable system engine. The router is the only layer that sees
@@ -2157,13 +2158,15 @@ fn open_workspace_channel(
         HostLinkWire::RESPONSE_CAPACITY,
     )
     .map_err(|_| StartFailure::new(36))?;
-    Ok(RingHostLink::new(
-        transport,
-        rings,
-        ClientEndpoints {
-            kick,
-            grants: [const { None }; kore_rt::service::MAX_GRANTS],
-        },
+    Ok(crate::host_workspace::WorkspaceConnection::new(
+        RingHostLink::new(
+            transport,
+            rings,
+            ClientEndpoints {
+                kick,
+                grants: [const { None }; kore_rt::service::MAX_GRANTS],
+            },
+        ),
     ))
 }
 

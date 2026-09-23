@@ -229,6 +229,15 @@ mod tests {
     }
 }
 
+/// Exact boundary of a failed inventory observation. This is diagnostic data,
+/// not a capability or a reason to retry an uncertain operation.
+#[cfg(feature = "runtime")]
+#[derive(Debug)]
+pub struct InventoryError {
+    pub stage: &'static str,
+    pub refusal: crate::Refusal,
+}
+
 #[cfg(feature = "runtime")]
 impl crate::Fs<'_, '_> {
     /// Inspect a bounded prefix of the held root. Copy the directory entries
@@ -238,34 +247,51 @@ impl crate::Fs<'_, '_> {
         &mut self,
         limit: usize,
     ) -> Result<Candidates, crate::Refusal> {
+        self.resource_candidates_detailed(limit)
+            .await
+            .map_err(|error| error.refusal)
+    }
+
+    /// Preserve which native observation failed while retaining the original refusal.
+    pub async fn resource_candidates_detailed(
+        &mut self,
+        limit: usize,
+    ) -> Result<Candidates, InventoryError> {
+        let at = |stage| move |refusal| InventoryError { stage, refusal };
         use crate::{FsError, FsRequest, FsResponse, Refusal};
         if limit == 0 || limit > MAX_CANDIDATES {
-            return Err(Refusal::Fs(FsError::Range));
+            return Err(at("limit")(Refusal::Fs(FsError::Range)));
         }
         let FsResponse::SystemStatusReported { len } = self
             .checked(&FsRequest::SystemStatus { window_offset: 0 })
-            .await?
+            .await
+            .map_err(at("status request"))?
         else {
-            return Err(Refusal::Pair);
+            return Err(at("status response")(Refusal::Pair));
         };
         if len as usize != kore_abi::svc::FsSystemStatusWire::BYTES {
-            return Err(Refusal::Pair);
+            return Err(at("status length")(Refusal::Pair));
         }
-        let status = crate::read_system_status(self.window(), 0).map_err(Refusal::Fs)?;
+        let status = crate::read_system_status(self.window(), 0)
+            .map_err(Refusal::Fs)
+            .map_err(at("status bytes"))?;
         let used = usize::from(status.views_private.get())
             .checked_add(usize::from(status.views_pinned.get()))
-            .ok_or(Refusal::Pair)?;
+            .ok_or_else(|| at("view count")(Refusal::Pair))?;
         let available = crate::bounds::MAX_INVOCATION_VIEWS
             .checked_sub(used)
-            .ok_or(Refusal::Pair)?;
-        let root = self.open(b"/", Rights::READ).await?;
+            .ok_or_else(|| at("view count")(Refusal::Pair))?;
+        let root = self
+            .open(b"/", Rights::READ)
+            .await
+            .map_err(at("open root"))?;
         let mut selected = heapless::Vec::<crate::DirEntry, MAX_CANDIDATES>::new();
         let mut cursor = 0;
         let mut more = false;
         let listing = loop {
             let (count, next) = match self.list_page(&root, cursor).await {
                 Ok(page) => page,
-                Err(error) => break Err(error),
+                Err(error) => break Err(at("list page")(error)),
             };
             let mut failure = None;
             for index in 0..count as usize {
@@ -287,7 +313,7 @@ impl crate::Fs<'_, '_> {
                 }
             }
             if let Some(error) = failure {
-                break Err(error);
+                break Err(at("directory entry")(error));
             }
             if selected.len() == limit {
                 more |= next.is_some();
@@ -302,7 +328,10 @@ impl crate::Fs<'_, '_> {
         listing?;
         let mut entries = heapless::Vec::new();
         for entry in selected {
-            let mut rights = self.effective_rights(entry.name.as_bytes()).await?;
+            let mut rights = self
+                .effective_rights(entry.name.as_bytes())
+                .await
+                .map_err(at("entry rights"))?;
             if entry.kind == ObjectKind::File {
                 rights =
                     rights.intersection(Rights::READ.union(Rights::WRITE).union(Rights::SHARE));
@@ -313,7 +342,7 @@ impl crate::Fs<'_, '_> {
                     kind: entry.kind,
                     rights,
                 })
-                .map_err(|_| Refusal::Fs(FsError::Range))?;
+                .map_err(|_| at("entry capacity")(Refusal::Fs(FsError::Range)))?;
         }
         Ok(Candidates {
             available_views: available as u8,
