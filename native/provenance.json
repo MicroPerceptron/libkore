@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/MicroPerceptron/kore",
-  "revision": "9702a67b645d34d1ae5d2a0e07bf021117050d48",
+  "revision": "b7fefa3156ad9f2bcbcb057403becb29e618d50d",
   "packages": {
     "crates/abi": "kore-abi",
     "crates/app": "kore-app",
@@ -421,7 +421,7 @@
     "services/hostlink/src/lib.rs": "8ce30d1083a7bb2be46939dcc34d0c21a203a641c958ffb0242c57bae5713a4c",
     "services/hostlink/src/mailbox.rs": "0b4ffb1970af1b89f1bc68d2c8b1334cdc8fa8d9e1e6f9686eee141bbc921d87",
     "services/hostlink/src/retirement.rs": "17843ec031e555cc94860e863db60e0e67d22ff0782d42d7fe2cfae0f49ed13f",
-    "services/hostlink/src/service.rs": "be32852305ad0ca7a72363e7f8eabf7494341c74942833717252c0443e73752b",
+    "services/hostlink/src/service.rs": "07f0e0802cf493e42368b67d07af8196f1036762380a6cd682e23819bafbdcf9",
     "services/hostlink/src/shmem.rs": "e97816dd3b1abde29821346474e3f558b599b9d4072942d0db9d1833b3a11680",
     "services/hostlink/src/supervisor.rs": "afe7dd56cb5fb3a612e4612cbb6bdc14cc04bd236336738a081c9a5e679f5ec5",
     "services/hostlink/src/virtio.rs": "4ce56013afeba2529b048cd0cf63f4aa7f4fd7955d585539245d100a020c5574",

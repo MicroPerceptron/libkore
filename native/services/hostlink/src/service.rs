@@ -3208,7 +3208,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_rotation_closes_generation_before_deriving_a_fresh_route() {
+    fn agent_rotation_closes_generation_before_deriving_a_fresh_route() {
         let mut service = activate(52);
         let old = service.bindings.for_endpoint(Endpoint::Agent(0)).unwrap();
         let next = TaskGeneration::new(old.generation.get() + 1).unwrap();
@@ -3248,6 +3248,46 @@ mod tests {
             service.rotate_agent_route(0, next),
             Err(ServiceError::Route)
         );
+    }
+
+    #[test]
+    fn broker_rotation_requires_close_ack_and_preserves_workspace() {
+        let mut service = activate(54);
+        let old = service.bindings.for_endpoint(Endpoint::Broker).unwrap();
+        let workspace = service.bindings.for_endpoint(Endpoint::Workspace).unwrap();
+        let next = TaskGeneration::new(old.generation.get() + 1).unwrap();
+        assert_eq!(service.rotate_broker_route(next), Err(ServiceError::Route));
+        assert_eq!(
+            service.close_broker_route(old.generation),
+            Err(ServiceError::Backpressure)
+        );
+        assert_eq!(service.rotate_broker_route(next), Err(ServiceError::Route));
+        let epoch = service.epoch().unwrap();
+        service.transport_mut().control_in.push_back(bytes(
+            link_envelope(
+                ROUTE_CLOSED,
+                epoch,
+                old.route,
+                old.generation.get(),
+                0,
+                RequestId::ZERO,
+                0,
+            ),
+            &[],
+        ));
+        service.drain(&mut [0; 4096], &mut [0; 4096]);
+        service.rotate_broker_route(next).unwrap();
+        let replacement = service.bindings.for_endpoint(Endpoint::Broker).unwrap();
+        assert_eq!(replacement.generation, next);
+        assert_ne!(replacement.route, old.route);
+        let retained = service.bindings.for_endpoint(Endpoint::Workspace).unwrap();
+        assert_eq!(retained.route, workspace.route);
+        assert_eq!(retained.generation, workspace.generation);
+        assert_eq!(
+            service.close_broker_route(old.generation),
+            Err(ServiceError::Route)
+        );
+        assert_eq!(service.rotate_broker_route(next), Err(ServiceError::Route));
     }
 
     #[test]
