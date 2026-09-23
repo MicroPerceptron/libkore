@@ -710,12 +710,11 @@ impl<P: StorageProvider> FsService<P> {
                 .as_ref()
                 .and_then(|view| view.canary.as_ref())
                 .is_some_and(|canary| {
-                    verbs::capability_scope_rid(
-                        canary.slot(),
-                        kore_abi::cap::ResourceKind::ChanSend,
-                        kore_abi::cap::Rights::ACCESS,
-                    )
-                    .is_none()
+                    // Arena records are immutable possession metadata. An
+                    // ancestor's revocation leaves those bytes unchanged;
+                    // only the kernel's held-subject bind proves closure.
+                    matches!(verbs::probe_chan_send_lineage(canary.slot()),
+                        verbs::ChannelLineage::Dead)
                 });
             if dead {
                 self.retire_invocation_namespace(slot);

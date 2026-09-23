@@ -136,3 +136,20 @@ fresh telemetry request: repeated timeout/recovery otherwise discards healthy
 late replies and prevents downstream monitor observations. Cancellation retains
 the exact original request, and bounded recovery does not replay it. This is an
 upstream owner change; the export contains no independent implementation.
+
+
+### Filesystem view retirement
+
+The current byte-exact native export is Kore
+`60e659644acf6e5e730b6b566a68765f8016563c`. Local capability records describe
+possession; they do not prove that an ancestor is still live. The runtime's
+`probe_chan_send_lineage` performs a kernel-validated same-kind derive/revoke
+probe without sending notices or consuming the parent. Only `Dead` permits
+DagFS to retire its retained view. A live non-delegable canary returns
+`Retryable`; it receives no additional rights. The existing receive-probe enum
+name and variant imports remain source-compatible.
+
+Upstream kernel tests distinguish live denial from revoked lineage, and a
+recorded native response-stop recovery keeps filesystem occupancy at its
+initial values. These are upstream observations, not a replacement for this
+export's owner/composition checks or final coordinated guest acceptance.

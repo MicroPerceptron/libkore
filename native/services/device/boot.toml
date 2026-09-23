@@ -48,4 +48,4 @@ protocol  = "kore_svc_device::DeviceBroker"
 instances = 8
 endows    = ["ROOT_COMPLEX@0", "PLATFORM_BUS@0", "FACE_SUPPLY@0"]
 digest_x86_64  = "blake3:fc8ffb392f61265807c771e5b8ef9fe2debf062158a3c6c1285f2bd8ff2b8476"  # res/x86_64/; make boot-digests
-digest_aarch64 = "blake3:a8d9ace7e1283e5e27ad9ccbc5496d5aaf457d748b71374ca97c38723decf69b"  # res/aarch64/; make boot-digests-aarch64
+digest_aarch64 = "blake3:45a7587c4614cff12db7a2c6756024f7b78a0f49dccbe034b4ed5fd737571367"  # res/aarch64/; make boot-digests-aarch64

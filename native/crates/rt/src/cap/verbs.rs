@@ -44,7 +44,7 @@ mod metal {
         Indeterminate,
     }
 
-    /// Result of a non-consuming lineage probe on a receive endpoint.
+    /// Result of a non-consuming lineage probe on a channel endpoint.
     ///
     /// `Dead` is positive kernel evidence that the endpoint or an ancestor was
     /// revoked. `Live` means a same-kind descendant was derived and then
@@ -56,6 +56,10 @@ mod metal {
         Dead,
         Retryable,
     }
+
+    /// Shared result for either endpoint kind. Preserve the original enum
+    /// name so existing receive-probe callers can still import its variants.
+    pub type ChannelLineage = ChanRecvLineage;
 
     /// Why a direct Found result could not become the caller's exact task
     /// authority.
@@ -276,7 +280,7 @@ mod metal {
 
     #[cfg(any(test, target_os = "none"))]
     #[inline]
-    fn classify_chan_recv_probe(committed: kore_abi::session::Committed) -> ChanRecvLineage {
+    fn classify_channel_probe(committed: kore_abi::session::Committed) -> ChannelLineage {
         match (committed.status(), committed.failing_index()) {
             (kore_abi::session::Status::Ok, 0) => ChanRecvLineage::Live,
             (kore_abi::session::Status::Revoked, 0) => ChanRecvLineage::Dead,
@@ -1633,62 +1637,75 @@ mod metal {
         }
     }
 
-    /// Probe whether a held receive endpoint's complete lineage is still live
-    /// without revoking the endpoint itself.
-    ///
-    /// A successful same-kind derive proves the parent live; the temporary
-    /// descendant is immediately retired before returning. A `Revoked`
-    /// refusal on that derive proves an ancestor died. This is the cleanup
-    /// witness used when a launcher must reconcile remote resources after a
-    /// caller-owned `TaskToken` reaps a child, without retaining a second task
-    /// handle or consuming a still-running child's canary.
-    #[cfg(target_os = "none")]
+    /// Probe a receive endpoint without consuming its parent. Only a kernel
+    /// `Revoked` refusal proves closure; local arena metadata does not.
     pub fn probe_chan_recv_lineage(parent: SlotRef) -> ChanRecvLineage {
+        probe_channel_lineage(parent, true)
+    }
+
+    /// Probe a send endpoint's lineage without sending a notice or revoking
+    /// the endpoint. This also accepts non-delegable canaries: a live one
+    /// refuses derivation and returns `Retryable`, while the kernel's earlier
+    /// held-subject bind proves `Dead` after ancestor revocation. Never widen
+    /// a filesystem binder's authority merely to obtain a cleanup witness.
+    pub fn probe_chan_send_lineage(parent: SlotRef) -> ChannelLineage {
+        probe_channel_lineage(parent, false)
+    }
+
+    #[cfg(target_os = "none")]
+    fn probe_channel_lineage(parent: SlotRef, receive: bool) -> ChannelLineage {
         use crate::session::SessionBuilder;
         use crate::transport::{Transport, TrapTransport};
 
         let Some(mut child) = crate::cap::OwnedSlot::reserve() else {
-            return ChanRecvLineage::Retryable;
+            return ChannelLineage::Retryable;
         };
         let mut probe = SessionBuilder::new();
-        let Ok(staged) =
+        let staged = if receive {
             probe.derive_chan_recv(parent, crate::cap::CHANNEL_ENDPOINT_RIGHTS, child.slot())
-        else {
-            return ChanRecvLineage::Retryable;
+        } else {
+            probe.derive_chan_send(parent, Rights::ACCESS | Rights::REVOKE, child.slot())
         };
-        // The probe result is a transactional witness only. Kill it in the
-        // same session so a live-parent probe cannot accumulate descendants;
-        // the local result name is then settled as AlreadyDead below.
+        let Ok(staged) = staged else {
+            return ChannelLineage::Retryable;
+        };
+        // Retire any temporary descendant in the same atomic session. A
+        // failed held-subject bind or denied derive publishes nothing.
         if probe.revoke(staged.into()).is_err() {
-            return ChanRecvLineage::Retryable;
+            return ChannelLineage::Retryable;
         }
         let Ok(committed) = TrapTransport::new().commit_now(&probe) else {
             child.quarantine_unknown_publish();
-            return ChanRecvLineage::Retryable;
+            return ChannelLineage::Retryable;
         };
-        match classify_chan_recv_probe(committed) {
-            ChanRecvLineage::Live => {
-                let owner = ChanRecvToken::new(child);
-                match owner.try_retire() {
-                    Ok(_) => ChanRecvLineage::Live,
-                    Err(_) => ChanRecvLineage::Retryable,
+        match classify_channel_probe(committed) {
+            ChannelLineage::Live => {
+                let retired = if receive {
+                    ChanRecvToken::new(child).try_retire().is_ok()
+                } else {
+                    ChanSendToken::new(child).try_retire().is_ok()
+                };
+                if retired {
+                    ChannelLineage::Live
+                } else {
+                    ChannelLineage::Retryable
                 }
             }
-            ChanRecvLineage::Dead => ChanRecvLineage::Dead,
-            ChanRecvLineage::Retryable => {
+            ChannelLineage::Dead => ChannelLineage::Dead,
+            ChannelLineage::Retryable => {
                 if committed.failing_index() != 0
                     || committed.raw() as u16 > kore_abi::session::Status::AltDelivery as u16
                 {
                     child.quarantine_unknown_publish();
                 }
-                ChanRecvLineage::Retryable
+                ChannelLineage::Retryable
             }
         }
     }
 
     #[cfg(not(target_os = "none"))]
-    pub fn probe_chan_recv_lineage(_parent: SlotRef) -> ChanRecvLineage {
-        ChanRecvLineage::Retryable
+    fn probe_channel_lineage(_parent: SlotRef, _receive: bool) -> ChannelLineage {
+        ChannelLineage::Retryable
     }
 
     /// Derive one locally retained endpoint below `source`.
@@ -6211,21 +6228,31 @@ mod metal {
         }
 
         #[test]
-        fn receive_lineage_probe_requires_positive_live_or_dead_evidence() {
+        fn channel_lineage_probe_requires_positive_live_or_dead_evidence() {
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::Ok, 0)),
+                classify_channel_probe(committed(Status::Ok, 0)),
                 ChanRecvLineage::Live
             );
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::Revoked, 0)),
+                classify_channel_probe(committed(Status::Revoked, 0)),
                 ChanRecvLineage::Dead
             );
+            for status in [Status::Denied, Status::Conflict, Status::Malformed] {
+                assert_eq!(
+                    classify_channel_probe(committed(status, 0)),
+                    ChannelLineage::Retryable
+                );
+            }
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::WouldBlock, 0)),
+                classify_channel_probe(committed(Status::Revoked, 1)),
+                ChannelLineage::Retryable
+            );
+            assert_eq!(
+                classify_channel_probe(committed(Status::WouldBlock, 0)),
                 ChanRecvLineage::Retryable
             );
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::Ok, 1)),
+                classify_channel_probe(committed(Status::Ok, 1)),
                 ChanRecvLineage::Retryable
             );
         }

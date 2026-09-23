@@ -41,4 +41,4 @@ exec_client = true
 # the witness that keeps it honest.
 heap_supply_bytes = 0x0080_0000
 digest_x86_64  = "blake3:19947558783c34d4ce322a896b032b0a18d5de26b57acbb832f31af20214eb70"
-digest_aarch64 = "blake3:97a2030dd39e2d3ec76e85b898a17509b5832e3863a06c9c4a76fd2f6098c960"
+digest_aarch64 = "blake3:f35ba5e9718e6ee15c42a85e45504ebaff28f21e4f85528ed199e4fd1e627a42"
