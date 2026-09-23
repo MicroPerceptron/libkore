@@ -1539,7 +1539,8 @@ impl SessionBuilder {
     /// the kernel moves into the new vCPU task only after the complete session
     /// commits.  The caller retains the guest-space owner and receives the
     /// ordinary lifecycle `Task` handle in `handle`.  Like process `Found`,
-    /// this is terminal: no later invocation may be staged in the session.
+    /// this begins a terminal Found tail: only guest Founds for this same
+    /// owner may follow, up to `MAX_SESSION_FOUNDS` members.
     #[allow(clippy::too_many_arguments)]
     pub fn found_guest(
         &mut self,

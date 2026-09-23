@@ -1376,6 +1376,100 @@ mod metal {
         Ok(TaskToken::possess_owned(handle, id, rights))
     }
 
+    /// Found a bounded SMP cohort through one guest Found tail. Every task is
+    /// dormant on return; the caller retains the shared-space owner until all
+    /// task handles have completed teardown. No compute barrier or join fold
+    /// participates in guest execution.
+    pub fn found_guest_cohort(
+        space: &GuestSpaceToken,
+        inputs: heapless::Vec<
+            (kore_abi::guest::GuestVcpuConfig, GuestVcpuInputs),
+            { kore_abi::session::MAX_SESSION_FOUNDS },
+        >,
+    ) -> Result<
+        heapless::Vec<TaskToken, { kore_abi::session::MAX_SESSION_FOUNDS }>,
+        kore_abi::session::Status,
+    > {
+        use kore_abi::session::Status;
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (space, inputs);
+            Err(Status::Denied)
+        }
+        #[cfg(target_os = "none")]
+        {
+            use crate::session::SessionBuilder;
+            use crate::transport::{Transport, TrapTransport};
+            if inputs.is_empty() {
+                return Err(Status::Malformed);
+            }
+            let mut handles = heapless::Vec::<_, { kore_abi::session::MAX_SESSION_FOUNDS }>::new();
+            let mut request = SessionBuilder::new();
+            for (cfg, input) in &inputs {
+                let handle = crate::cap::OwnedSlot::reserve().ok_or(Status::Unfounded)?;
+                request
+                    .found_guest(
+                        space.slot(),
+                        cfg.entry,
+                        cfg.stack,
+                        cfg.page_table_root,
+                        input.window.slot().ok_or(Status::Malformed)?,
+                        input.resume_recv.slot(),
+                        input.exit_send.slot(),
+                        handle.slot(),
+                    )
+                    .map_err(|_| Status::Malformed)?;
+                let _ = handles.push(handle);
+            }
+            let committed = match TrapTransport::new().commit_now(&request) {
+                Ok(committed) => committed,
+                Err(_) => {
+                    for handle in &mut handles {
+                        handle.quarantine_unknown_publish();
+                    }
+                    return Err(Status::Malformed);
+                }
+            };
+            if committed.raw() as u16 > Status::AltDelivery as u16
+                || (committed.status() == Status::Ok && committed.failing_index() != 0)
+            {
+                for handle in &mut handles {
+                    handle.quarantine_unknown_publish();
+                }
+                return Err(Status::Malformed);
+            }
+            if committed.status() != Status::Ok {
+                return Err(committed.status());
+            }
+            // Authenticate the WHOLE result before surrendering any local
+            // input owner. Malformed/unknown publication never frees a slot
+            // whose custody might have changed.
+            let mut records = heapless::Vec::<_, { kore_abi::session::MAX_SESSION_FOUNDS }>::new();
+            for handle in &handles {
+                match task_record(handle.slot()) {
+                    Some((id, rights)) if rights == crate::cap::GUEST_VCPU_HANDLE_RIGHTS => {
+                        let _ = records.push((id, rights));
+                    }
+                    _ => {
+                        for handle in &mut handles {
+                            handle.quarantine_unknown_publish();
+                        }
+                        return Err(Status::Malformed);
+                    }
+                }
+            }
+            let mut tasks = heapless::Vec::new();
+            for (((_, input), handle), (id, rights)) in inputs.into_iter().zip(handles).zip(records)
+            {
+                input.window.release_after_proven_move();
+                input.resume_recv.release_after_proven_move();
+                input.exit_send.release_after_proven_move();
+                let _ = tasks.push(TaskToken::possess_owned(handle, id, rights));
+            }
+            Ok(tasks)
+        }
+    }
+
     #[cfg(not(target_os = "none"))]
     pub fn found_guest_vcpu(
         _space: &GuestSpaceToken,

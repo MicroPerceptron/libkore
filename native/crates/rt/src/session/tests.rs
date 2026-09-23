@@ -2327,3 +2327,36 @@ fn task_identity_query_is_standalone_and_has_no_arguments() {
     assert_eq!(invs[0].arg.get(), u32::MAX);
     assert!(args.is_empty());
 }
+
+#[test]
+fn guest_cohort_encodes_one_owner_and_private_windows_in_one_found_tail() {
+    use kore_abi::session::{DERIVE_KIND_GUEST_FOUND, GuestFoundReq};
+    use zerocopy::TryFromBytes;
+    let mut builder = SessionBuilder::new();
+    for cpu in 0..2u32 {
+        let input = 10 + cpu * 3;
+        builder
+            .found_guest(
+                SlotRef::from_wire(2),
+                0x10000,
+                0x1f0000 - u64::from(cpu) * 0x8000,
+                0x1000,
+                SlotRef::from_wire(input),
+                SlotRef::from_wire(input + 1),
+                SlotRef::from_wire(input + 2),
+                SlotRef::from_wire(20 + cpu),
+            )
+            .unwrap();
+    }
+    let mut out = [0u8; DESCRIPTOR_MAX];
+    let len = builder.finish(&mut out).unwrap();
+    let (_, invs, args) = parse(&out[..len]);
+    assert_eq!(invs.len(), 2);
+    for (cpu, inv) in invs.iter().enumerate() {
+        assert_eq!(inv.kind, DERIVE_KIND_GUEST_FOUND);
+        assert_eq!(inv.subject.get(), 2);
+        let (req, _) = GuestFoundReq::try_ref_from_prefix(&args[inv.arg.get() as usize..]).unwrap();
+        assert_eq!(req.window.get(), 10 + cpu as u32 * 3);
+        assert_eq!(req.reserved.get(), 0);
+    }
+}

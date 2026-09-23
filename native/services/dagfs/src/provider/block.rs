@@ -707,9 +707,11 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> State<D, B, O> {
     }
 
     /// Shape a write so its aligned interior uses the namespace's preferred
-    /// granularity and optimal command size. Unaligned head/tail fragments
-    /// remain legal, while the bulk of a long extent follows the device's
-    /// endurance/performance guidance.
+    /// granularity and multi-block optimal command size. A one-block optimum
+    /// does not cap bulk writes: it is a preference, not a transfer limit,
+    /// and splitting at every block amplifies command/completion overhead.
+    /// Unaligned head/tail fragments remain legal; the registered-buffer,
+    /// device-transfer, and optimal-boundary limits still apply.
     fn streaming_write_blocks(&self, lba: u64, remaining: u32) -> u32 {
         let mut count = self.streaming_blocks(lba, remaining);
         let hints = self.channel.geometry().io_hints;
@@ -719,7 +721,7 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> State<D, B, O> {
                 return count.min(hints.write_alignment_blocks - within);
             }
         }
-        if hints.optimal_write_blocks != 0 {
+        if hints.optimal_write_blocks > 1 {
             count = count.min(hints.optimal_write_blocks);
         }
         if hints.preferred_write_blocks > 1 && count > hints.preferred_write_blocks {
@@ -2593,6 +2595,66 @@ mod tests {
         crate::block_on(provider.read_metadata(2, &mut read)).unwrap();
         assert_eq!(read, written);
         assert!(provider.channel_stats().max_outstanding <= 1);
+    }
+
+    #[test]
+    fn allocation_batches_single_block_hints_but_preserves_larger_optima() {
+        // Two registered windows of zeroes: a one-block hint must not turn
+        // these into sector-sized commands. Eight-block preferences still
+        // split each window in half, as on the measured 512-byte-LBA SSD.
+        const WINDOW_BYTES: usize = 8192;
+        const EXTENT_BYTES: usize = 2 * WINDOW_BYTES;
+        type BatchDevice = MemoryBlockDevice<65_536, WINDOW_BYTES>;
+        type BatchChannel = BlockChannel<BatchDevice, 3, 8>;
+        for (optimal, expected_writes) in [(0, 2), (1, 2), (8, 4)] {
+            let device = BatchDevice::new(512, 32)
+                .unwrap()
+                .with_io_hints(kore_driver::block::BlockIoHints {
+                    optimal_write_blocks: optimal,
+                    ..kore_driver::block::BlockIoHints::NONE
+                });
+            let channel = BatchChannel::new(device, CompletionMode::Poll).unwrap();
+            let provider = BlockProvider::new(channel).unwrap();
+            let before = provider.stats();
+            let key = crate::block_on(provider.allocate(ObjectKind::File, EXTENT_BYTES as u64))
+                .unwrap();
+            assert_eq!(provider.stats().writes - before.writes, expected_writes);
+            assert_eq!(provider.channel_stats().max_outstanding, 2);
+            assert_eq!(
+                provider.channel_stats().peak_registered_bytes,
+                2 * WINDOW_BYTES
+            );
+            let mut back = [0xff; crate::bounds::MAX_TRANSFER];
+            for offset in (0..EXTENT_BYTES).step_by(back.len()) {
+                back.fill(0xff);
+                assert_eq!(
+                    crate::block_on(provider.read(key, offset as u64, &mut back)),
+                    Ok(back.len())
+                );
+                assert_eq!(back, [0; crate::bounds::MAX_TRANSFER]);
+            }
+        }
+    }
+
+    #[test]
+    fn single_block_optimum_preserves_alignment_granularity_and_boundary() {
+        let device = Device::new(512, 8)
+            .unwrap()
+            .with_io_hints(kore_driver::block::BlockIoHints {
+                preferred_write_blocks: 4,
+                write_alignment_blocks: 4,
+                optimal_write_blocks: 1,
+                optimal_boundary_blocks: 8,
+                ..kore_driver::block::BlockIoHints::NONE
+            });
+        let channel = BlockChannel::new(device, CompletionMode::Poll).unwrap();
+        let provider = Provider::new(channel).unwrap();
+        let state = provider.state.borrow();
+        assert_eq!(state.streaming_write_blocks(6, 8), 2);
+        assert_eq!(state.streaming_write_blocks(8, 16), 8);
+        assert_eq!(state.streaming_write_blocks(8, 7), 4);
+        assert_eq!(state.streaming_write_blocks(8, 3), 3);
+        assert_eq!(state.streaming_write_blocks(8, 0), 0);
     }
 
     #[test]

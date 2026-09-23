@@ -2569,6 +2569,14 @@ impl HypervisorReqWire {
     /// `HypervisorRequest::Status` — one coherent, data-only snapshot of the
     /// service's single-guest and text-console books.
     pub const OP_STATUS: u8 = 11;
+    /// `HypervisorRequest::SpawnMmio` — found the MMIO console witness
+    /// (`blob::echo_mmio_package`): the echo guest again, but driving its
+    /// 16550 through a memory-mapped window instead of port I/O, so every
+    /// console byte is a stage-2 fault the hypervisor must decode and
+    /// complete (#765).  Same gating as [`OP_SPAWN_ECHO`](Self::OP_SPAWN_ECHO).
+    pub const OP_SPAWN_MMIO: u8 = 12;
+    /// Two-vCPU SPMD guest witness.
+    pub const OP_SPAWN_SMP: u8 = 13;
 }
 
 /// Capacity of the hypervisor pair window's **guest-output** console
@@ -2725,6 +2733,9 @@ impl HypervisorStatusWire {
     pub const PAYLOAD_MULTISEG: u8 = 4;
     /// The MicroPython acceptance payload.
     pub const PAYLOAD_MICROPYTHON: u8 = 5;
+    /// The echo guest on the memory-mapped console (#765).
+    pub const PAYLOAD_MMIO: u8 = 6;
+    pub const PAYLOAD_SMP: u8 = 7;
 
     /// A live guest task currently exists.
     pub const STATUS_GUEST_EXISTS: u16 = 1 << 0;
