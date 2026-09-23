@@ -177,13 +177,17 @@ impl<T: kore_rt::transport::Transport> RingMm<'_, '_, T> {
         }
     }
 
-    /// Observe a bounded, grant-free provider snapshot. Cancellation and
+    /// Observe a grant-free provider snapshot. `None` waits for the ordinary
+    /// reply; a deadline opts into a bounded observation. Cancellation and
     /// transport failure leave any published Stats request in this same pair.
     pub async fn stats_observed(
         &mut self,
-        deadline_ns: u64,
+        deadline_ns: Option<u64>,
     ) -> Result<Option<kore_abi::monitor::MemorySnapshot>, CallError> {
-        let reply = self.0.call_until(&MmRequest::Stats, deadline_ns).await?;
+        let reply = match deadline_ns {
+            Some(deadline) => self.0.call_until(&MmRequest::Stats, deadline).await?,
+            None => self.0.call(&MmRequest::Stats).await?,
+        };
         self.finish_stats(reply)
     }
 
@@ -597,7 +601,10 @@ mod tests {
             assert_eq!(transport.1.get(), calls);
             assert!(serve.req.pop().is_none());
         }
-        assert_eq!(run(mm.stats_observed(100)), Err(CallError::Outstanding));
+        assert_eq!(
+            run(mm.stats_observed(Some(100))),
+            Err(CallError::Outstanding)
+        );
         assert_eq!(run(mm.resume_stats_bounded(1)), Err(CallError::Outstanding));
         assert_eq!(mm.0.outstanding_request(), Some(&original));
         assert_eq!(transport.1.get(), calls);

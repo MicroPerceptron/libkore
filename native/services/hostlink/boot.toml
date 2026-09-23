@@ -9,7 +9,7 @@
 
 [service]
 image        = "kore-svc-hostlink"
-digest_x86_64 = "blake3:b5baa605380e22cf6b654babcdcdc177da9f77bdddb3887318ff7c80389deb97"
+digest_x86_64 = "blake3:bae18a968e7a5e66f50e18aae9d810491f0970ff91135a4fc16c21d07ac1d3c7"
 digest_aarch64 = "blake3:0d0d7f5a7bff13c113791e90ce19f03ec415a0ac478c69f3b7ad22ef255a6322"
 chain        = true
 endowment    = "kore_svc_hostlink::HostLinkEndowment"

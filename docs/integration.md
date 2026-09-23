@@ -124,3 +124,15 @@ existing Kore applications. A later subtree/package integration should make Kore
 consume the same native packages and deliberately transfer their source ownership
 if desired. Recheck the full consumer graph, user images, QEMU gates and hardware
 when making that transition.
+
+
+### Fresh MM telemetry and recovery
+
+The native export at Kore `52493011e3491f955f478f92e895731af9fa9604`
+lets `RingMm::stats_observed` distinguish an ordinary fresh reply wait (`None`)
+from a caller-selected observation deadline (`Some(deadline)`). Exec's 5 ms
+abandoned-operation recovery slice must not be reused as the lifetime of every
+fresh telemetry request: repeated timeout/recovery otherwise discards healthy
+late replies and prevents downstream monitor observations. Cancellation retains
+the exact original request, and bounded recovery does not replay it. This is an
+upstream owner change; the export contains no independent implementation.
