@@ -428,7 +428,10 @@ impl MintedExecClientFace {
         send_one!(publish_derived_send(
             &tx,
             &self.kick,
-            Rights::ACCESS | Rights::REVOKE,
+            // Child connection minting derives its wake from this endpoint.
+            // The service still authenticates every request by its ring pair;
+            // delegating the doorbell cannot select another client's pair.
+            kore_rt::cap::CHANNEL_ENDPOINT_RIGHTS,
             deadline_ns,
         ));
         for grant in &self.grants {
@@ -486,7 +489,7 @@ impl DelegatedExecClientFace {
             .map_err(|_| FaceReceiveError::Malformed)?;
         let kick = next(rx)
             .await?
-            .try_into_chan_send(Rights::ACCESS | Rights::REVOKE)
+            .try_into_chan_send(kore_rt::cap::CHANNEL_ENDPOINT_RIGHTS)
             .map_err(|_| FaceReceiveError::Malformed)?;
 
         let mut grants = [const { None }; crate::wire::EXEC_REPLY_GRANTS];
