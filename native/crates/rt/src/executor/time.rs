@@ -102,6 +102,7 @@ pub(crate) struct ExecCtx {
     /// blocking send-and-wait trap. The outer executor spends this edge as a
     /// total drain before it may park again.
     inline_doorbell: Cell<bool>,
+    notice_observer: Cell<Option<NoticeObserver>>,
     /// Whether every idle park also arms the task's held IRQ route. This is
     /// executor policy rather than future-local wait state: it remains armed
     /// until the hardware owner completes its one-way quiesce + route
@@ -114,6 +115,14 @@ pub(crate) struct ExecCtx {
     quiesce_ask: Cell<Option<u64>>,
 }
 
+/// Run-scoped borrowed callback. ExecCtx is thread-confined (Cell), and the
+/// installer keeps the referent alive until it clears this erased pointer.
+#[derive(Clone, Copy)]
+struct NoticeObserver {
+    data: NonNull<()>,
+    call: unsafe fn(NonNull<()>, u64, u64),
+}
+
 impl ExecCtx {
     pub(crate) const fn new() -> Self {
         Self {
@@ -123,8 +132,51 @@ impl ExecCtx {
             delivery: Cell::new(None),
             next_delivery: Cell::new(0),
             inline_doorbell: Cell::new(false),
+            notice_observer: Cell::new(None),
             irq: Cell::new(IrqParkPolicy::Unarmed),
             quiesce_ask: Cell::new(None),
+        }
+    }
+
+    /// Keep the callback borrow inside this call, including during unwinding.
+    /// No guard escapes to a caller that could forget it and leave a stale hook.
+    pub(super) fn with_notice_observer<O: Fn(u64, u64), R>(
+        &self,
+        observer: &O,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        unsafe fn call<O: Fn(u64, u64)>(data: NonNull<()>, cookie: u64, payload: u64) {
+            // SAFETY: the installer borrows this exact O throughout run. Fn
+            // uses a shared borrow even if a callback re-enters user code.
+            unsafe { (data.cast::<O>().as_ref())(cookie, payload) };
+        }
+        struct Clear<'a>(&'a Cell<Option<NoticeObserver>>);
+        impl Drop for Clear<'_> {
+            fn drop(&mut self) {
+                self.0.set(None);
+            }
+        }
+        assert!(
+            self.notice_observer.get().is_none(),
+            "notice observer already installed"
+        );
+        self.notice_observer.set(Some(NoticeObserver {
+            data: NonNull::from(observer).cast(),
+            call: call::<O>,
+        }));
+        let _clear = Clear(&self.notice_observer);
+        run()
+    }
+
+    /// Called before re-posting every consumed primary notice, including a
+    /// blocking service call's inline park. Power quiesce remains runtime-owned.
+    pub(super) fn dispatch_notice(&self, cookie: u64, payload: u64) {
+        if cookie == kore_abi::session::NOTICE_COOKIE_POWER_QUIESCE {
+            self.note_quiesce_ask(payload);
+        } else if let Some(observer) = self.notice_observer.get() {
+            // SAFETY: with_notice_observer owns the callback's live borrow;
+            // neither this context nor its hook can cross threads.
+            unsafe { (observer.call)(observer.data, cookie, payload) };
         }
     }
 
@@ -186,17 +238,19 @@ impl ExecCtx {
 
     /// Anchor the clock to a kernel clock stamp
     /// ([`Committed::clock_ms`](kore_abi::session::Committed::clock_ms)):
-    /// advance-to-max, never backward.  Called by the executor on every
+    /// extend its wrapping low word, never backward. Called on every
     /// trap return it owns (the idle park, the doorbell re-post), so on
     /// target `now()` tracks the kernel's monotonic clock to within one
     /// park round-trip.  Without it the event-driven clock starts at 0
     /// and advances only on `Deadline` outcomes — lagging real time by
     /// the whole boot age, which turned every relative back-off deadline
     /// into an already-past one (the input-stream convergence storm).
-    /// A `0` stamp (an unstamped word — host mock transports) anchors
-    /// nothing, preserving the host posture: event-driven time only.
+    /// Full calibrated uptime supplies the epoch when available. The
+    /// fallback needs observations less than half a stamp period apart.
+    /// Zero is a valid stamp at wrap; host tests supply their own stamps.
     pub(crate) fn anchor_ms(&self, stamp_ms: u32) {
-        let ns = (stamp_ms as u64).saturating_mul(1_000_000);
+        let ns = crate::clock::anchor_millis(self.now.get() / 1_000_000, stamp_ms)
+            .saturating_mul(1_000_000);
         if ns > self.now.get() {
             self.now.set(ns);
         }
@@ -784,6 +838,71 @@ pub async fn next_wake_until(deadline_ns: u64) -> WakeReason {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kernel_stamp_wrap_keeps_deadline_time_advancing() {
+        let ctx = super::ExecCtx::new();
+        let period_ns = (1u64 << 32) * 1_000_000;
+        ctx.anchor_ms(u32::MAX);
+        assert_eq!(ctx.now(), period_ns - 1_000_000);
+        ctx.anchor_ms(0);
+        assert_eq!(ctx.now(), period_ns);
+        ctx.anchor_ms(3);
+        assert_eq!(ctx.now(), period_ns + 3_000_000);
+        ctx.anchor_ms(u32::MAX);
+        assert_eq!(ctx.now(), period_ns + 3_000_000);
+        // Full-width deadline evidence can bridge any number of wraps.
+        ctx.advance(4 * period_ns + 8_000_999);
+        ctx.anchor_ms(8);
+        assert_eq!(ctx.now(), 4 * period_ns + 8_000_999);
+        ctx.anchor_ms(9);
+        assert_eq!(ctx.now(), 4 * period_ns + 9_000_000);
+    }
+
+    #[test]
+    fn scoped_notice_observer_preserves_payloads_and_reserves_quiesce() {
+        let ctx = super::ExecCtx::new();
+        let seen = core::cell::Cell::new([(0, 0); 3]);
+        let count = core::cell::Cell::new(0usize);
+        let observer = |cookie, payload| {
+            let mut rows = seen.get();
+            rows[count.get()] = (cookie, payload);
+            seen.set(rows);
+            count.set(count.get() + 1);
+        };
+        ctx.with_notice_observer(&observer, || {
+            ctx.dispatch_notice(0, 4);
+            ctx.dispatch_notice(0x7001, u64::MAX);
+            ctx.dispatch_notice(kore_abi::session::NOTICE_COOKIE_POWER_QUIESCE, 91);
+            ctx.dispatch_notice(0x7002, 0);
+        });
+        assert_eq!(seen.get(), [(0, 4), (0x7001, u64::MAX), (0x7002, 0)]);
+        assert_eq!(ctx.take_quiesce_ask(), Some(91));
+        ctx.dispatch_notice(99, 99);
+        assert_eq!(count.get(), 3, "the previous run's callback must be gone");
+        let replacement = core::cell::Cell::new(None);
+        ctx.with_notice_observer(&|c, p| replacement.set(Some((c, p))), || {
+            ctx.dispatch_notice(42, 12);
+        });
+        assert_eq!(replacement.get(), Some((42, 12)));
+    }
+
+    #[test]
+    fn scoped_notice_observer_is_removed_when_the_run_unwinds() {
+        let ctx = super::ExecCtx::new();
+        let calls = core::cell::Cell::new(0);
+        let observer = |_, _| calls.set(calls.get() + 1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.with_notice_observer(&observer, || {
+                ctx.dispatch_notice(1, 2);
+                panic!("root future failed");
+            });
+        }));
+        assert!(result.is_err());
+        ctx.dispatch_notice(3, 4);
+        assert_eq!(calls.get(), 1);
+        assert!(ctx.notice_observer.get().is_none());
+    }
+
     use super::super::task::waker_for;
     use super::*;
     use kore_abi::session::SlotRef;

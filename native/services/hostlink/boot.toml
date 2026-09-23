@@ -1,0 +1,23 @@
+# services/hostlink/boot.toml — two-port HostLink driver/service row.
+# Founding order lives in res/boot.toml. The one measured image always claims
+# the exact modern VirtIO-console function for control and serial fallback,
+# and opportunistically claims exact QEMU ivshmem-plain BAR2 for bulk. The
+# latter is coherent CPU-shared RAM and requests neither DMA nor interrupts;
+# the founder still supplies only the console's class-agnostic DMA pool and
+# explicitly declared capability-distinct serving pairs; optional supervisor
+# clients are absent from the disabled founder graph.
+
+[service]
+image        = "kore-svc-hostlink"
+digest_x86_64 = "blake3:bae18a968e7a5e66f50e18aae9d810491f0970ff91135a4fc16c21d07ac1d3c7"
+digest_aarch64 = "blake3:d33a2fb6fa90d5dc5926a85c86e9110257f3f6fd89fda4adb0aa8fd4d61f5cea"
+chain        = true
+endowment    = "kore_svc_hostlink::HostLinkEndowment"
+protocol     = "kore_svc_hostlink::HostLinkFront"
+endows       = ["DMA_POOL@0"]
+# The CONNECTED serve path allocates two ~1 MiB bulk buffers (BULK_FRAME_MAX
+# staging + the router's bulk_work) plus two 64 KiB control buffers — ~2.1 MiB,
+# over the 2 MiB default heap, so a real host attach panicked the service
+# (RUNG_PANIC) while the disconnected path (which the standalone boot gate
+# exercises) fit fine. 4 MiB covers the working set with headroom.
+heap_supply_bytes = 0x0040_0000

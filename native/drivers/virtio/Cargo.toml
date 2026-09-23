@@ -1,0 +1,18 @@
+[package]
+name = "kore-virtio"
+version = "0.0.0"
+edition = "2024"
+description = "Allocation-free modern VirtIO guest transport and multiport console core for kore"
+publish = false
+
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+kore-driver = { path = "../../crates/driver" }
+kore-rt = { path = "../../crates/rt", optional = true }
+kore-svc-device = { path = "../../services/device", optional = true }
+
+[features]
+service = ["kore-driver/service", "dep:kore-rt", "dep:kore-svc-device"]
+
+[dev-dependencies]
+kore-virtio = { path = ".", features = ["service"] }

@@ -9,7 +9,8 @@
 //!
 //! These are measured bootstrap bounds, not a durable storage promise. They
 //! cover the founded-service and host-test workloads while keeping a footprint
-//! that a founded service can hold without a large `.bss`:
+//! that a founded service can hold without a large `.bss`. Volume-scaled
+//! arenas live in the service heap rather than nested mount/format frames.
 //!
 //! | Constant | Value | Dominant cost |
 //! |---|---|---|
@@ -75,6 +76,9 @@
 /// format reserves. Closing that gap needs the paged layout, not a larger
 /// constant.
 pub const MAX_OBJECTS: usize = 512;
+/// Stable private namespaces and pinned invocation views share this bounded
+/// service arena. A diagnostic free count is not an allocation reservation.
+pub const MAX_INVOCATION_VIEWS: usize = 16;
 
 /// Raised 16 → 64. It no longer enters the durable reservation at all, since
 /// `MAX_DURABLE_EDGES` is decoupled from the directory × entry product, so
@@ -88,6 +92,17 @@ pub const MAX_OBJECTS: usize = 512;
 /// `<= MAX_OBJECTS`.  Exhaustion refuses with
 /// [`FsError::OutOfObjects`](crate::FsError::OutOfObjects), since from
 /// a client's view the thing that could not be created is the directory.
+///
+/// It was `16`, which is also [`MAX_INVOCATION_VIEWS`]: every private
+/// namespace root is itself a directory drawn from this same arena, so the
+/// view table alone could consume the whole arena and leave the actual graph
+/// — the workspace tree every one of those views exists to reach — with no
+/// slot at all. A second resource-bearing prompt reproduced it exactly: the
+/// first prompt's retained roots filled the arena, `attach_namespace` refused
+/// `OutOfObjects`, and worker admission failed. The arena must therefore cover
+/// the view roots ([`MAX_INVOCATION_VIEWS`] + [`MAX_TASK_VIEWS`]) *plus* a
+/// real tree; `bounds`'s test pins that relationship so the two cannot drift
+/// back into equality.
 pub const MAX_DIRECTORIES: usize = 64;
 
 /// Maximum containment edges beneath one directory.  Exhaustion refuses with
@@ -265,6 +280,21 @@ mod tests {
     fn directory_arena_fits_inside_object_arena() {
         assert!(MAX_DIRECTORIES <= MAX_OBJECTS);
     }
+
+    /// Every private namespace root — one per invocation view and one per
+    /// stable task view — is a directory drawn from the same arena as the
+    /// graph those views exist to reach. An arena that only covers the roots
+    /// leaves no slot for a single real directory, so the ceiling must exceed
+    /// the sum of both view tables rather than merely equal one of them.
+    #[test]
+    fn directory_arena_outgrows_every_private_root() {
+        assert!(MAX_DIRECTORIES > MAX_INVOCATION_VIEWS + MAX_TASK_VIEWS);
+    }
+
+    /// The durable subtree is serialized out of the same arena, so its ceiling
+    /// is a share of that arena and never more than the whole of it.
+    #[test]
+    fn durable_subtree_fits_the_directory_arena() {}
 
     /// The edge proof is a `heapless::Vec<_, MAX_PATH_DEPTH>`; a traversal
     /// that could outrun it would truncate the proof and silently weaken

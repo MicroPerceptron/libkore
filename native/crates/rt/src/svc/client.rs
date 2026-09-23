@@ -157,6 +157,21 @@ impl ReplyRekickCadence {
 /// loop. Starting a fresh duration after the compact park would leave that
 /// first (potentially silent) wait outside the caller's bound.
 #[derive(Clone, Copy, Debug)]
+enum ReplyLimit {
+    Duration(u64),
+    Deadline(u64),
+}
+
+impl ReplyLimit {
+    const fn deadline(self, now_ns: u64) -> u64 {
+        match self {
+            Self::Duration(budget) => now_ns.saturating_add(budget),
+            Self::Deadline(deadline) => deadline,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ReplyObservation {
     budget_ns: u64,
     started_ns: Option<u64>,
@@ -165,10 +180,12 @@ struct ReplyObservation {
 }
 
 impl ReplyObservation {
-    async fn begin(budget_ns: Option<u64>) -> Option<Self> {
-        let budget_ns = budget_ns?;
+    async fn begin(limit: Option<ReplyLimit>) -> Option<Self> {
+        let limit = limit?;
         let started_ns = crate::clock::uptime().ok().map(|now| now.as_nanos());
-        let deadline_ns = crate::executor::clock_ns().await.saturating_add(budget_ns);
+        let now_ns = crate::executor::clock_ns().await;
+        let deadline_ns = limit.deadline(now_ns);
+        let budget_ns = deadline_ns.saturating_sub(now_ns);
         Some(Self {
             budget_ns,
             started_ns,
@@ -249,8 +266,8 @@ fn reply_wait_expired(
 /// refusal is a normal response, never an error here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallError {
-    /// This client already has a published request whose reply has not been
-    /// consumed. Call [`SvcClient::resume`] instead of publishing another
+    /// This client already owns a preparing or published request. Call
+    /// [`SvcClient::resume`] instead of starting another
     /// request into the uncorrelated SPSC reply stream.
     Outstanding,
     /// No published request exists for [`SvcClient::resume`] to continue.
@@ -1108,6 +1125,11 @@ pub struct SvcClient<'w, 't, T: Transport, S: SvcProtocol> {
 #[derive(Debug)]
 enum ClientState<W, R> {
     Idle,
+    /// Plain-call preflight owns the pair before its first cancellable post.
+    /// No request is on the wire yet; only this exact continuation may publish it.
+    Preparing {
+        request: W,
+    },
     AwaitingReply {
         /// Exact request record already published into the uncorrelated ring.
         request: W,
@@ -1149,14 +1171,16 @@ fn exact_outstanding_request<W: PartialEq, R>(
     expected: &W,
 ) -> Result<(), CallError> {
     match state {
-        ClientState::AwaitingReply { request } | ClientState::Collecting { request, .. }
+        ClientState::Preparing { request }
+        | ClientState::AwaitingReply { request }
+        | ClientState::Collecting { request, .. }
             if request == expected =>
         {
             Ok(())
         }
-        ClientState::AwaitingReply { .. } | ClientState::Collecting { .. } => {
-            Err(CallError::Outstanding)
-        }
+        ClientState::Preparing { .. }
+        | ClientState::AwaitingReply { .. }
+        | ClientState::Collecting { .. } => Err(CallError::Outstanding),
         ClientState::Idle => Err(CallError::NoOutstanding),
         ClientState::Poisoned { .. } => Err(CallError::Poisoned),
     }
@@ -1258,6 +1282,18 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         matches!(self.state, ClientState::Idle)
     }
 
+    /// Inert request identity retained by this SPSC owner. Protocol wrappers
+    /// use it to route recovery to the operation actually awaiting completion;
+    /// this borrow neither consumes a reply nor makes a poisoned pair reusable.
+    pub fn outstanding_request(&self) -> Option<&S::ReqWire> {
+        match &self.state {
+            ClientState::Preparing { request }
+            | ClientState::AwaitingReply { request }
+            | ClientState::Collecting { request, .. } => Some(request),
+            ClientState::Idle | ClientState::Poisoned { .. } => None,
+        }
+    }
+
     /// Whether reply progress is driven by a pre-executor caller polling this
     /// future directly rather than by the kore executor's wake registry.
     fn is_direct_waiter(&self) -> bool {
@@ -1299,34 +1335,71 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         self.call_with_budget(req, Some(budget_ns)).await
     }
 
+    /// Start an ordinary request under an existing absolute executor deadline.
+    pub async fn call_until(
+        &mut self,
+        req: &S::Request,
+        deadline_ns: u64,
+    ) -> Result<CallReply<S::Response>, CallError> {
+        self.call_with_limit(req, Some(ReplyLimit::Deadline(deadline_ns)))
+            .await
+    }
+
     async fn call_with_budget(
         &mut self,
         req: &S::Request,
         budget_ns: Option<u64>,
     ) -> Result<CallReply<S::Response>, CallError> {
+        self.call_with_limit(req, budget_ns.map(ReplyLimit::Duration))
+            .await
+    }
+
+    async fn call_with_limit(
+        &mut self,
+        req: &S::Request,
+        limit: Option<ReplyLimit>,
+    ) -> Result<CallReply<S::Response>, CallError> {
         self.require_idle()?;
         // Direct polling intentionally owns no executor timer. Refuse the
         // bounded shape before publishing anything rather than claim a bound
         // this progress mode cannot enforce and strand an unseen live request.
-        if budget_ns.is_some() && self.is_direct_progress() {
+        if limit.is_some() && self.is_direct_progress() {
             return Err(CallError::Wiring);
         }
         let request = S::encode_req(req);
-        let grants = self.prepare_call(&request)?;
-        self.ensure_reply_wait_post().await?;
-        // 1 · Every grant receive stands before the request can become
-        //     visible to a concurrently draining service.
-        self.ensure_grant_posts(grants).await?;
+        self.prepare_call(&request)?;
+        self.state = ClientState::Preparing { request };
+        self.publish_prepared(limit).await
+    }
+
+    async fn publish_prepared(
+        &mut self,
+        limit: Option<ReplyLimit>,
+    ) -> Result<CallReply<S::Response>, CallError> {
+        let ClientState::Preparing { request } = self.state else {
+            return Err(CallError::NoOutstanding);
+        };
+        // The fixed wiring and retained landings were validated/reserved
+        // before entering Preparing. Cancellation retains their actual owners.
+        let grants = S::request_grants(&request);
+        if let Err(error) = self.ensure_reply_wait_post().await {
+            self.state = ClientState::Idle;
+            return Err(error);
+        }
+        if let Err(error) = self.ensure_grant_posts(grants).await {
+            self.state = ClientState::Idle;
+            return Err(error);
+        }
         // Start the observation before the request becomes visible, so the
         // compact initial kick/park is inside the same bound as every later
         // cadence wait. `None` performs no clock lookup and preserves the
         // ordinary unbounded path.
-        let mut observation = ReplyObservation::begin(budget_ns).await;
+        let mut observation = ReplyObservation::begin(limit).await;
         // 2 · The ring write — happens-before the kick (§5.5).
-        self.rings
-            .req
-            .push(request)
-            .map_err(|_| CallError::RingFull)?;
+        if self.rings.req.push(request).is_err() {
+            self.state = ClientState::Idle;
+            return Err(CallError::RingFull);
+        }
         self.state = ClientState::AwaitingReply { request };
 
         // 3 · Notify + (for a configured blocking client) wait in one compact
@@ -1352,12 +1425,12 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         self.collect_reply(observation).await
     }
 
-    /// Continue the sole already-published request after a transport,
+    /// Continue the sole preparing or already-published request after a transport,
     /// backpressure, or cancellation boundary. The SPSC pair carries no
     /// request identifier, so publishing a replacement while this state is
     /// outstanding would let its late reply satisfy the wrong call.
     pub async fn resume(&mut self) -> Result<CallReply<S::Response>, CallError> {
-        self.resume_with_budget(None).await
+        self.resume_with_limit(None).await
     }
 
     /// Continue the sole outstanding request for one bounded observation
@@ -1367,12 +1440,23 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         &mut self,
         budget_ns: u64,
     ) -> Result<CallReply<S::Response>, CallError> {
-        self.resume_with_budget(Some(budget_ns)).await
+        self.resume_with_limit(Some(ReplyLimit::Duration(budget_ns)))
+            .await
     }
 
-    async fn resume_with_budget(
+    /// Observe the outstanding request against an existing absolute executor
+    /// deadline. Preparation or rescheduling cannot extend that deadline.
+    pub async fn resume_until(
         &mut self,
-        budget_ns: Option<u64>,
+        deadline_ns: u64,
+    ) -> Result<CallReply<S::Response>, CallError> {
+        self.resume_with_limit(Some(ReplyLimit::Deadline(deadline_ns)))
+            .await
+    }
+
+    async fn resume_with_limit(
+        &mut self,
+        limit: Option<ReplyLimit>,
     ) -> Result<CallReply<S::Response>, CallError> {
         if matches!(&self.state, ClientState::Poisoned { .. }) {
             self.retry_poison_cleanup();
@@ -1380,36 +1464,45 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         }
         // As for `call_with_budget`: preserve the already-live request and
         // tell a direct owner to use the ordinary unbounded resume.
-        if budget_ns.is_some()
+        if limit.is_some()
             && self.is_direct_progress()
             && matches!(
                 &self.state,
-                ClientState::AwaitingReply { .. } | ClientState::Collecting { .. }
+                ClientState::Preparing { .. }
+                    | ClientState::AwaitingReply { .. }
+                    | ClientState::Collecting { .. }
             )
         {
             return Err(CallError::Wiring);
         }
+        if matches!(self.state, ClientState::Preparing { .. }) {
+            return self.publish_prepared(limit).await;
+        }
         match &self.state {
-            ClientState::AwaitingReply { .. } | ClientState::Collecting { .. } => {}
+            ClientState::Preparing { .. }
+            | ClientState::AwaitingReply { .. }
+            | ClientState::Collecting { .. } => {}
             ClientState::Idle => return Err(CallError::NoOutstanding),
             ClientState::Poisoned { .. } => return Err(CallError::Poisoned),
         }
         // A resumed slice likewise starts before its first progress action;
         // it never republishes the correlated request.
-        let observation = ReplyObservation::begin(budget_ns).await;
+        let observation = ReplyObservation::begin(limit).await;
         match &self.state {
             ClientState::AwaitingReply { .. } => {
                 self.ensure_reply_wait_post().await?;
                 self.kick_published_request().await?
             }
             ClientState::Collecting { .. } => {}
-            ClientState::Idle | ClientState::Poisoned { .. } => unreachable!(),
+            ClientState::Preparing { .. } | ClientState::Idle | ClientState::Poisoned { .. } => {
+                unreachable!()
+            }
         }
         self.collect_reply(observation).await
     }
 
-    /// Continue only when `req` is the exact request already published by
-    /// this pair.
+    /// Continue only when `req` is the exact preparing or published request
+    /// already owned by this pair.
     ///
     /// Unlike [`resume`](Self::resume), this is safe for a shared lifecycle
     /// cleanup engine whose rows may be visited in a different order from
@@ -1469,9 +1562,9 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         &mut self,
     ) -> Result<(S::ReqWire, CallReply<S::Response>), CallError> {
         let request = match &self.state {
-            ClientState::AwaitingReply { request } | ClientState::Collecting { request, .. } => {
-                *request
-            }
+            ClientState::Preparing { request }
+            | ClientState::AwaitingReply { request }
+            | ClientState::Collecting { request, .. } => *request,
             ClientState::Idle => return Err(CallError::NoOutstanding),
             ClientState::Poisoned { .. } => {
                 self.retry_poison_cleanup();
@@ -1570,10 +1663,9 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
             return Err(RetainedReturnCallError::NotMoved(CallError::RingFull));
         }
 
-        // This is the only pre-transfer await. The affine witness remains in
-        // the caller-owned option if this future is cancelled here.
-        self.ensure_grant_posts(grants)
-            .await
+        // Preflight and transfer are both non-parking. The caller's option
+        // changes custody before the first possible suspension.
+        self.ensure_grant_posts_affine(grants)
             .map_err(RetainedReturnCallError::NotMoved)?;
 
         let capability_slot = capability
@@ -1654,8 +1746,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         if !implicit && self.rings.req.capacity_left() == 0 {
             return Err(StagedReturnError::NotTransferred(CallError::RingFull));
         }
-        self.ensure_grant_posts(grants)
-            .await
+        self.ensure_grant_posts_affine(grants)
             .map_err(StagedReturnError::NotTransferred)?;
 
         let mut transfer = SessionBuilder::new();
@@ -1664,8 +1755,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         })?;
         let committed = self
             .transport
-            .commit(&transfer)
-            .await
+            .commit_affine(&transfer)
             .map_err(|_| StagedReturnError::NotTransferred(CallError::Transport))?;
         match classify_return_commit(committed, transfer.staged(), ReturnSource::Held) {
             ReturnCommit::Moved => {}
@@ -1736,7 +1826,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                 capability,
             });
         }
-        if let Err(error) = self.ensure_grant_posts(grants).await {
+        if let Err(error) = self.ensure_grant_posts_affine(grants) {
             return Err(ReturnCallError::NotMoved { error, capability });
         }
 
@@ -1759,7 +1849,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                 capability,
             });
         }
-        let committed = match self.transport.commit(&transfer).await {
+        let committed = match self.transport.commit_affine(&transfer) {
             Ok(committed) => committed,
             Err(_) => {
                 return Err(ReturnCallError::NotMoved {
@@ -1834,6 +1924,49 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         auxiliaries: [Option<InvocationAuxiliary>; MAX_INVOCATION_AUXILIARIES],
         auxiliary_tx: [SlotRef; MAX_INVOCATION_AUXILIARIES],
     ) -> Result<CallReply<S::Response>, AffineBundleCallError<A, B, C>> {
+        self.begin_invocation_bundle(
+            req,
+            first,
+            first_rights,
+            executable,
+            second,
+            second_rights,
+            process_tx,
+            proof_tx,
+            third,
+            third_rights,
+            third_tx,
+            auxiliaries,
+            auxiliary_tx,
+        )?;
+        self.resume()
+            .await
+            .map_err(AffineBundleCallError::AfterTransfer)
+    }
+
+    /// Commit all invocation inputs and install reply correlation without any
+    /// suspension. The caller then observes this same request with `resume` or
+    /// `resume_bounded`; cancellation never requires republishing its inputs.
+    pub fn begin_invocation_bundle<
+        A: ReturnCapability,
+        B: ReturnCapability,
+        C: ReturnCapability,
+    >(
+        &mut self,
+        req: &S::Request,
+        first: A,
+        first_rights: Rights,
+        executable: SlotRef,
+        second: B,
+        second_rights: Rights,
+        process_tx: SlotRef,
+        proof_tx: SlotRef,
+        third: C,
+        third_rights: Rights,
+        third_tx: SlotRef,
+        auxiliaries: [Option<InvocationAuxiliary>; MAX_INVOCATION_AUXILIARIES],
+        auxiliary_tx: [SlotRef; MAX_INVOCATION_AUXILIARIES],
+    ) -> Result<(), AffineBundleCallError<A, B, C>> {
         macro_rules! not_moved {
             ($error:expr) => {
                 AffineBundleCallError::NotMoved {
@@ -1874,7 +2007,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         if self.rings.req.capacity_left() == 0 {
             return Err(not_moved!(CallError::RingFull));
         }
-        if let Err(error) = self.ensure_grant_posts(grants).await {
+        if let Err(error) = self.ensure_grant_posts_affine(grants) {
             return Err(not_moved!(error));
         }
         let first_slot = match preflight_return_send(&first, first_rights) {
@@ -1963,7 +2096,11 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
             return Err(not_moved!(CallError::RingFull));
         }
         witness.begin_transfer();
-        let committed = match self.transport.commit(&transfer).await {
+        // Publication, the non-parking affine commit and installation of
+        // reply custody below have no intervening cancellable await. The
+        // admission proof keeps the prewritten request unservable until the
+        // complete transfer commits.
+        let committed = match self.transport.commit_affine(&transfer) {
             Ok(committed) => committed,
             Err(_) => {
                 witness.quarantine();
@@ -1990,12 +2127,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                 // lawfully busy notice channel roll back every bundle member.
                 // The receiver's `request_ready` gate keeps this prewritten
                 // record invisible until the complete transfer above lands.
-                self.kick_published_request()
-                    .await
-                    .map_err(AffineBundleCallError::AfterTransfer)?;
-                self.collect_reply(None)
-                    .await
-                    .map_err(AffineBundleCallError::AfterTransfer)
+                Ok(())
             }
             ReturnCommit::NotMoved(error) => {
                 witness.settle_proven();
@@ -2056,7 +2188,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
             Ok(grants) => grants,
             Err(error) => return Err(ReturnCallError::NotMoved { error, capability }),
         };
-        if let Err(error) = self.ensure_grant_posts(grants).await {
+        if let Err(error) = self.ensure_grant_posts_affine(grants) {
             return Err(ReturnCallError::NotMoved { error, capability });
         }
 
@@ -2151,8 +2283,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         if !implicit && self.rings.req.capacity_left() == 0 {
             return Err(StagedReturnError::NotTransferred(CallError::RingFull));
         }
-        self.ensure_grant_posts(grants)
-            .await
+        self.ensure_grant_posts_affine(grants)
             .map_err(StagedReturnError::NotTransferred)?;
 
         let mut transfer = SessionBuilder::new();
@@ -2174,11 +2305,11 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                 StagedReturnError::NotTransferred(CallError::Refused(Status::Malformed))
             })?;
 
-        // From this point until a typed completion settles the reservation, a
-        // dropped/cancelled future cannot know whether the result record was
-        // published, moved, or scrubbed. Its Drop posture is quarantine.
+        // The staged reservation crosses one non-parking commit and is
+        // settled before the next await. An impossible completion still
+        // quarantines it because local occupancy cannot then be proved.
         capability.begin_transfer();
-        let committed = match self.transport.commit(&transfer).await {
+        let committed = match self.transport.commit_affine(&transfer) {
             Ok(committed) => committed,
             Err(_) => {
                 // Transport::Error means "could not commit", so the reserved
@@ -2447,9 +2578,9 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
     fn require_idle(&mut self) -> Result<(), CallError> {
         match &self.state {
             ClientState::Idle => Ok(()),
-            ClientState::AwaitingReply { .. } | ClientState::Collecting { .. } => {
-                Err(CallError::Outstanding)
-            }
+            ClientState::Preparing { .. }
+            | ClientState::AwaitingReply { .. }
+            | ClientState::Collecting { .. } => Err(CallError::Outstanding),
             ClientState::Poisoned { .. } => {
                 self.retry_poison_cleanup();
                 Err(CallError::Poisoned)
@@ -2694,92 +2825,130 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
     /// ambiguous error quarantines the allocator name rather than releasing a
     /// slot a late commit may still target.
     async fn ensure_grant_posts(&mut self, expect: usize) -> Result<(), CallError> {
-        debug_assert!(expect <= S::REPLY_GRANTS && expect <= MAX_GRANTS);
         for _ in 0..RETRY_BOUND {
-            let mut s = SessionBuilder::new();
-            // The non-standing posts, in grant order; remember which
-            // invocation index maps to which channel.
-            let mut posted: [usize; MAX_GRANTS] = [0; MAX_GRANTS];
-            let mut n = 0;
-            for k in 0..expect {
-                if !self.standing[k] {
-                    let pin = self.ep.grants[k].ok_or(CallError::Wiring)?;
-                    let retain = S::retain_grant(k);
-                    if !pin.matches_retention(retain) {
-                        return Err(CallError::Wiring);
-                    }
-                    let landing = if retain {
-                        if self.retained_landings[k].is_none() {
-                            // The bitmap is a bounded fast index, while these
-                            // affine owners are the authoritative local set.
-                            // If a stale clear bit yields a name an armed lane
-                            // still owns, the CAS has now re-closed that bit;
-                            // quarantine the duplicate witness and choose a
-                            // genuinely fresh name rather than building a
-                            // DoubleAssign receive batch.
-                            self.retained_landings[k] = ReturnedCapability::reserve();
-                        }
-                        let Some(owner) = self.retained_landings[k].as_ref() else {
-                            return Err(CallError::Backpressure);
-                        };
-                        owner.target()
-                    } else {
-                        pin.fixed_landing().ok_or(CallError::Wiring)?
-                    };
-                    let staged = match S::grant_policy(k) {
-                        Some((kind, minimum_rights)) => {
-                            s.post_recv_typed(pin.recv, landing, kind, minimum_rights)
-                        }
-                        None => s.post_recv(pin.recv, landing),
-                    };
-                    staged.map_err(|_| CallError::Refused(Status::Malformed))?;
-                    if retain {
-                        if let Some(owner) = self.retained_landings[k].as_mut() {
-                            // Conservatively arm before the transport boundary.
-                            // Any later refusal reuses this same target. If the
-                            // transport outcome is ambiguous, Armed Drop keeps the
-                            // allocator bit quarantined until task teardown.
-                            owner.arm_post();
-                        }
-                    }
-                    posted[n] = k;
-                    n += 1;
-                }
-            }
-            if n == 0 {
+            let (session, posted, count) = self.grant_post_batch(expect)?;
+            if count == 0 {
                 return Ok(());
             }
             let committed = self
                 .transport
-                .commit(&s)
+                .commit(&session)
                 .await
                 .map_err(|_| CallError::Transport)?;
-            match committed.status() {
-                Status::Ok => {
-                    if committed.failing_index() != 0 {
-                        return Err(CallError::Refused(Status::Malformed));
-                    }
-                    for &k in &posted[..n] {
-                        self.standing[k] = true;
-                    }
-                    return Ok(());
-                }
-                Status::WouldBlock => {
-                    let failing = committed.failing_index() as usize;
-                    if failing >= n {
-                        return Err(CallError::Refused(Status::Malformed));
-                    }
-                    // This channel's post already stands. The atomic session
-                    // unwound every other newly staged post.
-                    self.standing[posted[failing]] = true;
-                    continue;
-                }
-                Status::Conflict if (committed.failing_index() as usize) < n => continue,
-                Status::Conflict => return Err(CallError::Refused(Status::Malformed)),
-                st => return Err(CallError::Refused(st)),
+            if self.settle_grant_posts(&posted[..count], committed)? {
+                return Ok(());
             }
         }
         Err(CallError::Backpressure)
+    }
+
+    /// Native affine calls cannot suspend while their input owners reside in
+    /// the calling future. Post preparation is a bounded sequence of sessions
+    /// with no WAIT bits, so the same batch/settlement rules can run on the
+    /// non-parking transport before the transfer and correlation are installed.
+    fn ensure_grant_posts_affine(&mut self, expect: usize) -> Result<(), CallError> {
+        for _ in 0..RETRY_BOUND {
+            let (session, posted, count) = self.grant_post_batch(expect)?;
+            if count == 0 {
+                return Ok(());
+            }
+            let committed = self
+                .transport
+                .commit_affine(&session)
+                .map_err(|_| CallError::Transport)?;
+            if self.settle_grant_posts(&posted[..count], committed)? {
+                return Ok(());
+            }
+        }
+        Err(CallError::Backpressure)
+    }
+
+    fn grant_post_batch(
+        &mut self,
+        expect: usize,
+    ) -> Result<(SessionBuilder, [usize; MAX_GRANTS], usize), CallError> {
+        debug_assert!(expect <= S::REPLY_GRANTS && expect <= MAX_GRANTS);
+        let mut s = SessionBuilder::new();
+        // The non-standing posts, in grant order; remember which
+        // invocation index maps to which channel.
+        let mut posted: [usize; MAX_GRANTS] = [0; MAX_GRANTS];
+        let mut n = 0;
+        for k in 0..expect {
+            if !self.standing[k] {
+                let pin = self.ep.grants[k].ok_or(CallError::Wiring)?;
+                let retain = S::retain_grant(k);
+                if !pin.matches_retention(retain) {
+                    return Err(CallError::Wiring);
+                }
+                let landing = if retain {
+                    if self.retained_landings[k].is_none() {
+                        // The bitmap is a bounded fast index, while these
+                        // affine owners are the authoritative local set.
+                        // If a stale clear bit yields a name an armed lane
+                        // still owns, the CAS has now re-closed that bit;
+                        // quarantine the duplicate witness and choose a
+                        // genuinely fresh name rather than building a
+                        // DoubleAssign receive batch.
+                        self.retained_landings[k] = ReturnedCapability::reserve();
+                    }
+                    let Some(owner) = self.retained_landings[k].as_ref() else {
+                        return Err(CallError::Backpressure);
+                    };
+                    owner.target()
+                } else {
+                    pin.fixed_landing().ok_or(CallError::Wiring)?
+                };
+                let staged = match S::grant_policy(k) {
+                    Some((kind, minimum_rights)) => {
+                        s.post_recv_typed(pin.recv, landing, kind, minimum_rights)
+                    }
+                    None => s.post_recv(pin.recv, landing),
+                };
+                staged.map_err(|_| CallError::Refused(Status::Malformed))?;
+                if retain {
+                    if let Some(owner) = self.retained_landings[k].as_mut() {
+                        // Conservatively arm before the transport boundary.
+                        // Any later refusal reuses this same target. If the
+                        // transport outcome is ambiguous, Armed Drop keeps the
+                        // allocator bit quarantined until task teardown.
+                        owner.arm_post();
+                    }
+                }
+                posted[n] = k;
+                n += 1;
+            }
+        }
+        Ok((s, posted, n))
+    }
+
+    fn settle_grant_posts(
+        &mut self,
+        posted: &[usize],
+        committed: Committed,
+    ) -> Result<bool, CallError> {
+        match committed.status() {
+            Status::Ok => {
+                if committed.failing_index() != 0 {
+                    return Err(CallError::Refused(Status::Malformed));
+                }
+                for &lane in posted {
+                    self.standing[lane] = true;
+                }
+                Ok(true)
+            }
+            Status::WouldBlock => {
+                let Some(&lane) = posted.get(committed.failing_index() as usize) else {
+                    return Err(CallError::Refused(Status::Malformed));
+                };
+                // This post already stands; the atomic session unwound all
+                // other staged posts. The next batch excludes this lane.
+                self.standing[lane] = true;
+                Ok(false)
+            }
+            Status::Conflict if (committed.failing_index() as usize) < posted.len() => Ok(false),
+            Status::Conflict => Err(CallError::Refused(Status::Malformed)),
+            status => Err(CallError::Refused(status)),
+        }
     }
 
     /// Establish or repair the reply post owned by a direct (pre-executor)
@@ -3268,6 +3437,109 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_plain_preflight_reserves_the_pair_before_request_publication() {
+        use core::{
+            cell::Cell,
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        struct Protocol;
+        impl SvcProtocol for Protocol {
+            type Request = u64;
+            type Response = u64;
+            type ReqWire = u64;
+            type RepWire = u64;
+            const REPLY_GRANTS: usize = 1;
+            fn encode_req(r: &u64) -> u64 {
+                *r
+            }
+            fn decode_req(r: &u64) -> Option<u64> {
+                Some(*r)
+            }
+            fn encode_rep(r: &u64, _: u8) -> u64 {
+                *r
+            }
+            fn decode_rep(r: &u64) -> Option<(u64, u8)> {
+                Some((*r, 0))
+            }
+        }
+        struct Posts(Cell<bool>);
+        impl Transport for Posts {
+            type Error = core::convert::Infallible;
+            fn commit_now(&self, _: &SessionBuilder) -> Result<Committed, Self::Error> {
+                Ok(Committed::from_raw(Status::Ok.encode(0)))
+            }
+            async fn commit(&self, _: &SessionBuilder) -> Result<Committed, Self::Error> {
+                if !self.0.get() {
+                    core::future::pending::<()>().await;
+                }
+                Ok(Committed::from_raw(Status::Ok.encode(0)))
+            }
+        }
+        const BYTES: usize = crate::svc::window_bytes::<Protocol>(REQ_CAP, REP_CAP);
+        #[repr(align(64))]
+        struct Window([u8; BYTES]);
+        let mut window = Window([0; BYTES]);
+        let (rings, mut serve) =
+            crate::svc::split_window::<Protocol>(&mut window.0, REQ_CAP, REP_CAP).unwrap();
+        let transport = Posts(Cell::new(false));
+        let mut grants = [None; MAX_GRANTS];
+        // Fixed-slot protocol fixture; no native retained grant is fabricated.
+        grants[0] = Some(GrantPin::fixed(
+            SlotRef::from_wire(7),
+            SlotRef::from_wire(8),
+        ));
+        let mut client = SvcClient::<_, Protocol>::new(
+            &transport,
+            rings,
+            ClientEndpoints {
+                kick: SlotRef::from_wire(9),
+                grants,
+            },
+        )
+        .with_direct_polling();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut first = core::pin::pin!(client.call(&17));
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(serve.req.pop().is_none());
+        assert!(!client.is_idle());
+        assert_eq!(client.outstanding_request(), Some(&17));
+        for request in [17, 23] {
+            let mut replacement = core::pin::pin!(client.call(&request));
+            assert!(matches!(
+                replacement.as_mut().poll(&mut cx),
+                Poll::Ready(Err(CallError::Outstanding))
+            ));
+        }
+        {
+            let mut wrong = core::pin::pin!(client.resume_exact(&23));
+            assert!(matches!(
+                wrong.as_mut().poll(&mut cx),
+                Poll::Ready(Err(CallError::Outstanding))
+            ));
+        }
+        transport.0.set(true);
+        {
+            let mut resumed = core::pin::pin!(client.resume_exact(&17));
+            assert!(resumed.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(serve.req.pop(), Some(17));
+        assert!(serve.req.pop().is_none());
+        serve.rep.push(91).unwrap();
+        {
+            let mut resumed = core::pin::pin!(client.resume_exact(&17));
+            let Poll::Ready(Ok(reply)) = resumed.as_mut().poll(&mut cx) else {
+                panic!("original reply")
+            };
+            assert_eq!(reply.response, 91);
+        }
+        assert!(client.is_idle());
+        assert!(serve.req.pop().is_none());
+    }
+
+    #[test]
     fn bounded_executor_reply_park_times_out_without_canceling_the_request() {
         let transport = crate::transport::TrapTransport::new();
         let mut window = RetainedTestWindow([0; RETAINED_TEST_WINDOW_BYTES]);
@@ -3299,6 +3571,7 @@ mod tests {
         let result = executor.run(client.call_bounded(&17, REPLY_REKICK_NS));
 
         assert!(matches!(result, Err(CallError::Timeout)));
+        assert_eq!(client.outstanding_request(), Some(&17));
         assert!(matches!(
             &client.state,
             ClientState::AwaitingReply { request } if *request == 17
@@ -3308,6 +3581,66 @@ mod tests {
             Some(17),
             "the sole request stays published"
         );
+    }
+
+    #[test]
+    fn absolute_invocation_observation_keeps_the_deadline_and_late_reply() {
+        use core::cell::Cell;
+        struct Kicks(Cell<usize>);
+        impl Transport for Kicks {
+            type Error = core::convert::Infallible;
+            async fn commit(&self, session: &SessionBuilder) -> Result<Committed, Self::Error> {
+                self.commit_now(session)
+            }
+            fn commit_now(&self, _: &SessionBuilder) -> Result<Committed, Self::Error> {
+                self.0.set(self.0.get() + 1);
+                Ok(Committed::from_raw(Status::Ok.encode(0)))
+            }
+        }
+        // Delayed observation never refreshes a lifetime into a new duration.
+        for now in [0, 12, 100, u64::MAX] {
+            assert_eq!(ReplyLimit::Deadline(12).deadline(now), 12);
+        }
+        let transport = Kicks(Cell::new(0));
+        let mut window = RetainedTestWindow([0; RETAINED_TEST_WINDOW_BYTES]);
+        let (rings, mut serve) =
+            crate::svc::split_window::<RetainedTestProtocol>(&mut window.0, REQ_CAP, REP_CAP)
+                .unwrap();
+        let mut client = SvcClient::new(
+            &transport,
+            rings,
+            ClientEndpoints {
+                kick: SlotRef::from_wire(100),
+                grants: [None; MAX_GRANTS],
+            },
+        );
+        let park = crate::transport::TrapTransport::new();
+        let doorbell = Doorbell {
+            chan: 7,
+            recv: SlotRef::from_wire(101),
+            land: SlotRef::from_wire(102),
+            recv_tag: 0x1234,
+        };
+        let mut executor = crate::Executor::from_standing(&park, doorbell);
+        assert!(matches!(
+            executor.run(client.call_bounded(&17, 0)),
+            Err(CallError::Timeout)
+        ));
+        assert_eq!(serve.req.pop(), Some(17));
+        for _ in 0..2 {
+            assert!(matches!(
+                executor.run(client.resume_until(0)),
+                Err(CallError::Timeout)
+            ));
+            assert_eq!(client.outstanding_request(), Some(&17));
+            assert!(serve.req.pop().is_none());
+        }
+        serve.rep.push(91).unwrap();
+        let reply = executor.run(client.resume_until(0)).unwrap();
+        assert_eq!(reply.response, 91);
+        assert!(client.is_idle());
+        assert!(serve.req.pop().is_none());
+        assert_eq!(transport.0.get(), 4);
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3412,6 +3745,232 @@ mod tests {
         assert_eq!(error, CallError::RingFull);
         assert_eq!(capability.marker, 0xfeed);
         assert_eq!(capability.slot, Some(SlotRef::from_wire(19)));
+    }
+
+    #[test]
+    fn affine_post_preparation_and_transfer_complete_before_the_first_await() {
+        use core::{
+            cell::Cell,
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        struct Protocol;
+        impl SvcProtocol for Protocol {
+            type Request = u64;
+            type Response = u64;
+            type ReqWire = u64;
+            type RepWire = u64;
+            const REPLY_GRANTS: usize = 1;
+            fn encode_req(r: &u64) -> u64 {
+                *r
+            }
+            fn decode_req(r: &u64) -> Option<u64> {
+                Some(*r)
+            }
+            fn encode_rep(r: &u64, _: u8) -> u64 {
+                *r
+            }
+            fn decode_rep(r: &u64) -> Option<(u64, u8)> {
+                Some((*r, 0))
+            }
+        }
+        struct Script {
+            first: Committed,
+            calls: Cell<usize>,
+            repeat: bool,
+        }
+        impl Transport for Script {
+            type Error = core::convert::Infallible;
+            async fn commit(&self, _: &SessionBuilder) -> Result<Committed, Self::Error> {
+                core::future::pending().await
+            }
+            fn commit_now(&self, session: &SessionBuilder) -> Result<Committed, Self::Error> {
+                assert!(!session.flags().intersects(
+                    kore_abi::session::SessionFlags::WAIT_DELIVERY
+                        | kore_abi::session::SessionFlags::WAIT_IRQ
+                        | kore_abi::session::SessionFlags::WAIT_SLEEP
+                ));
+                let at = self.calls.get();
+                self.calls.set(at + 1);
+                Ok(if at == 0 || self.repeat {
+                    self.first
+                } else {
+                    Committed::from_raw(Status::Ok.encode(0))
+                })
+            }
+        }
+        const BYTES: usize = crate::svc::window_bytes::<Protocol>(REQ_CAP, REP_CAP);
+        #[repr(align(64))]
+        struct Window([u8; BYTES]);
+        for (status, index, repeat, error, calls) in [
+            (Status::Ok, 0, false, None, 2),
+            (Status::WouldBlock, 0, false, None, 2),
+            (
+                Status::Conflict,
+                0,
+                true,
+                Some(CallError::Backpressure),
+                RETRY_BOUND,
+            ),
+            (
+                Status::WouldBlock,
+                1,
+                false,
+                Some(CallError::Refused(Status::Malformed)),
+                1,
+            ),
+            (
+                Status::Denied,
+                0,
+                false,
+                Some(CallError::Refused(Status::Denied)),
+                1,
+            ),
+        ] {
+            let transport = Script {
+                first: Committed::from_raw(status.encode(index)),
+                calls: Cell::new(0),
+                repeat,
+            };
+            let mut window = Window([0; BYTES]);
+            let (rings, mut serve) =
+                crate::svc::split_window::<Protocol>(&mut window.0, REQ_CAP, REP_CAP).unwrap();
+            let mut grants = [None; MAX_GRANTS];
+            grants[0] = Some(GrantPin::fixed(
+                SlotRef::from_wire(7),
+                SlotRef::from_wire(8),
+            ));
+            let mut client = SvcClient::new(
+                &transport,
+                rings,
+                ClientEndpoints {
+                    kick: SlotRef::from_wire(9),
+                    grants,
+                },
+            );
+            let source = TestCapability {
+                slot: Some(SlotRef::from_wire(92)),
+                rights: Rights::ACCESS | Rights::DERIVE,
+                marker: 0xace,
+            };
+            let mut cx = Context::from_waker(Waker::noop());
+            {
+                let mut call = core::pin::pin!(client.call_with_return(
+                    &17,
+                    SlotRef::from_wire(93),
+                    source,
+                    Rights::ACCESS
+                ));
+                match (error, call.as_mut().poll(&mut cx)) {
+                    (None, Poll::Pending) => {} // post-transfer kick only
+                    (
+                        Some(expected),
+                        Poll::Ready(Err(ReturnCallError::NotMoved { error, capability })),
+                    ) => {
+                        assert_eq!(error, expected);
+                        assert_eq!(capability.marker, 0xace);
+                        assert_eq!(capability.slot, Some(SlotRef::from_wire(92)));
+                    }
+                    _ => panic!("unexpected affine preflight outcome"),
+                }
+            }
+            assert_eq!(transport.calls.get(), calls);
+            if error.is_none() {
+                assert_eq!(serve.req.pop(), Some(17));
+                assert_eq!(client.outstanding_request(), Some(&17));
+                assert!(!client.is_idle());
+            } else {
+                assert!(serve.req.pop().is_none());
+                assert!(client.is_idle());
+            }
+        }
+    }
+
+    #[test]
+    fn owned_return_installs_reply_custody_before_the_next_cancellable_await() {
+        use core::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        // The async transport never completes. A lawful transfer must instead
+        // use the non-parking affine path, then suspend only in the kick.
+        let transport = PendingKickTransport {
+            transfer: Committed::from_raw(Status::Ok.encode(0)),
+        };
+        let mut window = RetainedTestWindow([0; RETAINED_TEST_WINDOW_BYTES]);
+        let (rings, mut serve) =
+            crate::svc::split_window::<RetainedTestProtocol>(&mut window.0, REQ_CAP, REP_CAP)
+                .unwrap();
+        let mut client = SvcClient::new(
+            &transport,
+            rings,
+            ClientEndpoints {
+                kick: SlotRef::from_wire(91),
+                grants: [None; MAX_GRANTS],
+            },
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            // Generic affine witness fixture; no native capability is minted.
+            let source = TestCapability {
+                slot: Some(SlotRef::from_wire(92)),
+                rights: Rights::ACCESS | Rights::DERIVE,
+                marker: 0xace,
+            };
+            let mut transfer = core::pin::pin!(client.call_with_return(
+                &17,
+                SlotRef::from_wire(93),
+                source,
+                Rights::ACCESS
+            ));
+            assert!(transfer.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(serve.req.pop(), Some(17));
+        assert_eq!(client.outstanding_request(), Some(&17));
+        assert!(!client.is_idle());
+        {
+            let mut replacement = core::pin::pin!(client.call(&18));
+            assert!(matches!(
+                replacement.as_mut().poll(&mut cx),
+                Poll::Ready(Err(CallError::Outstanding))
+            ));
+        }
+        assert!(serve.req.pop().is_none());
+    }
+
+    #[test]
+    fn exact_held_return_installs_reply_custody_before_the_next_cancellable_await() {
+        use core::{
+            future::Future,
+            task::{Context, Waker},
+        };
+        let transport = PendingKickTransport {
+            transfer: Committed::from_raw(Status::Ok.encode(0)),
+        };
+        let mut window = RetainedTestWindow([0; RETAINED_TEST_WINDOW_BYTES]);
+        let (rings, mut serve) =
+            crate::svc::split_window::<RetainedTestProtocol>(&mut window.0, REQ_CAP, REP_CAP)
+                .unwrap();
+        let mut client = SvcClient::new(
+            &transport,
+            rings,
+            ClientEndpoints {
+                kick: SlotRef::from_wire(91),
+                grants: [None; MAX_GRANTS],
+            },
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut transfer = core::pin::pin!(client.call_with_exact_held_return(
+                &17,
+                SlotRef::from_wire(93),
+                SlotRef::from_wire(92)
+            ));
+            assert!(transfer.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(serve.req.pop(), Some(17));
+        assert_eq!(client.outstanding_request(), Some(&17));
+        assert!(!client.is_idle());
     }
 
     #[test]

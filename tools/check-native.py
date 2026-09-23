@@ -7,6 +7,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Platform metadata files, never part of an export.
+IGNORED_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
+
 
 def violations(native: Path) -> list[str]:
     record = json.loads((native / "provenance.json").read_text())
@@ -18,6 +21,11 @@ def violations(native: Path) -> list[str]:
         if relative == Path("."):
             dirs[:] = [name for name in dirs if name != "target"]
         for name in files:
+            # A file the platform's file browser drops into the tree is not a
+            # native source and never was one: comparing it against the
+            # provenance record reports a tampered export for a Finder turd.
+            if name in IGNORED_NAMES:
+                continue
             path = relative / name
             if str(path) not in ("Cargo.toml", "Cargo.lock", "provenance.json"):
                 actual.add(str(path))

@@ -429,11 +429,13 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
 /// the 35-row bootstrap catalogue — the desktop's `editor` and `power-ui`
 /// beside the two native filesystem verbs `append` and `sync`, and the two
 /// WebAssembly rows, `wasm-witness` and `wasm` — plus the shell, the
-/// graphical terminal, and three extraction parsers.  Named
+/// graphical terminal, three extraction parsers, and the optional agent
+/// supervisor and runner. This reserves the enabled boot's peak even when
+/// optional applications are disabled. Named
 /// separately from the interactive reservation below because the two grow for
 /// unrelated reasons: this one when a row joins the catalogue, that one when
 /// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 40;
+pub const BOOTSTRAP_IMAGE_PEERS: usize = 42;
 
 /// Bootstrap face-supply sizing. Image and runtime grow their face tables and
 /// rings on demand; this reserves enough initial memory for the boot catalogue

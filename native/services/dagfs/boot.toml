@@ -1,0 +1,44 @@
+# services/dagfs/boot.toml — the filesystem service's boot-manifest row.
+# Founding order lives in res/boot.toml; this fragment declares only the
+# service-local image, bundle, and protocol citations.
+
+# The filesystem follows the terminal in the retained chain: it consumes a
+# client face onto block, then leaves its own service pair resident before the
+# exec and init rounds. Client multiplication belongs to the recyclable-session
+# seam, not to a fixed bank of shell-specific boot pairs.
+[service]
+image     = "kore-svc-dagfs"
+chain     = true
+endowment = "kore_svc_dagfs::FsEndowment"
+protocol  = "kore_svc_dagfs::FsProtocol"
+endows    = []
+# HostLink's importer pair is distinct from broker and agent traffic. The
+# generic declared-client role bank keeps this clear of the block client.
+clients   = [{ provider = "kore-svc-hostlink", pair = 3 }]
+# The measured archive digest is immutable startup data, not a capability.
+# The generated founder row stamps it as ARCHIVE_ERA@0..=7; FsEndowment
+# resolves all eight words before the durable policy can run.
+boot_data = "archive_digest"
+# Pair 1 is exec's authority-bearing administration face. Command processes
+# themselves arrive through the recyclable-peer seam; the fixed face count
+# therefore stays independent of the installed command set.
+exec_client = true
+# The filesystem's volume-scaled metadata is heap-backed rather than inline:
+# object and directory arenas, placement and extent indexes, the derived
+# index, and the handle arena all live here now, so raising a bound is a heap
+# number instead of a stack one. At MAX_OBJECTS = 512 the fixed startup
+# reservations come to roughly 1.75 MiB PER MOUNTED ENGINE, of which the
+# derived wire-chunk arena alone is 1 MiB — and a provisioned disk (the
+# `kore-fs` + `kore-system` GPT pair every metal machine carries, and the
+# `run-boot-gate-x86-fs-dual` fixture) mounts TWO engines, user and system,
+# each with its own arenas, plus the recovery transients of both.  4 MiB fit
+# the single engine a blank disk mounts and ran out on the second one: the
+# `service heap undersized` expect in `ExtractionState::new` NACKed the row
+# (rung 127, extraction.rs) on every provisioned boot — Gigatron and
+# Biggertron, 2026-09-15, #1003 — while every blank-disk QEMU boot passed.
+# 8 MiB is two engines' fixed reservations with better than 2× headroom for
+# recovery transients and the heap's growth granularity; the fs-dual gate is
+# the witness that keeps it honest.
+heap_supply_bytes = 0x0080_0000
+digest_x86_64  = "blake3:19947558783c34d4ce322a896b032b0a18d5de26b57acbb832f31af20214eb70"
+digest_aarch64 = "blake3:f35ba5e9718e6ee15c42a85e45504ebaff28f21e4f85528ed199e4fd1e627a42"

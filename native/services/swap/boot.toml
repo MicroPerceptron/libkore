@@ -1,0 +1,13 @@
+# services/swap/boot.toml — this service's boot-manifest row (the design
+# lives in res/boot.toml's header).  The row rides beside the crate it
+# endows, redox-style; whether and WHEN it founds is the root manifest's
+# `services` list — founding order and chain adjacency are topology, the
+# root's to declare, never a row's.
+
+[service]
+image     = "kore-svc-swap"
+endowment = "kore_svc_swap::ZramEndowment"
+protocol  = "kore_svc_swap::ZramSwap"
+endows    = ["MEM_SUPPLY@0"]
+digest_x86_64  = "blake3:692a7ad99446e8490bd6973aa28f8193616c6982e95c3697483ef20819bdacc6"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:2d4a7aef9e00b604c9dcaa2eacac1788fd1fa55fc25261e7d2bd44a0a70051e7"  # res/aarch64/; make boot-digests-aarch64

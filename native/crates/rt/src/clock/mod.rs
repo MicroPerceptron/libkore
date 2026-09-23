@@ -92,9 +92,57 @@ pub(crate) fn monotonic_nanos() -> Option<u64> {
     uptime().ok().map(Uptime::as_nanos)
 }
 
+/// Advance an absolute millisecond anchor from a wrapping kernel stamp.
+/// Prefer the full calibrated uptime when available; otherwise observations
+/// must be less than half a stamp period (about 24.9 days) apart. A zero
+/// anchor has no known epoch, so its first stamp initializes the low word.
+/// A caller handing time to a new executor must preserve the full anchor.
+/// Stale samples never move time backward or manufacture a future epoch.
+pub fn anchor_millis(previous_ms: u64, stamp_ms: u32) -> u64 {
+    let previous_ms = monotonic_nanos()
+        .map(|ns| previous_ms.max(ns / 1_000_000))
+        .unwrap_or(previous_ms);
+    extend_millis(previous_ms, stamp_ms)
+}
+
+fn extend_millis(previous_ms: u64, stamp_ms: u32) -> u64 {
+    if previous_ms == 0 {
+        return u64::from(stamp_ms);
+    }
+    let delta = stamp_ms.wrapping_sub(previous_ms as u32);
+    if delta < (1 << 31) {
+        previous_ms.saturating_add(u64::from(delta))
+    } else {
+        previous_ms
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn millisecond_anchor_crosses_wrap_and_rejects_stale_samples() {
+        let period = 1u64 << 32;
+        let mut now = extend_millis(0, u32::MAX - 2);
+        assert_eq!(now, period - 3);
+        for (stamp, expected) in [
+            (u32::MAX, period - 1),
+            (0, period),
+            (1, period + 1),
+            (u32::MAX, period + 1),
+            (0, period + 1),
+            (7, period + 7),
+            (7, period + 7),
+        ] {
+            now = extend_millis(now, stamp);
+            assert_eq!(now, expected);
+        }
+        assert_eq!(extend_millis(3 * period + 9, 12), 3 * period + 12);
+        assert_eq!(extend_millis(3 * period + 9, 8), 3 * period + 9);
+        assert_eq!(extend_millis(91, 91 + (1 << 31)), 91);
+        assert_eq!(extend_millis(u64::MAX - 1, 0), u64::MAX);
+    }
 
     #[test]
     fn malformed_or_privileged_only_pages_fail_closed() {

@@ -514,6 +514,13 @@ pub trait SystemService: crate::svc::SvcProtocol + Sized {
         0
     }
 
+    /// Deadline work that observes another service through its held client.
+    /// The deadline host awaits this before and after draining requests. The
+    /// synchronous default preserves ordinary alarm-service behavior.
+    async fn drive_deadlines_async(&mut self, now_ns: u64) -> u16 {
+        self.drive_deadlines(now_ns)
+    }
+
     /// **Terminal device quiesce** (#809 §L) — called once by the generic
     /// host when the kernel's shutdown sweep wakes the row, before
     /// `deadline_ns` (absolute monotonic nanoseconds).  The row reaches each

@@ -291,6 +291,28 @@ impl PeerBundleAssembler {
         self.is_empty()
     }
 
+    /// A valid new Ring abandons the preceding incomplete assembly. Keep
+    /// every old owner until its native retirement succeeds, and refuse the
+    /// new input meanwhile. Authorization belongs to the service's admin pair.
+    pub fn prepare(
+        &mut self,
+        part: PeerBundlePart,
+        capability: &ReturnedCapability,
+    ) -> Result<(), PeerAssemblyRefusal> {
+        if part == PeerBundlePart::Ring && !self.is_empty() {
+            use kore_abi::cap::Rights;
+            if !capability
+                .is_lease_with(Rights::ACCESS | Rights::MODIFY | Rights::DERIVE | Rights::REVOKE)
+            {
+                return Err(PeerAssemblyRefusal::WrongAuthority);
+            }
+            if !self.retire_incomplete() {
+                return Err(PeerAssemblyRefusal::Duplicate);
+            }
+        }
+        self.accepts(part, capability)
+    }
+
     /// Validate a proposed component without taking its affine owner.
     pub fn accepts(
         &self,
@@ -2174,6 +2196,16 @@ impl<'w, 't, T: Transport, S: SystemService> ServeHost<'w, 't, T, S> {
         }
     }
 
+    fn next_drive_deadline(&self, now_ns: u64) -> Option<u64> {
+        let service = self.svc.next_deadline();
+        if self.has_pending_cleanup() {
+            let retry = now_ns.saturating_add(1_000_000);
+            Some(service.map_or(retry, |deadline| deadline.min(retry)))
+        } else {
+            service
+        }
+    }
+
     /// Deadline-aware sibling of the ordinary ring-only drive.  It performs
     /// the same total request drain, but folds the service's current minimum
     /// into the executor's existing `WAIT_DELIVERY | WAIT_SLEEP` park.  There
@@ -2183,7 +2215,7 @@ impl<'w, 't, T: Transport, S: SystemService> ServeHost<'w, 't, T, S> {
             // Establish the service's monotonic anchor before serving a
             // relative arm request in this pass.
             let now = crate::executor::clock_ns().await;
-            let notify = self.svc.drive_deadlines(now);
+            let notify = self.svc.drive_deadlines_async(now).await;
             self.notify_pairs(notify).await;
 
             while self.serve_next().await {}
@@ -2192,10 +2224,12 @@ impl<'w, 't, T: Transport, S: SystemService> ServeHost<'w, 't, T, S> {
             // the next minimum, so an expired request never becomes a hot
             // already-past park loop.
             let now = crate::executor::clock_ns().await;
-            let notify = self.svc.drive_deadlines(now);
+            let notify = self.svc.drive_deadlines_async(now).await;
             self.notify_pairs(notify).await;
 
-            match self.svc.next_deadline() {
+            // Dynamic image faces can leave host-owned admission/retirement
+            // work after the service's own heap recovery has settled.
+            match self.next_drive_deadline(crate::executor::clock_ns().await) {
                 Some(deadline) => {
                     let _ = crate::executor::next_wake_until(deadline).await;
                 }
@@ -2532,6 +2566,7 @@ mod tests {
     struct AsyncAware {
         sync_calls: u8,
         async_calls: u8,
+        deadline_calls: Option<&'static Cell<(u8, u8)>>,
     }
 
     impl SystemService for AsyncAware {
@@ -2542,12 +2577,21 @@ mod tests {
             Self {
                 sync_calls: 0,
                 async_calls: 0,
+                deadline_calls: None,
             }
         }
 
         fn serve(&mut self, _: u64, sv: &mut Serve<'_, Reply>) {
             self.sync_calls += 1;
             sv.reply(Reply::Denied);
+        }
+
+        async fn drive_deadlines_async(&mut self, _: u64) -> u16 {
+            crate::executor::yield_now().await;
+            if let Some(calls) = self.deadline_calls {
+                calls.set((calls.get().0 + 1, self.async_calls));
+            }
+            0
         }
 
         async fn serve_async(&mut self, _: u64, sv: &mut Serve<'_, Reply>) {
@@ -2771,6 +2815,49 @@ mod tests {
         assert_eq!(host.service().async_calls, 1);
         assert_eq!(
             AsyncAware::decode_rep(&client.rep.pop().expect("reply")),
+            Some((Reply::Granted, 0))
+        );
+    }
+
+    #[test]
+    fn deadline_host_awaits_service_maintenance_before_and_after_requests() {
+        use core::{future::Future, task::Poll};
+        let calls = std::boxed::Box::leak(std::boxed::Box::new(Cell::new((0, 0))));
+        let mut service = AsyncAware::bind(NoCaps);
+        service.deadline_calls = Some(calls);
+        let (mut client, rings) =
+            split_window::<AsyncAware>(async_window(), REQ_CAP, REP_CAP).unwrap();
+        client.req.push(7).unwrap();
+        let endpoints = ServeEndpoints {
+            kick: SlotRef::from_wire(60),
+            grant_tx: [None; MAX_GRANTS],
+            scratch: [None; MAX_GRANTS],
+            return_post: None,
+        };
+        let transport = OkTransport::new();
+        let host = ServeHost::new(service, &transport, rings, endpoints);
+        let mut run = core::pin::pin!(host.run_deadline_driven());
+        let native = crate::transport::TrapTransport;
+        let bell = crate::executor::Doorbell {
+            chan: 7,
+            recv: SlotRef::from_wire(101),
+            land: SlotRef::from_wire(102),
+            recv_tag: 0x1234,
+        };
+        let mut executor = crate::executor::Executor::from_standing_at(&native, bell, 0);
+        // Both hooks deliberately suspend. Stop before the idle kernel park:
+        // this witnesses host ordering, not native capability or timer delivery.
+        executor.run(core::future::poll_fn(|cx| {
+            assert!(run.as_mut().poll(cx).is_pending());
+            if calls.get().0 == 2 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }));
+        assert_eq!(calls.get(), (2, 1));
+        assert_eq!(
+            AsyncAware::decode_rep(&client.rep.pop().unwrap()),
             Some((Reply::Granted, 0))
         );
     }
@@ -3354,6 +3441,7 @@ mod tests {
 
         assert!(host.retire_peer(peer, PeerClose::Died));
         assert!(host.has_pending_cleanup());
+        assert_eq!(host.next_drive_deadline(7), Some(1_000_007));
         assert_eq!(host.service().close_attempts, 1);
         assert_eq!(host.service().count, 0, "domain teardown deferred");
         let (_replacement, replacement_rings) = lifecycle_window();
@@ -3364,6 +3452,7 @@ mod tests {
 
         assert_eq!(host.retry_peer_cleanup(), 1);
         assert!(!host.has_pending_cleanup());
+        assert_eq!(host.next_drive_deadline(7), None);
         assert_eq!(host.service().close_attempts, 2);
         assert_eq!(
             host.service().closed[0],

@@ -17,6 +17,7 @@ pub use kore_rt as runtime;
 pub use kore_rt::futex;
 pub use kore_rt::process;
 pub use kore_rt::{Bundle, ExitCode, Termination, exit_codes, main, spmd, task};
+#[cfg(feature = "collections")]
 pub mod collections;
 /// Fatal-process evidence, rendering, and explicit parent-side persistence.
 pub mod crash;
@@ -28,6 +29,21 @@ pub use kore_rt::{thread, thread_controller};
 /// Hardware effects still require a device-specific owner and lifecycle policy.
 #[cfg(feature = "driver")]
 pub use kore_driver as driver;
+
+/// Capability-based executable invocation and lifecycle.
+///
+/// The one native owner, re-exported — not a second implementation. A local
+/// [`exec::CapabilityNamespace`] names the executables this task actually
+/// holds; [`exec::RingExec`] speaks the protocol over a founded face the
+/// process was given. Neither the name nor this module is authority: an
+/// invocation still needs the affine [`exec::ExecutableCapability`] the founder
+/// delivered, and the service refuses anything else.
+///
+/// Enabling this does **not** link the exec service. `kore-exec-client` is the
+/// protocol and the caller's face; the spawn engine that answers it stays in
+/// Kore, where enforcement belongs.
+#[cfg(feature = "exec")]
+pub use kore_exec_client as exec;
 
 /// Native clocks and deadlines; wall time never coerces into monotonic time.
 pub mod time {
@@ -56,6 +72,7 @@ pub mod fs;
 
 /// Common application types. Raw slots and kernel verbs stay explicitly named.
 pub mod prelude {
+    #[cfg(feature = "collections")]
     pub use crate::collections::{HashMap, HashSet, HashTable};
     #[cfg(feature = "fs")]
     pub use crate::fs::{Fs, View};

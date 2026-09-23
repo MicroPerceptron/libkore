@@ -1,0 +1,36 @@
+# services/mm/boot.toml — this service's boot-manifest row (the design
+# lives in res/boot.toml's header).  The row rides beside the crate it
+# endows, redox-style; whether and WHEN it founds is the root manifest's
+# `services` list — founding order and chain adjacency are topology, the
+# root's to declare, never a row's.
+
+# The lessor of last resort: MEM_SUPPLY is the founder-minted heap-grant
+# lease; MEM_REGION (slice D) is the minting authority — a revocable
+# self-kind grant of the boot DRAM region, off which `OP_SUPPLY` mints
+# each spawned child's root supply lease (quota-metered per serving
+# pair; the frames live and die against the region bitmap, so revoking
+# this one endowment reclaims every delegated child supply at once).
+#
+# `shell_client = true` + `exec_client = true` + `SERVE_PAIRS = 4` on the
+# protocol: pair 0
+# stays the founder-era pair, pair 1 is the FIRST SHELL's supply face
+# (prefab-minted before the founding loop, conveyed through the
+# pre-land bundle — the wire `run` allocates child memory over), and
+# pair 2 is INIT's face (delivered at its founding round; quiescent
+# until the respawn slices).  Pair 3 is exec's telemetry client face.
+# All extra pairs are post-less for returned capabilities. Supply quota uses a
+# separate kernel-authenticated lifecycle report after the complete lease
+# lineage dies and the region bitmap has accepted the frames (#747).
+[service]
+image     = "kore-svc-mm"
+endowment = "kore_svc_mm::MmEndowment"        # <_ as Bundle>::PROFILE, cited verbatim
+protocol  = "kore_svc_mm::MemoryManager"      # <_ as SvcProtocol>::REPLY_GRANTS, cited
+boot_data = "supply_quota"
+# Per-client live supply policy, not a reservation or physical-memory promise.
+# Keep receipt capacity independent of this deployment budget.
+supply_quota_bytes = 2147483648 # 2 GiB
+endows    = ["MEM_SUPPLY@0", "MEM_REGION@0"]  # review mirror; asserted === PROFILE.roles
+shell_client = true
+exec_client = true
+digest_x86_64  = "blake3:a071394ee991fe7191d971c1fa73d15e8c46e0a98e2ad004e0d76445209280c0"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:86e618e230f39684645826838db3c5e3e0f6f25acf1633c8947ab15c8dcb202d"  # res/aarch64/; make boot-digests-aarch64

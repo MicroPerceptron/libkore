@@ -92,6 +92,14 @@ impl<T, A: Allocator + ?Sized + 'static> AtomicSlotVec<T, A> {
     /// Insert into the first vacant slot. A full arena returns ownership of
     /// `value`; it never drops a caller's affine state on exhaustion.
     pub fn insert(&self, value: T) -> Result<SlotId, T> {
+        self.reserve(value).map(SlotVecReservation::commit)
+    }
+
+    /// Reserve initialized storage without exposing its payload. The exact
+    /// generation reports `Busy` until commit; dropping the reservation
+    /// retires it and drops its value synchronously. Capacity includes held
+    /// reservations, so suspended transactions cannot overbook the arena.
+    pub fn reserve(&self, value: T) -> Result<SlotVecReservation<'_, T, A>, T> {
         for index in 0..self.states.len() {
             let observed = self.states[index].load(Ordering::Acquire);
             if observed & (LIVE | WRITING) != 0 {
@@ -112,9 +120,15 @@ impl<T, A: Allocator + ?Sized + 'static> AtomicSlotVec<T, A> {
             // SAFETY: this CAS uniquely owns a vacant slot; no reader can
             // validate it without LIVE and no other insertion can win it.
             unsafe { (*self.slots[index].get()).write(value) };
-            self.states[index].store(generation as u64 | LIVE, Ordering::Release);
             self.live.fetch_add(1, Ordering::Relaxed);
-            return Ok(SlotId::new(index as u32, generation));
+            self.states[index].store(generation as u64 | LIVE | WRITING, Ordering::Release);
+            return Ok(SlotVecReservation {
+                claim: Some(SlotVecWrite {
+                    map: self,
+                    id: SlotId::new(index as u32, generation),
+                    armed: true,
+                }),
+            });
         }
         Err(value)
     }
@@ -314,6 +328,51 @@ pub struct SlotVecRead<'a, T, A: Allocator + ?Sized + 'static> {
     _reader: ReaderGuard<'a>,
 }
 
+/// An unpublished value owned by one bounded transaction. Unlike a write
+/// claim, drop aborts insertion; only explicit commit makes the value readable.
+pub struct SlotVecReservation<'a, T, A: Allocator + ?Sized + 'static> {
+    claim: Option<SlotVecWrite<'a, T, A>>,
+}
+
+impl<T, A: Allocator + ?Sized + 'static> SlotVecReservation<'_, T, A> {
+    pub fn id(&self) -> SlotId {
+        self.claim.as_ref().expect("live reservation").id()
+    }
+
+    pub fn commit(mut self) -> SlotId {
+        let claim = self.claim.take().expect("live reservation");
+        let id = claim.id();
+        drop(claim);
+        id
+    }
+}
+
+impl<T, A: Allocator + ?Sized + 'static> Deref for SlotVecReservation<'_, T, A> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.claim.as_ref().expect("live reservation")
+    }
+}
+
+impl<T, A: Allocator + ?Sized + 'static> DerefMut for SlotVecReservation<'_, T, A> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.claim.as_mut().expect("live reservation")
+    }
+}
+
+impl<T, A: Allocator + ?Sized + 'static> Drop for SlotVecReservation<'_, T, A> {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            drop(
+                claim
+                    .remove()
+                    .expect("reservation owns its exact generation"),
+            );
+        }
+    }
+}
+
 impl<T, A: Allocator + ?Sized + 'static> SlotVecRead<'_, T, A> {
     #[inline]
     pub const fn id(&self) -> SlotId {
@@ -459,6 +518,44 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     static ARENA: TestArena<{ 1 << 20 }> = TestArena::new();
+
+    #[test]
+    fn reservation_is_unreadable_until_commit_and_blocks_only_its_slot() {
+        let slots = AtomicSlotVec::<u32, _>::try_new_in(2, &ARENA).unwrap();
+        let mut reserved = slots.reserve(7).unwrap();
+        let id = reserved.id();
+        assert_eq!(slots.read(id, |value| *value), Err(SlotAccess::Busy));
+        assert_eq!(slots.try_remove(id), Err(SlotAccess::Busy));
+        let sibling = slots.insert(9).unwrap();
+        assert_eq!(slots.read(sibling, |value| *value), Ok(9));
+        assert!(matches!(slots.reserve(11), Err(11)));
+        *reserved = 8;
+        assert_eq!(reserved.commit(), id);
+        assert_eq!(slots.read(id, |value| *value), Ok(8));
+    }
+
+    #[test]
+    fn cancelled_reservation_drops_affine_value_once_and_retires_identity() {
+        struct Counted<'a>(&'a AtomicUsize);
+        impl Drop for Counted<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let drops = AtomicUsize::new(0);
+        let slots = AtomicSlotVec::<Counted<'_>, _>::try_new_in(1, &ARENA).unwrap();
+        let reserved = slots.reserve(Counted(&drops)).ok().unwrap();
+        let old = reserved.id();
+        drop(reserved);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(slots.len(), 0);
+        let next = slots.reserve(Counted(&drops)).ok().unwrap().commit();
+        assert_eq!(old.index(), next.index());
+        assert_ne!(old.generation(), next.generation());
+        assert_eq!(slots.read(old, |_| ()), Err(SlotAccess::Stale));
+        drop(slots);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn generations_fail_closed_after_reuse() {

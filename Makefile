@@ -40,6 +40,7 @@ cross:
 	    -Z build-std-features=compiler-builtins-mem; \
 	done
 	python3 tools/check-alloc-symbols.py
+	python3 tools/check-heapless.py
 	python3 tools/check-entry.py
 
 miri:

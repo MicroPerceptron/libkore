@@ -32,8 +32,8 @@ mod metal {
         FinalizeExecError, GuestRegionToken, GuestSpaceToken, HeldChanRecvToken, HeldChanSendToken,
         HypervisorToken, ImageStoreToken, LeaseToken, LeasedToken, MappedLeaseView, ObserveToken,
         PeerDmaAccess, PeerWindow, PlatformToken, PowerToken, QuiesceFault, Quiesced, RegionToken,
-        RetireOutcome, RouteToken, StashedLease, SupplyToken, TaskStartOutcome, TaskToken,
-        VirtMemoryToken, XMintToken,
+        RetireOutcome, RouteToken, SharedRamWindow, StashedLease, SupplyToken, TaskStartOutcome,
+        TaskToken, VirtMemoryToken, XMintToken,
     };
 
     #[cfg(any(test, target_os = "none"))]
@@ -44,7 +44,7 @@ mod metal {
         Indeterminate,
     }
 
-    /// Result of a non-consuming lineage probe on a receive endpoint.
+    /// Result of a non-consuming lineage probe on a channel endpoint.
     ///
     /// `Dead` is positive kernel evidence that the endpoint or an ancestor was
     /// revoked. `Live` means a same-kind descendant was derived and then
@@ -56,6 +56,10 @@ mod metal {
         Dead,
         Retryable,
     }
+
+    /// Shared result for either endpoint kind. Preserve the original enum
+    /// name so existing receive-probe callers can still import its variants.
+    pub type ChannelLineage = ChanRecvLineage;
 
     /// Why a direct Found result could not become the caller's exact task
     /// authority.
@@ -182,6 +186,74 @@ mod metal {
         })
     }
 
+    /// Claim and map exact ivshmem-plain BAR2 as coherent shared RAM.  The
+    /// caller supplies neither a BAR number nor cache attributes.
+    #[cfg(target_os = "none")]
+    pub fn map_shared_ram(dev: &DeviceToken) -> Option<SharedRamWindow> {
+        use crate::session::SessionBuilder;
+        use crate::transport::{Transport, TrapTransport};
+        use kore_abi::session::GeomReport;
+
+        let report = crate::entry::geometry::report_slot()?;
+        let mut owned = crate::cap::OwnedSlot::reserve()?;
+        let full = Rights::ACCESS | Rights::MODIFY | Rights::DERIVE | Rights::REVOKE;
+        let mut claim = SessionBuilder::new();
+        claim
+            .claim_shared_ram(dev.slot(), full, owned.slot())
+            .ok()?;
+        let committed = TrapTransport::new().commit_now(&claim).ok()?;
+        if committed.status() != kore_abi::session::Status::Ok {
+            return None;
+        }
+        owned.activate();
+
+        let mut map = SessionBuilder::new();
+        map.map_owned(owned.slot(), Rights::ACCESS | Rights::MODIFY, report)
+            .ok()?;
+        let committed = TrapTransport::new().commit_now(&map).ok()?;
+        if committed.status() != kore_abi::session::Status::Ok {
+            return None;
+        }
+        let ptr =
+            crate::entry::geometry::slot_record_va(report)? as *const kore_abi::cap::CapRecord;
+        let geom = GeomReport::decode(&unsafe { core::ptr::read_volatile(ptr) })?;
+        let len = usize::try_from(geom.len).ok()?;
+        if len == 0 {
+            return None;
+        }
+        Some(SharedRamWindow::new(geom.base as *mut u8, len, owned))
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn map_shared_ram(_dev: &DeviceToken) -> Option<SharedRamWindow> {
+        None
+    }
+
+    /// Why a redacted modern VirtIO PCI layout observation failed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum VirtioPciLayoutError {
+        Unavailable,
+        Build,
+        Transport,
+        Refused(kore_abi::session::Status),
+        MalformedCompletion,
+        MalformedReport,
+    }
+
+    #[cfg(target_os = "none")]
+    #[inline]
+    fn virtio_layout_committed(
+        committed: kore_abi::session::Committed,
+    ) -> Result<(), VirtioPciLayoutError> {
+        if committed.failing_index() != 0 {
+            return Err(VirtioPciLayoutError::MalformedCompletion);
+        }
+        match committed.status() {
+            kore_abi::session::Status::Ok => Ok(()),
+            status => Err(VirtioPciLayoutError::Refused(status)),
+        }
+    }
+
     #[cfg(any(test, target_os = "none"))]
     #[inline]
     fn device_read_committed(
@@ -208,7 +280,7 @@ mod metal {
 
     #[cfg(any(test, target_os = "none"))]
     #[inline]
-    fn classify_chan_recv_probe(committed: kore_abi::session::Committed) -> ChanRecvLineage {
+    fn classify_channel_probe(committed: kore_abi::session::Committed) -> ChannelLineage {
         match (committed.status(), committed.failing_index()) {
             (kore_abi::session::Status::Ok, 0) => ChanRecvLineage::Live,
             (kore_abi::session::Status::Revoked, 0) => ChanRecvLineage::Dead,
@@ -230,6 +302,76 @@ mod metal {
             Status::Revoked | Status::Exited => TaskStartOutcome::Terminal,
             status => TaskStartOutcome::Refused(status),
         }
+    }
+
+    /// Read the authoritative number of validated modern VirtIO PCI
+    /// capability rows on this exact held device.
+    #[cfg(target_os = "none")]
+    pub fn virtio_pci_cap_count(dev: &DeviceToken) -> Result<u8, VirtioPciLayoutError> {
+        use kore_abi::cap::CapRecord;
+        use kore_abi::session::VirtioPciCapCountReport;
+
+        use crate::session::SessionBuilder;
+        use crate::transport::{Transport, TrapTransport};
+
+        let report_slot =
+            crate::entry::geometry::report_slot().ok_or(VirtioPciLayoutError::Unavailable)?;
+        let mut builder = SessionBuilder::new();
+        builder
+            .read_virtio_pci_cap_count(dev.slot(), report_slot)
+            .map_err(|_| VirtioPciLayoutError::Build)?;
+        let committed = TrapTransport::new()
+            .commit_now(&builder)
+            .map_err(|_| VirtioPciLayoutError::Transport)?;
+        virtio_layout_committed(committed)?;
+        let ptr = crate::entry::geometry::slot_record_va(report_slot)
+            .ok_or(VirtioPciLayoutError::Unavailable)? as *const CapRecord;
+        VirtioPciCapCountReport::decode(&unsafe { core::ptr::read_volatile(ptr) })
+            .map(|report| report.len)
+            .ok_or(VirtioPciLayoutError::MalformedReport)
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn virtio_pci_cap_count(_dev: &DeviceToken) -> Result<u8, VirtioPciLayoutError> {
+        Err(VirtioPciLayoutError::Unavailable)
+    }
+
+    /// Read one BAR-relative modern VirtIO PCI capability row. The returned
+    /// value is data only; mapping the named BAR remains a separate affine
+    /// capability operation.
+    #[cfg(target_os = "none")]
+    pub fn virtio_pci_cap(
+        dev: &DeviceToken,
+        index: u8,
+    ) -> Result<kore_abi::session::VirtioPciCapReport, VirtioPciLayoutError> {
+        use kore_abi::cap::CapRecord;
+        use kore_abi::session::VirtioPciCapReport;
+
+        use crate::session::SessionBuilder;
+        use crate::transport::{Transport, TrapTransport};
+
+        let report_slot =
+            crate::entry::geometry::report_slot().ok_or(VirtioPciLayoutError::Unavailable)?;
+        let mut builder = SessionBuilder::new();
+        builder
+            .read_virtio_pci_cap(dev.slot(), index, report_slot)
+            .map_err(|_| VirtioPciLayoutError::Build)?;
+        let committed = TrapTransport::new()
+            .commit_now(&builder)
+            .map_err(|_| VirtioPciLayoutError::Transport)?;
+        virtio_layout_committed(committed)?;
+        let ptr = crate::entry::geometry::slot_record_va(report_slot)
+            .ok_or(VirtioPciLayoutError::Unavailable)? as *const CapRecord;
+        VirtioPciCapReport::decode(&unsafe { core::ptr::read_volatile(ptr) })
+            .ok_or(VirtioPciLayoutError::MalformedReport)
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn virtio_pci_cap(
+        _dev: &DeviceToken,
+        _index: u8,
+    ) -> Result<kore_abi::session::VirtioPciCapReport, VirtioPciLayoutError> {
+        Err(VirtioPciLayoutError::Unavailable)
     }
 
     /// Validate the kernel's arena-extension geometry before any userland
@@ -1238,6 +1380,100 @@ mod metal {
         Ok(TaskToken::possess_owned(handle, id, rights))
     }
 
+    /// Found a bounded SMP cohort through one guest Found tail. Every task is
+    /// dormant on return; the caller retains the shared-space owner until all
+    /// task handles have completed teardown. No compute barrier or join fold
+    /// participates in guest execution.
+    pub fn found_guest_cohort(
+        space: &GuestSpaceToken,
+        inputs: heapless::Vec<
+            (kore_abi::guest::GuestVcpuConfig, GuestVcpuInputs),
+            { kore_abi::session::MAX_SESSION_FOUNDS },
+        >,
+    ) -> Result<
+        heapless::Vec<TaskToken, { kore_abi::session::MAX_SESSION_FOUNDS }>,
+        kore_abi::session::Status,
+    > {
+        use kore_abi::session::Status;
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (space, inputs);
+            Err(Status::Denied)
+        }
+        #[cfg(target_os = "none")]
+        {
+            use crate::session::SessionBuilder;
+            use crate::transport::{Transport, TrapTransport};
+            if inputs.is_empty() {
+                return Err(Status::Malformed);
+            }
+            let mut handles = heapless::Vec::<_, { kore_abi::session::MAX_SESSION_FOUNDS }>::new();
+            let mut request = SessionBuilder::new();
+            for (cfg, input) in &inputs {
+                let handle = crate::cap::OwnedSlot::reserve().ok_or(Status::Unfounded)?;
+                request
+                    .found_guest(
+                        space.slot(),
+                        cfg.entry,
+                        cfg.stack,
+                        cfg.page_table_root,
+                        input.window.slot().ok_or(Status::Malformed)?,
+                        input.resume_recv.slot(),
+                        input.exit_send.slot(),
+                        handle.slot(),
+                    )
+                    .map_err(|_| Status::Malformed)?;
+                let _ = handles.push(handle);
+            }
+            let committed = match TrapTransport::new().commit_now(&request) {
+                Ok(committed) => committed,
+                Err(_) => {
+                    for handle in &mut handles {
+                        handle.quarantine_unknown_publish();
+                    }
+                    return Err(Status::Malformed);
+                }
+            };
+            if committed.raw() as u16 > Status::AltDelivery as u16
+                || (committed.status() == Status::Ok && committed.failing_index() != 0)
+            {
+                for handle in &mut handles {
+                    handle.quarantine_unknown_publish();
+                }
+                return Err(Status::Malformed);
+            }
+            if committed.status() != Status::Ok {
+                return Err(committed.status());
+            }
+            // Authenticate the WHOLE result before surrendering any local
+            // input owner. Malformed/unknown publication never frees a slot
+            // whose custody might have changed.
+            let mut records = heapless::Vec::<_, { kore_abi::session::MAX_SESSION_FOUNDS }>::new();
+            for handle in &handles {
+                match task_record(handle.slot()) {
+                    Some((id, rights)) if rights == crate::cap::GUEST_VCPU_HANDLE_RIGHTS => {
+                        let _ = records.push((id, rights));
+                    }
+                    _ => {
+                        for handle in &mut handles {
+                            handle.quarantine_unknown_publish();
+                        }
+                        return Err(Status::Malformed);
+                    }
+                }
+            }
+            let mut tasks = heapless::Vec::new();
+            for (((_, input), handle), (id, rights)) in inputs.into_iter().zip(handles).zip(records)
+            {
+                input.window.release_after_proven_move();
+                input.resume_recv.release_after_proven_move();
+                input.exit_send.release_after_proven_move();
+                let _ = tasks.push(TaskToken::possess_owned(handle, id, rights));
+            }
+            Ok(tasks)
+        }
+    }
+
     #[cfg(not(target_os = "none"))]
     pub fn found_guest_vcpu(
         _space: &GuestSpaceToken,
@@ -1334,8 +1570,8 @@ mod metal {
     /// Three dynamic arena names are reserved first. The staged SSA handles
     /// stay entirely inside this function; on commit each becomes an affine
     /// typed owner coupled to its reservation, on a proved refusal all three
-    /// reservations reopen, and an impossible completion quarantines all
-    /// three rather than guessing at occupancy.
+    /// reservations reopen, and an uncertain completion returns cleanup-only
+    /// custody of all three names rather than guessing at occupancy.
     #[cfg(target_os = "none")]
     pub fn mint_channel(space: &ChannelSpaceToken) -> Result<ChannelPair, ChannelMintError> {
         mint_channel_with_rights(
@@ -1367,9 +1603,9 @@ mod metal {
             return Err(ChannelMintError::InvalidRights);
         }
 
-        let mut root = crate::cap::OwnedSlot::reserve().ok_or(ChannelMintError::NoSlots)?;
-        let mut send = crate::cap::OwnedSlot::reserve().ok_or(ChannelMintError::NoSlots)?;
-        let mut recv = crate::cap::OwnedSlot::reserve().ok_or(ChannelMintError::NoSlots)?;
+        let root = crate::cap::OwnedSlot::reserve().ok_or(ChannelMintError::NoSlots)?;
+        let send = crate::cap::OwnedSlot::reserve().ok_or(ChannelMintError::NoSlots)?;
+        let recv = crate::cap::OwnedSlot::reserve().ok_or(ChannelMintError::NoSlots)?;
 
         let mut b = SessionBuilder::new();
         let staged_root = b
@@ -1380,9 +1616,12 @@ mod metal {
         b.derive_chan_recv(staged_root, recv_rights, recv.slot())
             .map_err(ChannelMintError::Build)?;
 
+        // This concrete transport returns TrapUnavailable only before the
+        // syscall. Unlike an arbitrary Transport error, it proves no result
+        // was published; the reservations may drop in their Reserved state.
         let committed = TrapTransport::new()
             .commit_now(&b)
-            .map_err(|_| ChannelMintError::Transport)?;
+            .map_err(|_| ChannelMintError::NotIssued)?;
         match classify_channel_mint(committed) {
             ChannelMintCompletion::Committed => Ok(ChannelPair::from_reserved_with_rights(
                 root,
@@ -1392,71 +1631,81 @@ mod metal {
                 recv_rights,
             )),
             ChannelMintCompletion::RolledBack(status) => Err(ChannelMintError::Refused(status)),
-            ChannelMintCompletion::Indeterminate => {
-                root.quarantine_unknown_publish();
-                send.quarantine_unknown_publish();
-                recv.quarantine_unknown_publish();
-                Err(ChannelMintError::MalformedCompletion)
-            }
+            ChannelMintCompletion::Indeterminate => Err(ChannelMintError::Uncertain(
+                crate::cap::UncertainChannel::new(root, send, recv),
+            )),
         }
     }
 
-    /// Probe whether a held receive endpoint's complete lineage is still live
-    /// without revoking the endpoint itself.
-    ///
-    /// A successful same-kind derive proves the parent live; the temporary
-    /// descendant is immediately retired before returning. A `Revoked`
-    /// refusal on that derive proves an ancestor died. This is the cleanup
-    /// witness used when a launcher must reconcile remote resources after a
-    /// caller-owned `TaskToken` reaps a child, without retaining a second task
-    /// handle or consuming a still-running child's canary.
-    #[cfg(target_os = "none")]
+    /// Probe a receive endpoint without consuming its parent. Only a kernel
+    /// `Revoked` refusal proves closure; local arena metadata does not.
     pub fn probe_chan_recv_lineage(parent: SlotRef) -> ChanRecvLineage {
+        probe_channel_lineage(parent, true)
+    }
+
+    /// Probe a send endpoint's lineage without sending a notice or revoking
+    /// the endpoint. This also accepts non-delegable canaries: a live one
+    /// refuses derivation and returns `Retryable`, while the kernel's earlier
+    /// held-subject bind proves `Dead` after ancestor revocation. Never widen
+    /// a filesystem binder's authority merely to obtain a cleanup witness.
+    pub fn probe_chan_send_lineage(parent: SlotRef) -> ChannelLineage {
+        probe_channel_lineage(parent, false)
+    }
+
+    #[cfg(target_os = "none")]
+    fn probe_channel_lineage(parent: SlotRef, receive: bool) -> ChannelLineage {
         use crate::session::SessionBuilder;
         use crate::transport::{Transport, TrapTransport};
 
         let Some(mut child) = crate::cap::OwnedSlot::reserve() else {
-            return ChanRecvLineage::Retryable;
+            return ChannelLineage::Retryable;
         };
         let mut probe = SessionBuilder::new();
-        let Ok(staged) =
+        let staged = if receive {
             probe.derive_chan_recv(parent, crate::cap::CHANNEL_ENDPOINT_RIGHTS, child.slot())
-        else {
-            return ChanRecvLineage::Retryable;
+        } else {
+            probe.derive_chan_send(parent, Rights::ACCESS | Rights::REVOKE, child.slot())
         };
-        // The probe result is a transactional witness only. Kill it in the
-        // same session so a live-parent probe cannot accumulate descendants;
-        // the local result name is then settled as AlreadyDead below.
+        let Ok(staged) = staged else {
+            return ChannelLineage::Retryable;
+        };
+        // Retire any temporary descendant in the same atomic session. A
+        // failed held-subject bind or denied derive publishes nothing.
         if probe.revoke(staged.into()).is_err() {
-            return ChanRecvLineage::Retryable;
+            return ChannelLineage::Retryable;
         }
         let Ok(committed) = TrapTransport::new().commit_now(&probe) else {
             child.quarantine_unknown_publish();
-            return ChanRecvLineage::Retryable;
+            return ChannelLineage::Retryable;
         };
-        match classify_chan_recv_probe(committed) {
-            ChanRecvLineage::Live => {
-                let owner = ChanRecvToken::new(child);
-                match owner.try_retire() {
-                    Ok(_) => ChanRecvLineage::Live,
-                    Err(_) => ChanRecvLineage::Retryable,
+        match classify_channel_probe(committed) {
+            ChannelLineage::Live => {
+                let retired = if receive {
+                    ChanRecvToken::new(child).try_retire().is_ok()
+                } else {
+                    ChanSendToken::new(child).try_retire().is_ok()
+                };
+                if retired {
+                    ChannelLineage::Live
+                } else {
+                    ChannelLineage::Retryable
                 }
             }
-            ChanRecvLineage::Dead => ChanRecvLineage::Dead,
-            ChanRecvLineage::Retryable => {
+            ChannelLineage::Dead => ChannelLineage::Dead,
+            ChannelLineage::Retryable => {
                 if committed.failing_index() != 0
                     || committed.raw() as u16 > kore_abi::session::Status::AltDelivery as u16
                 {
                     child.quarantine_unknown_publish();
                 }
-                ChanRecvLineage::Retryable
+                ChannelLineage::Retryable
             }
         }
     }
 
     #[cfg(not(target_os = "none"))]
-    pub fn probe_chan_recv_lineage(_parent: SlotRef) -> ChanRecvLineage {
-        ChanRecvLineage::Retryable
+    fn probe_channel_lineage(_parent: SlotRef, _receive: bool) -> ChannelLineage {
+        ChannelLineage::Retryable
     }
 
     /// Derive one locally retained endpoint below `source`.
@@ -1470,99 +1719,123 @@ mod metal {
         derive_owned_chan_send_with_rights(source, crate::cap::CHANNEL_ENDPOINT_RIGHTS)
     }
 
-    /// Derive one locally retained, explicitly attenuated send endpoint.
-    ///
-    /// A nonempty subset of the channel endpoint vocabulary is valid. In
-    /// particular, a `DERIVE | REVOKE` endpoint is a delegation pivot or
-    /// lineage selector but cannot itself rendezvous: the kernel independently
-    /// requires `ACCESS` when a send endpoint is used by `Rendezvous`. The
-    /// kernel also authenticates that the held source owns `DERIVE`; this
-    /// local validation only keeps empty or foreign-rights shapes out of the
-    /// session.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum EndpointDeriveRefusal {
+        Unavailable,
+        /// The concrete native transport returned before issuing a syscall.
+        NotIssued,
+        Rights,
+        Capacity,
+        Build,
+        Kernel(kore_abi::session::Status),
+    }
+
+    #[derive(Debug)]
+    pub enum EndpointDeriveError {
+        Refused(EndpointDeriveRefusal),
+        Uncertain(crate::cap::UncertainLocalCapability),
+    }
+
+    #[cfg(any(test, target_os = "none"))]
+    fn valid_endpoint_derivation(rights: Rights, receive: bool) -> bool {
+        valid_channel_endpoint_derivation_rights(rights)
+            && (!receive || rights.contains(Rights::ACCESS))
+    }
+
+    /// Derive a retained endpoint with explicit completion custody. Unknown
+    /// outcomes never expose a usable endpoint or reopen its fresh arena name.
     #[cfg(target_os = "none")]
+    fn derive_owned_endpoint(
+        source: SlotRef,
+        rights: Rights,
+        receive: bool,
+    ) -> Result<crate::cap::OwnedSlot, EndpointDeriveError> {
+        use crate::session::SessionBuilder;
+        use crate::transport::{Transport, TrapTransport};
+        let refused = EndpointDeriveError::Refused;
+        if !valid_endpoint_derivation(rights, receive) {
+            return Err(refused(EndpointDeriveRefusal::Rights));
+        }
+        let owned =
+            crate::cap::OwnedSlot::reserve().ok_or(refused(EndpointDeriveRefusal::Capacity))?;
+        let mut session = SessionBuilder::new();
+        if receive {
+            session.derive_chan_recv(source, rights, owned.slot())
+        } else {
+            session.derive_chan_send(source, rights, owned.slot())
+        }
+        .map_err(|_| refused(EndpointDeriveRefusal::Build))?;
+        let committed = TrapTransport::new()
+            .commit_now(&session)
+            .map_err(|_| refused(EndpointDeriveRefusal::NotIssued))?;
+        match classify_local_result(committed) {
+            Some(Ok(())) => Ok(owned),
+            Some(Err(status)) => Err(refused(EndpointDeriveRefusal::Kernel(status))),
+            None => Err(EndpointDeriveError::Uncertain(
+                crate::cap::UncertainLocalCapability::new(owned),
+            )),
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    pub fn derive_owned_chan_send_outcome(
+        source: SlotRef,
+        rights: Rights,
+    ) -> Result<ChanSendToken, EndpointDeriveError> {
+        derive_owned_endpoint(source, rights, false)
+            .map(|owned| ChanSendToken::new_with_rights(owned, rights))
+    }
+
+    #[cfg(target_os = "none")]
+    pub fn derive_owned_chan_recv_outcome(
+        source: SlotRef,
+        rights: Rights,
+    ) -> Result<ChanRecvToken, EndpointDeriveError> {
+        derive_owned_endpoint(source, rights, true)
+            .map(|owned| ChanRecvToken::new_with_rights(owned, rights))
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn derive_owned_chan_send_outcome(
+        _source: SlotRef,
+        _rights: kore_abi::cap::Rights,
+    ) -> Result<ChanSendToken, EndpointDeriveError> {
+        Err(EndpointDeriveError::Refused(
+            EndpointDeriveRefusal::Unavailable,
+        ))
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn derive_owned_chan_recv_outcome(
+        _source: SlotRef,
+        _rights: kore_abi::cap::Rights,
+    ) -> Result<ChanRecvToken, EndpointDeriveError> {
+        Err(EndpointDeriveError::Refused(
+            EndpointDeriveRefusal::Unavailable,
+        ))
+    }
+
+    /// Compatibility convenience. Send rights may be any nonempty endpoint
+    /// subset, including a non-invoking DERIVE/REVOKE pivot. Native possession
+    /// of DERIVE on the source remains required by the kernel.
     pub fn derive_owned_chan_send_with_rights(
         source: SlotRef,
         rights: kore_abi::cap::Rights,
     ) -> Option<ChanSendToken> {
-        use crate::session::SessionBuilder;
-        use crate::transport::{Transport, TrapTransport};
-
-        if !valid_channel_endpoint_derivation_rights(rights) {
-            return None;
-        }
-
-        let mut owned = crate::cap::OwnedSlot::reserve()?;
-        let mut session = SessionBuilder::new();
-        session
-            .derive_chan_send(source, rights, owned.slot())
-            .ok()?;
-        let committed = TrapTransport::new().commit_now(&session).ok()?;
-        if committed.status() == kore_abi::session::Status::Ok && committed.failing_index() == 0 {
-            return Some(ChanSendToken::new_with_rights(owned, rights));
-        }
-        // A normal refusal rolled the only derive back, so the still-reserved
-        // name safely reopens on drop. An unfamiliar completion cannot prove
-        // rollback and must remain quarantined.
-        if committed.failing_index() != 0
-            || committed.raw() as u16 > kore_abi::session::Status::AltDelivery as u16
-        {
-            owned.quarantine_unknown_publish();
-        }
-        None
+        derive_owned_chan_send_outcome(source, rights).ok()
     }
 
-    /// Receive-end counterpart of [`derive_owned_chan_send_with_rights`].
-    /// The caller retains `source` as the revocation pivot and owns exactly
-    /// one fresh attenuated descendant suitable for an exact rendezvous move.
-    #[cfg(target_os = "none")]
+    /// Receive endpoints additionally require ACCESS. Use the outcome form
+    /// when the caller must retain an uncertain result for repeated cleanup.
     pub fn derive_owned_chan_recv_with_rights(
         source: SlotRef,
         rights: kore_abi::cap::Rights,
     ) -> Option<ChanRecvToken> {
-        use crate::session::SessionBuilder;
-        use crate::transport::{Transport, TrapTransport};
-
-        if !rights.contains(kore_abi::cap::Rights::ACCESS)
-            || !crate::cap::CHANNEL_ENDPOINT_RIGHTS.contains(rights)
-        {
-            return None;
-        }
-
-        let mut owned = crate::cap::OwnedSlot::reserve()?;
-        let mut session = SessionBuilder::new();
-        session
-            .derive_chan_recv(source, rights, owned.slot())
-            .ok()?;
-        let committed = TrapTransport::new().commit_now(&session).ok()?;
-        if committed.status() == kore_abi::session::Status::Ok && committed.failing_index() == 0 {
-            return Some(ChanRecvToken::new_with_rights(owned, rights));
-        }
-        if committed.failing_index() != 0
-            || committed.raw() as u16 > kore_abi::session::Status::AltDelivery as u16
-        {
-            owned.quarantine_unknown_publish();
-        }
-        None
+        derive_owned_chan_recv_outcome(source, rights).ok()
     }
 
     #[cfg(not(target_os = "none"))]
     pub fn derive_owned_chan_send(_source: SlotRef) -> Option<ChanSendToken> {
-        None
-    }
-
-    #[cfg(not(target_os = "none"))]
-    pub fn derive_owned_chan_send_with_rights(
-        _source: SlotRef,
-        _rights: kore_abi::cap::Rights,
-    ) -> Option<ChanSendToken> {
-        None
-    }
-
-    #[cfg(not(target_os = "none"))]
-    pub fn derive_owned_chan_recv_with_rights(
-        _source: SlotRef,
-        _rights: kore_abi::cap::Rights,
-    ) -> Option<ChanRecvToken> {
         None
     }
 
@@ -3073,24 +3346,46 @@ mod metal {
         }
     }
 
-    /// Map a complete held lease R/W at the kernel-selected address while
-    /// retaining an exact-unshare owner. The parent lease must remain held
-    /// until this view closes; no caller-selected VA or second mapping occurs.
+    /// Map a complete lease at the kernel-selected address with explicit
+    /// ownership of both successful and uncertain native results.
     #[cfg(target_os = "none")]
-    pub fn map_owned_lease_rw(lease: SlotRef) -> Option<MappedLeaseView> {
-        map_named_cpu_view(lease, crate::entry::geometry::report_slot()?).ok()
+    pub fn map_owned_lease_rw_outcome(lease: SlotRef) -> Result<MappedLeaseView, LeaseMapError> {
+        let report = crate::entry::geometry::report_slot()
+            .ok_or(LeaseMapError::Refused(LeaseMapRefusal::Geometry))?;
+        map_named_cpu_view_outcome(lease, report)
     }
 
     #[cfg(not(target_os = "none"))]
-    pub fn map_owned_lease_rw(_lease: SlotRef) -> Option<MappedLeaseView> {
-        None
+    pub fn map_owned_lease_rw_outcome(_lease: SlotRef) -> Result<MappedLeaseView, LeaseMapError> {
+        Err(LeaseMapError::Refused(LeaseMapRefusal::Unavailable))
+    }
+
+    /// Compatibility convenience; retained owners should use the outcome API.
+    pub fn map_owned_lease_rw(lease: SlotRef) -> Option<MappedLeaseView> {
+        map_owned_lease_rw_outcome(lease).ok()
     }
 
     #[cfg(target_os = "none")]
     fn map_named_cpu_view(lease: SlotRef, report: SlotRef) -> Result<MappedLeaseView, DmaMapFault> {
+        map_named_cpu_view_outcome(lease, report).map_err(|error| match error {
+            LeaseMapError::Refused(LeaseMapRefusal::Capacity) => DmaMapFault::Slot,
+            LeaseMapError::Refused(LeaseMapRefusal::Kernel(status)) => {
+                DmaMapFault::Map(status as u8)
+            }
+            LeaseMapError::Refused(LeaseMapRefusal::Geometry) => DmaMapFault::Geometry,
+            _ => DmaMapFault::Map(0),
+        })
+    }
+
+    #[cfg(target_os = "none")]
+    fn map_named_cpu_view_outcome(
+        lease: SlotRef,
+        report: SlotRef,
+    ) -> Result<MappedLeaseView, LeaseMapError> {
         use crate::session::SessionBuilder;
         use crate::transport::{Transport, TrapTransport};
-        let mut owner = crate::cap::OwnedSlot::reserve().ok_or(DmaMapFault::Slot)?;
+        let refused = LeaseMapError::Refused;
+        let owner = crate::cap::OwnedSlot::reserve().ok_or(refused(LeaseMapRefusal::Capacity))?;
         let mut map = SessionBuilder::new();
         let view = map
             .map_owned_named(
@@ -3098,18 +3393,20 @@ mod metal {
                 Rights::ACCESS | Rights::MODIFY | Rights::REVOKE,
                 owner.slot(),
             )
-            .map_err(|_| DmaMapFault::Map(0))?;
+            .map_err(|_| refused(LeaseMapRefusal::Build))?;
         map.cpu_view_geometry(view, report)
-            .map_err(|_| DmaMapFault::Map(0))?;
-        let committed = match TrapTransport::new().commit_now(&map) {
-            Ok(committed) => committed,
-            Err(_) => {
-                owner.quarantine_unknown_publish();
-                return Err(DmaMapFault::Map(0));
+            .map_err(|_| refused(LeaseMapRefusal::Build))?;
+        let committed = TrapTransport::new()
+            .commit_now(&map)
+            .map_err(|_| refused(LeaseMapRefusal::NotIssued))?;
+        match classify_named_map_result(committed) {
+            Some(Ok(())) => {}
+            Some(Err(status)) => return Err(refused(LeaseMapRefusal::Kernel(status))),
+            None => {
+                return Err(LeaseMapError::Uncertain(
+                    crate::cap::UncertainLeaseMap::new(owner, lease),
+                ));
             }
-        };
-        if committed.status() != kore_abi::session::Status::Ok {
-            return Err(DmaMapFault::Map(committed.status() as u8));
         }
         let geometry = crate::entry::geometry::slot_record_va(report)
             .and_then(|ptr| {
@@ -3117,17 +3414,33 @@ mod metal {
                     core::ptr::read_volatile(ptr as *const kore_abi::cap::CapRecord)
                 })
             })
-            .and_then(|g| {
-                let base = NonNull::new(usize::try_from(g.base).ok()? as *mut u8)?;
-                let len = usize::try_from(g.len).ok()?;
-                (len != 0 && g.base.checked_add(g.len).is_some()).then_some((base, len))
-            });
+            .and_then(named_map_geometry);
         let Some((base, len)) = geometry else {
-            // Publication happened, so a missing report cannot free this name.
-            owner.quarantine_unknown_publish();
-            return Err(DmaMapFault::Geometry);
+            // The view was published; retain exact-unshare custody even when
+            // its geometry cannot safely become a userspace byte accessor.
+            return Err(LeaseMapError::Uncertain(
+                crate::cap::UncertainLeaseMap::new(owner, lease),
+            ));
         };
         Ok(MappedLeaseView::new(owner, lease, base, len))
+    }
+
+    #[cfg(any(test, target_os = "none"))]
+    fn classify_named_map_result(
+        committed: kore_abi::session::Committed,
+    ) -> Option<Result<(), kore_abi::session::Status>> {
+        classify_local_results(committed, 2)
+    }
+
+    #[cfg(any(test, target_os = "none"))]
+    fn named_map_geometry(g: kore_abi::session::GeomReport) -> Option<(NonNull<u8>, usize)> {
+        let base = NonNull::new(usize::try_from(g.base).ok()? as *mut u8)?;
+        let len = usize::try_from(g.len).ok()?;
+        (len != 0
+            && g.base % 4096 == 0
+            && g.len % 4096 == 0
+            && usize::try_from(g.base.checked_add(g.len)?).is_ok())
+        .then_some((base, len))
     }
 
     /// Pool storage is initialized before publication; imported storage belongs
@@ -4077,19 +4390,101 @@ mod metal {
         None
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LeaseMapRefusal {
+        Unavailable,
+        /// The concrete native transport returned before issuing a syscall.
+        NotIssued,
+        Geometry,
+        Bounds,
+        Capacity,
+        Build,
+        Kernel(kore_abi::session::Status),
+    }
+
+    #[derive(Debug)]
+    pub enum LeaseMapError {
+        Refused(LeaseMapRefusal),
+        Uncertain(crate::cap::UncertainLeaseMap),
+    }
+
+    #[cfg(any(test, target_os = "none"))]
+    fn classify_local_result(
+        committed: kore_abi::session::Committed,
+    ) -> Option<Result<(), kore_abi::session::Status>> {
+        classify_local_results(committed, 1)
+    }
+
+    /// These sessions contain only nonparking local operations. A refusal
+    /// proves rollback only when its invocation index belongs to this session.
+    #[cfg(any(test, target_os = "none"))]
+    fn classify_local_results(
+        committed: kore_abi::session::Committed,
+        invocations: u16,
+    ) -> Option<Result<(), kore_abi::session::Status>> {
+        if invocations == 0 {
+            return None;
+        }
+        match (committed.raw() as u16, committed.failing_index()) {
+            (0, 0) => Some(Ok(())),
+            (1..=6, index) if index < invocations => Some(Err(committed.status())),
+            _ => None,
+        }
+    }
+
+    /// Whole-lease R/W mapping with explicit custody on an unknown result.
+    /// Keep the parent and address reservation until either the view or the
+    /// returned uncertain owner has confirmed exact unshare.
+    #[cfg(target_os = "none")]
+    pub fn map_owned_lease_at_rw_outcome(
+        lease: SlotRef,
+        va: u64,
+        len: u64,
+    ) -> Result<MappedLeaseView, LeaseMapError> {
+        map_owned_whole_lease_at(
+            lease,
+            va,
+            len,
+            kore_abi::session::SHARE_ACCESS_R | kore_abi::session::SHARE_ACCESS_W,
+        )
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn map_owned_lease_at_rw_outcome(
+        _lease: SlotRef,
+        _va: u64,
+        _len: u64,
+    ) -> Result<MappedLeaseView, LeaseMapError> {
+        Err(LeaseMapError::Refused(LeaseMapRefusal::Unavailable))
+    }
+
     /// Map one complete held lease read-only at a caller-selected VA. `len`
     /// must equal the lease's kernel-reported length; subrange callers must
     /// first carve an exact lease. The affine result exact-unshares its PTE
     /// before its slot may be reused. Unlike [`map_held`], this does not touch
     /// the monotone receiver-map cursor.
     #[cfg(target_os = "none")]
-    pub fn map_owned_lease_at(lease: SlotRef, va: u64, len: u64) -> Option<MappedLeaseView> {
-        try_map_owned_whole_lease_at(lease, va, len, kore_abi::session::SHARE_ACCESS_R).ok()
+    pub fn map_owned_lease_at_outcome(
+        lease: SlotRef,
+        va: u64,
+        len: u64,
+    ) -> Result<MappedLeaseView, LeaseMapError> {
+        map_owned_whole_lease_at(lease, va, len, kore_abi::session::SHARE_ACCESS_R)
     }
 
     #[cfg(not(target_os = "none"))]
-    pub fn map_owned_lease_at(_lease: SlotRef, _va: u64, _len: u64) -> Option<MappedLeaseView> {
-        None
+    pub fn map_owned_lease_at_outcome(
+        _lease: SlotRef,
+        _va: u64,
+        _len: u64,
+    ) -> Result<MappedLeaseView, LeaseMapError> {
+        Err(LeaseMapError::Refused(LeaseMapRefusal::Unavailable))
+    }
+
+    /// Compatibility convenience. Persistent callers retain uncertain cleanup
+    /// custody through [`map_owned_lease_at_outcome`].
+    pub fn map_owned_lease_at(lease: SlotRef, va: u64, len: u64) -> Option<MappedLeaseView> {
+        map_owned_lease_at_outcome(lease, va, len).ok()
     }
 
     /// [`map_owned_lease_at`]'s **writable** whole-lease sibling. This is the
@@ -4098,7 +4493,7 @@ mod metal {
     /// the childless root. Σ5 still gates `W` through `MODIFY`.
     #[cfg(target_os = "none")]
     pub fn map_owned_lease_at_rw(lease: SlotRef, va: u64, len: u64) -> Option<MappedLeaseView> {
-        try_map_owned_lease_at_rw(lease, va, len).ok()
+        map_owned_lease_at_rw_outcome(lease, va, len).ok()
     }
 
     /// Map one complete finalized lease R/X at a caller-selected VA. The
@@ -4175,17 +4570,23 @@ mod metal {
         va: u64,
         len: u64,
         access: u8,
-    ) -> Option<MappedLeaseView> {
+    ) -> Result<MappedLeaseView, LeaseMapError> {
         use crate::session::SessionBuilder;
         use crate::transport::{Transport, TrapTransport};
-
-        let (_, lease_len) = lease_geometry(lease)?;
-        if len == 0 || len != lease_len {
-            return None;
+        let refused = LeaseMapError::Refused;
+        if va == 0 || va % 4096 != 0 || len == 0 || len % 4096 != 0 || va.checked_add(len).is_none()
+        {
+            return Err(refused(LeaseMapRefusal::Bounds));
         }
-        let len_usize = usize::try_from(len).ok()?;
-        let base = NonNull::new(usize::try_from(va).ok()? as *mut u8)?;
-        let mut b = SessionBuilder::new();
+        let (_, lease_len) = lease_geometry(lease).ok_or(refused(LeaseMapRefusal::Geometry))?;
+        if len != lease_len {
+            return Err(refused(LeaseMapRefusal::Bounds));
+        }
+        let len_usize = usize::try_from(len).map_err(|_| refused(LeaseMapRefusal::Bounds))?;
+        let base = NonNull::new(
+            usize::try_from(va).map_err(|_| refused(LeaseMapRefusal::Bounds))? as *mut u8,
+        )
+        .ok_or(refused(LeaseMapRefusal::Bounds))?;
         if access
             & !(kore_abi::session::SHARE_ACCESS_R
                 | kore_abi::session::SHARE_ACCESS_W
@@ -4195,19 +4596,37 @@ mod metal {
             || access & kore_abi::session::SHARE_ACCESS_W != 0
                 && access & kore_abi::session::SHARE_ACCESS_X != 0
         {
-            return None;
+            return Err(refused(LeaseMapRefusal::Build));
         }
+        let mut b = SessionBuilder::new();
         let mut rights = Rights::ACCESS | Rights::REVOKE;
         if access & kore_abi::session::SHARE_ACCESS_W != 0 {
             rights |= Rights::MODIFY;
         }
         b.share_cpu_access(lease, rights, va, len, access, owned.slot())
-            .ok()?;
-        let committed = TrapTransport::new().commit_now(&b).ok()?;
-        if committed.status() != kore_abi::session::Status::Ok {
-            return None;
+            .map_err(|_| refused(LeaseMapRefusal::Build))?;
+        let committed = TrapTransport::new()
+            .commit_now(&b)
+            .map_err(|_| refused(LeaseMapRefusal::NotIssued))?;
+        match classify_local_result(committed) {
+            Some(Ok(())) => Ok(MappedLeaseView::new(owned, lease, base, len_usize)),
+            Some(Err(reason)) => Err(refused(LeaseMapRefusal::Kernel(reason))),
+            None => Err(LeaseMapError::Uncertain(
+                crate::cap::UncertainLeaseMap::new(owned, lease),
+            )),
         }
-        Some(MappedLeaseView::new(owned, lease, base, len_usize))
+    }
+
+    #[cfg(target_os = "none")]
+    fn map_owned_whole_lease_at(
+        lease: SlotRef,
+        va: u64,
+        len: u64,
+        access: u8,
+    ) -> Result<MappedLeaseView, LeaseMapError> {
+        let owned = crate::cap::OwnedSlot::reserve()
+            .ok_or(LeaseMapError::Refused(LeaseMapRefusal::Capacity))?;
+        map_owned_whole_lease_in(owned, lease, va, len, access)
     }
 
     /// Reserve the arena slot, then map — the seam that separates "no slot"
@@ -4220,7 +4639,8 @@ mod metal {
         access: u8,
     ) -> Result<MappedLeaseView, LeaseWindowFault> {
         let owned = crate::cap::OwnedSlot::reserve().ok_or(LeaseWindowFault::Slot)?;
-        map_owned_whole_lease_in(owned, lease, va, len, access).ok_or(LeaseWindowFault::Refused)
+        map_owned_whole_lease_in(owned, lease, va, len, access)
+            .map_err(|_| LeaseWindowFault::Refused)
     }
 
     /// [`map_owned_lease_at_rw`] with the refusal named.
@@ -4287,6 +4707,68 @@ mod metal {
         false
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LeaseCarveRefusal {
+        Unavailable,
+        /// The concrete native transport returned before issuing a syscall.
+        NotIssued,
+        Bounds,
+        Capacity,
+        Build,
+        Kernel(kore_abi::session::Status),
+    }
+
+    #[derive(Debug)]
+    pub enum LeaseCarveError {
+        Refused(LeaseCarveRefusal),
+        Uncertain(crate::cap::UncertainLocalCapability),
+    }
+
+    /// Carve a lease while preserving its fresh local result on an unknown
+    /// completion. The error owner is cleanup-only and cannot grant access.
+    #[cfg(target_os = "none")]
+    pub fn carve_owned_lease_window_outcome(
+        subject: SlotRef,
+        offset: u64,
+        len: u64,
+    ) -> Result<StashedLease, LeaseCarveError> {
+        use crate::session::SessionBuilder;
+        use crate::transport::{Transport, TrapTransport};
+        let refused = LeaseCarveError::Refused;
+        if len == 0 || offset.checked_add(len).is_none() {
+            return Err(refused(LeaseCarveRefusal::Bounds));
+        }
+        let owned = crate::cap::OwnedSlot::reserve().ok_or(refused(LeaseCarveRefusal::Capacity))?;
+        let mut b = SessionBuilder::new();
+        b.carve_sublease(
+            subject,
+            Rights::ACCESS | Rights::MODIFY | Rights::DERIVE | Rights::REVOKE,
+            offset,
+            len,
+            owned.slot(),
+        )
+        .map_err(|_| refused(LeaseCarveRefusal::Build))?;
+        let committed = TrapTransport::new()
+            .commit_now(&b)
+            .map_err(|_| refused(LeaseCarveRefusal::NotIssued))?;
+        match classify_local_result(committed) {
+            Some(Ok(())) => Ok(StashedLease::new(owned)),
+            Some(Err(status)) => Err(refused(LeaseCarveRefusal::Kernel(status))),
+            None => Err(LeaseCarveError::Uncertain(
+                crate::cap::UncertainLocalCapability::new(owned),
+            )),
+        }
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn carve_owned_lease_window_outcome(
+        _subject: SlotRef,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<StashedLease, LeaseCarveError> {
+        Err(LeaseCarveError::Refused(LeaseCarveRefusal::Unavailable))
+    }
+
     /// Why an owned lease window could not be produced — the `Slot` arm is
     /// the one a bare `Option` hides.  An exhausted cap arena never reaches
     /// the kernel at all, so collapsing it into the same `None` as a kernel
@@ -4317,11 +4799,10 @@ mod metal {
         offset: u64,
         len: u64,
     ) -> Result<StashedLease, LeaseWindowFault> {
-        let owned = crate::cap::OwnedSlot::reserve().ok_or(LeaseWindowFault::Slot)?;
-        if !carve_lease_window(subject, offset, len, owned.slot()) {
-            return Err(LeaseWindowFault::Refused);
-        }
-        Ok(StashedLease::new(owned))
+        carve_owned_lease_window_outcome(subject, offset, len).map_err(|error| match error {
+            LeaseCarveError::Refused(LeaseCarveRefusal::Capacity) => LeaseWindowFault::Slot,
+            _ => LeaseWindowFault::Refused,
+        })
     }
 
     /// The lossy projection of [`try_carve_owned_lease_window`], kept for the
@@ -4589,38 +5070,79 @@ mod metal {
         false
     }
 
-    /// Carve a writable sub-lease and finalize it into one executable-only
-    /// runtime-owned lease in the same atomic session.  The temporary source
-    /// slot is cleared after its tag retires and is immediately reusable; only
-    /// the returned executable capability remains live.
+    #[derive(Debug)]
+    pub enum ExecCarveError {
+        Refused(LeaseCarveRefusal),
+        Uncertain(crate::cap::UncertainExecCarve),
+    }
+
+    /// Carve and finalize in one session. A canonical successful completion
+    /// and an executable-shaped result prove that the temporary writable name
+    /// was consumed. Every other non-refusal retains both result reservations
+    /// for explicit cleanup; observing only the executable slot is insufficient.
     #[cfg(target_os = "none")]
+    pub fn carve_owned_exec_window_outcome(
+        subject: SlotRef,
+        offset: u64,
+        len: u64,
+    ) -> Result<ExecutableCode, ExecCarveError> {
+        use crate::session::SessionBuilder;
+        use crate::transport::{Transport, TrapTransport};
+
+        let refused = ExecCarveError::Refused;
+        if len == 0 || offset.checked_add(len).is_none() {
+            return Err(refused(LeaseCarveRefusal::Bounds));
+        }
+        let writable =
+            crate::cap::OwnedSlot::reserve().ok_or(refused(LeaseCarveRefusal::Capacity))?;
+        let executable =
+            crate::cap::OwnedSlot::reserve().ok_or(refused(LeaseCarveRefusal::Capacity))?;
+        let mut b = SessionBuilder::new();
+        b.carve_sublease(
+            subject,
+            Rights::ACCESS | Rights::MODIFY | Rights::DERIVE | Rights::REVOKE,
+            offset,
+            len,
+            writable.slot(),
+        )
+        .map_err(|_| refused(LeaseCarveRefusal::Build))?;
+        b.finalize_exec(writable.slot(), executable.slot())
+            .map_err(|_| refused(LeaseCarveRefusal::Build))?;
+        // TrapUnavailable from this concrete transport means no syscall was
+        // issued; an arbitrary transport error would not prove rollback.
+        let committed = TrapTransport::new()
+            .commit_now(&b)
+            .map_err(|_| refused(LeaseCarveRefusal::NotIssued))?;
+        match classify_local_results(committed, 2) {
+            Some(Ok(())) if exec_result_state(executable.slot()) == ExecResultState::Replaced => {
+                drop(writable);
+                Ok(ExecutableCode::new(executable))
+            }
+            Some(Err(status)) => Err(refused(LeaseCarveRefusal::Kernel(status))),
+            _ => Err(ExecCarveError::Uncertain(
+                crate::cap::UncertainExecCarve::new(writable, executable),
+            )),
+        }
+    }
+
+    /// Off metal there is no executable-finalization session to issue.
+    #[cfg(not(target_os = "none"))]
+    pub fn carve_owned_exec_window_outcome(
+        _subject: SlotRef,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<ExecutableCode, ExecCarveError> {
+        Err(ExecCarveError::Refused(LeaseCarveRefusal::Unavailable))
+    }
+
+    /// Compatibility convenience. Persistent owners use the full outcome to
+    /// retry unknown results rather than leaving reservations quarantined.
     pub fn carve_owned_exec_window(
         subject: SlotRef,
         offset: u64,
         len: u64,
     ) -> Option<ExecutableCode> {
-        let writable = crate::cap::OwnedSlot::reserve()?;
-        let mut executable = crate::cap::OwnedSlot::reserve()?;
-        if !carve_exec_window(subject, offset, len, writable.slot(), executable.slot()) {
-            if exec_result_state(executable.slot()) == ExecResultState::Malformed {
-                executable.quarantine_unknown_publish();
-            }
-            return None;
-        }
-        // `writable` never activates: the committed transition cleared its
-        // now-dead record, so Reserved-drop releases exactly that scratch name.
-        drop(writable);
-        Some(ExecutableCode::new(executable))
-    }
-
-    /// Off metal there is no executable-finalization session to issue.
-    #[cfg(not(target_os = "none"))]
-    pub fn carve_owned_exec_window(
-        _subject: SlotRef,
-        _offset: u64,
-        _len: u64,
-    ) -> Option<ExecutableCode> {
-        None
+        carve_owned_exec_window_outcome(subject, offset, len).ok()
     }
 
     /// Consume a fixed-slot writable lease token and return a dynamically
@@ -5381,6 +5903,213 @@ mod metal {
         }
 
         #[test]
+        fn endpoint_outcomes_preserve_send_selectors_and_receive_access_rules() {
+            assert!(valid_endpoint_derivation(Rights::REVOKE, false));
+            assert!(valid_endpoint_derivation(
+                Rights::DERIVE | Rights::REVOKE,
+                false
+            ));
+            assert!(!valid_endpoint_derivation(Rights::REVOKE, true));
+            assert!(!valid_endpoint_derivation(
+                Rights::DERIVE | Rights::REVOKE,
+                true
+            ));
+            for receive in [false, true] {
+                assert!(valid_endpoint_derivation(
+                    Rights::ACCESS | Rights::REVOKE,
+                    receive
+                ));
+                assert!(!valid_endpoint_derivation(Rights::empty(), receive));
+                assert!(!valid_endpoint_derivation(
+                    Rights::ACCESS | Rights::MODIFY,
+                    receive
+                ));
+            }
+            assert!(matches!(
+                derive_owned_chan_send_outcome(SlotRef::from_wire(42), Rights::REVOKE),
+                Err(EndpointDeriveError::Refused(
+                    EndpointDeriveRefusal::Unavailable
+                ))
+            ));
+            assert!(matches!(
+                derive_owned_chan_recv_outcome(SlotRef::from_wire(42), Rights::ACCESS),
+                Err(EndpointDeriveError::Refused(
+                    EndpointDeriveRefusal::Unavailable
+                ))
+            ));
+        }
+
+        #[test]
+        fn executable_carve_classifies_both_invocations_without_guessing_rollback() {
+            assert!(matches!(
+                carve_owned_exec_window_outcome(SlotRef::from_wire(42), 0, 4096),
+                Err(ExecCarveError::Refused(LeaseCarveRefusal::Unavailable))
+            ));
+            assert_eq!(
+                classify_local_results(committed(Status::Ok, 0), 2),
+                Some(Ok(()))
+            );
+            for status in [
+                Status::Denied,
+                Status::Forged,
+                Status::Revoked,
+                Status::Conflict,
+                Status::Malformed,
+                Status::WouldBlock,
+            ] {
+                for index in 0..2 {
+                    assert_eq!(
+                        classify_local_results(committed(status, index), 2),
+                        Some(Err(status))
+                    );
+                }
+                assert_eq!(classify_local_results(committed(status, 2), 2), None);
+            }
+            for raw in [
+                Status::Ok.encode(1),
+                Status::Deadline.encode(0),
+                Status::Unfounded.encode(1),
+                0xffff,
+            ] {
+                assert_eq!(classify_local_results(Committed::from_raw(raw), 2), None);
+            }
+            assert_eq!(classify_local_results(committed(Status::Ok, 0), 0), None);
+            assert_eq!(
+                classify_local_results(
+                    Committed::from_raw((123u64 << 32) | Status::Ok.encode(0)),
+                    2
+                ),
+                Some(Ok(()))
+            );
+        }
+
+        #[test]
+        fn carved_lease_host_refusal_carries_no_native_owner() {
+            assert!(matches!(
+                carve_owned_lease_window_outcome(SlotRef::from_wire(42), 0, 4096),
+                Err(LeaseCarveError::Refused(LeaseCarveRefusal::Unavailable))
+            ));
+        }
+
+        #[test]
+        fn local_lease_results_require_a_canonical_nonparking_completion() {
+            use kore_abi::session::{Committed, Status};
+            assert_eq!(
+                classify_local_result(Committed::from_raw(Status::Ok.encode(0))),
+                Some(Ok(()))
+            );
+            for status in [
+                Status::Denied,
+                Status::Forged,
+                Status::Revoked,
+                Status::Conflict,
+                Status::Malformed,
+                Status::WouldBlock,
+            ] {
+                assert_eq!(
+                    classify_local_result(Committed::from_raw(status.encode(0))),
+                    Some(Err(status))
+                );
+                assert_eq!(
+                    classify_local_result(Committed::from_raw(status.encode(1))),
+                    None
+                );
+            }
+            for raw in [
+                Status::Ok.encode(1),
+                Status::Deadline.encode(0),
+                Status::Irq.encode(0),
+                Status::Exited.encode(0),
+                Status::AltDelivery.encode(0),
+                Status::Unfounded.encode(0),
+                0xffff,
+            ] {
+                assert_eq!(classify_local_result(Committed::from_raw(raw)), None);
+            }
+            assert_eq!(
+                classify_local_result(Committed::from_raw((123u64 << 32) | Status::Ok.encode(0))),
+                Some(Ok(()))
+            );
+        }
+
+        #[test]
+        fn named_map_results_cover_both_invocations_without_guessing_rollback() {
+            assert_eq!(
+                classify_named_map_result(committed(Status::Ok, 0)),
+                Some(Ok(()))
+            );
+            for status in [
+                Status::Denied,
+                Status::Forged,
+                Status::Revoked,
+                Status::Conflict,
+                Status::Malformed,
+                Status::WouldBlock,
+            ] {
+                for index in 0..=1 {
+                    assert_eq!(
+                        classify_named_map_result(committed(status, index)),
+                        Some(Err(status))
+                    );
+                }
+                assert_eq!(classify_named_map_result(committed(status, 2)), None);
+            }
+            for raw in [
+                Status::Ok.encode(1),
+                Status::Deadline.encode(0),
+                Status::Irq.encode(0),
+                Status::Exited.encode(0),
+                Status::AltDelivery.encode(0),
+                Status::Unfounded.encode(1),
+                0xffff,
+            ] {
+                assert_eq!(classify_named_map_result(Committed::from_raw(raw)), None);
+            }
+            assert_eq!(
+                classify_named_map_result(Committed::from_raw(
+                    (123u64 << 32) | Status::Ok.encode(0)
+                )),
+                Some(Ok(()))
+            );
+        }
+
+        #[test]
+        fn named_map_geometry_rejects_unusable_committed_views() {
+            use kore_abi::session::GeomReport;
+            let (base, len) = named_map_geometry(GeomReport {
+                base: 0x1000,
+                len: 0x2000,
+            })
+            .unwrap();
+            assert_eq!((base.as_ptr() as usize, len), (0x1000, 0x2000));
+            for (base, len) in [
+                (0, 4096),
+                (4096, 0),
+                (4097, 4096),
+                (4096, 4097),
+                (u64::MAX - 4095, 4096),
+            ] {
+                assert!(named_map_geometry(GeomReport { base, len }).is_none());
+            }
+        }
+
+        #[test]
+        fn lease_map_host_refusal_carries_no_mapping_authority() {
+            assert!(matches!(
+                map_owned_lease_at_outcome(SlotRef::from_wire(42), 0x1000, 4096),
+                Err(LeaseMapError::Refused(LeaseMapRefusal::Unavailable))
+            ));
+            assert!(matches!(
+                map_owned_lease_rw_outcome(SlotRef::from_wire(42)),
+                Err(LeaseMapError::Refused(LeaseMapRefusal::Unavailable))
+            ));
+            assert!(matches!(
+                map_owned_lease_at_rw_outcome(SlotRef::from_wire(42), 0x1000, 4096),
+                Err(LeaseMapError::Refused(LeaseMapRefusal::Unavailable))
+            ));
+        }
+
+        #[test]
         fn uncertain_peer_publication_never_reopens_or_revokes_the_result_name() {
             use crate::cap::{OwnedSlot, OwnedSlotState};
             for completion in [
@@ -5499,21 +6228,31 @@ mod metal {
         }
 
         #[test]
-        fn receive_lineage_probe_requires_positive_live_or_dead_evidence() {
+        fn channel_lineage_probe_requires_positive_live_or_dead_evidence() {
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::Ok, 0)),
+                classify_channel_probe(committed(Status::Ok, 0)),
                 ChanRecvLineage::Live
             );
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::Revoked, 0)),
+                classify_channel_probe(committed(Status::Revoked, 0)),
                 ChanRecvLineage::Dead
             );
+            for status in [Status::Denied, Status::Conflict, Status::Malformed] {
+                assert_eq!(
+                    classify_channel_probe(committed(status, 0)),
+                    ChannelLineage::Retryable
+                );
+            }
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::WouldBlock, 0)),
+                classify_channel_probe(committed(Status::Revoked, 1)),
+                ChannelLineage::Retryable
+            );
+            assert_eq!(
+                classify_channel_probe(committed(Status::WouldBlock, 0)),
                 ChanRecvLineage::Retryable
             );
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::Ok, 1)),
+                classify_channel_probe(committed(Status::Ok, 1)),
                 ChanRecvLineage::Retryable
             );
         }

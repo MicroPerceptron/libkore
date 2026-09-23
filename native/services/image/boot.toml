@@ -1,0 +1,25 @@
+# services/image/boot.toml — this service's boot-manifest row (the design
+# lives in res/boot.toml's header).  The row rides beside the crate it
+# endows, redox-style; whether and WHEN it founds is the root manifest's
+# `services` list — founding order and chain adjacency are topology, the
+# root's to declare, never a row's.
+
+[service]
+clients = ["kore-svc-mm"]
+image     = "kore-svc-image"
+endowment = "kore_svc_image::ImageEndowment"
+protocol  = "kore_svc_image::ImageService"
+# X_MINT is endowed HERE and nowhere else.  FACE_SUPPLY backs the minted
+# per-child loader-face rings (ABI-counted 12 KiB strides, the ABI's
+# FACE_SUPPLY_BYTES contract); CHANNEL_SPACE is the mint the face grant
+# channels are rooted beneath (revoking it cuts the whole face forest).
+endows    = ["IMAGE_STORE@0", "X_MINT@0", "FACE_SUPPLY@0", "CHANNEL_SPACE@0"]
+# Pair 1 is exec's resident STANDING LOADER face (`role::LOADER`'s wire,
+# res/IMAGE.md §4).  Its client halves are pre-landed in exec's convey
+# table (`EXEC_CV_LOADER_*`, the claimed class): exec resolves linked target
+# metadata and acquires the standing stub there.  A spawned task's startup
+# linker uses a per-child dynamically minted face.  The first shell owns no
+# image face, so this row is not a `shell_client`.
+shell_client = false
+digest_x86_64  = "blake3:67f011c29e1fdea0e82382ebce259987d3a80601f9037679d41764d657021a5d"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:22900b90c64e54f8b46cada5685df417f85e0822ab558e6e508167fbad20489f"  # res/aarch64/; make boot-digests-aarch64

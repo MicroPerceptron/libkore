@@ -190,9 +190,9 @@ language bindings. It does not claim a C/Zig CRT, automatic stack unwinding,
 initial-process exit hooks, asynchronous cancellation or physical acceptance.
 
 
-## Closed native exit vocabulary
+## Closed native exit vocabulary (prior baseline)
 
-The current export records Kore `b4113c30a8f2ae95a02e511664798eb85505a7c6`:
+The earlier closed-exit export recorded Kore `b4113c30a8f2ae95a02e511664798eb85505a7c6`:
 14 native packages and 223 exact source files. It includes the intervening #962
 owner updates and the closed exit vocabulary. Public integer constructors are
 removed; the session builder requires the same `ExitCode` as the thread API.
@@ -212,3 +212,196 @@ assertions on all three Kore architectures. The complete local-owner override
 passed its type-identity checks and duplicate-owner negative control. Both
 workspace dependency locks remain unchanged and pass locked resolution; the
 exporter verifies byte equality against the recorded Kore commit.
+
+## Prior vKore integration tuple (libkore #19)
+
+This is the pre-merge baseline. The refreshed candidate export and validation
+are still pending; this table does not certify the merged source.
+
+Recorded together, as the issue requires, so the graph can be reproduced rather
+than reconstructed:
+
+| component | value |
+|---|---|
+| Kore commit | `74ae24c87323dd7bc7ac0a12770c25ec8c8c4852` |
+| native export source revision | same — `native/provenance.json` |
+| exported packages / files | 29 / 397 |
+| libkore commit | `46e110a27fb3ccb0d270eb217ba2d3476581fa85` |
+| distribution lockfiles | `Cargo.lock` and `native/Cargo.lock`, regenerated together with the export |
+| host commit | vkore `codex/vkore-40-current-kore` |
+| Kore ISO SHA-256 | recorded in vkore's `config/real-stack.lock.mk` alongside the guest commit it was built from |
+
+| Kore ISO SHA-256 (verified) | `bfee034fa6312b3aab799e2b79031f8fe2da57d32028603541f2ee510cb4afac` |
+
+The Kore revision is the head of `codex/vkore-994-hostlink`
+(MicroPerceptron/kore#1015), which is **in review and not merged**. This export
+is therefore a candidate, not a release baseline: re-run
+`tools/sync-native.py <kore-checkout> --revision <reviewed-commit>` and update
+this table when that PR lands. Nothing here should be read as an approved
+distribution.
+
+`kore-exec-client` joins the exported owners with this revision. It is the exec
+protocol and caller face split out of `kore-svc-exec`, whose crate cites about
+twenty sibling services in its founder manifest — exporting the client used to
+mean exporting all of them. The service that answers exec requests stays in
+Kore; libkore exports only what a caller links.
+
+
+## Current-main integration candidate — 2026-09-21
+
+The candidate now exports Kore `f175014461c5549c59eba97c09e88afe2f8f677b`,
+which merges main `29138e0955e81569aac8c657d156d392a80d8670` into the
+vKore native integration. The export contains **31 packages and 412 files**,
+verified byte-for-byte against that committed source. It includes main's
+entry/crash interfaces and the affine exec client. This branch also incorporates
+libkore alpha `7fffce33b0aa00d38351a219d90cd6cf3460f48e`, retaining the WASI
+and ordinary Rust entry surfaces. Both distribution locks were updated for the
+new dependency closure while preserving existing resolved versions.
+
+`make fmt test check docs owners cross miri bindings-check` passed with the
+pinned Rust toolchain, cbindgen 0.29.4, and Zig 0.16.0. This includes:
+
+- 505 passing host Rust tests (6 ignored) and 7 Python tooling tests;
+- no-default-feature checking, Clippy, documentation with facade warnings denied,
+  source provenance, and one package per native owner;
+- all three actual Kore user targets and emitted C allocation/thread/futex symbols;
+- 12 renamed-dependency executables, built and linked in release mode, plus
+  9 missing-allocator negative controls that reject specifically for that reason;
+- 21 ordinary Rust entry programs and 9 invalid-return-type negative controls;
+- Miri, including the native erased-task pointer-provenance regression;
+- generated C/Zig declarations, ABI assertions, and the Zig build-system check.
+
+The renamed-consumer check previously used `cargo check` despite claiming to
+prove final executables. It now uses `cargo build`; the allocator findings above
+are actual final-build results. These fixtures establish linking, not execution
+of their entry points in a guest.
+
+The local/Git composition fixture passed against the merged Kore checkout,
+including its duplicate-owner negative control and native exec, entry, runtime,
+crash, filesystem and foreign-adapter type identities. The fixture's temporary
+Git source is confined to its own lockfile and is not a distribution dependency.
+
+Kore's integration production gate passed with 20/20 founded services, a ready
+shell, complete store seeding, and Lua/SPMD witnesses after its boot-stack fix.
+That image preceded the final source formatting and library-pin update. The final
+committed guest/host compatibility tuple and fresh native UI acceptance are still
+pending; the previous tuple above does not certify this candidate. This is an
+in-review source integration, not an approved release baseline.
+
+## Atomic workspace replacement integration — 2026-09-21
+
+The native export now records Kore
+`3508e7b020edf26ae4340f9448e06e3cefcfe9dd` (31 packages, 414 files), which
+also incorporates main `8a92182d24a102e0cf82444516d3bd3d0cc1c702`.
+Actual vKore UI testing of the preceding image found that native atomic
+replacement changed guest bytes without writing them to the host workspace.
+Kore now composes the session-owned replacement commit with the existing
+journaled HostLink transaction, and refuses direct dispatch that would bypass
+that composition. Refusal retains the private placement for abort or teardown.
+The facade is unchanged; the native export is byte-exact from the owning source.
+
+Focused owner tests cover host acknowledgment, write-only authority, disabled
+writeback, empty and incomplete replacements, concurrent revision conflict,
+lost receipt reconciliation, abort and close cleanup. The local/Git composition
+check passes for this source, including its duplicate-owner negative control.
+Formatting, host tests, Clippy, documentation, owner checks and all three
+Kore target checks passed. The remaining symbol/link, Miri and binding checks
+are being rerun, as is corrected guest image/UI acceptance. The earlier
+production gate alone did not establish host writeback. This export also
+includes the HostLink test fixture's explicit 64-byte ring alignment; Linux CI
+caught the prior byte-aligned allocation assumption.
+
+## Lifecycle delegation reconciliation — 2026-09-21
+
+The export advances to Kore `cce0f31670773eab781bf542b783c37f67a6921f`.
+The only exported source difference from the preceding snapshot is the
+SpawnSpec comment: an explicit delegable parent handle applies to any
+authorized spawn, matching current main and the existing native client.
+The owning Kore service had retained the old window-only restriction during
+integration; it now restores main's policy and rights regression. That server
+is not part of this native export. The facade and all exported implementation
+bytes are unchanged. The preceding atomic export completed its full local
+matrix and all seven remote checks. The refreshed full local matrix passed (505 host tests, 39 Miri tests,
+all three target and C/Zig checks), as did local/Git composition with its
+duplicate-owner negative control. The owning guest's two-terminal startup and
+Lua REPL witnesses pass after the policy correction, but its durable store
+still seeded only 33/35 applications with a resize failure. Guest acceptance
+and fresh companion UI acceptance remain incomplete.
+
+## Native I/O isolation — 2026-09-21
+
+The export advances to committed Kore source
+`3ca0edd4120903414aac7d6766bb7093a2a9a9eb` (31 packages, 414 files).
+Native file-handle I/O no longer waits for an unrelated HostLink attachment
+or workspace delta. Host-backed handles retain refresh, and native dispatch
+still checks authority and revision. The upstream serving-path regression
+proves native resize completes with host attachment or delta paused, denied
+write authority remains denied, and host operations still await refresh.
+
+The snapshot also includes application-projection failure codes and their
+existing seven-bit wire representation test. It changes no facade API or
+ownership boundary. The upstream privileged-install provider settlement fix
+belongs to the exec server and is outside this export.
+
+The full refreshed matrix passed: 505 host tests, 39 Miri tests, formatting,
+Clippy, documentation, owner checks, all three custom targets, actual executable
+links and negative controls, and C/Zig bindings. Actual-Kore local/Git composition
+also passed, including the duplicate-owner negative control. Binding verification
+initially stopped because `cbindgen` was absent from PATH; the remaining checks
+passed using the existing pinned 0.29.4 binary. Kore's current source passed
+6,354 host tests, architecture
+checks and an Intel TCG 4k48 two-terminal keyboard gate with all 35 apps seeded.
+Hardware CI and native UI acceptance remain outstanding; these local results
+do not replace them.
+
+## Keyboard preservation across backing replacement — 2026-09-21
+
+The export advances to committed Kore
+`ed515b61d9d1853b04271c3e2bed11b6d19be88e` (31 packages, 414 files).
+The window client preserves pending keyboard input while adopting replacement
+backing. The other exported change is the committed DagFS boot digest. There
+is no facade API or dependency-configuration change; both lockfiles remain
+unchanged and pass locked validation.
+
+The full matrix passed: 505 Rust host tests (six ignored), seven tooling tests,
+39 Miri tests, formatting, Clippy, documentation, owner checks, all three custom
+targets, actual executable links and negative controls, and C/Zig bindings.
+Exact upstream export verification and actual-Kore local/Git composition passed,
+including the duplicate-owner negative control.
+
+The matching Kore candidate passed 6,356 host tests, architecture/build checks,
+the separate boot-test image and production guest with all 35 apps seeded.
+Two-terminal provisioning still failed with projection-link code 74. The full
+desktop test failed to reopen Power after ten recycle rounds despite a correctly
+positioned click. Fresh hardware CI and companion real-stack/native UI acceptance
+remain pending. This SDK validation does not clear those guest failures or
+establish a sealed companion artifact; no ABI-stability or release claim is made.
+
+## Resize diagnostics and NVMe write sizing — 2026-09-22
+
+The export advances to committed Kore
+`68dda5a411d4d1ba0d015b5f341e2b5bfa0a5daf` (31 packages, 414 files).
+Application seed replies preserve resize failure categories in their existing
+seven-bit field; library replies keep the existing six-bit representation.
+NVMe treats a zero NOWS value as an absent optimal-write hint, preserving actual
+transfer limits and nonzero hints. This follows the Linux NVMe treatment of a
+decoded one-block hint and prevents QEMU's default from capping bulk writes at
+one sector. No facade API or dependency configuration changes are introduced.
+
+The full required SDK matrix passed: 505 Rust host tests (six ignored), seven
+tooling tests, 39 Miri tests, formatting, Clippy, documentation, owner checks,
+three custom targets, executable links and negative controls, and C/Zig bindings.
+Exact export verification and actual-Kore local/Git composition passed, including
+the duplicate-owner negative control. Both lockfiles remain unchanged and valid
+under locked checks.
+
+The matching Kore source passed 6,359 host tests, architecture and image builds,
+its separate boot-test image, production guest provisioning (35/35 apps), and
+the two-terminal keyboard gate. The production ISO SHA-256 was
+`0cb86fe87ef01114d6af296531a741618f8c8aa599359194849792b187595521`.
+The extended desktop test still failed to reopen Power on recycle round eight.
+Fresh hardware evidence includes passing Intel production and both boot tests,
+but AMD production seeded only 34/35 apps (projection directory-chain code 73),
+and some AMD interactive jobs failed during startup before their named tests.
+These results do not establish complete hardware or native vKore UI acceptance,
+and no companion artifact or release acceptance is claimed by this SDK refresh.

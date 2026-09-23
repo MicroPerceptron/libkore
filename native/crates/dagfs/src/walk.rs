@@ -18,9 +18,8 @@ use crate::{
 /// `READ` is in all of them because resolving a name *is* reading the
 /// directory it is resolved in, so a mask without it cannot take a single
 /// step. Past that each verb asks for exactly the right its leaf operation
-/// needs and no more — the private root grants everything, so the
-/// attenuation is the caller's own restraint rather than something the
-/// service imposes on it.
+/// needs and no more. The service independently enforces the rights of the
+/// selected containment route or named resource grant.
 ///
 /// `union`, not a `|` operator: `Rights` deliberately has no `BitOr`, so
 /// that combining authority always reads as the deliberate act it is.
@@ -117,6 +116,117 @@ impl View {
     }
 }
 
+/// Operations required by the common bounded path walker. Native Fs and
+/// service-backed verification use the same lookup and attenuation logic.
+#[allow(async_fn_in_trait)]
+pub trait WalkClient {
+    async fn request(&mut self, request: FsRequest) -> Result<FsResponse, Refusal>;
+    async fn named_grant(&mut self, name: &Name) -> Result<Option<GrantId>, Refusal>;
+
+    async fn close(&mut self, view: View) {
+        let _ = self
+            .request(FsRequest::Close {
+                handle: view.handle,
+            })
+            .await;
+    }
+}
+
+impl WalkClient for Fs<'_, '_> {
+    async fn request(&mut self, request: FsRequest) -> Result<FsResponse, Refusal> {
+        self.checked(&request).await
+    }
+
+    async fn named_grant(&mut self, name: &Name) -> Result<Option<GrantId>, Refusal> {
+        Fs::named_grant(self, name).await
+    }
+}
+
+/// Resolve one path while keeping containment names ahead of named grants.
+/// A read-only namespace root does not limit an independent named grant's
+/// rights; it still prevents writes through that root's containment edges.
+pub async fn open_path<C: WalkClient>(
+    client: &mut C,
+    path: &[u8],
+    rights: Rights,
+) -> Result<View, Refusal> {
+    let mut names = heapless::Vec::<Name, MAX_PATH_DEPTH>::new();
+    for component in path::components(path) {
+        names
+            .push(Name::from_bytes(component).map_err(Refusal::Fs)?)
+            .map_err(|_| Refusal::Fs(FsError::Range))?;
+    }
+    let mut skip_first = false;
+    let mut current = match client.request(FsRequest::OpenRoot { rights }).await {
+        Ok(opened) => View::from_opened(opened)?,
+        Err(Refusal::Fs(FsError::AccessDenied)) if !names.is_empty() => {
+            let root = View::from_opened(
+                client
+                    .request(FsRequest::OpenRoot {
+                        rights: Rights::READ,
+                    })
+                    .await?,
+            )?;
+            // A readable containment entry shadows a same-named grant even
+            // when it cannot carry the requested write/share rights. Only an
+            // actual NotFound allows the independent named edge lookup.
+            let probe = client
+                .request(FsRequest::OpenAt {
+                    parent: root.handle,
+                    name: names[0],
+                    rights: Rights::READ,
+                })
+                .await;
+            client.close(root).await;
+            match probe {
+                Ok(opened) => {
+                    client.close(View::from_opened(opened)?).await;
+                    return Err(Refusal::Fs(FsError::AccessDenied));
+                }
+                Err(Refusal::Fs(FsError::NotFound)) => {}
+                Err(error) => return Err(error),
+            }
+            let grant = client
+                .named_grant(&names[0])
+                .await?
+                .ok_or(Refusal::Fs(FsError::NotFound))?;
+            skip_first = true;
+            View::from_opened(
+                client
+                    .request(FsRequest::OpenGrant { grant, rights })
+                    .await?,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
+    for (depth, name) in names.into_iter().enumerate().skip(usize::from(skip_first)) {
+        let next = client
+            .request(FsRequest::OpenAt {
+                parent: current.handle,
+                name,
+                rights,
+            })
+            .await;
+        client.close(current).await;
+        current = match next {
+            Ok(opened) => View::from_opened(opened)?,
+            Err(Refusal::Fs(FsError::NotFound)) if depth == 0 => {
+                let grant = client
+                    .named_grant(&name)
+                    .await?
+                    .ok_or(Refusal::Fs(FsError::NotFound))?;
+                View::from_opened(
+                    client
+                        .request(FsRequest::OpenGrant { grant, rights })
+                        .await?,
+                )?
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    Ok(current)
+}
+
 impl<'w, 't> Fs<'w, 't> {
     /// Walk `path` from the task-visible root and hand back the final view.
     ///
@@ -125,45 +235,7 @@ impl<'w, 't> Fs<'w, 't> {
     /// below the client interface: after the first step, traversal is the
     /// same bounded `OpenAt` walk in both cases. An empty path is the root.
     pub async fn open(&mut self, path: &[u8], rights: Rights) -> Result<View, Refusal> {
-        let mut current = View::from_opened(self.checked(&FsRequest::OpenRoot { rights }).await?)?;
-        let mut depth = 0usize;
-        let mut components = path::components(path);
-        while let Some(component) = components.next() {
-            depth += 1;
-            // Refused, never truncated: past the engine's proof depth the
-            // walk cannot describe where it is, and silently stopping short
-            // would name a different object than the user asked for.
-            if depth > MAX_PATH_DEPTH {
-                self.close(current).await;
-                return Err(Refusal::Fs(FsError::Range));
-            }
-            let name = match Name::from_bytes(component) {
-                Ok(name) => name,
-                Err(err) => {
-                    self.close(current).await;
-                    return Err(Refusal::Fs(err));
-                }
-            };
-            let next = self
-                .checked(&FsRequest::OpenAt {
-                    parent: current.handle,
-                    name,
-                    rights,
-                })
-                .await;
-            self.close(current).await;
-            current = match next {
-                Ok(opened) => View::from_opened(opened)?,
-                Err(Refusal::Fs(FsError::NotFound)) if depth == 1 => {
-                    let Some(grant) = self.named_grant(&name).await? else {
-                        return Err(Refusal::Fs(FsError::NotFound));
-                    };
-                    self.open_grant(grant, rights).await?
-                }
-                Err(err) => return Err(err),
-            };
-        }
-        Ok(current)
+        open_path(self, path, rights).await
     }
 
     /// The task-visible root itself — [`open`](Self::open) of the empty
@@ -363,6 +435,90 @@ pub fn rights_parse(spelling: &[u8]) -> Option<Rights> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReadOnlyRoot {
+        probe: Option<FsError>,
+        requests: heapless::Vec<FsRequest, 8>,
+    }
+
+    impl WalkClient for ReadOnlyRoot {
+        async fn request(&mut self, request: FsRequest) -> Result<FsResponse, Refusal> {
+            self.requests.push(request).unwrap();
+            let opened = |handle| FsResponse::Opened {
+                handle: Handle::from_bits(handle),
+                stable_object: StableObjectId::new(handle).unwrap(),
+                kind: ObjectKind::Directory,
+                subtype: ObjectSubtype::from_bits(0),
+                len: 0,
+                revision: 0,
+            };
+            match request {
+                FsRequest::OpenRoot { rights } if rights == Rights::READ => Ok(opened(1)),
+                FsRequest::OpenRoot { .. } => Err(Refusal::Fs(FsError::AccessDenied)),
+                FsRequest::OpenAt { rights, .. } => {
+                    assert_eq!(rights, Rights::READ);
+                    match self.probe {
+                        Some(error) => Err(Refusal::Fs(error)),
+                        None => Ok(opened(2)),
+                    }
+                }
+                FsRequest::Close { .. } => Ok(FsResponse::Done),
+                _ => panic!("unexpected request"),
+            }
+        }
+        async fn named_grant(&mut self, _: &Name) -> Result<Option<GrantId>, Refusal> {
+            panic!("a present or uncertain containment edge cannot fall through to a grant")
+        }
+    }
+
+    #[test]
+    fn resource_path_walk_does_not_bypass_shadowed_or_uncertain_containment() {
+        for (probe, expected) in [
+            (None, FsError::AccessDenied),
+            (Some(FsError::Busy), FsError::Busy),
+            (Some(FsError::AccessLost), FsError::AccessLost),
+            (Some(FsError::NotDirectory), FsError::NotDirectory),
+        ] {
+            let mut client = ReadOnlyRoot {
+                probe,
+                requests: heapless::Vec::new(),
+            };
+            assert!(
+                matches!(crate::block_on(open_path(&mut client, b"input/child", WALK_WRITE)),
+                Err(Refusal::Fs(error)) if error == expected)
+            );
+            assert!(client.requests.contains(&FsRequest::Close {
+                handle: Handle::from_bits(1)
+            }));
+            assert_eq!(
+                client.requests.contains(&FsRequest::Close {
+                    handle: Handle::from_bits(2)
+                }),
+                probe.is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn resource_path_walk_validates_depth_and_names_before_opening() {
+        let mut client = ReadOnlyRoot {
+            probe: None,
+            requests: heapless::Vec::new(),
+        };
+        assert!(matches!(
+            crate::block_on(open_path(&mut client, b"../outside", WALK_WRITE)),
+            Err(Refusal::Fs(FsError::InvalidName))
+        ));
+        let mut path = heapless::Vec::<u8, 1024>::new();
+        for _ in 0..=MAX_PATH_DEPTH {
+            path.extend_from_slice(b"a/").unwrap();
+        }
+        assert!(matches!(
+            crate::block_on(open_path(&mut client, &path, WALK_WRITE)),
+            Err(Refusal::Fs(FsError::Range))
+        ));
+        assert!(client.requests.is_empty());
+    }
 
     #[test]
     fn rights_spellings_round_trip() {

@@ -19,6 +19,19 @@ use crate::cap::Rights;
 /// for a scratch offset.
 pub const INLINE_DESCRIPTOR_TAG: u64 = 1 << 63;
 
+/// Reserved control sentinel for the kernel debug console (`kdbg`), the one
+/// userland→console channel that survives the shell READY edge: init's parent
+/// beacons are drained only by the boot driver, so after READY a task has no
+/// way to say anything a human can read, and a steady-state defect can only be
+/// guessed at.
+///
+/// This is deliberately NOT a descriptor and consumes no vocabulary: it names
+/// an inline carrier whose length can never fit the register bank, so every
+/// build that does not compile the handler still refuses it exactly as before.
+/// The handler itself is behind the kernel's `kdbg` feature and is absent from
+/// a production image, so this can never become an ambient print authority.
+pub const DEBUG_EMIT_CONTROL: u64 = u64::MAX;
+
 /// Length bits admitted beside [`INLINE_DESCRIPTOR_TAG`].
 pub const INLINE_DESCRIPTOR_LENGTH_MASK: u64 = u8::MAX as u64;
 
@@ -309,6 +322,17 @@ pub const DERIVE_KIND_FABRIC_ROUTE_OBSERVE: u8 = 0xe6;
 pub const DEVICE_MMU_RIGHTS: crate::cap::Rights = crate::cap::Rights::ACCESS
     .union(crate::cap::Rights::DERIVE)
     .union(crate::cap::Rights::REVOKE);
+
+/// `Derive × PciDevice` observation flavor. The operation returns either the
+/// number of validated modern VirtIO PCI vendor-capability rows or one
+/// bind-inert [`VirtioPciCapReport`] and mints no child.
+///
+/// `ACCESS` on the exact held device authorizes the observation. Ring 3 sees
+/// only a BAR number and BAR-relative `(offset, length)`; PCI config-space
+/// offsets and physical BAR addresses never cross this boundary. The kernel
+/// also proves every reported interval lies wholly inside that BAR's
+/// user-mappable prefix before encoding it.
+pub const DERIVE_KIND_VIRTIO_PCI_LAYOUT: u8 = 0xdc;
 
 /// `Derive × AddrSpace` (the caller's **own** space — any thread view of
 /// it; the kernel verifies by page-table root, the same discriminator
@@ -693,6 +717,26 @@ pub struct DeviceActivateReq {
     /// Reserved; must be zero.
     pub reserved: [u8; 4],
 }
+
+/// Select one record or the count from [`DERIVE_KIND_VIRTIO_PCI_LAYOUT`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, TryFromBytes, KnownLayout, Immutable, Unaligned)]
+pub struct VirtioPciLayoutReq {
+    /// Row in capability-chain order. Must be zero for a count query.
+    pub index: u8,
+    /// [`VIRTIO_PCI_LAYOUT_QUERY_RECORD`] or
+    /// [`VIRTIO_PCI_LAYOUT_QUERY_COUNT`].
+    pub query: u8,
+    /// Reserved; must be zero.
+    pub reserved: [u8; 6],
+}
+
+impl VirtioPciLayoutReq {
+    pub const WIRE: usize = 8;
+}
+
+pub const VIRTIO_PCI_LAYOUT_QUERY_RECORD: u8 = 0;
+pub const VIRTIO_PCI_LAYOUT_QUERY_COUNT: u8 = 1;
 
 impl DeviceActivateReq {
     /// Wire size (repr(C), 4+4).
@@ -1244,7 +1288,7 @@ const _: () = {
     // Resource-kind derives occupy the low, append-only band.  START owns one
     // value in the global high-flavor band, and must remain distinct from
     // every defined flavor even where subject kinds currently disambiguate.
-    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_TASK_START as u16);
+    assert!((crate::cap::ResourceKind::SharedRamRegion as u16) < DERIVE_KIND_TASK_START as u16);
     assert!(DERIVE_KIND_TASK_START != DERIVE_KIND_IOVA_ANON);
     assert!(DERIVE_KIND_TASK_START != DERIVE_KIND_SET_TP);
     assert!(DERIVE_KIND_TASK_START != DERIVE_KIND_PROTECT);
@@ -1264,7 +1308,7 @@ const _: () = {
     assert!(DERIVE_KIND_ARENA_EXTEND != DERIVE_KIND_DEVICE_RECORD);
     assert!(DERIVE_KIND_ARENA_EXTEND != DERIVE_KIND_IOVA_ANON);
     assert!(DERIVE_KIND_ARENA_EXTEND != DERIVE_KIND_EXEC_SEAL);
-    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_ARENA_EXTEND as u16);
+    assert!((crate::cap::ResourceKind::SharedRamRegion as u16) < DERIVE_KIND_ARENA_EXTEND as u16);
     // DEVICE_ACTIVATE shares the PciDevice subject with resource derives but
     // owns the next high-band byte; keep it distinct from every effect flavor.
     assert!(DERIVE_KIND_DEVICE_ACTIVATE != DERIVE_KIND_ARENA_EXTEND);
@@ -1275,11 +1319,13 @@ const _: () = {
     assert!(DERIVE_KIND_DEVICE_ACTIVATE != DERIVE_KIND_IOVA_ANON);
     // DeviceMmu is the current highest resource kind; the whole band must
     // stay below the derive-kind flavors.
-    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_DEVICE_ACTIVATE as u16);
+    assert!(
+        (crate::cap::ResourceKind::SharedRamRegion as u16) < DERIVE_KIND_DEVICE_ACTIVATE as u16
+    );
     // The strict MSI-X route shares the PciDevice subject with ordinary route,
     // BAR, self-grant, and DEVICE_ACTIVATE derives. Its high flavor must remain
     // outside the resource band and distinct from the other PciDevice effect.
-    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_IRQ_ROUTE_MSIX as u16);
+    assert!((crate::cap::ResourceKind::SharedRamRegion as u16) < DERIVE_KIND_IRQ_ROUTE_MSIX as u16);
     assert!(DERIVE_KIND_IRQ_ROUTE_MSIX != DERIVE_KIND_DEVICE_ACTIVATE);
     assert!(DERIVE_KIND_IRQ_ROUTE_MSIX != DERIVE_KIND_SYSTEM_OBSERVE);
     // The I2C-HID observation shares the PciDevice subject with BAR, route,
@@ -1293,7 +1339,7 @@ const _: () = {
     );
     assert!(DERIVE_KIND_I2C_HID_READY_ROUTE != DERIVE_KIND_IRQ_ROUTE_LINE);
     assert!(DERIVE_KIND_I2C_HID_READY_ROUTE != DERIVE_KIND_I2C_HID_RECORD);
-    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_PEER_IOVA as u16);
+    assert!((crate::cap::ResourceKind::SharedRamRegion as u16) < DERIVE_KIND_PEER_IOVA as u16);
     assert!(DERIVE_KIND_PEER_IOVA != DERIVE_KIND_IRQ_ROUTE_MSIX);
     assert!(DERIVE_KIND_PEER_IOVA != DERIVE_KIND_DEVICE_ACTIVATE);
     // Task-subject flavors must be pairwise distinct for the same reason
@@ -1323,13 +1369,14 @@ const _: () = {
 /// Their authenticated subject kinds disambiguate both pairs. This table is a
 /// vocabulary, not a uniqueness proof; the pairwise same-subject assertions
 /// above carry the distinctness that matters.
-const DERIVE_FLAVORS: [u8; 35] = [
+const DERIVE_FLAVORS: [u8; 36] = [
     DERIVE_KIND_TASK_IDENTITY,
     DERIVE_KIND_TASK_NAME,
     DERIVE_KIND_PROCESS_DRAIN,
     DERIVE_KIND_CRASH_READ,
     DERIVE_KIND_PANIC_REPORT,
     DERIVE_KIND_CRASH_BIND,
+    DERIVE_KIND_VIRTIO_PCI_LAYOUT,
     DERIVE_KIND_IOVA_ANON,
     DERIVE_KIND_SET_TP,
     DERIVE_KIND_PROTECT,
@@ -1368,7 +1415,7 @@ const DERIVE_FLAVORS: [u8; 35] = [
 /// refuses it rather than running it as an unflavored derive (the
 /// `Revoke` arm's rule, finally applied to `Derive`).
 pub const fn derive_kind_known(kind: u8) -> bool {
-    if kind <= crate::cap::ResourceKind::DeviceMmu as u8 {
+    if kind <= crate::cap::ResourceKind::SharedRamRegion as u8 {
         return true;
     }
     let mut i = 0;
@@ -1387,7 +1434,7 @@ const _: () = {
     // admit would swallow a flavor.
     let mut i = 0;
     while i < DERIVE_FLAVORS.len() {
-        assert!(DERIVE_FLAVORS[i] > crate::cap::ResourceKind::DeviceMmu as u8);
+        assert!(DERIVE_FLAVORS[i] > crate::cap::ResourceKind::SharedRamRegion as u8);
         i += 1;
     }
 };
@@ -1399,10 +1446,12 @@ const _: () = {
 /// both `0xFF05` for ~80 commits because nothing owned the proof.  A new
 /// member joins by adding its row; forgetting to is caught by the arity
 /// assert any time the member count moves.
-const REPORT_KINDS: [u16; 20] = [
+const REPORT_KINDS: [u16; 22] = [
     TASK_IDENTITY_KIND,
     PROCESS_DRAIN_REPORT_KIND,
     CRASH_CHUNK_KIND,
+    VIRTIO_PCI_CAP_REPORT_KIND,
+    VIRTIO_PCI_CAP_COUNT_REPORT_KIND,
     NOTICE_KIND,
     GEOM_REPORT_KIND,
     DISPLAY_REPORT_KIND,
@@ -1469,10 +1518,11 @@ impl Status {
 /// (`kore-rt`'s `sleep_until`/`sleep_for`) advances on it instead of
 /// lagging boot-age behind the wheel it arms deadlines on.
 ///
-/// **Wrap**: 2^32 ms ≈ 49.7 days.  A consumer anchoring by max() sees the
-/// stamp fall behind after a wrap and simply stops advancing from it until
-/// its own armed deadlines catch up — degraded pacing, never corruption.
-/// A real clock capability can supersede this stamp without unpacking it:
+/// **Wrap**: 2^32 ms ≈ 49.7 days. Consumers must extend the low word against
+/// their full monotonic anchor, rather than compare it as an absolute time.
+/// Without a full clock source, ordering requires samples less than half a
+/// period apart; the low word alone cannot recover an unknown boot epoch.
+/// A full calibrated clock can supersede this stamp without unpacking it:
 /// readers use [`Committed::clock_ms`], writers use this, and both live
 /// here so the layout cannot drift.
 ///
@@ -1545,8 +1595,9 @@ impl Committed {
 
     /// The kernel's clock stamp (bits `[63:32]`, [`stamp_clock`]): monotonic
     /// milliseconds mod 2^32, stamped at the ring-3 boundary.  Reads `0` on
-    /// an unstamped word (a kernel-internal status, a mock transport) — a
-    /// max()-anchoring consumer treats that as "no anchor", losing nothing.
+    /// an unstamped word (a kernel-internal status, a mock transport). Zero
+    /// is also a valid wrapped native stamp; consumers extend native samples
+    /// against their full clock anchor rather than treating zero as absent.
     #[inline]
     pub const fn clock_ms(self) -> u32 {
         (self.0 >> 32) as u32
@@ -4510,6 +4561,89 @@ impl I2cHidCountReport {
     }
 }
 
+/// One redacted, kernel-validated modern VirtIO PCI vendor-capability row.
+///
+/// Offsets are relative to the named BAR's user-visible base. They carry no
+/// physical address and confer no mapping authority. `cfg_type` is the VirtIO
+/// specification value (common=1, notify=2, ISR=3, device=4, PCI=5,
+/// shared-memory=8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtioPciCapReport {
+    pub cfg_type: u8,
+    pub bar: u8,
+    pub id: u8,
+    pub offset: u32,
+    pub length: u32,
+    /// Non-zero only for `cfg_type = 2` (notification capability).
+    pub notify_multiplier: u32,
+}
+
+pub const VIRTIO_PCI_CAP_REPORT_KIND: u16 = 0xFF17;
+pub const VIRTIO_PCI_CAP_REPORT_MAGIC: u64 = 0x6B6F_7265_5650_4349; // "koreVPCI"
+
+impl VirtioPciCapReport {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(VIRTIO_PCI_CAP_REPORT_KIND, VIRTIO_PCI_CAP_REPORT_MAGIC);
+        rec.scope_rid = u64::from(self.offset) | (u64::from(self.length) << 32);
+        rec.holder = crate::cap::Cid(
+            u64::from(self.notify_multiplier)
+                | (u64::from(self.cfg_type) << 32)
+                | (u64::from(self.bar) << 40)
+                | (u64::from(self.id) << 48),
+        );
+        rec
+    }
+
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        let holder = rec.holder.0;
+        if holder >> 56 != 0 {
+            return None;
+        }
+        is_inert_report(rec, VIRTIO_PCI_CAP_REPORT_KIND, VIRTIO_PCI_CAP_REPORT_MAGIC).then_some(
+            Self {
+                cfg_type: (holder >> 32) as u8,
+                bar: (holder >> 40) as u8,
+                id: (holder >> 48) as u8,
+                offset: rec.scope_rid as u32,
+                length: (rec.scope_rid >> 32) as u32,
+                notify_multiplier: holder as u32,
+            },
+        )
+    }
+}
+
+/// Authoritative number of validated VirtIO PCI rows on the exact held
+/// device. A refused in-range record query is always an error, never EOF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtioPciCapCountReport {
+    pub len: u8,
+}
+
+pub const VIRTIO_PCI_CAP_COUNT_REPORT_KIND: u16 = 0xFF18;
+pub const VIRTIO_PCI_CAP_COUNT_REPORT_MAGIC: u64 = 0x6B6F_7265_5650_434E; // "koreVPCN"
+
+impl VirtioPciCapCountReport {
+    pub fn encode(self) -> crate::cap::CapRecord {
+        let mut rec = inert_frame(
+            VIRTIO_PCI_CAP_COUNT_REPORT_KIND,
+            VIRTIO_PCI_CAP_COUNT_REPORT_MAGIC,
+        );
+        rec.scope_rid = u64::from(self.len);
+        rec
+    }
+
+    pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
+        (is_inert_report(
+            rec,
+            VIRTIO_PCI_CAP_COUNT_REPORT_KIND,
+            VIRTIO_PCI_CAP_COUNT_REPORT_MAGIC,
+        ) && rec.scope_rid <= u64::from(u8::MAX))
+        .then_some(Self {
+            len: rec.scope_rid as u8,
+        })
+    }
+}
+
 /// One read-only system observation. The metric owns the interpretation of
 /// `value` and `aux`; combining unlike samples belongs to userland's monitor
 /// service, not this capability operation.
@@ -6163,6 +6297,38 @@ mod tests {
             DeviceCountReport::decode(&crate::cap::CapRecord::vacant()),
             None
         );
+    }
+    #[test]
+    fn virtio_pci_reports_round_trip_and_remain_bind_inert() {
+        let row = VirtioPciCapReport {
+            cfg_type: 2,
+            bar: 4,
+            id: 7,
+            offset: 0x1234_5678,
+            length: 0x8765_4321,
+            notify_multiplier: 4,
+        };
+        let encoded = row.encode();
+        assert_eq!(encoded.cid, crate::cap::Cid::NULL);
+        assert_eq!(VirtioPciCapReport::decode(&encoded), Some(row));
+        assert_eq!(VirtioPciCapCountReport::decode(&encoded), None);
+        assert_eq!(DeviceReport::decode(&encoded), None);
+
+        for len in [0, 1, 8, u8::MAX] {
+            let count = VirtioPciCapCountReport { len };
+            let encoded = count.encode();
+            assert_eq!(encoded.cid, crate::cap::Cid::NULL);
+            assert_eq!(VirtioPciCapCountReport::decode(&encoded), Some(count));
+            assert_eq!(VirtioPciCapReport::decode(&encoded), None);
+        }
+
+        let mut malformed = row.encode();
+        malformed.holder.0 |= 1u64 << 63;
+        assert_eq!(VirtioPciCapReport::decode(&malformed), None);
+
+        let mut wide = VirtioPciCapCountReport { len: 1 }.encode();
+        wide.scope_rid = 256;
+        assert_eq!(VirtioPciCapCountReport::decode(&wide), None);
     }
 }
 

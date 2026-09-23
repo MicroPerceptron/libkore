@@ -1,0 +1,62 @@
+[package]
+name = "kore-svc-dagfs"
+version = "0.0.1"
+edition = "2024"
+description = "kore filesystem service: a capability-confined userland object graph with private task views, bounded generational route proofs, and a replaceable async StorageProvider seam."
+publish = false
+
+# Phase 1 is the *pure engine*: namespace, authority, revisions, and the
+# provider seam, proven by host tests without any service IPC (plan §9
+# Phase 1).  It therefore carries no transport dependency at all —
+# `kore-abi`/`kore-ring`/`kore-rt` join in Phase 2 with `wire.rs`,
+# `service/`, and `client.rs`, which is when a frozen ABI record and a real
+# founded pair first exist.  Keeping them out until then is what makes the
+# engine's test suite independent of the serving framework.
+[dependencies]
+kore-workspace-sync = { path = "../../crates/workspace-sync" }
+kore-hostlink = { path = "../../crates/hostlink" }
+kore-svc-hostlink = { path = "../hostlink" }
+# Design-bounded inline storage (kore-design-doctrine §4 tier (b)): every
+# arena here has a capacity that is an architectural constant in `bounds`,
+# and exhaustion is a typed refusal — never hidden growth.  Same version
+# the device broker already carries.
+heapless = { version = "0.9.3", default-features = false }
+# The filesystem's bounded object, directory, authority, and handle arenas use
+# independently claimable generational slots.  This is the same shared
+# lock-free substrate available to every userland service, not an FS-local
+# duplicate of the kernel slab.
+kore-collections = { path = "../../crates/collections", default-features = false, features = ["alloc"] }
+# Process-visible naming/refusal/capability leaves live outside the storage
+# service so ordinary applications do not compile the NVMe/block/provider
+# stack merely to hold a directory entry or projected-view capability.
+kore-dagfs = { path = "../../crates/dagfs", features = ["runtime"] }
+# Phase 2: the frozen filesystem request/reply records live beside every other
+# service protocol in `kore-abi::svc`.  Pure layouts — the codec that gives them
+# meaning is `wire.rs`, and the engine below it still knows nothing of the wire.
+kore-abi = { path = "../../crates/abi" }
+# The little-endian field wrappers the frozen records are built from.  No
+# derive feature: this crate defines no wire layout of its own, it only reads
+# and writes kore-abi's.
+zerocopy = { version = "0.8", default-features = false }
+# The `SystemService`/`SvcProtocol` contract and the pair's ring helpers.
+kore-rt = { path = "../../crates/rt" }
+kore-ring = { path = "../../crates/ring" }
+# Immutable extraction-version identities use the same allocator-free digest
+# as the parser-neutral contract, and results cross that contract without an
+# FS-specific duplicate representation.
+blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
+kore-svc-extract = { path = "../extract" }
+kore-driver = { path = "../../crates/driver", features = ["service"] }
+kore-nvme = { path = "../../drivers/nvme", features = ["alloc"] }
+kore-svc-block = { path = "../block" }
+crc = { version = "3.4.0", default-features = false }
+
+[dev-dependencies]
+# The protocol suite reads records from adversary-shaped bytes, which needs the
+# `FromBytes`/`IntoBytes` faces the library itself has no reason to name.
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+# The pair suite formats a real ring window with the tree's own helpers.
+kore-ring = { path = "../../crates/ring" }
+kore-rt = { path = "../../crates/rt", features = ["std"] }
+kore-svc-extract-worker-rust = { path = "../extract-worker-rust" }
+kore-svc-extract-worker-c = { path = "../extract-worker-c" }

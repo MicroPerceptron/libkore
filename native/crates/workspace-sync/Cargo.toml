@@ -1,0 +1,15 @@
+[package]
+name = "kore-workspace-sync"
+version = "0.0.0"
+edition = "2024"
+description = "Bounded, transport-neutral workspace snapshot and change-set transactions for kore"
+publish = false
+
+[dependencies]
+blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
+heapless = { version = "0.9.3", default-features = false }
+unicode-normalization = { version = "=0.1.25", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1.9.0"

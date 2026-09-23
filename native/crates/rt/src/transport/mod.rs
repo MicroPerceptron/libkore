@@ -99,10 +99,12 @@ pub trait Transport {
     fn commit_now(&self, session: &SessionBuilder) -> Result<Committed, Self::Error>;
 }
 
-/// The trap transport's typed refusal: the syscall gate is not yet
-/// issued from userland (the runtime link is Phase A's; first boot is
-/// the #96/#298 boundary).  Every commit returns this until the trap
-/// lands — fail-closed and visible, never `todo!`.
+/// The native syscall was not issued: this build lacks a live trap, or
+/// descriptor encoding/scratch discovery failed before entering the kernel.
+/// Once issued, the trap always returns `Ok(Committed)`; even an unknown raw
+/// completion stays in that word and must be classified by the caller.
+/// This non-publication guarantee belongs to this concrete error type, not to
+/// arbitrary implementations of `Transport`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrapUnavailable;
 
@@ -398,6 +400,25 @@ pub(crate) fn trap_session(
     // SAFETY: control zero names scratch offset zero and payload word zero
     // carries the exact initialized descriptor length.
     Ok(Committed::from_raw(unsafe { raw_trap(0, &payload) }))
+}
+
+/// Emit one diagnostic word pair on the kernel console.
+///
+/// The only userland→console channel that survives the shell READY edge: after
+/// it, init's parent beacons are drained by nobody, so a steady-state defect is
+/// otherwise invisible. Inert unless the kernel compiled its `kdbg` feature —
+/// the sentinel is not a descriptor and simply refuses — so a call left behind
+/// costs one refused trap and grants nothing.
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+pub fn kdbg(code: u64, detail: u64) {
+    let mut payload = [0u64; INLINE_WORDS];
+    payload[0] = code;
+    payload[1] = detail;
+    // SAFETY: the sentinel names no descriptor and no scratch offset; the
+    // kernel either recognizes it before any decoding or refuses it whole.
+    unsafe {
+        let _ = raw_trap(kore_abi::session::DEBUG_EMIT_CONTROL, &payload);
+    }
 }
 
 /// **The raw `SYSCALL`** (x86 userland target): issue the trap with a

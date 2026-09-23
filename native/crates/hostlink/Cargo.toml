@@ -1,0 +1,11 @@
+[package]
+name = "kore-hostlink"
+version = "0.0.0"
+edition = "2024"
+description = "Transport-independent bounded HostLink wire and route state (#538)."
+publish = false
+
+[dependencies]
+blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
+heapless = { version = "0.9.3", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }

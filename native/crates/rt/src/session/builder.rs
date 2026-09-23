@@ -1539,7 +1539,8 @@ impl SessionBuilder {
     /// the kernel moves into the new vCPU task only after the complete session
     /// commits.  The caller retains the guest-space owner and receives the
     /// ordinary lifecycle `Task` handle in `handle`.  Like process `Found`,
-    /// this is terminal: no later invocation may be staged in the session.
+    /// this begins a terminal Found tail: only guest Founds for this same
+    /// owner may follow, up to `MAX_SESSION_FOUNDS` members.
     #[allow(clippy::too_many_arguments)]
     pub fn found_guest(
         &mut self,
@@ -1796,6 +1797,62 @@ impl SessionBuilder {
             device,
             rights,
             ResourceKind::MmioRegion as u8,
+            result,
+            Some(&req),
+        )
+    }
+
+    /// `Derive × PciDevice → SharedRamRegion`: claim exact ivshmem-plain
+    /// (`1af4:1110`) BAR2.  Argument-free by design: neither the BAR number
+    /// nor its fixed writeback/coherent cache policy is caller-selected.
+    pub fn claim_shared_ram(
+        &mut self,
+        device: SlotRef,
+        rights: Rights,
+        result: SlotRef,
+    ) -> Result<Staged, BuildError> {
+        self.derive_raw(
+            device,
+            rights,
+            kore_abi::cap::ResourceKind::SharedRamRegion as u8,
+            result,
+            None,
+        )
+    }
+
+    /// Read the number of validated modern VirtIO PCI capability rows from
+    /// the exact held device. The result is a bind-inert count report.
+    pub fn read_virtio_pci_cap_count(
+        &mut self,
+        device: SlotRef,
+        result: SlotRef,
+    ) -> Result<Staged, BuildError> {
+        let mut req = [0u8; kore_abi::session::VirtioPciLayoutReq::WIRE];
+        req[1] = kore_abi::session::VIRTIO_PCI_LAYOUT_QUERY_COUNT;
+        self.derive_raw(
+            device,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_VIRTIO_PCI_LAYOUT,
+            result,
+            Some(&req),
+        )
+    }
+
+    /// Read one validated modern VirtIO PCI capability row in chain order.
+    /// The result is redacted bind-inert data and mints no mapping authority.
+    pub fn read_virtio_pci_cap(
+        &mut self,
+        device: SlotRef,
+        index: u8,
+        result: SlotRef,
+    ) -> Result<Staged, BuildError> {
+        let mut req = [0u8; kore_abi::session::VirtioPciLayoutReq::WIRE];
+        req[0] = index;
+        req[1] = kore_abi::session::VIRTIO_PCI_LAYOUT_QUERY_RECORD;
+        self.derive_raw(
+            device,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_VIRTIO_PCI_LAYOUT,
             result,
             Some(&req),
         )

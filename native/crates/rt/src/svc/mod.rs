@@ -893,6 +893,9 @@ mod shell_failure_tests {
 /// testimony), and a seed verdict is not shell testimony.
 pub const COOKIE_STORE: u64 = 0x6B72_5F73_746F_7265; // "kr_store"
 
+/// First executable seed failure, separate from the full store census payload.
+pub const COOKIE_STORE_APP_FAILURE: u64 = 0x6B72_5F73_746F_7246; // "kr_storF"
+
 /// One init phase boundary (`"kr_initP"`): `[7:0]` the phase ordinal,
 /// `[63:8]` init's committed session clock in milliseconds. Posted at
 /// every step of the bring-up ladder so a boot log attributes the

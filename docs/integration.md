@@ -69,6 +69,49 @@ for either distribution lock.
 
 ## Bootstrap and future ownership
 
+### Optional supervisors and explicit endowments
+
+An application can implement agent orchestration using `kore::runtime`,
+`kore::process`, `kore::exec` and explicit filesystem capabilities. Enabling
+these library features does not start a broker, mint a project view, or grant
+installer authority. The optional supervisor implementation lives in Kore's
+`user/apps/agent-supervisor` and `crates/agent-supervisor`; its policy is not
+part of this SDK.
+
+The parent retains the native task and cleanup owners. It transfers a counted,
+versioned configuration package through a privately founded channel: selected
+executable capabilities, a delegated exec connection, HostLink connections,
+an optional project view, and parent/control endpoints. Executable delegation
+uses `ExecutableCapability::transfer_derived` in the native exec client;
+the endpoint's actual derive rights bound the transfer. A configured child
+connection may mint empty child connections, but cannot create filesystem
+homes or administer unrelated connections. Connection-tree retirement is
+enforced by the native service against the authenticated ingress.
+
+A directory view refers to the same underlying objects as other grants to that
+directory. Starting a process neither duplicates the project nor makes it
+empty. Omitting the project grant leaves no project inventory; there is no
+fallback to the launcher's administrative filesystem. A child's exit or a
+missing reply is not a cleanup acknowledgment. Reap descendants, retire the
+connection tree, confirm transport closure, and drain retained rings before
+issuing successor generations. Never replay an operation just because its
+response was lost.
+
+The current supervisor still uses Kore's transport-specific HostLink/MM
+adapters and the broker/runner support crates. The SDK facade reuses the same
+native owner types; it does not provide a second transport or supervisor
+implementation. Native export, application composition, and guest boot gates
+are distinct checks. The export revision in `native/provenance.json` is the
+authority for which native APIs this checkout currently distributes.
+
+Allocation-free executables can use `default-features = false` for the native
+clock, process, task and random surfaces without linking hash collections.
+The `collections` feature enables hashbrown and is on by default. It requires
+the application's real allocator; enabling it never installs one. Filesystem
+consumers can select `features = ["fs"]` independently. Verify these modes in
+an actual `no_std` executable: checking a library alone does not detect an
+unwanted global-allocator requirement at the final executable boundary.
+
 The export includes Kore #962, its runtime task-provenance repair and bounded
 SFNT metadata owner, resynchronized with current mainline. The exact source
 commit is in `native/provenance.json`. #962 is still open and
@@ -81,3 +124,32 @@ existing Kore applications. A later subtree/package integration should make Kore
 consume the same native packages and deliberately transfer their source ownership
 if desired. Recheck the full consumer graph, user images, QEMU gates and hardware
 when making that transition.
+
+
+### Fresh MM telemetry and recovery
+
+The native export at Kore `52493011e3491f955f478f92e895731af9fa9604`
+lets `RingMm::stats_observed` distinguish an ordinary fresh reply wait (`None`)
+from a caller-selected observation deadline (`Some(deadline)`). Exec's 5 ms
+abandoned-operation recovery slice must not be reused as the lifetime of every
+fresh telemetry request: repeated timeout/recovery otherwise discards healthy
+late replies and prevents downstream monitor observations. Cancellation retains
+the exact original request, and bounded recovery does not replay it. This is an
+upstream owner change; the export contains no independent implementation.
+
+
+### Filesystem view retirement
+
+The current byte-exact native export is Kore
+`60e659644acf6e5e730b6b566a68765f8016563c`. Local capability records describe
+possession; they do not prove that an ancestor is still live. The runtime's
+`probe_chan_send_lineage` performs a kernel-validated same-kind derive/revoke
+probe without sending notices or consuming the parent. Only `Dead` permits
+DagFS to retire its retained view. A live non-delegable canary returns
+`Retryable`; it receives no additional rights. The existing receive-probe enum
+name and variant imports remain source-compatible.
+
+Upstream kernel tests distinguish live denial from revoked lineage, and a
+recorded native response-stop recovery keeps filesystem occupancy at its
+initial values. These are upstream observations, not a replacement for this
+export's owner/composition checks or final coordinated guest acceptance.

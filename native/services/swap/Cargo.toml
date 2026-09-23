@@ -1,0 +1,21 @@
+[package]
+name = "kore-svc-swap"
+version = "0.0.1"
+edition = "2024"
+description = "kore swap service: the SwapRequest protocol and default in-RAM zram backend."
+publish = false
+
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+kore-rt = { path = "../../crates/rt" }
+# PAGE_BYTES (the lessor's grant granularity) and, in tests, the real
+# MemoryManager the lessor plays against.
+kore-svc-mm = { path = "../mm" }
+# The zram codec: pure-Rust LZ4, no_std in block mode (default-features
+# off), the wide-word fast paths (the heavier-SIMD codecs — zstd — are
+# C-bound and not no_std).  Block mode only: the frame format (and std)
+# stay off.
+lz4_flex = { version = "0.11", default-features = false }
+
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }

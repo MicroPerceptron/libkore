@@ -23,7 +23,11 @@ fn view_placement_requests_only_a_window_not_more_authority() {
     use kore_abi::session::{DERIVE_KIND_VIEW_MAP, ViewMapReq, ViewMapWindow};
     use zerocopy::TryFromBytes;
 
-    for window in [ViewMapWindow::Map, ViewMapWindow::Surfaces, ViewMapWindow::Heap] {
+    for window in [
+        ViewMapWindow::Map,
+        ViewMapWindow::Surfaces,
+        ViewMapWindow::Heap,
+    ] {
         let mut builder = SessionBuilder::new();
         builder
             .map_view_in(SlotRef::from_wire(2), window, SlotRef::from_wire(3))
@@ -2111,6 +2115,44 @@ fn selected_irq_only_and_deadline_waits_fit_the_inline_carrier() {
 }
 
 #[test]
+fn virtio_pci_layout_queries_are_inert_and_shape_tight() {
+    use kore_abi::session::{
+        DERIVE_KIND_VIRTIO_PCI_LAYOUT, VIRTIO_PCI_LAYOUT_QUERY_COUNT,
+        VIRTIO_PCI_LAYOUT_QUERY_RECORD, VirtioPciLayoutReq,
+    };
+    use zerocopy::TryFromBytes;
+
+    let mut builder = SessionBuilder::new();
+    builder
+        .read_virtio_pci_cap_count(SlotRef::from_wire(4), SlotRef::from_wire(8))
+        .expect("count query stages");
+    builder
+        .read_virtio_pci_cap(SlotRef::from_wire(4), 3, SlotRef::from_wire(9))
+        .expect("record query stages");
+
+    let mut out = [0u8; DESCRIPTOR_MAX];
+    let len = builder.finish(&mut out).expect("queries finish");
+    let (_, invocations, args) = parse(&out[..len]);
+    assert_eq!(invocations.len(), 2);
+    for invocation in invocations {
+        assert_eq!(invocation.kind, DERIVE_KIND_VIRTIO_PCI_LAYOUT);
+        assert_eq!(invocation.requested, 0);
+    }
+    let (count, tail) = VirtioPciLayoutReq::try_ref_from_prefix(args).expect("count request");
+    let (record, _) = VirtioPciLayoutReq::try_ref_from_prefix(tail).expect("record request");
+    assert_eq!(
+        (count.index, count.query),
+        (0, VIRTIO_PCI_LAYOUT_QUERY_COUNT)
+    );
+    assert_eq!(count.reserved, [0; 6]);
+    assert_eq!(
+        (record.index, record.query),
+        (3, VIRTIO_PCI_LAYOUT_QUERY_RECORD)
+    );
+    assert_eq!(record.reserved, [0; 6]);
+}
+
+#[test]
 fn typed_exit_serializes_every_status_bit_and_raw_exit_cannot_bypass_it() {
     use crate::ExitCode;
     use kore_abi::session::{DERIVE_KIND_TASK_EXIT, ExitReq};
@@ -2284,4 +2326,37 @@ fn task_identity_query_is_standalone_and_has_no_arguments() {
     assert_eq!(invs[0].kind, kore_abi::session::DERIVE_KIND_TASK_IDENTITY);
     assert_eq!(invs[0].arg.get(), u32::MAX);
     assert!(args.is_empty());
+}
+
+#[test]
+fn guest_cohort_encodes_one_owner_and_private_windows_in_one_found_tail() {
+    use kore_abi::session::{DERIVE_KIND_GUEST_FOUND, GuestFoundReq};
+    use zerocopy::TryFromBytes;
+    let mut builder = SessionBuilder::new();
+    for cpu in 0..2u32 {
+        let input = 10 + cpu * 3;
+        builder
+            .found_guest(
+                SlotRef::from_wire(2),
+                0x10000,
+                0x1f0000 - u64::from(cpu) * 0x8000,
+                0x1000,
+                SlotRef::from_wire(input),
+                SlotRef::from_wire(input + 1),
+                SlotRef::from_wire(input + 2),
+                SlotRef::from_wire(20 + cpu),
+            )
+            .unwrap();
+    }
+    let mut out = [0u8; DESCRIPTOR_MAX];
+    let len = builder.finish(&mut out).unwrap();
+    let (_, invs, args) = parse(&out[..len]);
+    assert_eq!(invs.len(), 2);
+    for (cpu, inv) in invs.iter().enumerate() {
+        assert_eq!(inv.kind, DERIVE_KIND_GUEST_FOUND);
+        assert_eq!(inv.subject.get(), 2);
+        let (req, _) = GuestFoundReq::try_ref_from_prefix(&args[inv.arg.get() as usize..]).unwrap();
+        assert_eq!(req.window.get(), 10 + cpu as u32 * 3);
+        assert_eq!(req.reserved.get(), 0);
+    }
 }

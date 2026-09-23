@@ -17,6 +17,16 @@ use crate::{
     Rights, SessionId, VersionLease,
 };
 
+/// Namespace installed behind a caller-rooted invocation endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ViewBindingMode {
+    Inherited,
+    Isolated,
+    /// A fresh read-only namespace containing only this named resource and
+    /// later explicit grants. The selected object can be a file or directory.
+    Resources(Name),
+}
+
 /// What a client asks the filesystem to do.
 ///
 /// Deliberately carries **no session field**: the engine keys every view on the
@@ -274,11 +284,12 @@ pub enum FsRequest {
         rights: Rights,
         announced: kore_abi::session::SlotRef,
     },
-    /// Bind a caller-minted endpoint lineage to a directory resolved through
+    /// Bind a caller-minted endpoint lineage to an object resolved through
     /// this exact task view.
     BindView {
         handle: Handle,
         rights: Rights,
+        mode: ViewBindingMode,
         announced: kore_abi::session::SlotRef,
     },
     /// Land one aggregate diagnostic snapshot ([`FsSystemStatusWire`]) in

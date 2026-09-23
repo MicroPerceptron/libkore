@@ -1004,7 +1004,8 @@ pub const SHELL_CV_COUNT: u8 = 30;
 /// is free), and `boot_share_idx` becomes the page offset into it.  Exec
 /// carves its own RW stamping view and the child's RO share from the
 /// same offset — the only spelling available to a spawner that holds no
-/// carveable lease of its own.
+/// carveable lease of its own. Current Invoke requires this form; the old
+/// detached RW-view/RO-sublease pair remains decodable for a typed refusal.
 pub const BOOT_FROM_SUPPLY: u8 = 1 << 7;
 
 /// **Data-only** boot entries one `Spawn` may carry ([`SpawnData`]) —
@@ -1246,7 +1247,9 @@ impl SpawnWire {
 /// or retirement metadata only. Ordinary `Invoke` requires it empty; immutable
 /// generation selection comes exclusively from the admitting capability.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct TaskReqWire {
     /// Verb discriminant: [`OP_WAIT`](Self::OP_WAIT) /
     /// [`OP_KILL`](Self::OP_KILL) / [`OP_EXIT`](Self::OP_EXIT) /
@@ -1260,8 +1263,9 @@ pub struct TaskReqWire {
     /// `Spawn`: live prefix of [`wiring`](Self::wiring)
     /// (`<= MAX_SPAWN_WIRING`).
     pub wiring_count: u8,
-    /// `Spawn`: convey-table index of the boot page's **RW view** (exec
-    /// maps it in its own space and stamps the child's blocks through it).
+    /// Historical `Spawn` spelling: index of the boot page's RW view.
+    /// Current Invoke refuses that pair before provisioning; all supported
+    /// launchers set `BOOT_FROM_SUPPLY` as described below.
     ///
     /// With [`BOOT_FROM_SUPPLY`](crate::svc::BOOT_FROM_SUPPLY) set, the
     /// low bits name a landed **root supply lease** instead and exec
@@ -1386,6 +1390,171 @@ impl LibraryFailure {
     pub const NO_IMAGE_CLIENT: u8 = 26;
     /// Write stage: the copy answered false without naming a stage (a new exit lacks its stamp).
     pub const UNCLASSIFIED: u8 = 27;
+    /// Source stage: an outstanding filesystem cleanup owner never settled,
+    /// so no fresh source request could be issued. Split out of
+    /// [`SOURCE`](Self::SOURCE), which used to carry every source-stage
+    /// stall as one indistinguishable code.
+    pub const SOURCE_CLEANUP: u8 = 28;
+    /// Source stage: exec holds no filesystem client at all.
+    pub const SOURCE_NO_FS: u8 = 29;
+    /// Source stage: the filesystem client was mid-request, so the source
+    /// window could not advance on this pass.
+    pub const SOURCE_FS_BUSY: u8 = 30;
+    /// Source stage: the backing window itself was never produced — the MM
+    /// supply refused, or the mapping was absent or short.
+    pub const SOURCE_WINDOW: u8 = 31;
+    /// Source stage: the window exists but its first `attach_window` did not
+    /// complete.
+    pub const SOURCE_ATTACH: u8 = 32;
+    /// Source stage: an `attach_window` is outstanding and its bounded resume
+    /// did not complete.
+    pub const SOURCE_ATTACHING: u8 = 33;
+    /// Source stage: the window attached but its grant listing or open did not
+    /// reach `Ready`.
+    pub const SOURCE_STAGE: u8 = 34;
+    /// Source stage: the outstanding owner is an open file cleanup.
+    pub const SOURCE_CLEANUP_FILE: u8 = 35;
+    /// Source stage: the outstanding owner is an immutable revision release.
+    pub const SOURCE_CLEANUP_VERSION: u8 = 36;
+    /// Source stage: the seed phase still needs maintenance.
+    pub const SOURCE_CLEANUP_SEED: u8 = 37;
+    /// Source stage: the write phase still needs maintenance.
+    pub const SOURCE_CLEANUP_WRITE: u8 = 38;
+    /// Source stage: the projection phase still needs maintenance.
+    pub const SOURCE_CLEANUP_PROJECTION: u8 = 39;
+
+    // Create stage: `WRITE_CREATE` named only "the typed create refused" and
+    // dropped the filesystem's own answer, which is the one fact that says
+    // whether the store is full, unreachable, or refusing authority. The band
+    // below carries that answer; `WRITE_CREATE` remains for an older image.
+    /// Create stage: the open succeeded but the object is not a file.
+    pub const CREATE_WRONG_KIND: u8 = 40;
+    /// Create stage: the reply was malformed.
+    pub const CREATE_WIRE: u8 = 41;
+    /// Create stage: the call itself did not complete (transport/ring/timeout).
+    pub const CREATE_CALL: u8 = 42;
+    /// Create stage: the filesystem refused — `FsError::NotFound`.
+    pub const CREATE_NOT_FOUND: u8 = 43;
+    /// Create stage: the filesystem refused — `FsError::AlreadyExists`.
+    pub const CREATE_ALREADY_EXISTS: u8 = 44;
+    /// Create stage: the filesystem refused — `FsError::NotDirectory`.
+    pub const CREATE_NOT_DIRECTORY: u8 = 45;
+    /// Create stage: the filesystem refused — `FsError::IsDirectory`.
+    pub const CREATE_IS_DIRECTORY: u8 = 46;
+    /// Create stage: the filesystem refused — `FsError::InvalidName`.
+    pub const CREATE_INVALID_NAME: u8 = 47;
+    /// Create stage: the filesystem refused — `FsError::InvalidHandle`.
+    pub const CREATE_INVALID_HANDLE: u8 = 48;
+    /// Create stage: the filesystem refused — `FsError::AccessDenied`.
+    pub const CREATE_ACCESS_DENIED: u8 = 49;
+    /// Create stage: the filesystem refused — `FsError::AccessLost`.
+    pub const CREATE_ACCESS_LOST: u8 = 50;
+    /// Create stage: the filesystem refused — `FsError::Conflict`.
+    pub const CREATE_CONFLICT: u8 = 51;
+    /// Create stage: the filesystem refused — `FsError::OutOfObjects`.
+    pub const CREATE_OUT_OF_OBJECTS: u8 = 52;
+    /// Create stage: the filesystem refused — `FsError::OutOfEdges`.
+    pub const CREATE_OUT_OF_EDGES: u8 = 53;
+    /// Create stage: the filesystem refused — `FsError::OutOfHandles`.
+    pub const CREATE_OUT_OF_HANDLES: u8 = 54;
+    /// Create stage: the filesystem refused — `FsError::OutOfStorage`.
+    pub const CREATE_OUT_OF_STORAGE: u8 = 55;
+    /// Create stage: the filesystem refused — `FsError::OutOfPlacements`.
+    pub const CREATE_OUT_OF_PLACEMENTS: u8 = 56;
+    /// Create stage: the filesystem refused — `FsError::OutOfVersionLeases`.
+    pub const CREATE_OUT_OF_VERSION_LEASES: u8 = 57;
+    /// Create stage: the filesystem refused — `FsError::OutOfIndexSlots`.
+    pub const CREATE_OUT_OF_INDEX_SLOTS: u8 = 58;
+    /// Create stage: the filesystem refused — `FsError::Range`.
+    pub const CREATE_RANGE: u8 = 59;
+    /// Create stage: the filesystem refused — `FsError::BudgetExceeded`.
+    pub const CREATE_BUDGET: u8 = 60;
+    /// Create stage: the filesystem refused — `FsError::Busy`.
+    pub const CREATE_BUSY: u8 = 61;
+    /// Create stage: the filesystem refused — `FsError::ProviderFailure`.
+    pub const CREATE_PROVIDER: u8 = 62;
+    /// Create stage: any other filesystem refusal. The `libs:` field is six
+    /// bits wide, so 63 is the last code a LIBRARY verdict can carry.
+    pub const CREATE_OTHER: u8 = 63;
+
+    // Executable-only stages. `TAG_APP_SEEDED.index` carries seven bits, so
+    // these live above the shared band and never appear in a `libs:` verdict.
+    /// App stage: the system-region seed posture could not be published.
+    pub const APP_POSTURE: u8 = 64;
+    /// App stage: the durable revision did not bind to the archive peer.
+    pub const APP_REVISION: u8 = 65;
+    /// App stage: a catalogued projection edge could not be materialised.
+    pub const APP_PROJECTIONS: u8 = 66;
+    /// App stage: the closing seed posture could not be published.
+    pub const APP_POSTURE_CLOSE: u8 = 67;
+    /// App stage: the member was present but its comparison did not complete.
+    pub const APP_INDETERMINATE: u8 = 68;
+    /// App stage: opening the existing member refused for a reason other than
+    /// absence, which must never authorise a replacement create.
+    pub const APP_OPEN: u8 = 69;
+    /// App stage: the export copy into the store did not complete.
+    pub const APP_COPY: u8 = 70;
+    /// Projection stage: a preceding source owner did not finish cleanup.
+    pub const APP_PROJECTION_CLEANUP: u8 = 71;
+    /// Projection stage: opening the seeded source file did not complete.
+    pub const APP_PROJECTION_SOURCE: u8 = 72;
+    /// Projection stage: opening or creating the directory chain failed.
+    pub const APP_PROJECTION_DIRECTORY: u8 = 73;
+    /// Projection stage: linking or validating an existing edge failed.
+    pub const APP_PROJECTION_LINK: u8 = 74;
+    /// Projection stage: retiring an acquired source/directory handle failed.
+    pub const APP_PROJECTION_CLOSE: u8 = 75;
+    /// App body resize: the exact outstanding request exhausted its observations.
+    pub const APP_RESIZE_TIMEOUT: u8 = 76;
+    /// App body resize: another retained request already owns the client.
+    pub const APP_RESIZE_OUTSTANDING: u8 = 77;
+    /// App body resize: another infrastructure failure prevented completion.
+    pub const APP_RESIZE_CALL: u8 = 78;
+    /// App body resize: the filesystem reply violated the wire protocol.
+    pub const APP_RESIZE_WIRE: u8 = 79;
+    /// App body resize: the medium has no room for the requested bytes.
+    pub const APP_RESIZE_STORAGE: u8 = 80;
+    /// App body resize: the bounded placement table is full.
+    pub const APP_RESIZE_PLACEMENTS: u8 = 81;
+    /// App body resize: the filesystem's work budget was exhausted.
+    pub const APP_RESIZE_BUDGET: u8 = 82;
+    /// App body resize: another request holds an exact filesystem claim.
+    pub const APP_RESIZE_BUSY: u8 = 83;
+    /// App body resize: the storage provider reported a failure.
+    pub const APP_RESIZE_PROVIDER: u8 = 84;
+    /// App body resize: the expected revision was stale.
+    pub const APP_RESIZE_CONFLICT: u8 = 85;
+    /// App body resize: filesystem authority was denied or lost.
+    pub const APP_RESIZE_ACCESS: u8 = 86;
+    /// App body resize: another filesystem refusal prevented completion.
+    pub const APP_RESIZE_OTHER: u8 = 87;
+    /// App body resize: the write owner has no retained file/request.
+    pub const APP_RESIZE_NO_OWNER: u8 = 88;
+    /// App body resize: the service client is poisoned.
+    pub const APP_RESIZE_POISONED: u8 = 89;
+    /// App body resize: the request ring is full.
+    pub const APP_RESIZE_RING_FULL: u8 = 90;
+    /// App body resize: the bounded client has invalid endpoint/timer wiring.
+    pub const APP_RESIZE_WIRING: u8 = 91;
+    /// App body resize: the transport could not commit.
+    pub const APP_RESIZE_TRANSPORT: u8 = 92;
+    /// App body resize: runtime-owned landing capacity did not become available.
+    pub const APP_RESIZE_BACKPRESSURE: u8 = 93;
+    /// App body resize: the request session returned WouldBlock.
+    pub const APP_RESIZE_CALL_BUSY: u8 = 94;
+    /// App body resize: the request session returned Conflict.
+    pub const APP_RESIZE_CALL_CONFLICT: u8 = 95;
+
+    /// Shared member-copy code retains detailed resize causes internally.
+    /// Only application replies have room for them: a library/data verdict
+    /// preserves the existing six-bit BODY_RESIZE value instead of truncating
+    /// a seven-bit application diagnostic into an unrelated library cause.
+    pub const fn for_library_reply(failure: u8) -> u8 {
+        match failure {
+            Self::APP_RESIZE_TIMEOUT..=Self::APP_RESIZE_CALL_CONFLICT => Self::BODY_RESIZE,
+            _ => failure,
+        }
+    }
 }
 
 impl TaskReqWire {
@@ -1415,8 +1584,16 @@ impl TaskReqWire {
     /// `15`: the first value above the retired band — `7`/`8`/`9` carried
     /// `Launch`/`PrepareImages`/`SetWorkspace` and stay frozen refusals.
     pub const OP_INSTALL: u8 = 15;
-    /// Ordinary invocation through a structurally selected executable pair.
-    pub const OP_INVOKE: u8 = 16;
+    /// Retired Invoke whose task-first grant order could not describe a
+    /// committed wake-only prefix after terminal Unfounded.
+    pub const OP_INVOKE_LEGACY: u8 = 16;
+    /// Capability-selected Invoke with wake-first results and explicit
+    /// committed-discard refusal. Mixed old/new peers cannot reinterpret it.
+    pub const OP_INVOKE: u8 = 25;
+    pub const INVOKE_WAKE_GRANT: usize = 0;
+    pub const fn invoke_task_grant(return_shared_wake: bool) -> usize {
+        return_shared_wake as usize
+    }
     /// Irreversibly close the bootstrap-only global-name installation phase
     /// before the ordinary client inherits the serving pair.
     pub const OP_SEAL_INSTALLER: u8 = 17;
@@ -1461,7 +1638,7 @@ impl TaskReqWire {
     /// live operation, and a stale caller receives a typed refusal rather
     /// than a dropped request.
     pub const fn op_retired(op: u8) -> bool {
-        op >= 1 && op <= Self::OP_SET_WORKSPACE
+        (op >= 1 && op <= Self::OP_SET_WORKSPACE) || op == Self::OP_INVOKE_LEGACY
     }
     /// Privileged retirement of the newest immutable generation named by the
     /// installer. Ordinary executable holders cannot issue this operation.
@@ -1474,7 +1651,11 @@ impl TaskReqWire {
     pub const OP_CLIENT_CONTEXT: u8 = 13;
     /// Retire one exact minted exec client face.
     pub const OP_RETIRE_CLIENT: u8 = 14;
-    /// `Spawn` asks exec to return an affine parent handle as grant 0.
+    /// Confirm physical cleanup of a client retirement. `slot` is the face,
+    /// `entry` is the nonzero service-issued retirement token.
+    pub const OP_CONFIRM_CLIENT_RETIRED: u8 = 24;
+    /// `Spawn` asks exec to return an affine parent handle after any optional
+    /// shared-wake grant (see `invoke_task_grant`).
     /// Bootstrap founding clears this bit because the kernel temporarily owns
     /// the pair and consumes only the data reply.
     pub const SPAWN_RETURN_HANDLE: u8 = 1 << 0;
@@ -1495,8 +1676,8 @@ impl TaskReqWire {
     /// the parent's returned handle, not the child's authority. Ordinary exec
     /// clients continue to receive a non-delegable owner.
     pub const SPAWN_DELEGABLE_HANDLE: u8 = 1 << 2;
-    /// `Invoke` asks exec to return a second affine result at grant lane 1:
-    /// an attenuated send descendant of the provisioned service response channel that
+    /// `Invoke` asks exec to return an optional affine wake at grant lane 0,
+    /// with the task handle following at lane 1: an attenuated send descendant of the provisioned service response channel that
     /// also supplies the child's sole executor receive endpoint. This is a
     /// closed application-bundle contract, not caller-selected channel
     /// authority: exec accepts it only for the exactly authenticated
@@ -1544,11 +1725,13 @@ pub struct TaskRepWire {
     pub grants: u8,
     /// `Spawned`: the selected generation's validated segment count (`<=
     /// crate::image::MAX_SEGMENTS`; zero for an unlinked spawn).
-    /// Zero on every other tag.
+    /// Client lifecycle replies: face index; other tags use their documented
+    /// tag-contextual index or zero.
     pub index: u8,
     /// Frozen tag 3: historical service-wait exit status.
     pub status: I32,
     /// `Spawned`: the founded task's id (diagnostic).
+    /// Client retirement replies: nonzero service-issued retirement token.
     pub id: U64,
     /// `Spawned`: exec's bounded process-table snapshot after admitting the
     /// child. Zero/empty on every other tag.
@@ -1605,6 +1788,15 @@ impl TaskRepWire {
     /// 1 when it is, 0 when no store could be reached — a posture, not a
     /// refusal.
     pub const TAG_APP_SEEDED: u8 = 18;
+    /// `TAG_APP_SEEDED.index`: the executable is in the durable store.
+    pub const APP_SEEDED: u8 = 1 << 0;
+    /// `TAG_APP_SEEDED.index` bits 1..7: why the executable did NOT seed
+    /// ([`LibraryFailure`](crate::svc::LibraryFailure), which the executable
+    /// path shares and extends). Seven bits, so it reaches the app-only
+    /// stages above 63 that a six-bit library verdict cannot carry.
+    pub const APP_FAILURE_SHIFT: u8 = 1;
+    pub const APP_FAILURE_MASK: u8 = 0xfe;
+    pub const APP_SEED_MASK: u8 = Self::APP_SEEDED | Self::APP_FAILURE_MASK;
     /// Reply tag for [`TaskReqWire::OP_TREE_LOAD_PROBE`]: `index` is the
     /// fail-closed [`TREE_PROBE_LINKED`](Self::TREE_PROBE_LINKED) /
     /// [`TREE_PROBE_ALREADY_RESIDENT`](Self::TREE_PROBE_ALREADY_RESIDENT)
@@ -1652,7 +1844,12 @@ impl TaskRepWire {
     /// A minted face received its invocation-context endpoint set.
     pub const TAG_CLIENT_CONTEXT: u8 = 13;
     /// One exact minted exec client face entered retirement.
+    /// Legacy queued acknowledgement; never proves physical cleanup.
     pub const TAG_CLIENT_RETIRED: u8 = 14;
+    /// Retirement accepted or still pending: `index` face, `id` token.
+    pub const TAG_CLIENT_RETIRING: u8 = 24;
+    /// Physical cleanup confirmed: `index` face, `id` token.
+    pub const TAG_CLIENT_RETIREMENT_CONFIRMED: u8 = 25;
 
     /// `TaskRefusal::BadBlock`.
     pub const REFUSE_BAD_BLOCK: u8 = 1;
@@ -1738,6 +1935,9 @@ impl TaskRepWire {
     /// the other is what makes a launch look intermittently slow when it is
     /// in fact permanently refused.
     pub const REFUSE_PEER_ADMISSION_WEDGED: u8 = 22;
+    /// Terminal Found committed its preceding effects but discarded the
+    /// child. An optional wake grant still belongs to this exact response.
+    pub const REFUSE_UNFOUNDED: u8 = 23;
 }
 
 // Live task discriminants stay disjoint from the frozen retired band on
@@ -1749,7 +1949,11 @@ const _: () = {
     assert!(!TaskReqWire::op_retired(TaskReqWire::OP_CLIENT_BANK));
     assert!(!TaskReqWire::op_retired(TaskReqWire::OP_CLIENT_CONTEXT));
     assert!(!TaskReqWire::op_retired(TaskReqWire::OP_RETIRE_CLIENT));
+    assert!(!TaskReqWire::op_retired(
+        TaskReqWire::OP_CONFIRM_CLIENT_RETIRED
+    ));
     assert!(!TaskReqWire::op_retired(TaskReqWire::OP_INSTALL));
+    assert!(TaskReqWire::op_retired(TaskReqWire::OP_INVOKE_LEGACY));
     assert!(!TaskReqWire::op_retired(TaskReqWire::OP_INVOKE));
     assert!(!TaskReqWire::op_retired(TaskReqWire::OP_SEAL_INSTALLER));
     assert!(TaskRepWire::TAG_INSTALLED > TaskRepWire::TAG_WORKSPACE_SET);
@@ -2365,6 +2569,14 @@ impl HypervisorReqWire {
     /// `HypervisorRequest::Status` — one coherent, data-only snapshot of the
     /// service's single-guest and text-console books.
     pub const OP_STATUS: u8 = 11;
+    /// `HypervisorRequest::SpawnMmio` — found the MMIO console witness
+    /// (`blob::echo_mmio_package`): the echo guest again, but driving its
+    /// 16550 through a memory-mapped window instead of port I/O, so every
+    /// console byte is a stage-2 fault the hypervisor must decode and
+    /// complete (#765).  Same gating as [`OP_SPAWN_ECHO`](Self::OP_SPAWN_ECHO).
+    pub const OP_SPAWN_MMIO: u8 = 12;
+    /// Two-vCPU SPMD guest witness.
+    pub const OP_SPAWN_SMP: u8 = 13;
 }
 
 /// Capacity of the hypervisor pair window's **guest-output** console
@@ -2521,6 +2733,9 @@ impl HypervisorStatusWire {
     pub const PAYLOAD_MULTISEG: u8 = 4;
     /// The MicroPython acceptance payload.
     pub const PAYLOAD_MICROPYTHON: u8 = 5;
+    /// The echo guest on the memory-mapped console (#765).
+    pub const PAYLOAD_MMIO: u8 = 6;
+    pub const PAYLOAD_SMP: u8 = 7;
 
     /// A live guest task currently exists.
     pub const STATUS_GUEST_EXISTS: u16 = 1 << 0;
@@ -4240,6 +4455,8 @@ impl FsReqWire {
     pub const OP_APPLY_VIEW: u8 = 33;
     /// Bind one caller-minted endpoint lineage to a handle resolved through
     /// this exact filesystem session.
+    /// `kind`: 0 retains the issuer's named grants; 1 binds an isolated root.
+    /// Other mode bytes are reserved and refused.
     pub const OP_BIND_VIEW: u8 = 34;
     /// Remove one exact native containment edge without requiring the child
     /// subgraph to become unreachable.

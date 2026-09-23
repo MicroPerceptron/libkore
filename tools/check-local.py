@@ -20,40 +20,45 @@ def module(name):
     return result
 
 
+def distribution(snapshot: Path):
+    # Snapshot the current source into a local Git distribution, including
+    # uncommitted alpha edits. Consumers of a Git package can override its
+    # native owners; a path dependency itself is not a patchable Git source.
+    snapshot.mkdir(parents=True)
+    files = subprocess.check_output(
+        ["git", "ls-files", "-c", "-o", "--exclude-standard", "-z", "--",
+         "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md", "LICENSE",
+         ".cargo", "src", "docs", "tests/consumer", "native", "crates/ffi", "crates/entry", "crates/wasi", "extern"], cwd=ROOT,
+    ).decode().split("\0")
+    for name in sorted(set(files)):
+        if not name or not (ROOT / name).is_file():
+            continue
+        destination = snapshot / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, destination)
+    subprocess.run(["git", "init", "-q", str(snapshot)], check=True)
+    subprocess.run(["git", "add", "."], cwd=snapshot, check=True)
+    subprocess.run(["git", "-c", "user.name=libkore test", "-c", "user.email=test@localhost",
+                    "-c", "commit.gpgsign=false", "commit", "-qm", "consumer fixture"],
+                   cwd=snapshot, check=True)
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=snapshot).decode().strip()
+    source = snapshot.as_uri()
+    return source, revision
+
+
 def check(tree: Path):
     tree = tree.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="libkore-consumer-") as temporary:
         work = Path(temporary)
         (work / "src").mkdir()
-        # Snapshot the current source into a local Git distribution, including
-        # uncommitted alpha edits. Consumers of a Git package can override its
-        # native owners; a path dependency itself is not a patchable Git source.
-        snapshot = work / "distribution"
-        snapshot.mkdir()
-        files = subprocess.check_output(
-            ["git", "ls-files", "-c", "-o", "--exclude-standard", "-z", "--",
-             "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md", "LICENSE",
-             ".cargo", "src", "docs", "tests/consumer", "native", "crates/ffi", "crates/entry", "extern"], cwd=ROOT,
-        ).decode().split("\0")
-        for name in sorted(set(files)):
-            if not name or not (ROOT / name).is_file():
-                continue
-            destination = snapshot / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(ROOT / name, destination)
-        subprocess.run(["git", "init", "-q", str(snapshot)], check=True)
-        subprocess.run(["git", "add", "."], cwd=snapshot, check=True)
-        subprocess.run(["git", "-c", "user.name=libkore test", "-c", "user.email=test@localhost",
-                        "-c", "commit.gpgsign=false", "commit", "-qm", "consumer fixture"],
-                       cwd=snapshot, check=True)
-        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=snapshot).decode().strip()
-        source = snapshot.as_uri()
+        source, revision = distribution(work / "distribution")
         dependencies = {
-            "sdk": {"package": "kore-std", "git": source, "rev": revision},
+            "sdk": {"package": "kore-std", "git": source, "rev": revision, "features": ["exec"]},
             "ffi": {"package": "kore-ffi", "git": source, "rev": revision},
             "entry": {"package": "kore-entry", "git": source, "rev": revision},
             "kore-abi": {"path": str(tree / "crates/abi")},
             "kore-rt": {"path": str(tree / "crates/rt"), "default-features": False},
+            "kore-exec-client": {"path": str(tree / "services/exec-client")},
             "kore-dagfs": {"path": str(tree / "crates/dagfs"), "features": ["runtime"]},
         }
         manifest = '[package]\nname="libkore-local-consumer"\nversion="0.0.0"\nedition="2024"\n[workspace]\n'
@@ -63,6 +68,14 @@ def check(tree: Path):
         (work / "Cargo.toml").write_text(manifest)
         (work / "Cargo.lock").write_bytes((ROOT / "Cargo.lock").read_bytes())
         (work / "src/lib.rs").write_text('''
+pub fn exec_identity(cap: kore_exec_client::ExecutableCapability) -> sdk::exec::ExecutableCapability { cap }
+pub async fn delegate_executable<T: sdk::runtime::transport::Transport>(
+    cap: &sdk::exec::ExecutableCapability,
+    tx: &kore_rt::chan::ChanTx<'_, T>,
+    rights: kore_abi::cap::Rights,
+) -> Result<(), sdk::runtime::chan::SendError> {
+    cap.transfer_derived(tx, rights).await
+}
 pub fn crash_identity(record: kore_abi::crash::CrashRecord) -> sdk::crash::CrashRecord { record }
 pub fn task_identity(id: kore_abi::task::TaskIdentity) -> sdk::abi::task::TaskIdentity { id }
 pub fn abi_identity(slot: kore_abi::session::SlotRef) -> sdk::abi::session::SlotRef { slot }
@@ -76,8 +89,8 @@ pub fn foreign_owner<'w, 't>(fs: kore_dagfs::Fs<'w, 't>) -> Result<ffi::Session<
 ''')
         # Keep the distribution lock untouched; this consumer has its own lock.
         toolchain = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
-        env = dict(os.environ, CARGO_TARGET_DIR=str(ROOT / "target/local-consumer"),
-                   RUSTUP_TOOLCHAIN=toolchain, CARGO_NET_OFFLINE="false")
+        env = dict(os.environ, RUSTUP_TOOLCHAIN=toolchain, CARGO_NET_OFFLINE="false")
+        env.setdefault("CARGO_TARGET_DIR", str(ROOT / "target/local-consumer"))
 
         def metadata(*config):
             return json.loads(subprocess.check_output(
@@ -100,5 +113,14 @@ pub fn foreign_owner<'w, 't>(fs: kore_dagfs::Fs<'w, 't>) -> Result<ffi::Session<
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checkout", type=Path)
-    check(parser.parse_args().checkout)
+    parser.add_argument("checkout", type=Path, nargs="?")
+    parser.add_argument("--snapshot-only", type=Path,
+                        help="retain a local Git distribution for native executable integration checks")
+    args = parser.parse_args()
+    if args.snapshot_only:
+        source, revision = distribution(args.snapshot_only.resolve())
+        print(json.dumps({"source": source, "revision": revision}))
+    elif args.checkout:
+        check(args.checkout)
+    else:
+        parser.error("a checkout or --snapshot-only is required")
