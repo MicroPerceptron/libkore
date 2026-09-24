@@ -7,6 +7,8 @@ members = [
     "crates/dagfs",
     "crates/driver",
     "crates/hint",
+    "crates/late",
+    "crates/ld",
     "crates/ring",
     "crates/rt",
     "crates/rt-macros",
