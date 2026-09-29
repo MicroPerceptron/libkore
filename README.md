@@ -91,13 +91,22 @@ a local Kore tree, follow [local integration](https://github.com/MicroPerceptron
 | Rust | Working foundation with native ownership types |
 | C | Generated filesystem, time, random, task and joined worker APIs |
 | Zig | Target-specific C translation and generated module namespaces |
-| Lua / Python | Planned handwritten ownership/scheduling adapters |
+| Lua | Lua 5.5 on a worker thread, with `io`/`os` over the task's own filesystem |
+| Python | Planned handwritten ownership/scheduling adapter |
 
 Filesystem support remains a requirement for **every initial language surface**.
 A clocks-only foreign binding would not satisfy that requirement. The C/Zig owner uses scoped generational handles and bounded copied buffers;
-callbacks return to the native executor for each request. Standalone foreign
-entry/CRT, allocator adapters and the bounded Lua driver experiment interface
-remain follow-on work. See [the language contract](https://github.com/MicroPerceptron/libkore/blob/alpha/docs/languages.md) for ownership, cancellation and validation boundaries.
+callbacks return to the native executor for each request. The `kore-lua` package
+carries the pinned Lua 5.5 engine, its freestanding host and the `kore.*`
+standard library a script sees; `io` and `os` are written over the task's own
+filesystem rather than vendored, because both of Lua's are libc over POSIX and
+this target has neither. `os.execute` and `io.popen` are absent, and arrive
+through `Extension` like `kore.accel`: both launch a process, which is a service
+face the embedding program holds. See
+[`crates/lua/KORE-VENDOR.md`](crates/lua/KORE-VENDOR.md) for the provenance, the
+selected libraries and every place the manual leaves a detail to the system.
+Standalone foreign entry/CRT, allocator adapters and the bounded Lua driver
+experiment interface remain follow-on work. See [the language contract](https://github.com/MicroPerceptron/libkore/blob/alpha/docs/languages.md) for ownership, cancellation and validation boundaries.
 
 The previous sketches and address/collection experiments remain in Git history
 at `8a6381c`; their parallel runtime, allocator placeholder and empty language

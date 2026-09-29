@@ -85,9 +85,12 @@ The context and completion pointers exist only for one callback. They may not be
 retained, accessed by another thread, used for re-entry, or crossed by
 unwinding/longjmp. C/Zig callers must supply valid, aligned, non-overlapping
 buffers. This is the usual memory-unsafe FFI boundary, not an intra-process
-sandbox; the process's Kore capabilities remain the security boundary. Lua and
-Python adapters can later own this lifecycle instead of exposing these pointers
-to scripts.
+sandbox; the process's Kore capabilities remain the security boundary.
+
+`kore-lua` already owns this lifecycle rather than exposing these pointers to a
+script: the VM runs on a worker thread and reaches every service through one
+request cell served on thread 0, so a script holds a handle — an index and a
+generation — and never a native view. A Python adapter can do the same.
 
 ## Build and verify
 

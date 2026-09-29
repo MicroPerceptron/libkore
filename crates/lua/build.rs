@@ -48,46 +48,27 @@ fn zig_command(zig: &OsStr, out: &Path) -> Command {
     command
 }
 
-fn main() {
-    println!("cargo:rerun-if-env-changed=KORE_ZIG");
-    println!("cargo:rerun-if-env-changed=KORE_HOST_CC");
-    println!("cargo:rerun-if-changed=src/numeric.rs");
-    println!("cargo:rerun-if-changed=src/kore_lua.c");
-    println!("cargo:rerun-if-changed=tests/host_smoke.c");
-    println!("cargo:rerun-if-changed=tests/target_shim.rs");
-    println!("cargo:rerun-if-changed=vendor/lua");
-    println!("cargo:rerun-if-changed=vendor/musl-setjmp");
+/// Whether a C compiler answers at all.
+///
+/// Deliberately `--version` and not a probe compile: the question is
+/// "is there a toolchain here", and a compiler that exists but cannot
+/// build the engine must fail loudly rather than be skipped.
+fn compiler_present(cc: &OsStr) -> bool {
+    Command::new(cc)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
 
-    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    fs::create_dir_all(&out).expect("create Lua build output");
-    let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture");
-    let c_target = match arch.as_str() {
-        "x86_64" => "x86_64-linux-musl",
-        "aarch64" => "aarch64-linux-musl",
-        "riscv64" => "riscv64-linux-musl",
-        other => panic!("Lua has no kore C ABI mapping for {other}"),
-    };
-    let zig = env::var_os("KORE_ZIG").unwrap_or_else(|| "zig".into());
-    let zig_version = Command::new(&zig)
-        .arg("version")
-        .output()
-        .expect("could not query the supported Zig toolchain");
-    assert!(zig_version.status.success(), "`zig version` failed");
-    let zig_version = std::str::from_utf8(&zig_version.stdout)
-        .expect("`zig version` returned non-UTF-8 output")
-        .trim();
-    assert!(
-        zig_version_supported(zig_version),
-        "Lua requires Zig {SUPPORTED_ZIG_MAJOR}.{SUPPORTED_ZIG_MINOR}.x; found {zig_version}. \
-         The target C build separately verifies the musl jmp_buf ABI used by the vendored assembly"
-    );
-    let object = out.join("kore_lua.o");
-    let archive = out.join("libkore_lua.a");
-
-    // Exercise the same amalgamation through a native protected-call cycle
-    // on every clean build. This catches C-ABI/longjmp regressions before a
-    // boot image can merely prove that the freestanding object linked.
-    let host = env::var("HOST").expect("host triple");
+/// Build and run the C smoke tests with a host C compiler.
+///
+/// Answers `false` when no C compiler is available, which is a skip and
+/// not a failure: an ordinary host `cargo check`/`cargo test` of this
+/// workspace must not require a C toolchain. A compiler that is present
+/// but fails still panics — a broken smoke is a real regression.
+fn host_smoke(out: &Path, host: &str) -> bool {
     let host_cc = env::var_os("KORE_HOST_CC").unwrap_or_else(|| {
         if host.contains("apple-darwin") {
             "/usr/bin/clang".into()
@@ -95,6 +76,9 @@ fn main() {
             "cc".into()
         }
     });
+    if !compiler_present(&host_cc) {
+        return false;
+    }
     let host_smoke = out.join("lua-host-smoke");
     let mut smoke_cc = Command::new(&host_cc);
     smoke_cc
@@ -173,6 +157,73 @@ fn main() {
         "native Lua target-shim smoke execution",
     );
 
+    true
+}
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=KORE_ZIG");
+    println!("cargo:rerun-if-env-changed=KORE_HOST_CC");
+    println!("cargo:rerun-if-changed=src/numeric.rs");
+    println!("cargo:rerun-if-changed=src/kore_lua.c");
+    println!("cargo:rerun-if-changed=tests/host_smoke.c");
+    println!("cargo:rerun-if-changed=tests/host_fs.c");
+    println!("cargo:rerun-if-changed=tests/target_shim.rs");
+    println!("cargo:rerun-if-changed=vendor/lua");
+    println!("cargo:rerun-if-changed=vendor/musl-setjmp");
+
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    fs::create_dir_all(&out).expect("create Lua build output");
+
+    // The C smoke tests need only a host C compiler, which is worth having
+    // on every build: they run the whole engine and the whole `io`/`os`/
+    // `kore.fs` surface against the in-memory store in `tests/host_fs.c`,
+    // and they are the only place that happens without a machine.
+    //
+    // They are skipped rather than fatal when no C compiler is present:
+    // `cargo check`/`cargo test` of this workspace must work for a
+    // consumer who has neither toolchain, which is what the README
+    // promises and AGENTS.md requires. `make cross` builds for the Kore
+    // targets and therefore always runs them.
+    let host = env::var("HOST").expect("host triple");
+    if !host_smoke(&out, &host) {
+        println!(
+            "cargo:warning=kore-lua: no host C compiler; skipped the engine smoke tests. \
+             Set KORE_HOST_CC to run them."
+        );
+    }
+
+    // The engine itself exists only where `src/lib.rs` compiles its Rust
+    // half: the amalgamation, the worker thread and the doorbell are all
+    // `target_os = "none"` surfaces. A host build carries `files`' logic
+    // and none of the C, so there is no object for it to link and no
+    // reason to require Zig.
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "none" {
+        return;
+    }
+
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture");
+    let c_target = match arch.as_str() {
+        "x86_64" => "x86_64-linux-musl",
+        "aarch64" => "aarch64-linux-musl",
+        "riscv64" => "riscv64-linux-musl",
+        other => panic!("Lua has no kore C ABI mapping for {other}"),
+    };
+    let zig = env::var_os("KORE_ZIG").unwrap_or_else(|| "zig".into());
+    let zig_version = Command::new(&zig)
+        .arg("version")
+        .output()
+        .expect("could not query the supported Zig toolchain");
+    assert!(zig_version.status.success(), "`zig version` failed");
+    let zig_version = std::str::from_utf8(&zig_version.stdout)
+        .expect("`zig version` returned non-UTF-8 output")
+        .trim();
+    assert!(
+        zig_version_supported(zig_version),
+        "Lua requires Zig {SUPPORTED_ZIG_MAJOR}.{SUPPORTED_ZIG_MINOR}.x; found {zig_version}. \
+         The target C build separately verifies the musl jmp_buf ABI used by the vendored assembly"
+    );
+    let object = out.join("kore_lua.o");
+    let archive = out.join("libkore_lua.a");
     let mut cc = zig_command(&zig, &out);
     cc.arg("cc")
         // Zig's musl target supplies ISO C headers only. The resulting object

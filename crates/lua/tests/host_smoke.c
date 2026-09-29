@@ -7,6 +7,11 @@
 #include "lua.h"
 #include "lauxlib.h"
 
+/* The in-memory store behind the real host transport.  Included rather
+   than compiled separately so both this harness's builds — libc numeric
+   and target numeric — get the same store. */
+#include "host_fs.c"
+
 /* The engine's real arity.  This prototype MUST match src/kore_lua.c: a
    short one leaves the library array and its count as whatever the call's
    argument registers happened to hold, which `luaopen_kore` then walks. */
@@ -127,6 +132,493 @@ static int protected_setup_smoke(void) {
   return 0;
 }
 
+/*
+ * The fault hooks, reachable from Lua as `kore.test.*`.
+ *
+ * Registered through the same `libraries` array an embedder uses, so the
+ * suite also proves that path: a name and an opener handed to
+ * `kore_lua_new` land beneath `kore` and list themselves in `kore.caps()`.
+ */
+static int test_fail_reads_after(lua_State *L) {
+  host_fs_fail_reads_after((int)luaL_checkinteger(L, 1));
+  return 0;
+}
+
+static int test_fail_closes(lua_State *L) {
+  host_fs_set_refuse_close(lua_toboolean(L, 1));
+  return 0;
+}
+
+static int test_open_library(lua_State *L) {
+  static const luaL_Reg entries[] = {
+    {"fail_reads_after", test_fail_reads_after},
+    {"fail_closes", test_fail_closes},
+    {NULL, NULL}
+  };
+  luaL_newlib(L, entries);
+  return 1;
+}
+
+static const kore_lua_library test_libraries[] = {
+  {"test", test_open_library}
+};
+
+/*
+ * Run a chunk and report the Lua error on failure, so a broken assertion
+ * names itself instead of arriving as a numeric exit code.
+ */
+static int run_reporting(lua_State *L, const char *source, const char *what) {
+  if (kore_lua_load(L, source, strlen(source), "=host-smoke") != LUA_OK ||
+      kore_lua_call(L, 0, LUA_MULTRET) != LUA_OK) {
+    const char *why = lua_tostring(L, -1);
+    fprintf(stderr, "%s: %s\n", what, why != NULL ? why : "(no message)");
+    return 0;
+  }
+  return 1;
+}
+
+/*
+ * The filesystem surface, over the in-memory store in tests/host_fs.c.
+ *
+ * Everything here needs a host to answer, which is why it is a separate
+ * pass: the selftest below runs with whatever the weak stubs do, and this
+ * one runs the same engine against a store that actually holds bytes.
+ * Between them they cover `io`, `os` and `kore.fs` end to end.
+ */
+static int filesystem_smoke(void) {
+  static const char suite[] =
+      /* ---------------------------------------------- open, write, read */
+      "local f = assert(io.open('/hello.txt','w'))\n"
+      "assert(io.type(f)=='file')\n"
+      "assert(f:write('hello ')==f)\n"
+      "assert(f:write('world\\n')==f)\n"
+      "assert(f:close()==true)\n"
+      "assert(io.type(f)=='closed file')\n"
+      /* A second close is idempotent, never an error (rule 4). */
+      "assert(f:close()==true)\n"
+      /* A closed file raises on use: a programming error, not a failure. */
+      "assert(not pcall(f.read, f, 'a'))\n"
+
+      "local r = assert(io.open('/hello.txt','r'))\n"
+      "assert(r:read('a')=='hello world\\n')\n"
+      "assert(r:seek('set')==0)\n"
+      "assert(r:read('l')=='hello world')\n"
+      "assert(r:read('l')==nil)\n"
+      "assert(r:seek('set')==0)\n"
+      "assert(r:read('L')=='hello world\\n')\n"
+      "assert(r:seek('set',6)==6)\n"
+      "assert(r:read(5)=='world')\n"
+      "assert(r:seek('cur')==11)\n"
+      "assert(r:seek('end')==12)\n"
+      "assert(r:seek('set',0)==0)\n"
+      "assert(r:read(0)=='')\n"
+      "assert(r:seek('end')==12 and r:read(0)==nil)\n"
+      /* A negative resulting position is a refusal, not a wrap. */
+      "local ok,why,err = r:seek('set',-1)\n"
+      "assert(ok==nil and why=='range' and err==34)\n"
+      "assert(r:close()==true)\n"
+
+      /* ------------------------------------------------ the `a` append mode */
+      "local a = assert(io.open('/hello.txt','a'))\n"
+      /* An append stream starts at the end, so a seek before the first
+         write reports where those bytes will actually land. */
+      "assert(a:seek('cur')==12)\n"
+      "assert(a:write('again\\n'))\n"
+      "assert(a:close())\n"
+      "assert(kore.fs.read_file('/hello.txt')=='hello world\\nagain\\n')\n"
+
+      /* ----------------------------------------------------- update modes */
+      "local u = assert(io.open('/update.txt','w+'))\n"
+      "assert(u:write('abcdef'))\n"
+      "assert(u:seek('set',2)==2)\n"
+      "assert(u:read(2)=='cd')\n"
+      "assert(u:seek('set',0)==0)\n"
+      "assert(u:write('ZY'))\n"
+      "assert(u:seek('set',0)==0 and u:read('a')=='ZYcdef')\n"
+      "assert(u:close())\n"
+      /* `r+` reads and writes but does not create. */
+      "assert(io.open('/absent.txt','r+')==nil)\n"
+      "local p = assert(io.open('/update.txt','r+'))\n"
+      "assert(p:read(2)=='ZY')\n"
+      "assert(p:close())\n"
+      /* A mode Lua does not define is an argument error, not a silent open. */
+      "assert(not pcall(io.open,'/update.txt','q'))\n"
+      "assert(not pcall(io.open,'/update.txt',''))\n"
+      /* `b` is accepted and means nothing here. */
+      "assert(io.open('/update.txt','rb')):close()\n"
+
+      /* ------------------------------------------------- the two spellings */
+      /* One failure, two renderings, both derived from the same FsError. */
+      "local h,why,err = io.open('/nowhere.txt','r')\n"
+      "assert(h==nil and why=='not-found' and err==2)\n"
+      "local g,e = kore.fs.open('/nowhere.txt','r')\n"
+      "assert(g==nil and e.code=='not-found' and e.kind=='refused')\n"
+      "assert(tostring(e)=='not-found')\n"
+      /* The reply the bridge hands back is length-delimited and carries no
+         terminator; the store poisons the byte after it.  An exact match
+         here is what proves nothing above reached for `strlen`. */
+      "assert(#why==9)\n"
+
+      /* ------------------------------------------------- read-only handles */
+      "local ro = assert(io.open('/hello.txt','r'))\n"
+      "local ok2,why2,err2 = ro:write('x')\n"
+      "assert(ok2==nil and why2=='access-denied' and err2==13)\n"
+      "assert(ro:close())\n"
+      "local wo = assert(io.open('/writeonly.txt','w'))\n"
+      "local ok3,why3 = wo:read('a')\n"
+      "assert(ok3==nil and why3=='access-denied')\n"
+      "assert(wo:close())\n"
+
+      /* ------------------------------------------------- multi-page reads */
+      /* Larger than the store's single-reply cap, so the read-ahead in
+         kore_lua.c must loop rather than assume one refill is enough. */
+      "local big = assert(io.open('/big.txt','w'))\n"
+      "local chunk = string.rep('0123456789', 100)\n"
+      "for _ = 1, 10 do assert(big:write(chunk)) end\n"
+      "assert(big:close())\n"
+      "local rb = assert(io.open('/big.txt','r'))\n"
+      "local whole = rb:read('a')\n"
+      "assert(#whole==10000, #whole)\n"
+      "assert(whole==string.rep(chunk,10))\n"
+      "assert(rb:seek('set')==0)\n"
+      "assert(#rb:read(6000)==6000)\n"
+      "assert(rb:close())\n"
+
+      /* ------------------------------------------------------ read formats */
+      "assert(kore.fs.write_file('/nums.txt','12 -3.5 0x10\\nrest\\n')>0)\n"
+      "local n = assert(io.open('/nums.txt','r'))\n"
+      "assert(n:read('n')==12)\n"
+      "assert(n:read('n')==-3.5)\n"
+      "assert(n:read('n')==16)\n"
+      "assert(n:read('l')=='')\n"
+      "assert(n:read('l')=='rest')\n"
+      "assert(n:close())\n"
+      /* Several formats in one call, and the 5.2 star spelling. */
+      "local m = assert(io.open('/hello.txt','r'))\n"
+      "local one,two = m:read(5,'*l')\n"
+      "assert(one=='hello' and two==' world')\n"
+      "assert(m:close())\n"
+
+      /* ------------------------------------------------------------ lines */
+      "assert(kore.fs.write_file('/lines.txt','a\\nb\\nc\\n')>0)\n"
+      "local seen = {}\n"
+      "for line in io.lines('/lines.txt') do seen[#seen+1] = line end\n"
+      "assert(#seen==3 and seen[1]=='a' and seen[3]=='c')\n"
+      /* io.lines(name) answers four values, the last to-be-closed. */
+      "local n1,n2,n3,n4 = io.lines('/lines.txt')\n"
+      "assert(type(n1)=='function' and n2==nil and n3==nil)\n"
+      "assert(io.type(n4)=='file' and n4:close())\n"
+      "local it,_,_,tbc = io.lines('/lines.txt')\n"
+      "assert(io.type(tbc)=='file' and it()=='a')\n"
+      "assert(tbc:close())\n"
+      /* f:lines leaves the file open, and closing it stops the iterator. */
+      "local lf = assert(io.open('/lines.txt','r'))\n"
+      "local step = lf:lines('L')\n"
+      "assert(step()=='a\\n')\n"
+      "assert(lf:close())\n"
+      "assert(not pcall(step))\n"
+
+      /* ------------------------------------------------ default input/output */
+      "local infile = io.input('/lines.txt')\n"
+      "assert(io.type(infile)=='file')\n"
+      "assert(io.read('l')=='a')\n"
+      "assert(io.read('l')=='b')\n"
+      "io.input(io.stdin)\n"
+      "assert(io.read('l')==nil)\n"
+      "assert(infile:close())\n"
+
+      /* -------------------------------------------------------- kore.fs */
+      "assert(kore.fs.exists('/hello.txt'))\n"
+      "assert(not kore.fs.exists('/nowhere.txt'))\n"
+      "local st = assert(kore.fs.stat('/hello.txt'))\n"
+      "assert(st.size_bytes==18 and st.kind=='file' and st.directory==false)\n"
+      "assert(kore.fs.mkdir('/dir'))\n"
+      "local dst = assert(kore.fs.stat('/dir'))\n"
+      "assert(dst.kind=='directory' and dst.directory==true)\n"
+      /* A directory that exists is `already-exists`, not a silent success. */
+      "local md,mderr = kore.fs.mkdir('/dir')\n"
+      "assert(md==nil and mderr.code=='already-exists')\n"
+      "assert(kore.fs.write_file('/dir/one','1')==1)\n"
+      "assert(kore.fs.write_file('/dir/two','22')==2)\n"
+      "local names = assert(kore.fs.list('/dir'))\n"
+      "table.sort(names)\n"
+      "assert(#names==2 and names[1]=='one' and names[2]=='two')\n"
+      /* A non-empty directory is not removable. */
+      "local rm,rmerr = kore.fs.remove('/dir')\n"
+      "assert(rm==nil and rmerr.code=='not-empty')\n"
+      "assert(kore.fs.remove('/dir/one'))\n"
+      "assert(kore.fs.rename('/dir/two','/dir/three'))\n"
+      "assert(kore.fs.read_file('/dir/three')=='22')\n"
+      "assert(kore.fs.remove('/dir/three'))\n"
+      "assert(kore.fs.remove('/dir'))\n"
+      "assert(not kore.fs.exists('/dir'))\n"
+      /* `read_file` on a missing path answers the kore spelling. */
+      "local rf,rferr = kore.fs.read_file('/nowhere.txt')\n"
+      "assert(rf==nil and rferr.code=='not-found')\n"
+      /* The root has no parent to mutate. */
+      "local root,rooterr = kore.fs.remove('/')\n"
+      "assert(root==nil and rooterr.code=='access-denied')\n"
+
+      /* ------------------------------------------------------ kore.fs.resize */
+      "local rz = assert(kore.fs.open('/resize.txt','w+'))\n"
+      "assert(rz:write('abcdefgh'))\n"
+      "assert(kore.fs.resize(rz,3))\n"
+      /* A truncation drags the position back with it. */
+      "assert(rz:seek('cur')==3)\n"
+      "assert(rz:seek('set')==0 and rz:read('a')=='abc')\n"
+      "assert(kore.fs.resize(rz,5))\n"
+      "assert(rz:seek('end')==5)\n"
+      "assert(not pcall(kore.fs.resize, rz, -1))\n"
+      "assert(rz:close())\n"
+
+      /* ----------------------------------------------------------- os verbs */
+      "assert(kore.fs.write_file('/gone.txt','x')==1)\n"
+      "assert(os.remove('/gone.txt')==true)\n"
+      "local orm,ormwhy,ormerr = os.remove('/gone.txt')\n"
+      "assert(orm==nil and ormwhy=='not-found' and ormerr==2)\n"
+      "assert(kore.fs.write_file('/from.txt','y')==1)\n"
+      "assert(os.rename('/from.txt','/to.txt')==true)\n"
+      "assert(kore.fs.read_file('/to.txt')=='y')\n"
+      "assert(os.remove('/to.txt'))\n"
+
+      /* --------------------------------------------------------- temporaries */
+      /* os.tmpname creates its file, so the name it answers is one nothing
+         else can already hold. */
+      "local name = assert(os.tmpname())\n"
+      "assert(name:sub(1,9)=='/tmp/lua_')\n"
+      "assert(kore.fs.exists(name))\n"
+      "local name2 = assert(os.tmpname())\n"
+      "assert(name2~=name)\n"
+      "assert(os.remove(name) and os.remove(name2))\n"
+      /* io.tmpfile removes its own file when the handle retires. */
+      "local tmp = assert(io.tmpfile())\n"
+      "assert(tmp:write('scratch'))\n"
+      "assert(tmp:seek('set')==0 and tmp:read('a')=='scratch')\n"
+      "assert(tmp:close())\n"
+
+      /* ------------------------------------------------------- kore.proc */
+      "assert(type(kore.proc.args)=='table')\n"
+      "assert(kore.proc.args[1]=='one' and kore.proc.args[2]=='two')\n"
+      "assert(#kore.proc.args==2)\n"
+      /* A missing key answers nil, as an ordinary table does. */
+      "assert(kore.proc.nothing==nil and kore.proc[1]==nil)\n"
+
+      /* ------------------------------------------------------- kore.time */
+      "assert(kore.time.sleep(0.001)==true)\n"
+      "assert(type(kore.time.now())=='number')\n"
+      "assert(math.type(kore.time.mono_ns())=='integer')\n"
+      "assert(kore.time.wall()==1700000000.0)\n"
+      "assert(not pcall(kore.time.sleep,-1))\n"
+      /* os.time with no argument reads the same wall clock. */
+      "assert(os.time()==1700000000)\n"
+      "assert(os.date('!%Y-%m-%dT%H:%M:%SZ')=='2023-11-14T22:13:20Z')\n"
+
+      /* ----------------------------------------------------- kore.random */
+      "assert(kore.random.available()==true)\n"
+      "assert(#kore.random.bytes(32)==32)\n"
+      "assert(#kore.random.bytes(0)==0)\n"
+      "assert(not pcall(kore.random.bytes,-1))\n"
+      "assert(not pcall(kore.random.bytes,4097))\n"
+      "local lo = kore.random.integer(5,5)\n"
+      "assert(lo==5)\n"
+      "for _ = 1, 50 do\n"
+      "  local v = kore.random.integer(-3,3)\n"
+      "  assert(v>=-3 and v<=3, v)\n"
+      "end\n"
+      "assert(not pcall(kore.random.integer,3,-3))\n"
+
+      /* --------------------------------------------------------- kore.caps */
+      "local caps = kore.caps()\n"
+      "assert(caps[1]=='time' and caps[2]=='random' and caps[3]=='fs')\n"
+      "assert(caps[4]=='proc' and caps[5]=='test')\n"
+      "assert(#caps==5 and type(kore.test)=='table')\n"
+      "assert(kore.has('fs')==true and kore.has('nothing')==false)\n"
+
+      /* ------------------------------------------------ the `__gc` backstop */
+      /* Deterministic close is primary, but a script that simply drops a
+         file must still give the store its handle back (rule 4).  The
+         open-handle count the harness checks next is what proves it. */
+      "do local abandoned = assert(io.open('/hello.txt','r'))\n"
+      "   assert(abandoned:read(1)=='h') end\n"
+      "collectgarbage('collect')\n"
+      "collectgarbage('collect')\n"
+      "return true\n";
+
+  /*
+   * A refused call renders through `kore_lua_fail`'s concatenating arm.
+   * The store poisons the byte past its reply, so an exact match is what
+   * proves the refusal was not spelled with `%s` over a buffer that has
+   * no terminator.
+   */
+  static const char refusal_suite[] =
+      "local ok,why = kore.time.sleep(0.5)\n"
+      "assert(ok==nil, 'the sleep should have been refused')\n"
+      "assert(why=='refused: the timer is busy', why)\n"
+      "return true\n";
+
+  /*
+   * A read that fails partway answers the failure alone, as stock `g_read`
+   * does — not a partial result with a failure stapled to the end.
+   */
+  static const char read_failure_suite[] =
+      /* A failure on the very first refill: the whole answer is the
+         failure triple, in `io`'s spelling. */
+      "local f = assert(io.open('/hello.txt','r'))\n"
+      "kore.test.fail_reads_after(0)\n"
+      "local a,b,c,d = f:read('l','l')\n"
+      "assert(a==nil, 'a failed read answers nil first')\n"
+      "assert(b=='access-lost', tostring(b))\n"
+      "assert(c==9, tostring(c))\n"
+      "assert(d==nil, 'the failure is the whole answer')\n"
+      "kore.test.fail_reads_after(-1)\n"
+      "assert(f:close())\n"
+      /* A failure *after* a partial read, which is the interesting one:
+         6000 bytes needs two refills, so by the time the third is refused
+         the `luaL_Buffer` has moved onto the stack as a box.  The failure
+         must replace the partial result rather than trail it, and must not
+         be pushed above the box. */
+      "local big = assert(io.open('/big.txt','r'))\n"
+      "kore.test.fail_reads_after(2)\n"
+      "local e,g,h,i = big:read(6000,'l')\n"
+      "assert(e==nil, 'the failure replaces the partial read')\n"
+      "assert(g=='access-lost', tostring(g))\n"
+      "assert(h==9, tostring(h))\n"
+      "assert(i==nil, 'nothing trails the failure')\n"
+      "kore.test.fail_reads_after(-1)\n"
+      "assert(big:close())\n"
+      /* The same shape through `read('a')`, whose buffer is the largest. */
+      "local all = assert(io.open('/big.txt','r'))\n"
+      "kore.test.fail_reads_after(1)\n"
+      "local j,k = all:read('a')\n"
+      "assert(j==nil and k=='access-lost', tostring(k))\n"
+      "kore.test.fail_reads_after(-1)\n"
+      "assert(all:close())\n"
+      /* A file `kore.fs.open` answered is the *same* object, so its methods
+         render the same way: only the two surfaces' own verbs differ, and
+         `file:read` is one of `io`'s seven.  `kore.fs.open`'s failure is a
+         table; `f:read`'s is a message and an errno, whichever surface
+         opened the file. */
+      "local kf = assert(kore.fs.open('/big.txt','r'))\n"
+      "kore.test.fail_reads_after(0)\n"
+      "local l,m,n2 = kf:read('a')\n"
+      "assert(l==nil and m=='access-lost' and n2==9, tostring(m))\n"
+      "kore.test.fail_reads_after(-1)\n"
+      "assert(kf:close())\n"
+      /* A read failure inside `io.lines` raises, as `io_readline` does: a
+         `for` loop that merely stopped would read as end of file. */
+      "local lines = io.lines('/big.txt')\n"
+      "kore.test.fail_reads_after(0)\n"
+      "local raised = select(2, pcall(lines))\n"
+      "kore.test.fail_reads_after(-1)\n"
+      "assert(type(raised)=='string' and raised:find('access%-lost'), \n"
+      "       tostring(raised))\n"
+
+      /* ------------------------------------------- a close that also fails */
+      /* `kore.fs.read_file` opens, reads and retires the handle itself.
+         A refused close pushes two values where success pushes one, so a
+         caller that popped a fixed count would hand back the wrong thing
+         entirely — the file object, or the error table, instead of the
+         bytes it read. */
+      "kore.test.fail_closes(true)\n"
+      "local body, bodyerr = kore.fs.read_file('/hello.txt')\n"
+      "assert(body=='hello world\\nagain\\n', tostring(body))\n"
+      "assert(bodyerr==nil, 'the close is not the caller\\'s answer')\n"
+      /* And when the read failed too, the read's failure is what survives. */
+      "kore.test.fail_reads_after(0)\n"
+      "local none, noneerr = kore.fs.read_file('/hello.txt')\n"
+      "assert(none==nil, tostring(none))\n"
+      "assert(type(noneerr)=='table' and noneerr.code=='access-lost',\n"
+      "       tostring(noneerr))\n"
+      "kore.test.fail_reads_after(-1)\n"
+      /* A refused close on the file object answers the refusal itself, and
+         the handle is retired either way: a re-close is still idempotent. */
+      "local rc = assert(io.open('/hello.txt','r'))\n"
+      "local cok, cwhy, cerr = rc:close()\n"
+      "assert(cok==nil and cwhy=='access-lost' and cerr==9, tostring(cwhy))\n"
+      "assert(rc:close()==true)\n"
+      "kore.test.fail_closes(false)\n"
+
+      /* ------------------------------------ a temporary draw that cannot land */
+      /* With no `/tmp` to create in, the exclusive open answers `not-found`
+         and both verbs render that reason exactly.  Exact is the point: the
+         store poisons the byte after its reply, so a `strlen` over it would
+         answer a longer, garbled string. */
+      "assert(kore.fs.remove('/tmp'))\n"
+      "local tn, tnwhy = os.tmpname()\n"
+      "assert(tn==nil and tnwhy=='not-found', tostring(tnwhy))\n"
+      "local tf, tfwhy, tferr = io.tmpfile()\n"
+      "assert(tf==nil and tfwhy=='not-found' and tferr==2, tostring(tfwhy))\n"
+      "assert(kore.fs.mkdir('/tmp'))\n"
+      "return true\n";
+
+  /* `os.exit` records its code and unwinds; it is not an error. */
+  static const char exit_suite[] =
+      "local closed = false\n"
+      "do\n"
+      "  local guard <close> = setmetatable({}, {__close=function() closed=true end})\n"
+      "  os.exit(7)\n"
+      "end\n"
+      "error('os.exit did not unwind')\n";
+
+  host_fs_reset("one two");
+  struct capture capture = {{0}, 0};
+  lua_State *L = kore_lua_new(host_alloc, NULL, 0x4b4f5245u, test_libraries,
+                              sizeof test_libraries / sizeof test_libraries[0]);
+  if (L == NULL) return 1;
+  if (kore_lua_install_print(L, capture_append, &capture) != LUA_OK) {
+    kore_lua_close(L); return 2;
+  }
+  if (!run_reporting(L, suite, "filesystem suite")) { kore_lua_close(L); return 3; }
+  kore_lua_set_top(L, 0);
+
+  /* Every handle the suite opened was closed: a leak here means a verb
+     kept one the script can no longer name. */
+  if (host_fs_open_handles() != 0) { kore_lua_close(L); return 4; }
+  /* io.tmpfile's file went with its handle, and os.tmpname's did not. */
+  if (host_fs_exists("/tmp/lua_")) { kore_lua_close(L); return 5; }
+
+  host_fs_set_refuse_sleep(1);
+  if (!run_reporting(L, refusal_suite, "refusal rendering")) {
+    kore_lua_close(L); return 6;
+  }
+  host_fs_set_refuse_sleep(0);
+  kore_lua_set_top(L, 0);
+
+  if (!run_reporting(L, read_failure_suite, "read failure")) {
+    kore_lua_close(L); return 7;
+  }
+  kore_lua_set_top(L, 0);
+  kore_lua_close(L);
+
+  /* A fresh VM: the exit suite ends its own evaluation. */
+  host_fs_reset("");
+  struct capture exit_capture = {{0}, 0};
+  L = kore_lua_new(host_alloc, NULL, 0x4b4f5245u, NULL, 0);
+  if (L == NULL) return 8;
+  if (kore_lua_install_print(L, capture_append, &exit_capture) != LUA_OK) {
+    kore_lua_close(L); return 9;
+  }
+  if (kore_lua_load(L, exit_suite, strlen(exit_suite), "=exit") != LUA_OK) {
+    kore_lua_close(L); return 10;
+  }
+  /* The sentinel reaches the host as an error — that is how it ran the
+     `<close>` handler on its way out.  src/vm.rs is what recognizes it;
+     here the contract under test is that the code was recorded and the
+     raise carries the sentinel the host matches on. */
+  if (kore_lua_call(L, 0, LUA_MULTRET) == LUA_OK) { kore_lua_close(L); return 11; }
+  {
+    const char *why = lua_tostring(L, -1);
+    if (why == NULL || strstr(why, "kore:exit") == NULL) {
+      kore_lua_close(L); return 12;
+    }
+  }
+  if (!host_fs_exit_requested() || host_fs_exit_code() != 7) {
+    kore_lua_close(L); return 13;
+  }
+  kore_lua_close(L);
+  return 0;
+}
+
 #if defined(KORE_LUA_USE_TARGET_NUMERIC)
 int kore_lua_host_smoke(void) {
 #else
@@ -231,7 +723,10 @@ int main(void) {
       "assert(type(raised)=='string' and raised:find('cannot open file'),\n"
       "       tostring(raised))\n"
       "assert(not pcall(io.input,'/nowhere'))\n"
-      "assert(not pcall(io.output,'/nowhere'))\n"
+      /* `io.output` opens for writing, so it fails only where it cannot
+         create: a parent that is not there. */
+      "assert(not pcall(io.output,'/nodir/file'))\n"
+      "assert(not pcall(io.lines,'/nodir/file'))\n"
       "assert(io.type(42)==nil and io.type('x')==nil)\n"
       "assert(io.stdin:read('a')=='')\n"
       "assert(io.stdin:read('l')==nil)\n"
@@ -255,6 +750,21 @@ int main(void) {
       "assert(os.date('%I',0)=='12' and os.date('%I',43200)=='12')\n"
       "assert(os.date('%%',0)=='%')\n"
       "assert(not pcall(os.date,'%Q',0))\n"
+      /* The calendar states its range instead of truncating a huge year
+         into a plausible-looking date: the broken-down year is an `int`
+         and `%F` spells four digits.  The bounds are the first and last
+         instants of years 0000 and 9999. */
+      "assert(os.date('%F',253402300799)=='9999-12-31')\n"
+      "assert(os.date('%T',253402300799)=='23:59:59')\n"
+      "assert(os.date('%F',-62167219200)=='0000-01-01')\n"
+      "local over = select(2, pcall(os.date,'%F',253402300800))\n"
+      "assert(over:find('cannot be represented'), tostring(over))\n"
+      "assert(not pcall(os.date,'%F',-62167219201))\n"
+      "assert(not pcall(os.date,'*t',1e18))\n"
+      "assert(not pcall(os.date,'%F',-1e18))\n"
+      "assert(not pcall(os.time,{year=99999,month=1,day=1,hour=0}))\n"
+      "assert(not pcall(os.time,{year=2023,month=1,day=1e15,hour=0}))\n"
+      "assert(not pcall(os.time,{year=-5,month=1,day=1,hour=0}))\n"
       /* `*t` and `os.time` are exact inverses, which is what makes date
          arithmetic by field addition work. */
       "local t=os.date('*t',1700000000)\n"
@@ -286,13 +796,19 @@ int main(void) {
       "print(6*7)\n";
   int setup_status = protected_setup_smoke();
   if (setup_status != 0) return 10 + setup_status;
+  /* A store with nothing in it: the selftest below asserts what an absent
+     path answers, and the pass after it fills one in. */
+  host_fs_reset("");
+  int fs_status = filesystem_smoke();
+  if (fs_status != 0) return 30 + fs_status;
+  host_fs_reset("");
   struct capture capture = {{0}, 0};
   lua_State *L = kore_lua_new(host_alloc, NULL, 0x4b4f5245u, NULL, 0);
   if (L == NULL) return 1;
   if (kore_lua_install_print(L, capture_append, &capture) != LUA_OK) {
     kore_lua_close(L); return 2;
   }
-  if (!run(L, selftest, 0)) return 2;
+  if (!run_reporting(L, selftest, "selftest")) return 2;
   if (capture.len != 3 || memcmp(capture.bytes, "42\n", 3) != 0) return 3;
 
   /* Saved-script regression: a local closure adds mixed integer/float

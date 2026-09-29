@@ -72,7 +72,7 @@ use kore::runtime::{
 };
 use kore_late::{LoadError, Loader, Search};
 
-use crate::vm::{ReplResult, Vm};
+use crate::vm::{EvalResult, ReplResult, Vm};
 use crate::{Answer, Extension, OP_EMBEDDER_BASE};
 
 /// The bound on a source module (`<name>.lua`).  Sized like a generous
@@ -162,6 +162,12 @@ use core::ffi::c_void;
 pub enum Outcome {
     Ok,
     Failed,
+    /// The chunk ran `os.exit`. The sentinel it raised unwound every
+    /// `<close>` handler on the way out, so this is a completed evaluation
+    /// and not a failure; the code is in
+    /// [`Services::exit_request`]. A batch run leaves with it and a REPL
+    /// stops reading.
+    Exited,
     /// REPL only: the chunk needs a continuation line.
     Incomplete,
     /// REPL only: the expression buffer could not be allocated.
@@ -316,16 +322,20 @@ fn run_eval(vm: &mut Vm) {
         KIND_REPL => match vm.eval_repl(script) {
             ReplResult::Complete(true) => Outcome::Ok,
             ReplResult::Complete(false) => Outcome::Failed,
+            ReplResult::Exited => Outcome::Exited,
             ReplResult::Incomplete => Outcome::Incomplete,
             ReplResult::ResourceRefused => Outcome::ResourceRefused,
         },
         _ => {
+            // SAFETY: thread 0 posts a non-empty `&'static [u8]` chunk
+            // name with every KIND_CHUNK evaluation, so this is never the
+            // dangling-null case `from_raw_parts` forbids.
             let name: &'static [u8] =
                 unsafe { core::slice::from_raw_parts(cell.chunk_name, cell.chunk_name_len) };
-            if vm.eval(script, name) {
-                Outcome::Ok
-            } else {
-                Outcome::Failed
+            match vm.eval(script, name) {
+                EvalResult::Ok => Outcome::Ok,
+                EvalResult::Failed => Outcome::Failed,
+                EvalResult::Exited => Outcome::Exited,
             }
         }
     };
@@ -706,8 +716,9 @@ impl<'r, 't> Services<'r, 't> {
 
     /// The exit code a script asked for with `os.exit`, if it did.
     ///
-    /// The embedder checks this after each evaluation: a REPL stops reading
-    /// and a batch run leaves with it.
+    /// The embedder checks this after each evaluation, which
+    /// [`Outcome::Exited`] tells it to do: a REPL stops reading and a batch
+    /// run leaves with it.
     pub fn exit_request(&self) -> Option<i32> {
         self.exit_request
     }

@@ -18,8 +18,13 @@
 //! kore.random.bytes(32)
 //! kore.proc.args                       -- a 1-based array, read once
 //! kore.fs.read_file "/etc/hosts"       -- value, err
+//! kore.fs.stat "/etc/hosts"            -- size_bytes, kind, directory
 //! kore.has "fs"  kore.caps()           -- honest provisioning
 //! ```
+//!
+//! `kore.fs` adds only what the stock surface has no spelling for —
+//! `read_file`, `write_file`, `mkdir`, `resize`, `stat`, `exists`, `list`
+//! — and never changes a stock member.
 //!
 //! ```lua
 //! local f = assert(io.open("/tmp/log", "a"))   -- the SAME object
@@ -64,9 +69,15 @@
 //! # Threads
 //!
 //! Lua is a synchronous C engine, so the VM runs on a [`kore::thread`]
-//! worker and the executor stays on thread 0. [`bridge`] documents the one
-//! transport between them. Verbs needing no service — `kore.time.now`,
-//! `kore.random`, and the whole calendar — never cross it.
+//! worker and the executor stays on thread 0. The `bridge` module
+//! documents the one transport between them. Verbs needing no service —
+//! `kore.time.now`, `kore.random`, and the whole calendar — never cross
+//! it.
+//!
+//! `bridge`, and with it `Host`, `Services` and `Outcome`, exist only
+//! where the engine does. They are named in prose rather than linked
+//! throughout these docs: a host build compiles no engine, so the items
+//! are absent and an intra-doc link to one would not resolve.
 //!
 //! # Time
 //!
@@ -92,10 +103,9 @@ extern crate alloc;
 // vocabulary — be checked and unit-tested by the host workspace.
 #[cfg(target_os = "none")]
 pub mod bridge;
-/// `kore.fs`'s thread-0 half: the open-file table, the positional verbs,
-/// and the error vocabulary. Public because the vocabulary is part of the
-/// contract — an embedder whose own library can fail a filesystem failure
-/// renders it with [`files::code`] rather than spelling one of its own.
+// Documented by its own `//!` header. Keeping the module's docs in one
+// file is what lets rustdoc resolve their intra-doc links against that
+// file's imports.
 pub mod files;
 #[cfg(target_os = "none")]
 mod numeric;
@@ -180,7 +190,7 @@ pub const OP_EMBEDDER_BASE: u32 = 64;
 /// `kore.accel`; the shape mirrors `kore-wasi`'s embedder-composed
 /// interfaces.
 ///
-/// Selection is by type instantiation, not runtime dispatch: [`Host::start`]
+/// Selection is by type instantiation, not runtime dispatch: `Host::start`
 /// is generic over `E`, so `LIBRARIES` reaches the worker thread as
 /// monomorphized static data with no global to publish it.
 ///

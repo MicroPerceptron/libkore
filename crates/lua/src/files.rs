@@ -1,12 +1,18 @@
 //! `kore.fs`, and everything `io` and `os` are spellings of.
 //!
-//! The filesystem session lives on thread 0 and a [`View`] is affine, so
-//! Lua never holds one. It holds a *handle* — an index and a generation
-//! into the [`Files`] table below — and every verb here resolves that
-//! handle back to the view before touching the store. A handle whose slot
-//! was recycled names a generation that no longer matches, so a use after
-//! close is [`FsError::InvalidHandle`] rather than a read of somebody
-//! else's file.
+//! `kore.fs`'s thread-0 half: the open-file table, the positional verbs,
+//! and the error vocabulary. Public because the vocabulary is part of the
+//! contract — an embedder whose own library can fail a filesystem failure
+//! renders it with [`code`] rather than spelling one of its own.
+//!
+//! The filesystem session lives on thread 0 and a [`View`]
+//! is affine, so Lua never holds one. It holds a *handle* — an index and a
+//! generation into the [`Files`] table below — and every verb here
+//! resolves that handle back to the view before touching the store. A
+//! handle whose slot was recycled names a generation that no longer
+//! matches, so a use after close is
+//! [`FsError::InvalidHandle`] rather
+//! than a read of somebody else's file.
 //!
 //! Every verb here is *positional*. DagFS addresses bytes absolutely
 //! (`read_at` / `write_at`), and a stream position is a POSIX idea that
@@ -16,13 +22,14 @@
 //! two authorities for one number, and they would drift the first time a
 //! buffered read looked further ahead than the script had consumed.
 //!
-//! Every verb answers in the three shapes [`Answer`] names, and an expected
-//! failure — a missing file, a denied right — is a `Refused` carrying the
-//! kebab-case spelling of the [`FsError`] that caused it, never a raise.
+//! Every verb answers in the three shapes [`Answer`] names,
+//! and an expected failure — a missing file, a denied right — is a
+//! `Refused` carrying the kebab-case spelling of the
+//! [`FsError`] that caused it, never a raise.
 //! One vocabulary, two spellings: `kore.fs` renders it as a table and `io`
 //! as a message and an errno (`res/SYSTEM_LIBRARY.md`, the six rules).
 
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
 use kore::fs::{Fs, FsError, Name, Refusal, Rights, View, dag::ObjectKind};
 
@@ -92,30 +99,38 @@ impl Files {
         }
     }
 
-    fn insert(&mut self, view: View, readable: bool, writable: bool, append: bool) -> Option<u64> {
+    /// Take the view into a free slot and answer its handle.
+    ///
+    /// `Err` hands the view **back**, because it is affine: the store still
+    /// believes the handle is open, and a refusal that dropped it here
+    /// would retire it locally and leak it remotely. The caller owes it a
+    /// `close` either way, which is the whole reason this cannot answer a
+    /// bare `Option`.
+    fn insert(
+        &mut self,
+        view: View,
+        readable: bool,
+        writable: bool,
+        append: bool,
+    ) -> Result<u64, View> {
+        let index = match self.slots.iter().position(Option::is_none) {
+            Some(index) => index,
+            None if self.slots.len() < MAX_OPEN_FILES => {
+                self.slots.push(None);
+                self.slots.len() - 1
+            }
+            None => return Err(view),
+        };
         let generation = self.next_generation;
-        let file = OpenFile {
+        self.slots[index] = Some(OpenFile {
             view,
             generation,
             readable,
             writable,
             append,
-        };
-        let index = match self.slots.iter().position(Option::is_none) {
-            Some(index) => {
-                self.slots[index] = Some(file);
-                index
-            }
-            None => {
-                if self.slots.len() >= MAX_OPEN_FILES {
-                    return None;
-                }
-                self.slots.push(Some(file));
-                self.slots.len() - 1
-            }
-        };
+        });
         self.next_generation = self.next_generation.wrapping_add(1);
-        Some(encode(index, generation))
+        Ok(encode(index, generation))
     }
 
     /// Take the file out of the table, leaving the slot free.
@@ -300,7 +315,7 @@ pub async fn open(fs: &mut Fs<'_, '_>, files: &mut Files, path: &[u8], flags: u6
         // The length rides back beside the handle: an append stream starts
         // its position at the end, and the object in C would otherwise
         // have to stat immediately just to learn where it is.
-        Some(handle) => Answer::Value(
+        Ok(handle) => Answer::Value(
             handle,
             if flags & mode::TRUNCATE != 0 {
                 0
@@ -308,12 +323,10 @@ pub async fn open(fs: &mut Fs<'_, '_>, files: &mut Files, path: &[u8], flags: u6
                 length
             },
         ),
-        None => {
+        Err(view) => {
             // The table is full. Give the store its handle back rather
             // than holding one the VM can no longer name.
-            if let Ok(view) = files.take(u64::MAX) {
-                fs.close(view).await;
-            }
+            fs.close(view).await;
             refused(FsError::OutOfHandles)
         }
     }
@@ -373,7 +386,14 @@ pub async fn read(
         return refused(FsError::AccessDenied);
     }
     let count = (count as usize).min(MAX_READ_BYTES);
-    let mut buffer = vec![0u8; count];
+    // `try_reserve`, not `vec![0; count]`: the size is a script's argument
+    // and the refusal belongs to the script, not to the task. An abort
+    // here would take thread 0 with it.
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(count).is_err() {
+        return refused(FsError::OutOfStorage);
+    }
+    buffer.resize(count, 0);
     let mut filled = 0;
     while filled < count {
         match fs

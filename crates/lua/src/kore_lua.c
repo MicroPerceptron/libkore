@@ -294,7 +294,8 @@ enum {
   KORE_LUA_OP_FS_WRITE = 21,
   /* 22 was a host-side seek.  The stream position lives in the file object
      below, so there is nothing for the host to seek; the number is left
-     unused rather than recycled, because src/bridge.rs must agree. */  KORE_LUA_OP_FS_SYNC = 23,
+     unused rather than recycled, because src/bridge.rs must agree. */
+  KORE_LUA_OP_FS_SYNC = 23,
   KORE_LUA_OP_FS_RESIZE = 24,
   KORE_LUA_OP_FS_STAT = 25,
   KORE_LUA_OP_FS_REMOVE = 26,
@@ -304,9 +305,11 @@ enum {
      the evaluation has unwound. */
   KORE_LUA_OP_PROC_EXIT = 29
 };
-/* The error `os.exit` raises to unwind the evaluation.  The host matches it
-   exactly and reports the recorded code instead of an error; anything else
-   is a genuine error and is reported as one. */
+/* The error `os.exit` raises to unwind the evaluation.  `luaL_error` puts
+   the chunk and line in front of it, so the host matches this as a *suffix*
+   and reports the recorded code instead of an error; anything else is a
+   genuine error and is reported as one.  src/vm.rs holds the other half of
+   this spelling, as src/bridge.rs holds the other half of the op numbers. */
 #define KORE_LUA_EXIT_SENTINEL "kore:exit"
 /* The open-mode bits src/files.rs reads out of arg0. */
 enum {
@@ -318,10 +321,6 @@ enum {
   KORE_LUA_O_EXCLUSIVE = 1 << 5,
   KORE_LUA_O_DIRECTORY = 1 << 6
 };
-/* "wherever this handle's cursor is" — src/files.rs `FROM_CURSOR`.  Not a
-   reachable file offset, so one word tells a stream read from a positional
-   one and `f:read` and `kore.fs.read_at` share an arm. */
-#define KORE_LUA_FROM_CURSOR 0xffffffffffffffffull
 enum {
   KORE_LUA_STATUS_OK = 0,
   KORE_LUA_STATUS_REFUSED = 1,
@@ -361,11 +360,19 @@ __attribute__((weak)) int kore_lua_host_call(unsigned op,
  */
 static int kore_lua_fail(lua_State *L, int status, const char *text, size_t text_len) {
   lua_pushnil(L);
+  if (text == NULL) {
+    text = "unavailable";
+    text_len = sizeof "unavailable" - 1;
+  }
   if (status == KORE_LUA_STATUS_REFUSED) {
-    lua_pushfstring(L, "refused: %s", text != NULL ? text : "?");
-    if (text_len == 0) { /* keep the format's copy */ }
+    /* Concatenated rather than `lua_pushfstring(L, "refused: %s", text)`:
+       the bridge's text is length-delimited and carries no terminator, so
+       `%s` would run off the end of the reply buffer. */
+    lua_pushliteral(L, "refused: ");
+    lua_pushlstring(L, text, text_len);
+    lua_concat(L, 2);
   } else {
-    lua_pushlstring(L, text != NULL ? text : "unavailable", text_len);
+    lua_pushlstring(L, text, text_len);
   }
   return 2;
 }
@@ -401,10 +408,15 @@ static int kore_lua_fail_table(lua_State *L, int status, const char *text,
 }
 
 /*
- * [`kore_lua_fail`] for a NUL-terminated reason.  The bridge answers a text
- * with an explicit length (it carries arbitrary bytes); the synchronous
- * leaf calls answer a C string, and passing those a length of zero would
- * push an empty reason beside the nil.
+ * [`kore_lua_fail`] for a NUL-terminated reason.
+ *
+ * The two host contracts differ and the difference is load-bearing:
+ * `kore_lua_host_call` answers a text with an explicit length and **no
+ * terminator** (it carries arbitrary bytes out of a Rust `Vec`), while the
+ * synchronous leaf calls — `kore_lua_host_uptime_ns`, `..._wall_ns`,
+ * `..._random` — answer a `&'static CStr`.  Only the latter may reach this
+ * function; a length-carrying text must go to [`kore_lua_fail`] with the
+ * length the bridge gave it, or `strlen` reads past the reply buffer.
  */
 static int kore_lua_fail_cstr(lua_State *L, int status, const char *text) {
   return kore_lua_fail(L, status, text, text != NULL ? strlen(text) : 0);
@@ -664,11 +676,10 @@ static int kore_lua_proc_index(lua_State *L) {
 }
 
 /*
- * `exit` is deliberately absent until the host owns it.  Termination has to
- * unwind the evaluation, run `<close>` handlers and let the REPL flush
- * before the task leaves; a verb that raised instead would be a member that
- * does not do what its name says, which is the one thing this build does
- * not ship (see KORE-VENDOR.md on `string.format`).
+ * `kore.proc` carries no functions: `args` is the lazy field above, and
+ * termination is `os.exit`, which belongs on the stock surface where a
+ * script already looks for it.  The empty list is what `luaL_newlib` wants
+ * for a table whose only member arrives through `__index`.
  */
 static const luaL_Reg kore_lua_proc_lib[] = {
   {NULL, NULL}
@@ -758,7 +769,7 @@ static kore_lua_writer *kore_lua_sink(lua_State *L) {
  * answers `EIO`, which is the honest "something below failed".
  */
 static int kore_lua_errno(const char *code, size_t len) {
-  struct { const char *code; int number; } static const table[] = {
+  static const struct { const char *code; int number; } table[] = {
     {"not-found", 2},          /* ENOENT */
     {"already-exists", 17},    /* EEXIST */
     {"not-directory", 20},     /* ENOTDIR */
@@ -1022,16 +1033,27 @@ static int kore_lua_file_tostring(lua_State *L) {
 
 /*
  * Refill the read-ahead from the stream position.  Answers 1 on progress,
- * 0 at end of file, and -1 on a failure it has already pushed onto the
- * stack in `render`'s spelling.
+ * 0 at end of file, and -1 on a failure whose status and text it hands
+ * back *without pushing anything*.
+ *
+ * Not rendering here is the whole point of the out-parameters: every
+ * caller but one has a live `luaL_Buffer`, and once that buffer outgrows
+ * `LUAL_BUFFERSIZE` it keeps a box userdata on the stack at a level
+ * `luaL_pushresult` re-checks.  Pushing a failure triple on top of it
+ * would leave the box below values it does not expect.  The caller
+ * finalizes its buffer first and renders afterwards, which is safe because
+ * `*why` stays alive until the *next* host call and finishing a buffer
+ * makes none.
  */
-static int kore_lua_file_fill(lua_State *L, kore_lua_file *file, int *pushed,
-                              kore_lua_render_fail render) {
+static int kore_lua_file_fill(lua_State *L, kore_lua_file *file, int *status,
+                              const char **why, size_t *why_len) {
   unsigned long long count = 0, len = 0;
   const char *bytes = NULL;
   size_t bytes_len = 0;
-  int n;
-  *pushed = 0;
+  (void)L;
+  *status = KORE_LUA_STATUS_OK;
+  *why = NULL;
+  *why_len = 0;
   if (file->taken < file->have) return 1;       /* still buffered */
   if (file->eof) return 0;
   if (file->kind != KORE_LUA_FILE_STORE) {      /* stdin: always at end */
@@ -1041,10 +1063,15 @@ static int kore_lua_file_fill(lua_State *L, kore_lua_file *file, int *pushed,
   file->base = file->position;
   file->have = 0;
   file->taken = 0;
-  n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_READ, file->handle, file->position,
-                          KORE_LUA_BUFSIZE, NULL, 0, &count, &len, &bytes,
-                          &bytes_len, render);
-  if (n) { *pushed = n; return -1; }
+  *status = kore_lua_host_call(KORE_LUA_OP_FS_READ, file->handle,
+                               file->position, KORE_LUA_BUFSIZE, NULL, 0,
+                               &count, &len, &bytes, &bytes_len);
+  if (*status != KORE_LUA_STATUS_OK) {
+    *why = bytes;
+    *why_len = bytes_len;
+    return -1;
+  }
+  if (bytes == NULL) bytes_len = 0;
   if (bytes_len > KORE_LUA_BUFSIZE) bytes_len = KORE_LUA_BUFSIZE;
   if (bytes_len != 0) memcpy(file->buf, bytes, bytes_len);
   file->have = bytes_len;
@@ -1064,16 +1091,32 @@ static size_t kore_lua_file_take(kore_lua_file *file, luaL_Buffer *b,
   return take;
 }
 
+/*
+ * Drop a partial read's buffer and answer the failure in `render`'s
+ * spelling, as a negative count.  The buffer is finished and popped before
+ * anything is pushed, so `render`'s values never land above a live box.
+ */
+static int kore_lua_read_failed(lua_State *L, luaL_Buffer *b, int status,
+                                const char *why, size_t why_len,
+                                kore_lua_render_fail render) {
+  luaL_pushresult(b);
+  lua_pop(L, 1);
+  return -render(L, status, why, why_len);
+}
+
 /* `f:read("l")` / `"L"`: up to and including the newline. */
 static int kore_lua_read_line(lua_State *L, kore_lua_file *file, int keep,
                               kore_lua_render_fail render) {
   luaL_Buffer b;
   int got = 0;
+  int status = KORE_LUA_STATUS_OK;
+  const char *why = NULL;
+  size_t why_len = 0;
   luaL_buffinit(L, &b);
   for (;;) {
-    int pushed = 0;
-    int state = kore_lua_file_fill(L, file, &pushed, render);
-    if (state < 0) { luaL_pushresult(&b); lua_pop(L, 1); return pushed; }
+    int state = kore_lua_file_fill(L, file, &status, &why, &why_len);
+    if (state < 0)
+      return kore_lua_read_failed(L, &b, status, why, why_len, render);
     if (state == 0) break;
     {
       const char *from = file->buf + file->taken;
@@ -1101,11 +1144,14 @@ static int kore_lua_read_line(lua_State *L, kore_lua_file *file, int keep,
 static int kore_lua_read_all(lua_State *L, kore_lua_file *file,
                              kore_lua_render_fail render) {
   luaL_Buffer b;
+  int status = KORE_LUA_STATUS_OK;
+  const char *why = NULL;
+  size_t why_len = 0;
   luaL_buffinit(L, &b);
   for (;;) {
-    int pushed = 0;
-    int state = kore_lua_file_fill(L, file, &pushed, render);
-    if (state < 0) { luaL_pushresult(&b); lua_pop(L, 1); return pushed; }
+    int state = kore_lua_file_fill(L, file, &status, &why, &why_len);
+    if (state < 0)
+      return kore_lua_read_failed(L, &b, status, why, why_len, render);
     if (state == 0) break;
     kore_lua_file_take(file, &b, file->have - file->taken);
   }
@@ -1119,21 +1165,24 @@ static int kore_lua_read_count(lua_State *L, kore_lua_file *file, size_t want,
                                kore_lua_render_fail render) {
   luaL_Buffer b;
   size_t total = 0;
+  int status = KORE_LUA_STATUS_OK;
+  const char *why = NULL;
+  size_t why_len = 0;
   if (want == 0) {
     /* Lua's zero-length read is a probe: the empty string when there is
-       anything left, nil at end of file. */
-    int pushed = 0;
-    int state = kore_lua_file_fill(L, file, &pushed, render);
-    if (state < 0) return pushed;
+       anything left, nil at end of file.  No buffer is live here, so the
+       failure renders directly. */
+    int state = kore_lua_file_fill(L, file, &status, &why, &why_len);
+    if (state < 0) return -render(L, status, why, why_len);
     if (state == 0) { lua_pushnil(L); return 1; }
     lua_pushliteral(L, "");
     return 1;
   }
   luaL_buffinit(L, &b);
   while (total < want) {
-    int pushed = 0;
-    int state = kore_lua_file_fill(L, file, &pushed, render);
-    if (state < 0) { luaL_pushresult(&b); lua_pop(L, 1); return pushed; }
+    int state = kore_lua_file_fill(L, file, &status, &why, &why_len);
+    if (state < 0)
+      return kore_lua_read_failed(L, &b, status, why, why_len, render);
     if (state == 0) break;
     total += kore_lua_file_take(file, &b, want - total);
   }
@@ -1149,10 +1198,14 @@ static int kore_lua_read_number(lua_State *L, kore_lua_file *file,
   char text[64];
   size_t len = 0;
   int seen_digit = 0;
+  int status = KORE_LUA_STATUS_OK;
+  const char *why = NULL;
+  size_t why_len = 0;
   for (;;) {
-    int pushed = 0;
-    int state = kore_lua_file_fill(L, file, &pushed, render);
-    if (state < 0) return pushed;
+    int state = kore_lua_file_fill(L, file, &status, &why, &why_len);
+    /* The numeral is accumulated in `text`, not a `luaL_Buffer`, so this
+       one renders directly. */
+    if (state < 0) return -render(L, status, why, why_len);
     if (state == 0) break;
     {
       char c = file->buf[file->taken];
@@ -1177,7 +1230,9 @@ static int kore_lua_read_number(lua_State *L, kore_lua_file *file,
 }
 
 /* One read format; answers how many values it pushed, or a negative count
-   meaning "a failure of `-n` values is already on the stack". */
+   meaning "a failure of `-n` values is already on the stack".  A format
+   that merely found nothing is *not* a failure: it answers 1 with nil on
+   top, which is what end of file looks like to a script. */
 static int kore_lua_read_one(lua_State *L, kore_lua_file *file, int index,
                              kore_lua_render_fail render) {
   if (lua_type(L, index) == LUA_TNUMBER) {
@@ -1207,9 +1262,22 @@ static int kore_lua_file_read_with(lua_State *L, kore_lua_file *file, int first,
     return render(L, KORE_LUA_STATUS_REFUSED, "access-denied",
                   sizeof "access-denied" - 1);
   }
-  if (first > top) return kore_lua_read_line(L, file, 0, render);
+  if (first > top) {
+    int n = kore_lua_read_line(L, file, 0, render);
+    return n < 0 ? -n : n;
+  }
   for (int index = first; index <= top; index++) {
     int n = kore_lua_read_one(L, file, index, render);
+    if (n < 0) {
+      /* The read failed.  Stock `g_read` answers `luaL_fileresult` alone
+         in this case, so drop whatever the earlier formats managed to
+         read: the failure is the whole answer, not a tail on a partial
+         one.  The failure's `-n` values are on top; each `lua_remove`
+         takes the value directly beneath them. */
+      int failed = -n;
+      for (int drop = 0; drop < pushed; drop++) lua_remove(L, -failed - 1);
+      return failed;
+    }
     pushed += n;
     /* Stop at the first format that answered nil: the rest cannot succeed
        when this one hit end of file, and Lua stops too. */
@@ -1365,12 +1433,31 @@ static int kore_lua_lines_step(lua_State *L) {
   if (file == NULL || file->closed)
     return luaL_error(L, "file is already closed");
   for (int i = 0; i < formats; i++) lua_pushvalue(L, lua_upvalueindex(4 + i));
-  pushed = formats == 0
-               ? kore_lua_read_line(L, file, 0, kore_lua_fail_io)
-               : kore_lua_file_read_with(L, file, lua_gettop(L) - formats + 1,
-                                         lua_gettop(L), kore_lua_fail_io);
-  if (close_at_end && lua_isnil(L, -1))
-    (void)kore_lua_file_do_close(L, file, kore_lua_fail_io), lua_pop(L, 1);
+  if (formats == 0) {
+    pushed = kore_lua_read_line(L, file, 0, kore_lua_fail_io);
+    if (pushed < 0) pushed = -pushed;
+  } else {
+    pushed = kore_lua_file_read_with(L, file, lua_gettop(L) - formats + 1,
+                                     lua_gettop(L), kore_lua_fail_io);
+  }
+  /*
+   * The *first* result decides, not the last: with several formats the
+   * tail can be nil while the head read fine, and `io_readline` looks at
+   * the head.  A falsy head with a message beside it is a read failure,
+   * which stock Lua raises rather than ending the loop on — a `for` that
+   * simply stopped would make an I/O error look like end of file.
+   */
+  if (!lua_toboolean(L, -pushed)) {
+    if (pushed > 1) {
+      const char *why = lua_tostring(L, -pushed + 1);
+      return luaL_error(L, "%s", why != NULL ? why : "read failed");
+    }
+    if (close_at_end) {
+      int top = lua_gettop(L);
+      (void)kore_lua_file_do_close(L, file, kore_lua_fail_io);
+      lua_settop(L, top);
+    }
+  }
   return pushed;
 }
 
@@ -1485,6 +1572,37 @@ static int kore_lua_fs_rename(lua_State *L) {
   return 1;
 }
 
+/*
+ * `kore.fs.resize(file, bytes)` — the one verb that shortens or extends a
+ * file without rewriting it.
+ *
+ * On `kore.fs` and not on the file object: `io`'s seven methods are what
+ * the manual lists and a stock `file:` gains nothing here, while truncation
+ * is exactly the kind of thing the kore surface exists to expose.  A
+ * shortened file drags the stream position back with it — the next write
+ * must not land past a hole the caller never asked for.
+ */
+static int kore_lua_fs_resize(lua_State *L) {
+  kore_lua_file *file = kore_lua_file_live(L, 1);
+  lua_Integer length = luaL_checkinteger(L, 2);
+  unsigned long long r = 0, r2 = 0;
+  int n;
+  luaL_argcheck(L, length >= 0, 2, "length must not be negative");
+  if (file->kind != KORE_LUA_FILE_STORE)
+    return kore_lua_fail_table(L, KORE_LUA_STATUS_REFUSED, "unsupported",
+                               sizeof "unsupported" - 1);
+  kore_lua_file_drop(file);
+  n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_RESIZE, file->handle,
+                          (unsigned long long)length, 0, NULL, 0, &r, &r2,
+                          NULL, NULL, kore_lua_fail_table);
+  if (n) return n;
+  if (file->position > (unsigned long long)length)
+    file->position = (unsigned long long)length;
+  file->base = file->position;
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
 static int kore_lua_fs_stat(lua_State *L) {
   size_t len = 0;
   const char *path = luaL_checklstring(L, 1, &len);
@@ -1552,13 +1670,22 @@ static int kore_lua_fs_read_file(lua_State *L) {
                               kore_lua_fail_table);
   if (n) return n;
   {
+    /* `base + 1` is the file object; the read's results sit above it. */
+    int base = lua_gettop(L);
     kore_lua_file *file = kore_lua_file_push(L, handle, KORE_LUA_FILE_STORE, 1, 0, 0);
-    int pushed = kore_lua_read_all(L, file, kore_lua_fail_table);
-    /* The handle is retired here whatever the read did: this verb never
-       hands the object out, so nothing else can close it. */
-    lua_pushvalue(L, -1 - pushed);
+    int read = kore_lua_read_all(L, file, kore_lua_fail_table);
+    int pushed = read < 0 ? -read : read;
+    /*
+     * The handle is retired here whatever the read did: this verb never
+     * hands the object out, so nothing else can close it.  The close's own
+     * answer is discarded — the read's is what the caller asked for — and
+     * it is discarded by level rather than by a fixed count, because
+     * `kore_lua_file_do_close` pushes one value on success and two on a
+     * refusal.
+     */
     (void)kore_lua_file_do_close(L, file, kore_lua_fail_table);
-    lua_pop(L, 2);
+    lua_settop(L, base + 1 + pushed);
+    lua_remove(L, base + 1);
     return pushed;
   }
 }
@@ -1596,6 +1723,7 @@ static const luaL_Reg kore_lua_fs_lib[] = {
   {"remove", kore_lua_fs_remove},
   {"rename", kore_lua_fs_rename},
   {"mkdir", kore_lua_fs_mkdir},
+  {"resize", kore_lua_fs_resize},
   {"stat", kore_lua_fs_stat},
   {"exists", kore_lua_fs_exists},
   {"list", kore_lua_fs_list},
@@ -1740,24 +1868,34 @@ static int kore_lua_io_lines(lua_State *L) {
 /*
  * Draw an unused temporary name into `dst` (at least 32 bytes) and create
  * the file exclusively, so the name answered is one nothing else can
- * already hold.  Answers the open handle, or 0 with `why` set.
+ * already hold.  Answers the open handle, or 0 with `why` / `why_len` set.
+ *
+ * The length is an out-parameter and not a `strlen` at the call site: a
+ * reason coming back from `kore_lua_host_call` is length-delimited with no
+ * terminator, and only the entropy draw's reason is a C string.  Both are
+ * normalized to a length here so neither caller has to know which it got.
  *
  * `os.tmpname` and `io.tmpfile` are the same act — a name nobody else has —
  * differing only in what they hand back, so they share this.
  */
 static unsigned long long kore_lua_tempfile(char *dst, size_t *len_out,
                                             unsigned long long flags,
-                                            const char **why) {
+                                            const char **why,
+                                            size_t *why_len_out) {
   static const char digits[] = "0123456789abcdef";
   *why = NULL;
+  *why_len_out = 0;
   for (int attempt = 0; attempt < 16; attempt++) {
     unsigned char draw[8];
     unsigned long long handle = 0, length = 0;
     size_t why_len = 0;
     size_t len = 0;
     int status;
-    if (kore_lua_host_random(draw, sizeof draw, why) != KORE_LUA_STATUS_OK)
+    if (kore_lua_host_random(draw, sizeof draw, why) != KORE_LUA_STATUS_OK) {
+      /* A leaf call's reason is a `&'static CStr`. */
+      *why_len_out = *why != NULL ? strlen(*why) : 0;
       return 0;
+    }
     memcpy(dst, "/tmp/lua_", 9);
     len = 9;
     for (size_t i = 0; i < sizeof draw; i++) {
@@ -1775,11 +1913,14 @@ static unsigned long long kore_lua_tempfile(char *dst, size_t *len_out,
       return handle + 1;   /* biased so 0 means failure */
     }
     /* Only a collision is worth another draw; anything else is the answer. */
-    if (!(why_len == sizeof "already-exists" - 1 &&
-          memcmp(*why, "already-exists", why_len) == 0))
+    if (!(*why != NULL && why_len == sizeof "already-exists" - 1 &&
+          memcmp(*why, "already-exists", why_len) == 0)) {
+      *why_len_out = why_len;
       return 0;
+    }
   }
   *why = "no unused temporary name was found";
+  *why_len_out = sizeof "no unused temporary name was found" - 1;
   return 0;
 }
 
@@ -1792,14 +1933,14 @@ static unsigned long long kore_lua_tempfile(char *dst, size_t *len_out,
  */
 static int kore_lua_io_tmpfile(lua_State *L) {
   char path[48];
-  size_t len = 0;
+  size_t len = 0, why_len = 0;
   const char *why = NULL;
-  unsigned long long biased =
-      kore_lua_tempfile(path, &len, KORE_LUA_O_READ | KORE_LUA_O_WRITE, &why);
+  unsigned long long biased = kore_lua_tempfile(
+      path, &len, KORE_LUA_O_READ | KORE_LUA_O_WRITE, &why, &why_len);
   if (biased == 0)
     return kore_lua_fail_io(L, KORE_LUA_STATUS_UNAVAILABLE,
                             why != NULL ? why : "unavailable",
-                            why != NULL ? strlen(why) : 0);
+                            why != NULL ? why_len : sizeof "unavailable" - 1);
   {
     kore_lua_file *file =
         kore_lua_file_push(L, biased - 1, KORE_LUA_FILE_STORE, 1, 1, 0);
@@ -1898,6 +2039,35 @@ static void kore_lua_break_down(long long seconds, kore_lua_civil *out) {
   out->yearday =
       (int)(days - kore_lua_days_from_civil(out->year, 1, 1) + 1);
 }
+
+/*
+ * The instants this calendar answers for.
+ *
+ * `civil_from_days` is exact for every day the proleptic Gregorian
+ * calendar defines, but `kore_lua_civil` holds an `int` year and `%Y`
+ * spells four digits, so the range is stated rather than left to overflow
+ * into a truncated year.  Computed from the calendar itself rather than
+ * tabulated, so the bound and the conversion cannot disagree: years
+ * 0000-01-01 through 9999-12-31, which is also the range `os.time` accepts
+ * a table for.
+ */
+#define KORE_LUA_YEAR_MIN 0
+#define KORE_LUA_YEAR_MAX 9999
+
+static int kore_lua_time_representable(long long seconds) {
+  long long low = kore_lua_days_from_civil(KORE_LUA_YEAR_MIN, 1, 1) * 86400;
+  long long high =
+      kore_lua_days_from_civil(KORE_LUA_YEAR_MAX, 12, 31) * 86400 + 86399;
+  return seconds >= low && seconds <= high;
+}
+
+/*
+ * Every `os.time` field is bounded before any arithmetic, so a
+ * normalization cannot overflow on its way to the check above.  Generous
+ * by design — far more than date arithmetic by field addition needs — and
+ * it is `kore_lua_time_representable` that decides the answer.
+ */
+#define KORE_LUA_DATE_FIELD_MAX 1000000000ll
 
 /* The wall clock, as whole seconds since the epoch; `ok` says whether the
    machine could answer at all. */
@@ -2087,6 +2257,9 @@ static int kore_lua_os_time(lua_State *L) {
        caller would read as 1970 rather than as "no reading". */
     if (!ok) return kore_lua_fail_cstr(L, KORE_LUA_STATUS_UNAVAILABLE,
                                        "the wall clock is not set");
+    if (!kore_lua_time_representable(when))
+      return luaL_error(
+          L, "time result cannot be represented in this installation");
     lua_pushinteger(L, (lua_Integer)when);
     return 1;
   }
@@ -2102,13 +2275,37 @@ static int kore_lua_os_time(lua_State *L) {
     lua_Integer hour = kore_lua_datefield(L, "hour", 12, 0);
     lua_Integer minute = kore_lua_datefield(L, "min", 0, 0);
     lua_Integer second = kore_lua_datefield(L, "sec", 0, 0);
-    long long carry = kore_lua_floor_div((long long)month - 1, 12);
+    long long carry;
     long long days;
     kore_lua_civil t;
+    /*
+     * Bound the fields before any arithmetic, then bound the result.
+     *
+     * Two checks, not three: the field bound is what makes `(int)year`
+     * exact — a year normalized from fields this size stays under 1.1e9
+     * and an `int` holds it — and what keeps `days * 86400 + ...` from
+     * overflowing, since the widest reachable value is about 3.4e16.
+     * With overflow and truncation both excluded, `time_representable` is
+     * the one thing that decides whether there is an answer.
+     */
+    if (day < -KORE_LUA_DATE_FIELD_MAX || day > KORE_LUA_DATE_FIELD_MAX ||
+        hour < -KORE_LUA_DATE_FIELD_MAX || hour > KORE_LUA_DATE_FIELD_MAX ||
+        minute < -KORE_LUA_DATE_FIELD_MAX ||
+        minute > KORE_LUA_DATE_FIELD_MAX ||
+        second < -KORE_LUA_DATE_FIELD_MAX ||
+        second > KORE_LUA_DATE_FIELD_MAX ||
+        month < -KORE_LUA_DATE_FIELD_MAX || month > KORE_LUA_DATE_FIELD_MAX ||
+        year < -KORE_LUA_DATE_FIELD_MAX || year > KORE_LUA_DATE_FIELD_MAX)
+      return luaL_error(
+          L, "time result cannot be represented in this installation");
+    carry = kore_lua_floor_div((long long)month - 1, 12);
     year += carry;
     month = (long long)month - 1 - carry * 12 + 1;
     days = kore_lua_days_from_civil((int)year, (int)month, 1) + (day - 1);
     when = days * 86400 + hour * 3600 + minute * 60 + second;
+    if (!kore_lua_time_representable(when))
+      return luaL_error(
+          L, "time result cannot be represented in this installation");
     /* `mktime` normalizes the caller's table in place and fills in the
        fields it derived; `setallfields` is what a script reads back to
        learn the weekday it never supplied. */
@@ -2144,6 +2341,9 @@ static int kore_lua_os_date(lua_State *L) {
      same calendar it would without it.  Accepted rather than rejected: a
      portable script writes `!` and must not fail here for doing so. */
   if (*format == '!') format++;
+  if (!kore_lua_time_representable(when))
+    return luaL_error(L,
+                      "date result cannot be represented in this installation");
   kore_lua_break_down(when, &t);
   if (strcmp(format, "*t") == 0 || strcmp(format, "!*t") == 0) {
     lua_createtable(L, 0, 9);
@@ -2232,13 +2432,14 @@ static int kore_lua_os_rename(lua_State *L) {
  */
 static int kore_lua_os_tmpname(lua_State *L) {
   char path[48];
-  size_t len = 0;
+  size_t len = 0, why_len = 0;
   const char *why = NULL;
   unsigned long long biased =
-      kore_lua_tempfile(path, &len, KORE_LUA_O_WRITE, &why);
+      kore_lua_tempfile(path, &len, KORE_LUA_O_WRITE, &why, &why_len);
   if (biased == 0)
-    return kore_lua_fail_cstr(L, KORE_LUA_STATUS_UNAVAILABLE,
-                              why != NULL ? why : "unavailable");
+    return kore_lua_fail(L, KORE_LUA_STATUS_UNAVAILABLE,
+                         why != NULL ? why : "unavailable",
+                         why != NULL ? why_len : sizeof "unavailable" - 1);
   {
     /* The name is what was asked for, not the handle: close it and leave
        the file in place, which is the POSIX behaviour the manual describes
@@ -2439,11 +2640,19 @@ static int kore_lua_require(lua_State *L) {
     lua_remove(L, -2);  /* the chunk name */
   }
   else if (kind == KORE_LUA_MODULE_NATIVE && opener != NULL) {
+    /* Nothing is borrowed for a native answer — the opener is an address
+       in this task's JIT arena — but the release is unconditional so the
+       host has exactly one rule: every answer is released once. */
+    kore_lua_host_release();
     lua_pushcfunction(L, opener);
   }
   else {
-    return luaL_error(L, "module '%s' not found: %s", name,
-                      bytes != NULL ? bytes : "no route");
+    /* `%s`, not a length: unlike `kore_lua_host_call`'s reply, a
+       `require` failure is a `&'static CStr` from src/bridge.rs's
+       `describe`, so it is terminated and outlives the release. */
+    const char *why = bytes != NULL ? bytes : "no route";
+    kore_lua_host_release();
+    return luaL_error(L, "module '%s' not found: %s", name, why);
   }
   lua_pushstring(L, name);
   lua_call(L, 1, 1);  /* loader(name) */
@@ -2552,9 +2761,9 @@ static int kore_lua_open_libraries(lua_State *L) {
   luaL_requiref(L, LUA_TABLIBNAME, luaopen_table, 1); lua_pop(L, 1);
   luaL_requiref(L, LUA_STRLIBNAME, luaopen_string, 1);
   /* No partial printf and no producer for unsupported binary chunks. */
-  lua_pushnil(L); lua_setfield(L, -2, "format"); lua_pop(L, 1);
-  lua_getglobal(L, LUA_STRLIBNAME);
-  lua_pushnil(L); lua_setfield(L, -2, "dump"); lua_pop(L, 1);
+  lua_pushnil(L); lua_setfield(L, -2, "format");
+  lua_pushnil(L); lua_setfield(L, -2, "dump");
+  lua_pop(L, 1);
   luaL_requiref(L, LUA_MATHLIBNAME, luaopen_math, 1); lua_pop(L, 1);
   luaL_requiref(L, LUA_UTF8LIBNAME, luaopen_utf8, 1); lua_pop(L, 1);
   /* The file object's metatable, before anything that can create one. */

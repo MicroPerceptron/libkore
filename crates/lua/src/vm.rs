@@ -14,6 +14,17 @@ use crate::shim;
 const LUA_OK: c_int = 0;
 const LUA_MULTRET: c_int = -1;
 
+/// The error `os.exit` raises to unwind the evaluation, as `kore_lua.c`'s
+/// `KORE_LUA_EXIT_SENTINEL` spells it.
+///
+/// Matched as a *suffix*, because `luaL_error` puts the chunk name and line
+/// in front of it. `os.exit` cannot leave from inside the VM — there are C
+/// frames below it and `<close>` handlers above it — so it records the code
+/// with the host and raises this; the raise is the unwind, not a failure,
+/// and the code is read afterwards through
+/// [`Services::exit_request`](crate::Services::exit_request).
+const EXIT_SENTINEL: &[u8] = b"kore:exit";
+
 #[repr(C)]
 struct LuaState {
     _private: [u8; 0],
@@ -85,8 +96,19 @@ unsafe extern "C" fn append(
 
 pub enum ReplResult {
     Complete(bool),
+    /// The chunk ran `os.exit`.
+    Exited,
     Incomplete,
     ResourceRefused,
+}
+
+/// How one chunk ended.
+pub enum EvalResult {
+    Ok,
+    Failed,
+    /// The chunk ran `os.exit`: the sentinel unwound every `<close>` on the
+    /// way out and the recorded code is the answer, not the raise.
+    Exited,
 }
 
 pub struct Vm {
@@ -155,6 +177,19 @@ impl Vm {
         }
     }
 
+    /// Whether the pending error is `os.exit`'s unwind rather than a
+    /// failure. `luaL_error` prefixes the chunk and line, so this is a
+    /// suffix match on [`EXIT_SENTINEL`].
+    fn error_is_exit(&self) -> bool {
+        let (error, len) = self.error_parts();
+        // SAFETY: `error_parts` answers a live Lua string or a static.
+        let error = unsafe { slice::from_raw_parts(error, len) };
+        error
+            .strip_suffix(b"\n")
+            .unwrap_or(error)
+            .ends_with(EXIT_SENTINEL)
+    }
+
     fn publish_error(&mut self) {
         let (error, len) = self.error_parts();
         let used = self
@@ -179,29 +214,48 @@ impl Vm {
         self.clear_stack();
     }
 
-    fn execute_loaded(&mut self, print_results: bool) -> bool {
+    fn execute_loaded(&mut self, print_results: bool) -> EvalResult {
         if unsafe { kore_lua_call(self.state.as_ptr(), 0, LUA_MULTRET) } != LUA_OK {
+            // `os.exit`'s unwind reaches here as an error, because that is
+            // how it ran the `<close>` handlers on its way out. It is not
+            // one, so it is not reported as one.
+            if self.error_is_exit() {
+                self.clear_stack();
+                return EvalResult::Exited;
+            }
             self.publish_error();
-            return false;
+            return EvalResult::Failed;
         }
         if print_results
             && unsafe { kore_lua_top(self.state.as_ptr()) } > 0
             && unsafe { kore_lua_print_results(self.state.as_ptr()) } != LUA_OK
         {
+            if self.error_is_exit() {
+                self.clear_stack();
+                return EvalResult::Exited;
+            }
             self.publish_error();
-            return false;
+            return EvalResult::Failed;
         }
         self.clear_stack();
-        true
+        EvalResult::Ok
     }
 
-    pub fn eval(&mut self, bytes: &[u8], name: &'static [u8]) -> bool {
+    pub fn eval(&mut self, bytes: &[u8], name: &'static [u8]) -> EvalResult {
         self.clear_stack();
         if self.load(bytes, name) != LUA_OK {
             self.publish_error();
-            false
+            EvalResult::Failed
         } else {
             self.execute_loaded(false)
+        }
+    }
+
+    fn repl_result(result: EvalResult) -> ReplResult {
+        match result {
+            EvalResult::Ok => ReplResult::Complete(true),
+            EvalResult::Failed => ReplResult::Complete(false),
+            EvalResult::Exited => ReplResult::Exited,
         }
     }
 
@@ -220,12 +274,12 @@ impl Vm {
         expression.extend_from_slice(bytes);
         if self.load(&expression, b"=stdin\0") == LUA_OK {
             drop(expression);
-            return ReplResult::Complete(self.execute_loaded(true));
+            return Self::repl_result(self.execute_loaded(true));
         }
         self.clear_stack();
         drop(expression);
         if self.load(bytes, b"=stdin\0") == LUA_OK {
-            return ReplResult::Complete(self.execute_loaded(true));
+            return Self::repl_result(self.execute_loaded(true));
         }
         let (error, len) = self.error_parts();
         let error = unsafe { slice::from_raw_parts(error, len) };

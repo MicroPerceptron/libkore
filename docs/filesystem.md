@@ -47,5 +47,8 @@ owner-scoped generational handles. It drives one native request at a time,
 returns completions through a callback, and quarantines an uncertain/cancelled
 owner until task retirement. It never represents `Drop` as acknowledged cleanup.
 The callback-only pointer and host integration contracts are specified in
-[languages.md](languages.md). Lua/Python adapters still need their own script
-lifetime and scheduling integration above this native owner.
+[languages.md](languages.md). `kore-lua` supplies that integration for Lua: its
+open-file table holds the affine views and Lua holds generational handles, so a
+use after close is `invalid-handle` rather than a read of a recycled slot. A
+Python adapter still needs its own script lifetime and scheduling integration
+above this native owner.

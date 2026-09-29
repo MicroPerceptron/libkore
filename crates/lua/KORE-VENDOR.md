@@ -36,6 +36,13 @@ along with all seven `file:` methods:
 - `os.clock`, `os.date`, `os.difftime`, `os.exit`, `os.getenv`, `os.remove`,
   `os.rename`, `os.setlocale`, `os.time`, `os.tmpname`
 
+The file object carries a `closed` method beside the manual's seven, and
+`kore.fs` adds the verbs the stock surface has no spelling for —
+`read_file`, `write_file`, `mkdir`, `resize`, `stat`, `exists`, `list`.
+Those are additions on kore's own surface, never changes to a stock member:
+a file `kore.fs.open` answers is the same object `io.open` answers, and its
+seven methods render failure the same way on both.
+
 Where the manual leaves a detail to the system, this build chooses and says
 so:
 
@@ -57,6 +64,14 @@ so:
 - `os.getenv` answers `nil` for every name: a kore task has no environment,
   authority arrives as capabilities in its launch, and an unset variable is
   exactly what `nil` means.
+- `os.date` and `os.time` answer for years 0000 through 9999 and refuse
+  anything outside that with the manual's own
+  `date result cannot be represented in this installation`. The civil
+  conversion is exact for every day the proleptic Gregorian calendar
+  defines, but the broken-down year is an `int` and `%Y` spells four
+  digits, so the range is stated rather than left to truncate a huge year
+  into a plausible-looking date. The bound is computed from the same
+  `days_from_civil` the conversion uses, so the two cannot disagree.
 - `io.stdin` is a real file object that is always at end of file, the
   conforming shape for a stream with nothing behind it. `io.stdin`,
   `io.stdout` and `io.stderr` refuse `:close()` with
@@ -111,3 +126,37 @@ python3 crates/lua/tests/run_setjmp_targets.py
 
 That probe crosses a deeper stack frame and checks both a nonzero long-jump
 value and C's required `longjmp(..., 0) -> 1` normalization.
+
+## What the build tests
+
+`build.rs` compiles and runs `tests/host_smoke.c` on every build that has a
+host C compiler, and `make cross` therefore runs it for all three targets.
+It is skipped, with a `cargo:warning`, where no C compiler is present: an
+ordinary `cargo check`/`cargo test` of this workspace must not require a C
+or Zig toolchain, and the Zig steps that build the freestanding object run
+only for `target_os = "none"`.
+
+The harness has two passes over the same engine:
+
+- The **selftest** runs with `src/kore_lua.c`'s weak host stubs, which is
+  what a build with no Rust host links. It covers the engine, the
+  calendar, the number formatting, the selected and omitted library
+  members, and the shapes every `io`/`os` member answers with nothing
+  behind them.
+- The **filesystem suite** runs against `tests/host_fs.c`, an in-memory
+  store behind the *real* host transport, and covers `io`, `os` and
+  `kore.fs` end to end: open modes including append and update, seeks,
+  every read format, multi-page reads, `lines` and its to-be-closed
+  variable, the default input and output, directories and listings,
+  `resize`, `os.remove`/`rename`/`tmpname`, `io.tmpfile`'s self-removal,
+  `os.exit`'s recorded code, the `__gc` backstop, and both failure
+  spellings.
+
+Two properties of that store are deliberate and load-bearing. Its reply is
+**length-delimited with no terminator and a poisoned byte after it**, which
+is the bridge's actual contract (`src/bridge.rs` answers a Rust `Vec<u8>`),
+so anything that reaches for `strlen` over a reply fails a test rather than
+passing by luck. And it injects faults — a refused read after *n* reads, a
+refused close, a refused sleep — which is the only way to reach the paths
+where a failure lands after a partial read, with `luaL_Buffer` already
+grown onto the stack as a box.
