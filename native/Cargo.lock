@@ -124,6 +124,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "elf"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
+
+[[package]]
 name = "embedded-graphics"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -271,6 +277,29 @@ name = "kore-hint"
 version = "0.0.0"
 dependencies = [
  "raw-cpuid",
+]
+
+[[package]]
+name = "kore-late"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "kore-abi",
+ "kore-dagfs",
+ "kore-ld",
+ "kore-rt",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-ld"
+version = "0.1.1"
+dependencies = [
+ "bitflags",
+ "elf",
+ "heapless",
+ "kore-abi",
+ "zerocopy",
 ]
 
 [[package]]
