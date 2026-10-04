@@ -135,6 +135,14 @@ const OP_FS_LIST: u32 = 28;
 /// VM still has C frames below it and `<close>` handlers above it, and
 /// leaving from here would run neither.
 const OP_PROC_EXIT: u32 = 29;
+/// `kore.fs.read_file(path)` — a whole file, opened, streamed and closed
+/// here.  The one filesystem verb that is *not* positional, and
+/// deliberately so: only a read the host performs end to end can hold one
+/// pinned version for the whole file, or hand the facade a destination
+/// large enough to stream through the storage ring.  Numbered past
+/// `OP_PROC_EXIT` rather than filling the retired 22, because a recycled op
+/// number is one a stale half of the bridge would answer wrongly.
+const OP_FS_READ_FILE: u32 = 30;
 
 /// Host-call outcomes: the value(s) are good; the service refused (the
 /// text names the refusal); the call could not be made at all (the text
@@ -949,7 +957,8 @@ async fn serve_value<E: Extension>(services: &mut Services<'_, '_>, extension: &
             core::slice::from_raw_parts(cell.input, cell.input_len)
         }
     };
-    if (OP_FS_OPEN..=OP_FS_LIST).contains(&op) {
+    // The contiguous block, plus the one verb numbered past `os.exit`.
+    if (OP_FS_OPEN..=OP_FS_LIST).contains(&op) || op == OP_FS_READ_FILE {
         let answer = serve_fs(services, op, args, input).await;
         return finish_answer(answer);
     }
@@ -1021,6 +1030,7 @@ async fn serve_fs(
         OP_FS_OPEN => crate::files::open(fs, files, input, args[0]).await,
         OP_FS_CLOSE => crate::files::close(fs, files, args[0]).await,
         OP_FS_READ => crate::files::read(fs, files, args[0], args[1], args[2]).await,
+        OP_FS_READ_FILE => crate::files::read_file(fs, input).await,
         OP_FS_WRITE => crate::files::write(fs, files, args[0], args[1], input).await,
         OP_FS_SYNC => crate::files::sync(fs, files, args[0]).await,
         OP_FS_RESIZE => crate::files::resize(fs, files, args[0], args[1]).await,

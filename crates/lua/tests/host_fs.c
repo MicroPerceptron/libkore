@@ -11,7 +11,7 @@
  *
  * So this file defines those symbols *strongly* and puts a small store
  * behind them.  It is not a filesystem: it is the smallest thing that can
- * answer the ten filesystem ops faithfully enough that the C above it is
+ * answer the eleven filesystem ops faithfully enough that the C above it is
  * exercised for real.  Faithfully means, specifically:
  *
  *   - The reply text is **length-delimited and not NUL-terminated**, and
@@ -24,8 +24,11 @@
  *     tested against the words they will really see.
  *   - A handle is an index and a generation, encoded as `src/files.rs`
  *     encodes it, so a use after close is `invalid-handle` here too.
- *   - Reads are short by design: the store answers at most one page, which
- *     is what makes the read-ahead loop in `kore_lua.c` run more than once.
+ *   - Positional reads are short by design: the store answers at most one
+ *     page whatever was asked for, which is what makes both the read-ahead
+ *     loop in `kore_lua.c` and its large-read bypass run more than once.
+ *     The whole-file op is the one exception, because its whole contract is
+ *     that there is no second call.
  *
  * Included by tests/host_smoke.c rather than compiled separately, so both
  * the libc-numeric and target-numeric builds of that harness get it.
@@ -49,7 +52,8 @@ enum {
   HOST_FS_OP_REMOVE = 26,
   HOST_FS_OP_RENAME = 27,
   HOST_FS_OP_LIST = 28,
-  HOST_FS_OP_PROC_EXIT = 29
+  HOST_FS_OP_PROC_EXIT = 29,
+  HOST_FS_OP_READ_FILE = 30
 };
 
 enum {
@@ -64,16 +68,23 @@ enum {
 
 enum { HOST_FS_OK = 0, HOST_FS_REFUSED = 1, HOST_FS_UNAVAILABLE = 2 };
 
-/* One page, so `f:read("a")` over a larger file refills more than once. */
+/* One page, so `f:read("a")` over a larger file refills more than once.
+   This bounds one *positional* read and nothing else: a short answer is
+   the store's whole point, and it is what makes both the page-buffer loop
+   and the large-read bypass in `kore_lua.c` run more than once. */
 #define HOST_FS_READ_MAX 4096
 #define HOST_FS_MAX_OBJECTS 32
 #define HOST_FS_MAX_HANDLES 16
 #define HOST_FS_PATH_MAX 64
-#define HOST_FS_BYTES_MAX 16384
+/* Past `KORE_LUA_STREAM_MIN`, so a fixture can be large enough for the C
+   side to take its bypass at the real threshold rather than a lowered one.
+   Object storage is allocated on first use, so an empty store costs
+   nothing for the capacity it does not hold. */
+#define HOST_FS_BYTES_MAX (512 * 1024)
 
 struct host_fs_object {
   char path[HOST_FS_PATH_MAX];
-  unsigned char bytes[HOST_FS_BYTES_MAX];
+  unsigned char *bytes;
   size_t len;
   int directory;
   int used;
@@ -95,7 +106,7 @@ static struct {
   /* The reply window.  One buffer, overwritten by each call, exactly as
      the bridge's `cell.text` is: C copies it into a Lua string before it
      makes another call.  The poison byte is the point — see the header. */
-  unsigned char reply[HOST_FS_READ_MAX + 1];
+  unsigned char reply[HOST_FS_BYTES_MAX + 1];
   size_t reply_len;
   /* What the harness inspects afterwards. */
   int exit_requested;
@@ -117,6 +128,11 @@ static struct {
      longer expects. */
   int reads_armed;
   int reads_allowed;
+  /* The largest destination a positional read ever asked for, before this
+     store clamps it to one page.  The clamp is why it has to be recorded
+     here: what the facade decides on is the *ask*, and after the clamp
+     nothing downstream can still see how big it was. */
+  unsigned long long max_read_want;
   /* Refuse every close.  The slot is still freed, so the harness's
      leak accounting stays meaningful; what is under test is the *caller's*
      stack discipline, because `kore_lua_file_do_close` pushes one value on
@@ -133,14 +149,27 @@ static struct {
  * no terminator, so any caller that reaches for `strlen` must produce a
  * visibly wrong answer here rather than a lucky one.
  */
-static void host_fs_reply(const void *bytes, size_t len,
-                          const char **text, size_t *text_len) {
-  if (len > HOST_FS_READ_MAX) len = HOST_FS_READ_MAX;
+static void host_fs_reply_bounded(const void *bytes, size_t len, size_t cap,
+                                  const char **text, size_t *text_len) {
+  if (len > cap) len = cap;
   if (len != 0 && bytes != NULL) memcpy(host_fs.reply, bytes, len);
   host_fs.reply[len] = 0xff;
   host_fs.reply_len = len;
   if (text != NULL) *text = (const char *)host_fs.reply;
   if (text_len != NULL) *text_len = len;
+}
+
+/* One page at most: the short answer every positional read gets. */
+static void host_fs_reply(const void *bytes, size_t len,
+                          const char **text, size_t *text_len) {
+  host_fs_reply_bounded(bytes, len, HOST_FS_READ_MAX, text, text_len);
+}
+
+/* A whole file in one reply — only `HOST_FS_OP_READ_FILE` answers this
+   way, because only that op promises the caller there is no "again". */
+static void host_fs_reply_whole(const void *bytes, size_t len,
+                                const char **text, size_t *text_len) {
+  host_fs_reply_bounded(bytes, len, HOST_FS_BYTES_MAX, text, text_len);
 }
 
 static int host_fs_refuse(const char *code, const char **text,
@@ -182,6 +211,20 @@ static int host_fs_parent_ok(const char *path, size_t len) {
   return at >= 0 && host_fs.objects[at].directory;
 }
 
+/*
+ * An object's bytes, allocated on first use.
+ *
+ * `HOST_FS_BYTES_MAX` is half a megabyte so a fixture can cross the C
+ * side's streaming threshold; holding that inline in every slot would be
+ * sixteen megabytes of store for a harness whose files are mostly a line
+ * long. `NULL` is an allocation failure, which the caller answers as
+ * `out-of-storage` — the same word the real store would use.
+ */
+static unsigned char *host_fs_bytes(struct host_fs_object *object) {
+  if (object->bytes == NULL) object->bytes = (unsigned char *)calloc(1, HOST_FS_BYTES_MAX);
+  return object->bytes;
+}
+
 static int host_fs_make(const char *path, size_t len, int directory) {
   if (len == 0 || len >= HOST_FS_PATH_MAX) return -1;
   for (int i = 0; i < HOST_FS_MAX_OBJECTS; i++) {
@@ -213,6 +256,12 @@ static struct host_fs_handle *host_fs_resolve(unsigned long long handle) {
 /* ---------------------------------------------------------- the harness */
 
 void host_fs_reset(const char *args) {
+  /* Before the wipe, or the pointers go with it: object storage is
+     allocated on first use and the struct is cleared wholesale. */
+  for (int i = 0; i < HOST_FS_MAX_OBJECTS; i++) {
+    free(host_fs.objects[i].bytes);
+    host_fs.objects[i].bytes = NULL;
+  }
   memset(&host_fs, 0, sizeof host_fs);
   host_fs.entropy = 0x243f6a8885a308d3ull;   /* any fixed, well-mixed word */
   host_fs.entropy_available = 1;
@@ -248,6 +297,12 @@ int host_fs_open_handles(void) {
   return live;
 }
 
+/* The largest destination a positional read asked for since the last
+   reset — what proves a read was big enough for the facade to stream. */
+unsigned long long host_fs_max_read_want(void) { return host_fs.max_read_want; }
+
+void host_fs_reset_max_read_want(void) { host_fs.max_read_want = 0; }
+
 int host_fs_exists(const char *path) {
   return host_fs_find(path, strlen(path)) >= 0;
 }
@@ -258,7 +313,9 @@ int host_fs_put(const char *path, const char *bytes, size_t len) {
   int at = host_fs_find(path, path_len);
   if (at < 0) at = host_fs_make(path, path_len, 0);
   if (at < 0 || len > HOST_FS_BYTES_MAX) return 0;
-  memcpy(host_fs.objects[at].bytes, bytes, len);
+  unsigned char *store = host_fs_bytes(&host_fs.objects[at]);
+  if (store == NULL) return 0;
+  if (len != 0) memcpy(store, bytes, len);
   host_fs.objects[at].len = len;
   return 1;
 }
@@ -396,13 +453,49 @@ int kore_lua_host_call(unsigned op, unsigned long long arg0,
       }
       struct host_fs_object *object = &host_fs.objects[slot->object];
       unsigned long long offset = arg1;
+      if (arg2 > host_fs.max_read_want) host_fs.max_read_want = arg2;
       size_t want = (size_t)(arg2 < HOST_FS_READ_MAX ? arg2 : HOST_FS_READ_MAX);
       if (offset >= object->len) { *result = 0; return HOST_FS_OK; }
       size_t available = object->len - (size_t)offset;
       if (want > available) want = available;
-      host_fs_reply(object->bytes + offset, want, text, text_len);
+      unsigned char *store = host_fs_bytes(object);
+      if (store == NULL) return host_fs_refuse("out-of-storage", text, text_len);
+      host_fs_reply(store + offset, want, text, text_len);
       *result = want;
       *result2 = want;
+      return HOST_FS_OK;
+    }
+
+    /*
+     * A whole file by path, with no handle anywhere.  The real host opens,
+     * streams and closes on its own thread under one pinned version; what
+     * matters here is only that it answers the whole file in one reply and
+     * leaves no handle behind, which is what the harness's leak accounting
+     * then proves.
+     *
+     * It counts as one read against `reads_armed`: the real host performs
+     * the reads itself, so fault injection has to be able to reach them
+     * here too, and the verb answers once either way.
+     */
+    case HOST_FS_OP_READ_FILE: {
+      if (host_fs.reads_armed) {
+        if (host_fs.reads_allowed == 0)
+          return host_fs_refuse("access-lost", text, text_len);
+        host_fs.reads_allowed--;
+      }
+      if (input_len == 0 || input_len >= HOST_FS_PATH_MAX)
+        return host_fs_refuse("invalid-name", text, text_len);
+      int at = host_fs_find(path, input_len);
+      if (at < 0) return host_fs_refuse("not-found", text, text_len);
+      if (host_fs.objects[at].directory)
+        return host_fs_refuse("is-directory", text, text_len);
+      struct host_fs_object *object = &host_fs.objects[at];
+      if (object->len > HOST_FS_BYTES_MAX)
+        return host_fs_refuse("range", text, text_len);
+      host_fs_reply_whole(object->len != 0 ? host_fs_bytes(object) : NULL,
+                          object->len, text, text_len);
+      *result = (unsigned long long)object->len;
+      *result2 = (unsigned long long)object->len;
       return HOST_FS_OK;
     }
 
@@ -417,9 +510,11 @@ int kore_lua_host_call(unsigned op, unsigned long long arg0,
       size_t at = slot->append ? object->len : (size_t)arg1;
       if (at > HOST_FS_BYTES_MAX || input_len > HOST_FS_BYTES_MAX - at)
         return host_fs_refuse("out-of-storage", text, text_len);
+      unsigned char *store = host_fs_bytes(object);
+      if (store == NULL) return host_fs_refuse("out-of-storage", text, text_len);
       if (at > object->len)
-        memset(object->bytes + object->len, 0, at - object->len);
-      if (input_len != 0) memcpy(object->bytes + at, input, input_len);
+        memset(store + object->len, 0, at - object->len);
+      if (input_len != 0) memcpy(store + at, input, input_len);
       if (at + input_len > object->len) object->len = at + input_len;
       *result = input_len;
       *result2 = at + input_len;
@@ -441,8 +536,10 @@ int kore_lua_host_call(unsigned op, unsigned long long arg0,
       size_t length = (size_t)arg1;
       if (length > HOST_FS_BYTES_MAX)
         return host_fs_refuse("out-of-storage", text, text_len);
+      unsigned char *store = host_fs_bytes(object);
+      if (store == NULL) return host_fs_refuse("out-of-storage", text, text_len);
       if (length > object->len)
-        memset(object->bytes + object->len, 0, length - object->len);
+        memset(store + object->len, 0, length - object->len);
       object->len = length;
       *result = length;
       return HOST_FS_OK;

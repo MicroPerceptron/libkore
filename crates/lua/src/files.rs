@@ -46,10 +46,45 @@ const MAX_OPEN_FILES: usize = 256;
 
 /// The largest single read a verb will answer.
 ///
-/// `f:read("a")` on a big file loops rather than asking for all of it at
-/// once: the reply crosses the bridge as one buffer, and an unbounded one
-/// would be an unbounded allocation on thread 0 driven by a script.
+/// A positional read that wants more asks again, so this bounds one reply
+/// and not one file: the reply crosses the bridge as one buffer, and an
+/// unbounded one would be an unbounded allocation on thread 0 driven by a
+/// script.
 const MAX_READ_BYTES: usize = 1 << 20;
+
+/// The largest whole file [`read_file`] will answer.
+///
+/// [`MAX_READ_BYTES`] bounds a verb a script can call again; this bounds
+/// one that has no "again", so it is the ceiling on a single Lua string
+/// the store will produce in one call. Past it the answer is
+/// [`FsError::Range`]: the file is real and readable, and it is having all
+/// of it at once that is refused.
+const MAX_FILE_BYTES: usize = 16 << 20;
+
+/// The destination size at which the native facade streams a read through
+/// this launch's storage ring instead of copying it a window at a time.
+///
+/// Not used here — the decision is made in C, where the read-ahead buffer
+/// is (`KORE_LUA_STREAM_MIN` in `src/kore_lua.c`) — but pinned here
+/// because this is the side that knows what the facade promises. A read
+/// below it is a window copy however large the file is, so a surface that
+/// only ever asks for a page can never stream.
+///
+/// The C half pins the same number as `KORE_LUA_FACADE_STREAM_MIN` and its
+/// harness asserts the engine compiled it, so a drift on either side fails
+/// a build rather than quietly costing every read its ring.
+pub const FACADE_STREAM_BYTES: u64 = 256 * 1024;
+
+// A ceiling below the threshold would mean no read this surface can
+// express is ever large enough to stream — the defect this path exists to
+// remove, and an easy one to reintroduce by lowering a cap for an
+// unrelated reason. Compile-time, because a cap is a compile-time choice
+// and a test would only catch it after the build that shipped it.
+const _: () = assert!(MAX_READ_BYTES as u64 >= FACADE_STREAM_BYTES);
+const _: () = assert!(MAX_FILE_BYTES as u64 >= FACADE_STREAM_BYTES);
+// A whole file is the verb with no "again", so its ceiling must not be the
+// stricter of the two.
+const _: () = assert!(MAX_FILE_BYTES >= MAX_READ_BYTES);
 
 /// One open file the VM holds a handle to.
 struct OpenFile {
@@ -365,6 +400,105 @@ pub async fn close(fs: &mut Fs<'_, '_>, files: &mut Files, handle: u64) -> Answe
     }
 }
 
+/// Where the positional verbs move their bytes.
+///
+/// A seam, not an abstraction: the only implementation outside this file's
+/// tests is [`Session`], which is the task's filesystem face and one handle
+/// in the table above. It exists because the rule the two loops below
+/// encode — what a refusal answers once some bytes have *already* moved —
+/// is reachable only from a session with a device under it, and it is
+/// exactly the rule worth pinning.
+// One caller, one thread, never spawned: a `Send` bound is not wanted here,
+// which is the whole of what this lint is for.
+#[allow(async_fn_in_trait)]
+trait Transfer {
+    /// Read at most one transfer's worth into `dst`, answering how many
+    /// bytes arrived. Zero is end of file.
+    async fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<usize, Refusal>;
+
+    /// Write at most one transfer's worth, answering how many bytes the
+    /// store acknowledged.
+    async fn write_at(&mut self, offset: u64, src: &[u8]) -> Result<usize, Refusal>;
+}
+
+/// The real one: the filesystem face, and one handle resolved per
+/// transfer.
+///
+/// Per transfer rather than once across a loop because the store's window
+/// bounds each one anyway, so the call is already a loop and holding the
+/// borrow would only forbid the resolve.
+struct Session<'a, 'w, 't> {
+    fs: &'a mut Fs<'w, 't>,
+    files: &'a mut Files,
+    handle: u64,
+}
+
+impl Transfer for Session<'_, '_, '_> {
+    async fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<usize, Refusal> {
+        let view = &self.files.resolve(self.handle).map_err(Refusal::Fs)?.view;
+        self.fs.read_at(view, offset, dst).await
+    }
+
+    async fn write_at(&mut self, offset: u64, src: &[u8]) -> Result<usize, Refusal> {
+        let view = &self.files.resolve(self.handle).map_err(Refusal::Fs)?.view;
+        self.fs.write_at(view, offset, src).await
+    }
+}
+
+/// Fill `dst` from `offset`, answering the prefix that arrived and the
+/// refusal that stopped it, if one did.
+///
+/// **A refusal is reported beside the prefix, never instead of it.** Bytes
+/// the store already moved are the caller's; answering only the refusal
+/// would throw them away. Nothing is hidden by that — the caller's next
+/// call starts at a zero prefix and meets the same refusal — it is only
+/// deferred past the bytes that are real.
+///
+/// The prefix is what was *acknowledged*, which is not the same as what
+/// was initialized: a read large enough to stream through the storage ring
+/// writes into `dst` as it lands, so a refusal part way can leave bytes
+/// past the prefix clobbered. It is a count, never a replay offset.
+async fn fill<T: Transfer>(
+    transfer: &mut T,
+    offset: u64,
+    dst: &mut [u8],
+) -> (usize, Option<Refusal>) {
+    let mut filled = 0;
+    while filled < dst.len() {
+        match transfer
+            .read_at(offset + filled as u64, &mut dst[filled..])
+            .await
+        {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(error) => return (filled, Some(error)),
+        }
+    }
+    (filled, None)
+}
+
+/// Write all of `src` at `offset`, answering the acknowledged prefix and
+/// the refusal that stopped it, if one did.
+///
+/// [`fill`]'s rule, outward — with one asymmetry that matters: on a
+/// transport failure the current unacknowledged chunk may *also* have
+/// committed, so the prefix is a lower bound on what changed, not a
+/// description of it.
+async fn drain<T: Transfer>(transfer: &mut T, offset: u64, src: &[u8]) -> (usize, Option<Refusal>) {
+    let mut written = 0;
+    while written < src.len() {
+        match transfer
+            .write_at(offset + written as u64, &src[written..])
+            .await
+        {
+            Ok(0) => break,
+            Ok(count) => written += count,
+            Err(error) => return (written, Some(error)),
+        }
+    }
+    (written, None)
+}
+
 /// Read up to `count` bytes from `offset`.
 ///
 /// Short is not an error: a read that reaches the end answers the bytes it
@@ -394,20 +528,57 @@ pub async fn read(
         return refused(FsError::OutOfStorage);
     }
     buffer.resize(count, 0);
-    let mut filled = 0;
-    while filled < count {
-        match fs
-            .read_at(&file.view, offset + filled as u64, &mut buffer[filled..])
-            .await
-        {
-            Ok(0) => break,
-            Ok(got) => filled += got,
-            Err(error) => return refusal(error),
-        }
+    let mut session = Session { fs, files, handle };
+    let (filled, stopped) = fill(&mut session, offset, &mut buffer).await;
+    if filled == 0
+        && let Some(error) = stopped
+    {
+        return refusal(error);
     }
     buffer.truncate(filled);
     let length = buffer.len() as u64;
     Answer::Bytes(length, buffer)
+}
+
+/// A whole file by path, in one call.
+///
+/// Not a convenience over [`read`]. `Fs::read_file` opens, streams and
+/// closes under **one pinned version**, so the answer is one revision of
+/// the file rather than a seam of several; and a file of at least
+/// [`FACADE_STREAM_BYTES`] crosses by DMA through this launch's storage
+/// ring instead of a window at a time. Neither is reachable by looping
+/// [`read`] — each call there pins its own version, and a page-sized
+/// destination is never large enough to stream.
+///
+/// Bounded by `MAX_FILE_BYTES` (16 MiB), refused as `range` rather than
+/// grown without a ceiling.
+pub async fn read_file(fs: &mut Fs<'_, '_>, path: &[u8]) -> Answer {
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut overflow = false;
+    let read = fs
+        .read_file(path, |chunk| {
+            if bytes.len() + chunk.len() > MAX_FILE_BYTES {
+                overflow = true;
+                return Err(Refusal::Fs(FsError::Range));
+            }
+            // The size is the file's, not this task's choice, so a heap
+            // that cannot hold it refuses the script rather than aborting
+            // thread 0 — `read`'s rule, at a larger scale.
+            bytes
+                .try_reserve(chunk.len())
+                .map_err(|_| Refusal::Fs(FsError::OutOfStorage))?;
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        })
+        .await;
+    match read {
+        _ if overflow => refused(FsError::Range),
+        Ok(()) => {
+            let length = bytes.len() as u64;
+            Answer::Bytes(length, bytes)
+        }
+        Err(error) => refusal(error),
+    }
 }
 
 /// Write `bytes` at `offset`, answering how many were acknowledged and
@@ -449,30 +620,12 @@ async fn finish_write(
     start: u64,
     bytes: &[u8],
 ) -> Answer {
-    let mut written = 0;
-    while written < bytes.len() {
-        let view = match files.resolve(handle) {
-            Ok(file) => &file.view,
-            Err(error) => return refused(error),
-        };
-        // The view is borrowed per chunk rather than across the loop: the
-        // store's window bounds each transfer, so the call is already a
-        // loop and holding the borrow would only forbid the resolve.
-        match fs
-            .write_at(view, start + written as u64, &bytes[written..])
-            .await
-        {
-            Ok(0) => break,
-            Ok(count) => written += count,
-            Err(error) => {
-                // A short write is a fact, not a detail: report the
-                // acknowledged prefix so a caller knows what committed.
-                if written == 0 {
-                    return refusal(error);
-                }
-                break;
-            }
-        }
+    let mut session = Session { fs, files, handle };
+    let (written, stopped) = drain(&mut session, start, bytes).await;
+    if written == 0
+        && let Some(error) = stopped
+    {
+        return refusal(error);
     }
     Answer::Value(written as u64, start + written as u64)
 }
@@ -601,6 +754,173 @@ pub async fn list(fs: &mut Fs<'_, '_>, path: &[u8]) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use alloc::vec;
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+
+    /// Drive a future that never pends.
+    ///
+    /// [`Scripted`] answers from a list, so one poll always finishes. A
+    /// `Pending` here would mean the test grew a real await and needs a
+    /// real executor — worth a panic rather than a hang.
+    fn answer<F: Future>(future: F) -> F::Output {
+        let mut future = core::pin::pin!(future);
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("the scripted transfer never pends"),
+        }
+    }
+
+    /// A [`Transfer`] that answers a written script.
+    ///
+    /// The point is the states a real session cannot be put into on
+    /// demand: a refusal that lands *after* some bytes have moved, a store
+    /// that accepts nothing without refusing, a window that answers short
+    /// twice running. Each step is one transfer's answer, in order.
+    struct Scripted {
+        steps: Vec<Result<usize, Refusal>>,
+        /// Stamped into a read's destination, so a test can tell bytes
+        /// that were delivered from bytes that were only zeroed.
+        mark: u8,
+        /// What each transfer was actually asked for: `(offset, len)`.
+        asked: Vec<(u64, usize)>,
+    }
+
+    impl Scripted {
+        fn new(steps: Vec<Result<usize, Refusal>>) -> Self {
+            Self {
+                steps,
+                mark: 0xab,
+                asked: Vec::new(),
+            }
+        }
+
+        fn step(&mut self, offset: u64, len: usize) -> Result<usize, Refusal> {
+            assert!(!self.steps.is_empty(), "the script ran out of answers");
+            self.asked.push((offset, len));
+            match self.steps.remove(0) {
+                // Never more than was asked for: a store that overran the
+                // destination would be a different bug, tested elsewhere.
+                Ok(count) => Ok(count.min(len)),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    impl Transfer for Scripted {
+        async fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> Result<usize, Refusal> {
+            let count = self.step(offset, dst.len())?;
+            dst[..count].fill(self.mark);
+            Ok(count)
+        }
+
+        async fn write_at(&mut self, offset: u64, src: &[u8]) -> Result<usize, Refusal> {
+            self.step(offset, src.len())
+        }
+    }
+
+    fn lost() -> Refusal {
+        Refusal::Fs(FsError::AccessLost)
+    }
+
+    /// The rule S-L3 exists for, in the direction it was wrong.
+    #[test]
+    fn a_read_refused_after_some_bytes_answers_the_prefix_beside_the_refusal() {
+        let mut source = Scripted::new(vec![Ok(4), Err(lost())]);
+        let mut dst = [0u8; 8];
+        let (filled, stopped) = answer(fill(&mut source, 0, &mut dst));
+        assert_eq!(filled, 4);
+        assert!(stopped.is_some());
+        // The prefix is the caller's: it must still be in the destination,
+        // not discarded along with the refusal.
+        assert_eq!(&dst[..4], &[0xab; 4]);
+        assert_eq!(&dst[4..], &[0; 4]);
+    }
+
+    #[test]
+    fn a_read_refused_before_anything_moved_answers_only_the_refusal() {
+        let mut source = Scripted::new(vec![Err(lost())]);
+        let mut dst = [0u8; 8];
+        let (filled, stopped) = answer(fill(&mut source, 0, &mut dst));
+        // Zero and a reason is what `read` turns back into a refusal; a
+        // prefix of zero with a reason is the only case where it may.
+        assert_eq!(filled, 0);
+        assert!(stopped.is_some());
+        assert_eq!(dst, [0; 8]);
+    }
+
+    #[test]
+    fn a_read_stops_at_end_of_file_without_a_refusal() {
+        let mut source = Scripted::new(vec![Ok(3), Ok(0)]);
+        let mut dst = [0u8; 8];
+        let (filled, stopped) = answer(fill(&mut source, 0, &mut dst));
+        assert_eq!(filled, 3);
+        // Short is not an error. A caller that cannot tell these apart
+        // reports end of file as a failure.
+        assert!(stopped.is_none());
+    }
+
+    #[test]
+    fn a_short_read_resumes_where_the_prefix_left_off() {
+        let mut source = Scripted::new(vec![Ok(2), Ok(3), Ok(3)]);
+        let mut dst = [0u8; 8];
+        let (filled, stopped) = answer(fill(&mut source, 100, &mut dst));
+        assert_eq!((filled, stopped.is_none()), (8, true));
+        // Each transfer asks from the caller's offset plus what has
+        // already arrived, for only what is left.
+        assert_eq!(source.asked, vec![(100, 8), (102, 6), (105, 3)]);
+    }
+
+    /// The same rule outward. A short write is a fact, not a detail.
+    #[test]
+    fn a_write_refused_after_some_bytes_answers_the_acknowledged_prefix() {
+        let mut sink = Scripted::new(vec![Ok(5), Err(lost())]);
+        let (written, stopped) = answer(drain(&mut sink, 0, &[7; 9]));
+        assert_eq!(written, 5);
+        assert!(stopped.is_some());
+    }
+
+    #[test]
+    fn a_write_refused_before_anything_committed_answers_only_the_refusal() {
+        let mut sink = Scripted::new(vec![Err(lost())]);
+        let (written, stopped) = answer(drain(&mut sink, 0, &[7; 9]));
+        assert_eq!(written, 0);
+        assert!(stopped.is_some());
+    }
+
+    #[test]
+    fn a_store_that_takes_nothing_stops_rather_than_spinning() {
+        // Zero acknowledged and no refusal: the loop must end, or a store
+        // under pressure becomes a hang instead of a short write.
+        let mut sink = Scripted::new(vec![Ok(4), Ok(0)]);
+        let (written, stopped) = answer(drain(&mut sink, 0, &[7; 9]));
+        assert_eq!(written, 4);
+        assert!(stopped.is_none());
+    }
+
+    #[test]
+    fn a_write_resumes_where_the_acknowledged_prefix_left_off() {
+        let mut sink = Scripted::new(vec![Ok(2), Ok(7)]);
+        let (written, stopped) = answer(drain(&mut sink, 64, &[7; 9]));
+        assert_eq!((written, stopped.is_none()), (9, true));
+        assert_eq!(sink.asked, vec![(64, 9), (66, 7)]);
+    }
+
+    #[test]
+    fn an_empty_transfer_asks_the_store_nothing() {
+        let mut source = Scripted::new(Vec::new());
+        let (filled, stopped) = answer(fill(&mut source, 0, &mut []));
+        assert_eq!((filled, stopped.is_none()), (0, true));
+        let mut sink = Scripted::new(Vec::new());
+        let (written, stopped) = answer(drain(&mut sink, 0, &[]));
+        assert_eq!((written, stopped.is_none()), (0, true));
+        // `Scripted` panics when asked past its script, so reaching here
+        // is the assertion: neither loop made a round trip.
+    }
 
     #[test]
     fn a_path_splits_into_a_parent_and_a_leaf() {

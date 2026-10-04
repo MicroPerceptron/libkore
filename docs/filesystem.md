@@ -20,11 +20,22 @@ The C/Zig callback adapter still uses its explicitly bounded 4 KiB scratch buffe
 a short read need not be EOF. Zero bytes read is EOF. The existing zero-copy
 `read_chunk` remains available when the owner can consume its borrowed window.
 
+The window is not the only transport. A `read_at` whose destination is at
+least **256 KiB**, and `read_file` over a file at least that large, may instead
+stream through the launch's storage ring from one pinned version. This is a
+property of the destination's size, not of the file's: a caller that loops over
+a small buffer stays on the window however large the range is, and one whole-file
+call holds a single version where a loop of positional reads pins one per call.
+Whether a launch holds a ring at all is decided at founding.
+
 `read_exact_at` and `write_all_at` loop bounded transfers without allocation.
-They check the entire offset range before the first request. Read errors report
-an initialized prefix. Write errors report only the acknowledged prefix: the
-current unacknowledged chunk may already have committed. This is **not a retry
-offset**. Neither helper automatically replays a mutation.
+They check the entire offset range before the first request. Both report only
+the **acknowledged** prefix. For a write, the current unacknowledged chunk may
+already have committed. For a read, the destination may hold bytes past the
+reported count — a streamed transfer writes into caller storage as it lands,
+and a refusal part way leaves that prefix uncounted — so storage past the
+acknowledged prefix is clobbered, not retained. Neither count is a **retry
+offset**, and neither helper automatically replays a mutation.
 
 Offset writes preserve the old tail. `resize` is a separate operation; successful
 chunks followed by a refused resize leave a partially changed file. Sync and

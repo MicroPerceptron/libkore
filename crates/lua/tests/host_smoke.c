@@ -25,6 +25,13 @@ extern int kore_lua_call(lua_State *, int, int);
 extern int kore_lua_print_results(lua_State *);
 extern void kore_lua_set_top(lua_State *, int);
 extern void kore_lua_close(lua_State *);
+/* The sizes the read path turns on, as src/kore_lua.c compiled them. */
+extern unsigned long long kore_lua_read_geometry(int);
+enum {
+  GEOMETRY_BUFSIZE = 0,
+  GEOMETRY_STREAM_MIN = 1,
+  GEOMETRY_FACADE_STREAM_MIN = 2
+};
 
 #if !defined(KORE_LUA_USE_TARGET_NUMERIC)
 double kore_lua_strtod(const char *text, char **end) { return strtod(text, end); }
@@ -149,10 +156,26 @@ static int test_fail_closes(lua_State *L) {
   return 0;
 }
 
+/* The largest destination a positional read asked the store for — the one
+   thing a host build can observe about whether a read could have streamed,
+   since there is no device under it to watch. */
+static int test_max_read_want(lua_State *L) {
+  lua_pushinteger(L, (lua_Integer)host_fs_max_read_want());
+  return 1;
+}
+
+static int test_reset_max_read_want(lua_State *L) {
+  (void)L;
+  host_fs_reset_max_read_want();
+  return 0;
+}
+
 static int test_open_library(lua_State *L) {
   static const luaL_Reg entries[] = {
     {"fail_reads_after", test_fail_reads_after},
     {"fail_closes", test_fail_closes},
+    {"max_read_want", test_max_read_want},
+    {"reset_max_read_want", test_reset_max_read_want},
     {NULL, NULL}
   };
   luaL_newlib(L, entries);
@@ -514,16 +537,17 @@ static int filesystem_smoke(void) {
       "       tostring(raised))\n"
 
       /* ------------------------------------------- a close that also fails */
-      /* `kore.fs.read_file` opens, reads and retires the handle itself.
-         A refused close pushes two values where success pushes one, so a
-         caller that popped a fixed count would hand back the wrong thing
-         entirely — the file object, or the error table, instead of the
-         bytes it read. */
+      /* `kore.fs.read_file` is one host call, so it leaves no handle on
+         this side to close: a store refusing every close cannot reach its
+         answer at all.  That is what moving it off open/read/close bought
+         — the stack discipline a fixed-count pop used to need here is now
+         absent rather than merely correct. */
       "kore.test.fail_closes(true)\n"
       "local body, bodyerr = kore.fs.read_file('/hello.txt')\n"
       "assert(body=='hello world\\nagain\\n', tostring(body))\n"
-      "assert(bodyerr==nil, 'the close is not the caller\\'s answer')\n"
-      /* And when the read failed too, the read's failure is what survives. */
+      "assert(bodyerr==nil, 'a close is not the caller\\'s answer')\n"
+      /* The read is still the caller's answer when it is the read that
+         failed: the host performs it, so fault injection reaches it. */
       "kore.test.fail_reads_after(0)\n"
       "local none, noneerr = kore.fs.read_file('/hello.txt')\n"
       "assert(none==nil, tostring(none))\n"
@@ -615,6 +639,124 @@ static int filesystem_smoke(void) {
   if (!host_fs_exit_requested() || host_fs_exit_code() != 7) {
     kore_lua_close(L); return 13;
   }
+  kore_lua_close(L);
+  return 0;
+}
+
+
+/* The fixture, in bytes.  Past any threshold this test will accept, so the
+   large-read bypass is genuinely taken; and not a multiple of the store's
+   page, so the last answer is short. */
+#define STREAM_FIXTURE_BYTES 300000
+#define STREAM_FIXTURE_UNIT "0123456789abcdef"
+
+/*
+ * Large reads, the whole-file verb, and the sizes both turn on.
+ *
+ * The thing under test is a *decision*, not a transfer: the host facade
+ * streams a read through this launch's storage ring only when it is handed
+ * a destination of at least `KORE_LUA_FACADE_STREAM_MIN`, so a surface that
+ * only ever asks for a page can never stream however large the file is.
+ * Nothing here can observe a ring — there is no device under a host build —
+ * but everything here can observe the ask, and the ask is what was wrong.
+ *
+ * The store still answers one page at a time, which is the point: the
+ * bypass must assemble a short answer correctly and hand back to the page
+ * buffer once the remainder is small, and both halves run in every read
+ * below.
+ */
+static int streaming_smoke(void) {
+  /* The geometry first, because every assertion after it is only
+     meaningful if the engine still believes these numbers. */
+  if (kore_lua_read_geometry(GEOMETRY_BUFSIZE) != 4096) return 1;
+  if (kore_lua_read_geometry(GEOMETRY_FACADE_STREAM_MIN) != 256u * 1024u) return 2;
+  {
+    unsigned long long ask = kore_lua_read_geometry(GEOMETRY_STREAM_MIN);
+    /* A read must be at least the facade's threshold to stream at all, and
+       must still fit the fixture or this test stops covering the bypass. */
+    if (ask < kore_lua_read_geometry(GEOMETRY_BUFSIZE)) return 3;
+    if (ask > STREAM_FIXTURE_BYTES) return 4;
+  }
+
+  static const char suite[] =
+      "local unit = '" STREAM_FIXTURE_UNIT "'\n"
+      "local want = string.rep(unit, 300000 // #unit)\n"
+      "assert(#want == 300000, 'fixture length')\n"
+
+      /* The whole-file verb: one host call, the whole file, no handle. */
+      "assert(kore.fs.read_file('/big.bin') == want)\n"
+
+      /* `f:read('a')` over the same file.  The ask starts at the length
+         `open` answered and shrinks as the file is consumed, so this runs
+         the bypass first and the page buffer for the remainder. */
+      "local f = assert(io.open('/big.bin','r'))\n"
+      "assert(f:read('a') == want)\n"
+      "assert(f:read('a') == '')\n"
+
+      /* An explicit count, from the start and then from an offset that is
+         neither page nor threshold aligned. */
+      "assert(f:seek('set') == 0)\n"
+      "assert(f:read(300000) == want)\n"
+      "assert(f:seek('set', 10) == 10)\n"
+      "assert(f:read(299990) == want:sub(11))\n"
+
+      /* A large ask past the end answers what there is, and is not an
+         error: short is short, only zero is end of file. */
+      "assert(f:seek('set') == 0)\n"
+      "assert(f:read(400000) == want)\n"
+      "assert(f:seek('end') == 300000)\n"
+      "assert(f:read(300000) == nil)\n"
+
+      /* Small reads still take the page buffer, and still agree. */
+      "assert(f:seek('set') == 0)\n"
+      "assert(f:read(100) == want:sub(1, 100))\n"
+      "assert(f:read('l') == want:sub(101))\n"
+      "assert(f:close())\n"
+
+      /* The whole-file verb's refusals are `kore.fs`'s table spelling, not
+         `io`'s message-and-errno one. */
+      "local v, e = kore.fs.read_file('/nowhere.bin')\n"
+      "assert(v == nil and e.code == 'not-found' and e.kind == 'refused')\n"
+      "local d, de = kore.fs.read_file('/tmp')\n"
+      "assert(d == nil and de.code == 'is-directory')\n"
+      /* An empty file reads successfully as an empty string, never nil. */
+      "assert(kore.fs.write_file('/empty.bin', '') == 0)\n"
+      "assert(kore.fs.read_file('/empty.bin') == '')\n"
+
+      /* Small reads must still be small: the bypass is for the reads that
+         can use it, not a blanket change of how every file is read. */
+      "assert(kore.test.max_read_want() >= 262144, 'a read reached the facade threshold')\n"
+      "local s = assert(io.open('/hello.txt','w'))\n"
+      "assert(s:write('short'))\n"
+      "assert(s:close())\n"
+      "kore.test.reset_max_read_want()\n"
+      "local t = assert(io.open('/hello.txt','r'))\n"
+      "assert(t:read('a') == 'short')\n"
+      "assert(t:close())\n"
+      "assert(kore.test.max_read_want() <= 4096, 'a small file still reads a page at a time')\n";
+
+  host_fs_reset("");
+  {
+    /* Seeded directly: the point is a file larger than the threshold, not
+       the writing of one. */
+    static char fixture[STREAM_FIXTURE_BYTES];
+    size_t unit = sizeof STREAM_FIXTURE_UNIT - 1;
+    for (size_t i = 0; i < sizeof fixture; i++) fixture[i] = STREAM_FIXTURE_UNIT[i % unit];
+    if (!host_fs_put("/big.bin", fixture, sizeof fixture)) return 5;
+  }
+
+  struct capture capture = {{0}, 0};
+  lua_State *L = kore_lua_new(host_alloc, NULL, 0x4b4f5245u, test_libraries,
+                              sizeof test_libraries / sizeof test_libraries[0]);
+  if (L == NULL) return 6;
+  if (kore_lua_install_print(L, capture_append, &capture) != LUA_OK) {
+    kore_lua_close(L); return 7;
+  }
+  if (!run_reporting(L, suite, "streaming suite")) { kore_lua_close(L); return 8; }
+  kore_lua_set_top(L, 0);
+  /* The whole-file verb holds no handle of its own, and every file the
+     suite opened was closed. */
+  if (host_fs_open_handles() != 0) { kore_lua_close(L); return 9; }
   kore_lua_close(L);
   return 0;
 }
@@ -801,6 +943,8 @@ int main(void) {
   host_fs_reset("");
   int fs_status = filesystem_smoke();
   if (fs_status != 0) return 30 + fs_status;
+  int stream_status = streaming_smoke();
+  if (stream_status != 0) return 50 + stream_status;
   host_fs_reset("");
   struct capture capture = {{0}, 0};
   lua_State *L = kore_lua_new(host_alloc, NULL, 0x4b4f5245u, NULL, 0);

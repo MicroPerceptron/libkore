@@ -303,7 +303,13 @@ enum {
   KORE_LUA_OP_FS_LIST = 28,
   /* `os.exit(code)` — records the code with the host, which reads it once
      the evaluation has unwound. */
-  KORE_LUA_OP_PROC_EXIT = 29
+  KORE_LUA_OP_PROC_EXIT = 29,
+  /* A whole file by path, in one call: open, stream, close, all on thread
+     0.  Not a convenience over `KORE_LUA_OP_FS_READ` — the host's streaming
+     read is the only one that can hold a pinned version for the whole file,
+     and a read assembled here from page-sized calls could not (see
+     `kore_lua_file_fill`). */
+  KORE_LUA_OP_FS_READ_FILE = 30
 };
 /* The error `os.exit` raises to unwind the evaluation.  `luaL_error` puts
    the chunk and line in front of it, so the host matches this as a *suffix*
@@ -717,6 +723,61 @@ typedef struct kore_lua_writer {
    `f:read("l")` is a memchr over bytes already here. */
 #define KORE_LUA_BUFSIZE 4096
 
+/*
+ * The host facade's streaming threshold (`FACADE_MIN_BYTES` in kore-dagfs,
+ * `files::FACADE_STREAM_BYTES` on the Rust half of this bridge).
+ *
+ * A destination at least this large is read through the launch's storage
+ * ring from one pinned version; below it the facade copies a window at a
+ * time.  It is a fact about the host, not a tunable here, and the two
+ * halves are pinned against each other by `kore_lua_read_geometry` below.
+ */
+#define KORE_LUA_FACADE_STREAM_MIN (256u * 1024u)
+
+/*
+ * A read of at least this much bypasses the page buffer and asks the host
+ * for the whole remainder in one call.
+ *
+ * Reading a large file a page at a time presents a page-sized destination
+ * on every call and so never reaches the threshold above, however large
+ * the file is.  The decision therefore has to be made on this side, which
+ * is why the constant lives next to the buffer it bypasses.
+ *
+ * Separately defined from the facade's own number, and overridable, so a
+ * test can reach the bypass without a quarter-megabyte fixture — without
+ * that lowering what this file believes the facade promises.
+ */
+#ifndef KORE_LUA_STREAM_MIN
+#define KORE_LUA_STREAM_MIN KORE_LUA_FACADE_STREAM_MIN
+#endif
+
+_Static_assert(KORE_LUA_STREAM_MIN > KORE_LUA_BUFSIZE,
+               "a bypass no larger than the page buffer saves no round trip");
+
+/*
+ * The sizes the read path's behaviour turns on, as this translation unit
+ * actually compiled them.
+ *
+ * A harness asserts against these rather than against a header, because
+ * the failure worth catching is exactly the one a header cannot show: an
+ * edit to `KORE_LUA_BUFSIZE` or to the threshold that silently stops every
+ * read from ever being large enough to stream.
+ */
+enum {
+  KORE_LUA_GEOMETRY_BUFSIZE = 0,
+  KORE_LUA_GEOMETRY_STREAM_MIN = 1,
+  KORE_LUA_GEOMETRY_FACADE_STREAM_MIN = 2
+};
+
+unsigned long long kore_lua_read_geometry(int which) {
+  switch (which) {
+    case KORE_LUA_GEOMETRY_BUFSIZE: return KORE_LUA_BUFSIZE;
+    case KORE_LUA_GEOMETRY_STREAM_MIN: return KORE_LUA_STREAM_MIN;
+    case KORE_LUA_GEOMETRY_FACADE_STREAM_MIN: return KORE_LUA_FACADE_STREAM_MIN;
+    default: return 0;
+  }
+}
+
 enum {
   KORE_LUA_FILE_STORE = 0,  /* a file in the store */
   KORE_LUA_FILE_OUT = 1,    /* io.stdout */
@@ -739,6 +800,12 @@ typedef struct {
   size_t have;
   size_t taken;
   int eof;
+  /* The length `open` answered, kept as a *hint* for sizing a whole-file
+     read and nothing else.  It goes stale the moment anyone writes or
+     resizes, here or elsewhere, so no read trusts it: it only decides
+     whether to try one large ask first, and every read still loops until
+     the host answers zero. */
+  unsigned long long length;
   /* `io.tmpfile`: the file unlinks itself when it closes, so `path` is the
      name to remove.  Nothing else records a path — an ordinary file is
      reached only through its handle, and remembering where it came from
@@ -832,6 +899,7 @@ static kore_lua_file *kore_lua_file_push(lua_State *L, unsigned long long handle
   file->have = 0;
   file->taken = 0;
   file->eof = 0;
+  file->length = 0;
   file->temporary = 0;
   file->path[0] = '\0';
   luaL_setmetatable(L, KORE_LUA_FILE);
@@ -895,10 +963,17 @@ static int kore_lua_open_named(lua_State *L, const char *path, size_t path_len,
   if (n) return n;
   /* An append stream starts at the end, so `f:seek()` before the first
      write answers where those bytes will actually land. */
-  kore_lua_file_push(L, handle, KORE_LUA_FILE_STORE,
-                     (flags & KORE_LUA_O_READ) != 0,
-                     (flags & KORE_LUA_O_WRITE) != 0,
-                     (flags & KORE_LUA_O_APPEND) ? length : 0);
+  {
+    kore_lua_file *file =
+        kore_lua_file_push(L, handle, KORE_LUA_FILE_STORE,
+                           (flags & KORE_LUA_O_READ) != 0,
+                           (flags & KORE_LUA_O_WRITE) != 0,
+                           (flags & KORE_LUA_O_APPEND) ? length : 0);
+    /* The same word `open` already answered, kept so `f:read("a")` can size
+       one ask instead of discovering the end a page at a time.  A hint, not
+       an authority — see the field. */
+    file->length = length;
+  }
   return 1;
 }
 
@@ -1092,6 +1167,66 @@ static size_t kore_lua_file_take(kore_lua_file *file, luaL_Buffer *b,
 }
 
 /*
+ * A large read, from the host straight into `b`, with no page buffer in the
+ * middle.
+ *
+ * One call for the whole `want` instead of `want`/`KORE_LUA_BUFSIZE` of
+ * them.  That is the point: the host's facade streams a destination of at
+ * least `KORE_LUA_STREAM_MIN` through this launch's storage ring from one
+ * pinned version, and it can only do that for a destination it is handed
+ * whole.  A page-at-a-time read is below the threshold on every call, so it
+ * never streams however large the file is.
+ *
+ * The caller must have drained the buffer first: `base`, `have` and `taken`
+ * describe a window this read moves past, and they are reset here.
+ *
+ * Answers how many bytes landed, or -1 with `*status`, `*why` and
+ * `*why_len` set.  A short answer is neither an error nor necessarily the
+ * end: the host bounds one reply, so the caller loops until it has what it
+ * asked for or the answer is zero.  Nothing is pushed on the Lua stack
+ * beyond `b`'s own growth, so a live `luaL_Buffer` stays at its level.
+ */
+static long long kore_lua_file_stream(kore_lua_file *file, luaL_Buffer *b,
+                                      unsigned long long want, int *status,
+                                      const char **why, size_t *why_len) {
+  unsigned long long count = 0, len = 0;
+  const char *bytes = NULL;
+  size_t bytes_len = 0;
+  *status = kore_lua_host_call(KORE_LUA_OP_FS_READ, file->handle,
+                               file->position, want, NULL, 0, &count, &len,
+                               &bytes, &bytes_len);
+  if (*status != KORE_LUA_STATUS_OK) {
+    *why = bytes;
+    *why_len = bytes_len;
+    return -1;
+  }
+  if (bytes == NULL) bytes_len = 0;
+  /* The host answers at most what was asked; clamp rather than trust, for
+     the same reason `kore_lua_file_fill` clamps to its buffer. */
+  if ((unsigned long long)bytes_len > want) bytes_len = (size_t)want;
+  if (bytes_len != 0) luaL_addlstring(b, bytes, bytes_len);
+  file->position += bytes_len;
+  file->base = file->position;
+  file->have = 0;
+  file->taken = 0;
+  if (bytes_len == 0) file->eof = 1;
+  return (long long)bytes_len;
+}
+
+/*
+ * Whether the next `want` bytes should bypass the page buffer.
+ *
+ * Only with the buffer already drained — bytes already here are cheaper
+ * than any round trip — only for a file in the store, and only when the ask
+ * is one the host could stream.
+ */
+static int kore_lua_file_streams(const kore_lua_file *file,
+                                 unsigned long long want) {
+  return file->kind == KORE_LUA_FILE_STORE && !file->eof &&
+         file->have == file->taken && want >= KORE_LUA_STREAM_MIN;
+}
+
+/*
  * Drop a partial read's buffer and answer the failure in `render`'s
  * spelling, as a negative count.  The buffer is finished and popped before
  * anything is pushed, so `render`'s values never land above a live box.
@@ -1149,11 +1284,26 @@ static int kore_lua_read_all(lua_State *L, kore_lua_file *file,
   size_t why_len = 0;
   luaL_buffinit(L, &b);
   for (;;) {
-    int state = kore_lua_file_fill(L, file, &status, &why, &why_len);
-    if (state < 0)
-      return kore_lua_read_failed(L, &b, status, why, why_len, render);
-    if (state == 0) break;
-    kore_lua_file_take(file, &b, file->have - file->taken);
+    /* What `open` said was left, if anything did.  A stale hint costs
+       nothing either way: too high and the host answers short, too low and
+       the fill below is the backstop that finds the real end. */
+    unsigned long long left =
+        file->length > file->position ? file->length - file->position : 0;
+    if (kore_lua_file_streams(file, left)) {
+      long long got =
+          kore_lua_file_stream(file, &b, left, &status, &why, &why_len);
+      if (got < 0)
+        return kore_lua_read_failed(L, &b, status, why, why_len, render);
+      if (got == 0) break;
+      continue;
+    }
+    {
+      int state = kore_lua_file_fill(L, file, &status, &why, &why_len);
+      if (state < 0)
+        return kore_lua_read_failed(L, &b, status, why, why_len, render);
+      if (state == 0) break;
+      kore_lua_file_take(file, &b, file->have - file->taken);
+    }
   }
   /* "a" never fails: at end of file it answers the empty string, which is
      the one read format that does. */
@@ -1180,11 +1330,22 @@ static int kore_lua_read_count(lua_State *L, kore_lua_file *file, size_t want,
   }
   luaL_buffinit(L, &b);
   while (total < want) {
-    int state = kore_lua_file_fill(L, file, &status, &why, &why_len);
-    if (state < 0)
-      return kore_lua_read_failed(L, &b, status, why, why_len, render);
-    if (state == 0) break;
-    total += kore_lua_file_take(file, &b, want - total);
+    if (kore_lua_file_streams(file, want - total)) {
+      long long got = kore_lua_file_stream(file, &b, want - total, &status,
+                                           &why, &why_len);
+      if (got < 0)
+        return kore_lua_read_failed(L, &b, status, why, why_len, render);
+      if (got == 0) break;
+      total += (size_t)got;
+      continue;
+    }
+    {
+      int state = kore_lua_file_fill(L, file, &status, &why, &why_len);
+      if (state < 0)
+        return kore_lua_read_failed(L, &b, status, why, why_len, render);
+      if (state == 0) break;
+      total += kore_lua_file_take(file, &b, want - total);
+    }
   }
   if (total == 0) { luaL_pushresult(&b); lua_pop(L, 1); lua_pushnil(L); return 1; }
   luaL_pushresult(&b);
@@ -1658,36 +1819,34 @@ static int kore_lua_fs_list(lua_State *L) {
   return 1;
 }
 
-/* Read a whole file without a handle — the shape a script reaches for far
-   more often than open/read/close, and the one `io.lines(name)` is built
-   on.  Bounded by the host's single-reply cap. */
+/*
+ * Read a whole file without a handle — the shape a script reaches for far
+ * more often than open/read/close.
+ *
+ * One host call, not open + read + close: the host opens, streams and
+ * closes on its own thread, which is the only arrangement that can hold a
+ * single pinned version for the whole file.  Assembled here from
+ * `KORE_LUA_OP_FS_READ` calls it could not — each call pins and releases
+ * its own version, so a concurrent writer could leave this answer a mix of
+ * revisions, and no call would be large enough to stream besides.
+ *
+ * Bounded by the host's whole-file cap (`MAX_FILE_BYTES` in src/files.rs),
+ * which refuses `range` rather than growing without one.
+ */
 static int kore_lua_fs_read_file(lua_State *L) {
   size_t path_len = 0;
   const char *path = luaL_checklstring(L, 1, &path_len);
-  unsigned long long handle = 0, length = 0;
-  int n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_OPEN, KORE_LUA_O_READ, 0, 0,
-                              path, path_len, &handle, &length, NULL, NULL,
-                              kore_lua_fail_table);
-  if (n) return n;
-  {
-    /* `base + 1` is the file object; the read's results sit above it. */
-    int base = lua_gettop(L);
-    kore_lua_file *file = kore_lua_file_push(L, handle, KORE_LUA_FILE_STORE, 1, 0, 0);
-    int read = kore_lua_read_all(L, file, kore_lua_fail_table);
-    int pushed = read < 0 ? -read : read;
-    /*
-     * The handle is retired here whatever the read did: this verb never
-     * hands the object out, so nothing else can close it.  The close's own
-     * answer is discarded — the read's is what the caller asked for — and
-     * it is discarded by level rather than by a fixed count, because
-     * `kore_lua_file_do_close` pushes one value on success and two on a
-     * refusal.
-     */
-    (void)kore_lua_file_do_close(L, file, kore_lua_fail_table);
-    lua_settop(L, base + 1 + pushed);
-    lua_remove(L, base + 1);
-    return pushed;
-  }
+  unsigned long long count = 0, len = 0;
+  const char *bytes = NULL;
+  size_t bytes_len = 0;
+  int status = kore_lua_host_call(KORE_LUA_OP_FS_READ_FILE, 0, 0, 0, path,
+                                  path_len, &count, &len, &bytes, &bytes_len);
+  if (status != KORE_LUA_STATUS_OK)
+    return kore_lua_fail_table(L, status, bytes, bytes_len);
+  /* The reply is length-delimited and not NUL-terminated; an empty file
+     answers an empty string, never nil, because it read successfully. */
+  lua_pushlstring(L, bytes != NULL ? bytes : "", bytes != NULL ? bytes_len : 0);
+  return 1;
 }
 
 static int kore_lua_fs_write_file(lua_State *L) {
