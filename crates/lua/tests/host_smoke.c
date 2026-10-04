@@ -170,12 +170,19 @@ static int test_reset_max_read_want(lua_State *L) {
   return 0;
 }
 
+/* Acknowledge at most n bytes per positional write; negative disarms. */
+static int test_short_writes(lua_State *L) {
+  host_fs_short_writes((int)luaL_checkinteger(L, 1));
+  return 0;
+}
+
 static int test_open_library(lua_State *L) {
   static const luaL_Reg entries[] = {
     {"fail_reads_after", test_fail_reads_after},
     {"fail_closes", test_fail_closes},
     {"max_read_want", test_max_read_want},
     {"reset_max_read_want", test_reset_max_read_want},
+    {"short_writes", test_short_writes},
     {NULL, NULL}
   };
   luaL_newlib(L, entries);
@@ -644,6 +651,103 @@ static int filesystem_smoke(void) {
 }
 
 
+/*
+ * The write path: a whole-file save, and what a short write answers.
+ *
+ * Two rules, and the store has to be made to break for either to be
+ * reachable.  A positional write that is acknowledged *short* is a fact
+ * and not a refusal, so `f:write` must ask again from where it stopped
+ * rather than declare a reason it does not know; and a store that
+ * acknowledges nothing without refusing has no reason to give, which is
+ * the one case `f:write` spells itself.
+ *
+ * `kore.fs.write_file` goes over as one save rather than a loop of
+ * positional writes, so the short-write cap must not shorten it: a save
+ * has no prefix to answer, it either replaced the file or it did not.
+ */
+static int write_smoke(void) {
+  static const char suite[] =
+      /* A save replaces, rather than overwriting in place: the old tail
+         must not survive a shorter save. */
+      "assert(kore.fs.write_file('/w.txt','aaaaaaaaaaaa')==12)\n"
+      "assert(kore.fs.read_file('/w.txt')=='aaaaaaaaaaaa')\n"
+      "assert(kore.fs.write_file('/w.txt','bb')==2)\n"
+      "assert(kore.fs.read_file('/w.txt')=='bb')\n"
+
+      /* A short acknowledgement is not a failure: the write asks again
+         from where it stopped, and all the bytes land. */
+      "local f = assert(io.open('/short.txt','w'))\n"
+      "kore.test.short_writes(3)\n"
+      "assert(f:write('abcdefghij')==f)\n"
+      "kore.test.short_writes(-1)\n"
+      "assert(f:close())\n"
+      "assert(kore.fs.read_file('/short.txt')=='abcdefghij')\n"
+
+      /* The same, spread over several arguments and a seek, so the
+         position the loop continues from is exercised too. */
+      "local g = assert(io.open('/short2.txt','w'))\n"
+      "kore.test.short_writes(2)\n"
+      "assert(g:write('hello ','world',33))\n"
+      "kore.test.short_writes(-1)\n"
+      "assert(g:seek('set')==0)\n"
+      "assert(g:close())\n"
+      "assert(kore.fs.read_file('/short2.txt')=='hello world33')\n"
+
+      /* An append file writes wherever the store finds the end now, so a
+         short acknowledgement must continue from the end it answered and
+         not from a remembered offset. */
+      "local a = assert(io.open('/short.txt','a'))\n"
+      "kore.test.short_writes(3)\n"
+      "assert(a:write('KLMNOPQ'))\n"
+      "kore.test.short_writes(-1)\n"
+      "assert(a:close())\n"
+      "assert(kore.fs.read_file('/short.txt')=='abcdefghijKLMNOPQ')\n"
+
+      /* A store that acknowledges nothing and does not refuse has no
+         reason to give; this is the one place `f:write` names one. */
+      "local z = assert(io.open('/none.txt','w'))\n"
+      "kore.test.short_writes(0)\n"
+      "local ok, why, err = z:write('abc')\n"
+      "kore.test.short_writes(-1)\n"
+      "assert(ok==nil and why=='out-of-storage' and err==28, tostring(why))\n"
+      "assert(z:close())\n"
+
+      /* A save is one call, so the cap that shortens positional writes
+         cannot shorten it. */
+      "kore.test.short_writes(1)\n"
+      "assert(kore.fs.write_file('/whole.txt','0123456789')==10)\n"
+      "kore.test.short_writes(-1)\n"
+      "assert(kore.fs.read_file('/whole.txt')=='0123456789')\n"
+
+      /* A save into a directory that is not there is refused in
+         `kore.fs`'s spelling, and creates nothing. */
+      "local v, e = kore.fs.write_file('/nodir/x.txt','x')\n"
+      "assert(v==nil and type(e)=='table' and e.code=='not-found', tostring(e))\n"
+      /* Saving nothing is a save, and empties the file. */
+      "assert(kore.fs.write_file('/w.txt','')==0)\n"
+      "assert(kore.fs.read_file('/w.txt')=='')\n"
+      /* A read-only handle refuses the save rather than silently dropping
+         it, and `io`'s surface renders the same refusal its own way. */
+      "local r = assert(io.open('/w.txt','r'))\n"
+      "local wok, wwhy, werr = r:write('x')\n"
+      "assert(wok==nil and wwhy=='access-denied' and werr==13, tostring(wwhy))\n"
+      "assert(r:close())\n";
+
+  host_fs_reset("");
+  struct capture capture = {{0}, 0};
+  lua_State *L = kore_lua_new(host_alloc, NULL, 0x4b4f5245u, test_libraries,
+                              sizeof test_libraries / sizeof test_libraries[0]);
+  if (L == NULL) return 1;
+  if (kore_lua_install_print(L, capture_append, &capture) != LUA_OK) {
+    kore_lua_close(L); return 2;
+  }
+  if (!run_reporting(L, suite, "write suite")) { kore_lua_close(L); return 3; }
+  kore_lua_set_top(L, 0);
+  if (host_fs_open_handles() != 0) { kore_lua_close(L); return 4; }
+  kore_lua_close(L);
+  return 0;
+}
+
 /* The fixture, in bytes.  Past any threshold this test will accept, so the
    large-read bypass is genuinely taken; and not a multiple of the store's
    page, so the last answer is short. */
@@ -943,8 +1047,10 @@ int main(void) {
   host_fs_reset("");
   int fs_status = filesystem_smoke();
   if (fs_status != 0) return 30 + fs_status;
+  int write_status = write_smoke();
+  if (write_status != 0) return 50 + write_status;
   int stream_status = streaming_smoke();
-  if (stream_status != 0) return 50 + stream_status;
+  if (stream_status != 0) return 70 + stream_status;
   host_fs_reset("");
   struct capture capture = {{0}, 0};
   lua_State *L = kore_lua_new(host_alloc, NULL, 0x4b4f5245u, NULL, 0);

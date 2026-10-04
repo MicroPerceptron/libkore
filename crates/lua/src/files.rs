@@ -630,6 +630,60 @@ async fn finish_write(
     Answer::Value(written as u64, start + written as u64)
 }
 
+/// Replace an open file's whole contents in one transaction.
+///
+/// Not a loop of [`write`](fn@write) with a truncation in front. `Fs::write_bytes`
+/// opens the store's own replacement (`BeginReplace`), and the hold around
+/// it is what makes every window-sized chunk land under **one** commit
+/// instead of one commit each — the difference between a save costing one
+/// image/flush/root/flush chain and one costing that per window.
+///
+/// A refused hold is not a failed save: the chunks still commit one at a
+/// time, exactly as they did before, so the hold is attempted and its
+/// refusal left unreported. The release, though, *is* the commit — a save
+/// whose bytes all landed but whose release was refused is not saved, and
+/// says so.
+///
+/// Nothing is bounded here and nothing is allocated: `bytes` is borrowed
+/// from the Lua frame the parked worker is holding open and the store
+/// chunks it, so the ceiling [`read_file`] needs has no counterpart —
+/// there is no reply to build.
+///
+/// `kore_dagfs::Fs::replace_file` additionally publishes the index for what
+/// it wrote. That verb is behind the crate's `index` feature, which this
+/// build does not carry, so a save here leaves the index stale. A stated
+/// gap, not an oversight: see `docs/pack-backed-reads.md`.
+pub async fn save(fs: &mut Fs<'_, '_>, files: &mut Files, handle: u64, bytes: &[u8]) -> Answer {
+    let writable = match files.resolve(handle) {
+        Ok(file) => file.writable,
+        Err(error) => return refused(error),
+    };
+    if !writable {
+        return refused(FsError::AccessDenied);
+    }
+    let held = fs.hold_commits(true).await.is_ok();
+    let view = match files.resolve(handle) {
+        Ok(file) => &file.view,
+        Err(error) => return refused(error),
+    };
+    let written = fs.write_bytes(view, bytes).await;
+    // Released whatever the write did, so a refused replacement cannot
+    // leave this session holding commits for every later writer.
+    let released = if held {
+        fs.hold_commits(false).await
+    } else {
+        Ok(())
+    };
+    if let Err(error) = written {
+        return refusal(error);
+    }
+    if let Err(error) = released {
+        return refusal(error);
+    }
+    let length = bytes.len() as u64;
+    Answer::Value(length, length)
+}
+
 pub async fn sync(fs: &mut Fs<'_, '_>, files: &mut Files, handle: u64) -> Answer {
     let view = match files.resolve(handle) {
         Ok(file) => &file.view,

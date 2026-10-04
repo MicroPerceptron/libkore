@@ -309,7 +309,12 @@ enum {
      read is the only one that can hold a pinned version for the whole file,
      and a read assembled here from page-sized calls could not (see
      `kore_lua_file_fill`). */
-  KORE_LUA_OP_FS_READ_FILE = 30
+  KORE_LUA_OP_FS_READ_FILE = 30,
+  /* Replace an open file's whole contents in one call.  The store commits
+     a positional write once per window; this is its own replacement under
+     one held commit, so a save is one commit however many windows it
+     takes. */
+  KORE_LUA_OP_FS_SAVE = 31
 };
 /* The error `os.exit` raises to unwind the evaluation.  `luaL_error` puts
    the chunk and line in front of it, so the host matches this as a *suffix*
@@ -1488,21 +1493,34 @@ static int kore_lua_file_write_with(lua_State *L, kore_lua_file *file, int first
       continue;
     }
     {
-      unsigned long long written = 0, end = 0;
-      int n;
+      /*
+       * A short write is not a failure and not a success: the store
+       * acknowledges what it took, and the rest is still owed.  Ask again
+       * from where it stopped rather than guessing a reason — if there is
+       * a real one, the next call is what carries it, in the store's own
+       * vocabulary instead of this one's best guess.  Only a store that
+       * acknowledges *nothing* without refusing has no reason to give, and
+       * that is the one case spelled here.
+       */
+      size_t done = 0;
       kore_lua_file_drop(file);
-      n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_WRITE, file->handle,
-                              file->position, 0, bytes, len, &written, &end,
-                              NULL, NULL, render);
-      if (n) return n;
-      file->position = end;
-      file->base = end;
-      lua_pop(L, 1);
-      if (written != (unsigned long long)len) {
-        /* A short write is not silently successful. */
-        return render(L, KORE_LUA_STATUS_REFUSED, "out-of-storage",
-                      sizeof "out-of-storage" - 1);
+      while (done < len) {
+        unsigned long long written = 0, end = 0;
+        int n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_WRITE, file->handle,
+                                    file->position, 0, bytes + done, len - done,
+                                    &written, &end, NULL, NULL, render);
+        if (n) return n;
+        /* An append file writes wherever the store finds the end now, so
+           the position to continue from is the one it answered. */
+        file->position = end;
+        file->base = end;
+        if (written == 0) {
+          return render(L, KORE_LUA_STATUS_REFUSED, "out-of-storage",
+                        sizeof "out-of-storage" - 1);
+        }
+        done += (size_t)written;
       }
+      lua_pop(L, 1);
     }
   }
   /* Lua answers the file itself, so writes chain. */
@@ -1849,20 +1867,34 @@ static int kore_lua_fs_read_file(lua_State *L) {
   return 1;
 }
 
+/*
+ * Write a whole file by path, creating it if it is not there.
+ *
+ * The bytes go over in one `KORE_LUA_OP_FS_SAVE`, which is the store's own
+ * replacement under a held commit — one commit for the save rather than
+ * one per window, which is what a loop of positional writes costs.
+ *
+ * The open deliberately does **not** truncate.  The replacement sets the
+ * whole contents, so truncating first would only add a round trip; and it
+ * would mean a save that then failed had already destroyed the previous
+ * contents, where this way they survive a refusal intact.
+ */
 static int kore_lua_fs_write_file(lua_State *L) {
   size_t path_len = 0, bytes_len = 0;
   const char *path = luaL_checklstring(L, 1, &path_len);
   const char *bytes = luaL_checklstring(L, 2, &bytes_len);
   unsigned long long handle = 0, length = 0, written = 0, end = 0;
   int n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_OPEN,
-                              KORE_LUA_O_WRITE | KORE_LUA_O_CREATE |
-                                  KORE_LUA_O_TRUNCATE,
-                              0, 0, path, path_len, &handle, &length, NULL,
-                              NULL, kore_lua_fail_table);
+                              KORE_LUA_O_WRITE | KORE_LUA_O_CREATE, 0, 0, path,
+                              path_len, &handle, &length, NULL, NULL,
+                              kore_lua_fail_table);
   if (n) return n;
-  n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_WRITE, handle, 0, 0, bytes,
+  n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_SAVE, handle, 0, 0, bytes,
                           bytes_len, &written, &end, NULL, NULL,
                           kore_lua_fail_table);
+  /* The handle is retired whatever the save did: this verb never hands the
+     file out, so nothing else can close it.  The close's own answer is
+     discarded — the save's is what the caller asked for. */
   {
     unsigned long long r = 0, r2 = 0;
     const char *why = NULL;

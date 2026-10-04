@@ -11,7 +11,7 @@
  *
  * So this file defines those symbols *strongly* and puts a small store
  * behind them.  It is not a filesystem: it is the smallest thing that can
- * answer the eleven filesystem ops faithfully enough that the C above it is
+ * answer the twelve filesystem ops faithfully enough that the C above it is
  * exercised for real.  Faithfully means, specifically:
  *
  *   - The reply text is **length-delimited and not NUL-terminated**, and
@@ -53,7 +53,8 @@ enum {
   HOST_FS_OP_RENAME = 27,
   HOST_FS_OP_LIST = 28,
   HOST_FS_OP_PROC_EXIT = 29,
-  HOST_FS_OP_READ_FILE = 30
+  HOST_FS_OP_READ_FILE = 30,
+  HOST_FS_OP_SAVE = 31
 };
 
 enum {
@@ -133,6 +134,13 @@ static struct {
      here: what the facade decides on is the *ask*, and after the clamp
      nothing downstream can still see how big it was. */
   unsigned long long max_read_want;
+  /* Acknowledge at most this much per positional write, once armed: the
+     only way to reach a *short* write, which the store otherwise never
+     produces because it writes everything or refuses.  Zero acknowledges
+     nothing at all without refusing — the one case the C side has no
+     reason to report and must spell itself. */
+  int writes_armed;
+  int write_cap;
   /* Refuse every close.  The slot is still freed, so the harness's
      leak accounting stays meaningful; what is under test is the *caller's*
      stack discipline, because `kore_lua_file_do_close` pushes one value on
@@ -302,6 +310,13 @@ int host_fs_open_handles(void) {
 unsigned long long host_fs_max_read_want(void) { return host_fs.max_read_want; }
 
 void host_fs_reset_max_read_want(void) { host_fs.max_read_want = 0; }
+
+/* Acknowledge at most `cap` bytes per positional write; a negative `cap`
+   disarms.  Zero acknowledges nothing, without refusing. */
+void host_fs_short_writes(int cap) {
+  host_fs.writes_armed = cap >= 0;
+  host_fs.write_cap = cap > 0 ? cap : 0;
+}
 
 int host_fs_exists(const char *path) {
   return host_fs_find(path, strlen(path)) >= 0;
@@ -499,6 +514,30 @@ int kore_lua_host_call(unsigned op, unsigned long long arg0,
       return HOST_FS_OK;
     }
 
+    /*
+     * Replace an open file's whole contents.  The real host does this in
+     * one held-commit transaction; what the harness can check is that it
+     * is one call, that it replaces rather than overwrites in place, and
+     * that the short-write cap does *not* apply to it — a save has no
+     * prefix to answer, it either replaced the file or did not.
+     */
+    case HOST_FS_OP_SAVE: {
+      struct host_fs_handle *slot = host_fs_resolve(arg0);
+      if (slot == NULL) return host_fs_refuse("invalid-handle", text, text_len);
+      if (!slot->writable)
+        return host_fs_refuse("access-denied", text, text_len);
+      if (input_len > HOST_FS_BYTES_MAX)
+        return host_fs_refuse("out-of-storage", text, text_len);
+      struct host_fs_object *object = &host_fs.objects[slot->object];
+      unsigned char *store = host_fs_bytes(object);
+      if (store == NULL) return host_fs_refuse("out-of-storage", text, text_len);
+      if (input_len != 0) memcpy(store, input, input_len);
+      object->len = input_len;
+      *result = (unsigned long long)input_len;
+      *result2 = (unsigned long long)input_len;
+      return HOST_FS_OK;
+    }
+
     case HOST_FS_OP_WRITE: {
       struct host_fs_handle *slot = host_fs_resolve(arg0);
       if (slot == NULL) return host_fs_refuse("invalid-handle", text, text_len);
@@ -512,12 +551,17 @@ int kore_lua_host_call(unsigned op, unsigned long long arg0,
         return host_fs_refuse("out-of-storage", text, text_len);
       unsigned char *store = host_fs_bytes(object);
       if (store == NULL) return host_fs_refuse("out-of-storage", text, text_len);
+      /* A short acknowledgement, once armed: the store took a prefix and
+         owes the rest, which is a fact and not a refusal. */
+      size_t taken = input_len;
+      if (host_fs.writes_armed && (size_t)host_fs.write_cap < taken)
+        taken = (size_t)host_fs.write_cap;
       if (at > object->len)
         memset(store + object->len, 0, at - object->len);
-      if (input_len != 0) memcpy(store + at, input, input_len);
-      if (at + input_len > object->len) object->len = at + input_len;
-      *result = input_len;
-      *result2 = at + input_len;
+      if (taken != 0) memcpy(store + at, input, taken);
+      if (at + taken > object->len) object->len = at + taken;
+      *result = taken;
+      *result2 = at + taken;
       return HOST_FS_OK;
     }
 

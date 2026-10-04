@@ -143,6 +143,12 @@ const OP_PROC_EXIT: u32 = 29;
 /// `OP_PROC_EXIT` rather than filling the retired 22, because a recycled op
 /// number is one a stale half of the bridge would answer wrongly.
 const OP_FS_READ_FILE: u32 = 30;
+/// `kore.fs.write_file`'s second half — replace an open file's whole
+/// contents (`arg0` the handle, `input` the bytes).  Positional
+/// [`OP_FS_WRITE`] commits once per window; this is the store's own
+/// replacement under one held commit, which is the difference between one
+/// image/flush/root/flush chain for a save and one per window.
+const OP_FS_SAVE: u32 = 31;
 
 /// Host-call outcomes: the value(s) are good; the service refused (the
 /// text names the refusal); the call could not be made at all (the text
@@ -958,7 +964,7 @@ async fn serve_value<E: Extension>(services: &mut Services<'_, '_>, extension: &
         }
     };
     // The contiguous block, plus the one verb numbered past `os.exit`.
-    if (OP_FS_OPEN..=OP_FS_LIST).contains(&op) || op == OP_FS_READ_FILE {
+    if (OP_FS_OPEN..=OP_FS_LIST).contains(&op) || matches!(op, OP_FS_READ_FILE | OP_FS_SAVE) {
         let answer = serve_fs(services, op, args, input).await;
         return finish_answer(answer);
     }
@@ -1031,6 +1037,7 @@ async fn serve_fs(
         OP_FS_CLOSE => crate::files::close(fs, files, args[0]).await,
         OP_FS_READ => crate::files::read(fs, files, args[0], args[1], args[2]).await,
         OP_FS_READ_FILE => crate::files::read_file(fs, input).await,
+        OP_FS_SAVE => crate::files::save(fs, files, args[0], input).await,
         OP_FS_WRITE => crate::files::write(fs, files, args[0], args[1], input).await,
         OP_FS_SYNC => crate::files::sync(fs, files, args[0]).await,
         OP_FS_RESIZE => crate::files::resize(fs, files, args[0], args[1]).await,
