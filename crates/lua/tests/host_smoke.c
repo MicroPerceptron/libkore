@@ -183,6 +183,12 @@ static int test_set_subtype(lua_State *L) {
   return 1;
 }
 
+/* The rights spelling the last open asked the store for. */
+static int test_last_rights(lua_State *L) {
+  lua_pushstring(L, host_fs_last_rights());
+  return 1;
+}
+
 static int test_open_library(lua_State *L) {
   static const luaL_Reg entries[] = {
     {"fail_reads_after", test_fail_reads_after},
@@ -191,6 +197,7 @@ static int test_open_library(lua_State *L) {
     {"reset_max_read_want", test_reset_max_read_want},
     {"short_writes", test_short_writes},
     {"set_subtype", test_set_subtype},
+    {"last_rights", test_last_rights},
     {NULL, NULL}
   };
   luaL_newlib(L, entries);
@@ -398,7 +405,7 @@ static int filesystem_smoke(void) {
       "assert(root==nil and rooterr.code=='access-denied')\n"
 
       /* ------------------------------------------------------ kore.fs.resize */
-      "local rz = assert(kore.fs.open('/resize.txt','w+'))\n"
+      "local rz = assert(kore.fs.open('/resize.txt','rw',{create=true,truncate=true}))\n"
       "assert(rz:write('abcdefgh'))\n"
       "assert(kore.fs.resize(rz,3))\n"
       /* A truncation drags the position back with it. */
@@ -658,6 +665,117 @@ static int filesystem_smoke(void) {
   return 0;
 }
 
+
+/*
+ * `kore.fs.open` in the store's own vocabulary.
+ *
+ * A mode string fuses authority with behaviour — `"w"` is write *and*
+ * create *and* truncate — and the whole reason this surface exists is to
+ * say what the store says.  So: authority is the rights string, behaviour
+ * is the options table, and the two are asserted apart.
+ *
+ * The store records the spelling each open asked for, which is the only
+ * way to show that `io.open`'s mode still reaches the same authority after
+ * the two surfaces converged onto one path.
+ */
+static int open_smoke(void) {
+  static const char suite[] =
+      /* ------------------------------------------------- authority */
+      "assert(kore.fs.write_file('/o.txt','abc')==3)\n"
+      "local r = assert(kore.fs.open('/o.txt'))\n"
+      "assert(kore.test.last_rights()=='r', kore.test.last_rights())\n"
+      "assert(r:read('a')=='abc')\n"
+      /* A read-only route answers a read-only object. */
+      "local w, werr = r:write('x')\n"
+      "assert(w==nil and werr=='access-denied', tostring(werr))\n"
+      "assert(r:close())\n"
+
+      "local rw = assert(kore.fs.open('/o.txt','rw'))\n"
+      "assert(kore.test.last_rights()=='rw')\n"
+      /* Asked for both, so the object permits both — unlike io's `\"w\"`. */
+      "assert(rw:write('Z'))\n"
+      "assert(rw:seek('set')==0 and rw:read(3)=='Zbc')\n"
+      "assert(rw:close())\n"
+
+      /* ------------------------------------------------- behaviour */
+      /* Rights alone do not create: that is an option, and its absence is
+         a `not-found` rather than a silent create. */
+      "local m, merr = kore.fs.open('/absent.txt','rw')\n"
+      "assert(m==nil and merr.code=='not-found', tostring(merr))\n"
+      "local c = assert(kore.fs.open('/absent.txt','rw',{create=true}))\n"
+      "assert(c:write('hello'))\n"
+      "assert(c:close())\n"
+      "assert(kore.fs.read_file('/absent.txt')=='hello')\n"
+      /* Truncate empties; without it the bytes stay. */
+      "local k = assert(kore.fs.open('/absent.txt','rw'))\n"
+      "assert(k:close())\n"
+      "assert(kore.fs.read_file('/absent.txt')=='hello')\n"
+      "local t = assert(kore.fs.open('/absent.txt','rw',{truncate=true}))\n"
+      "assert(t:close())\n"
+      "assert(kore.fs.read_file('/absent.txt')=='')\n"
+      /* Append writes at the end, whatever the position says. */
+      "assert(kore.fs.write_file('/ap.txt','one')==3)\n"
+      "local a = assert(kore.fs.open('/ap.txt','rw',{append=true}))\n"
+      "assert(a:write('two'))\n"
+      "assert(a:close())\n"
+      "assert(kore.fs.read_file('/ap.txt')=='onetwo')\n"
+      /* Exclusive refuses an existing name. */
+      "local x, xerr = kore.fs.open('/ap.txt','rw',{create=true,exclusive=true})\n"
+      "assert(x==nil and xerr.code=='already-exists', tostring(xerr))\n"
+
+      /* -------------------------------------- mistakes, which raise */
+      /* A POSIX mode is not a rights spelling, and says so. */
+      "assert(not pcall(kore.fs.open,'/o.txt','w+'))\n"
+      "assert(not pcall(kore.fs.open,'/o.txt','a'))\n"
+      "assert(not pcall(kore.fs.open,'/o.txt','rb'))\n"
+      /* A letter twice is not a subset. */
+      "assert(not pcall(kore.fs.open,'/o.txt','rr'))\n"
+      /* Rights this surface cannot exercise are refused by name, not
+         silently dropped — that is the rule the whole slice turns on. */
+      "assert(not pcall(kore.fs.open,'/o.txt','rn'))\n"
+      "assert(not pcall(kore.fs.open,'/o.txt','rs'))\n"
+      /* Options that cannot mean anything. */
+      "assert(not pcall(kore.fs.open,'/o.txt','r',{truncate=true}))\n"
+      "assert(not pcall(kore.fs.open,'/o.txt','rw',{exclusive=true}))\n"
+      /* A typo is an error, not a silently ignored request. */
+      "assert(not pcall(kore.fs.open,'/o.txt','r',{creat=true}))\n"
+      "assert(not pcall(kore.fs.open,'/o.txt','r',{[1]=true}))\n"
+      "assert(not pcall(kore.fs.open,'/o.txt','r','create'))\n"
+
+      /* ------------------------- io's modes reach the same authority */
+      /* The capability default in docs/lua.md, asserted rather than
+         described: a write mode opens a readable route, because a route
+         that cannot read cannot take a step. */
+      "assert(io.open('/o.txt','r')):close()\n"
+      "assert(kore.test.last_rights()=='r')\n"
+      "assert(io.open('/o.txt','w')):close()\n"
+      "assert(kore.test.last_rights()=='rw')\n"
+      "assert(io.open('/o.txt','a')):close()\n"
+      "assert(kore.test.last_rights()=='rw')\n"
+      "assert(io.open('/o.txt','r+')):close()\n"
+      "assert(kore.test.last_rights()=='rw')\n"
+      /* And io still refuses the object what the mode withheld, even
+         though the route could have carried it. */
+      "local iw = assert(io.open('/o.txt','w'))\n"
+      "local ir, irwhy = iw:read('a')\n"
+      "assert(ir==nil and irwhy=='access-denied', tostring(irwhy))\n"
+      "assert(iw:close())\n"
+      "return true\n";
+
+  host_fs_reset("");
+  struct capture capture = {{0}, 0};
+  lua_State *L = kore_lua_new(host_alloc, NULL, 0x4b4f5245u, test_libraries,
+                              sizeof test_libraries / sizeof test_libraries[0]);
+  if (L == NULL) return 1;
+  if (kore_lua_install_print(L, capture_append, &capture) != LUA_OK) {
+    kore_lua_close(L); return 2;
+  }
+  if (!run_reporting(L, suite, "open suite")) { kore_lua_close(L); return 3; }
+  kore_lua_set_top(L, 0);
+  if (host_fs_open_handles() != 0) { kore_lua_close(L); return 4; }
+  kore_lua_close(L);
+  return 0;
+}
 
 /*
  * The graph a script can see.
@@ -1159,6 +1277,8 @@ int main(void) {
   host_fs_reset("");
   int fs_status = filesystem_smoke();
   if (fs_status != 0) return 30 + fs_status;
+  int open_status = open_smoke();
+  if (open_status != 0) return 110 + open_status;
   int graph_status = graph_smoke();
   if (graph_status != 0) return 90 + graph_status;
   int write_status = write_smoke();

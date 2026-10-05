@@ -144,6 +144,9 @@ static struct {
      here: what the facade decides on is the *ask*, and after the clamp
      nothing downstream can still see how big it was. */
   unsigned long long max_read_want;
+  /* The rights spelling the last open asked for, so a test can assert what
+     authority a mode string actually requested. */
+  char last_rights[9];
   /* Acknowledge at most this much per positional write, once armed: the
      only way to reach a *short* write, which the store otherwise never
      produces because it writes everything or refuses.  Zero acknowledges
@@ -204,6 +207,42 @@ static int host_fs_refuse(const char *code, const char **text,
                           size_t *text_len) {
   host_fs_reply(code, strlen(code), text, text_len);
   return HOST_FS_REFUSED;
+}
+
+/* -------------------------------------------------------------- rights */
+
+/*
+ * The spelling `src/files.rs` unpacks and hands to the store's own
+ * `rights_parse`: READ implied, a subset of `rwns`, each letter at most
+ * once — and, for now, no `n` or `s`, which name authority this surface
+ * cannot exercise.
+ *
+ * Modelled here rather than ignored.  The C half's claim is that a
+ * spelling it will not open a route with comes back as `usage`, and a
+ * store that accepted everything could not show that.  This is a test
+ * double of the rule, not a second authority over it: the product's one
+ * parser is the store's.
+ */
+static int host_fs_rights(unsigned long long word, char *out) {
+  unsigned seen = 0;
+  size_t len = 0;
+  for (int i = 0; i < 8; i++) {
+    unsigned char letter = (unsigned char)(word >> (8 * i));
+    unsigned bit;
+    if (letter == 0) break;
+    switch (letter) {
+      case 'r': bit = 1; break;
+      case 'w': bit = 2; break;
+      case 'n': bit = 4; break;
+      case 's': bit = 8; break;
+      default: return 0;
+    }
+    if (seen & bit) return 0;      /* each letter at most once */
+    seen |= bit;
+    out[len++] = (char)letter;
+  }
+  out[len] = '\0';
+  return (seen & (4 | 8)) == 0;    /* not reachable from this surface yet */
 }
 
 /* ------------------------------------------------------------ the store */
@@ -335,6 +374,9 @@ int host_fs_open_handles(void) {
 unsigned long long host_fs_max_read_want(void) { return host_fs.max_read_want; }
 
 void host_fs_reset_max_read_want(void) { host_fs.max_read_want = 0; }
+
+/* The rights spelling the last open asked the store for. */
+const char *host_fs_last_rights(void) { return host_fs.last_rights; }
 
 /* Acknowledge at most `cap` bytes per positional write; a negative `cap`
    disarms.  Zero acknowledges nothing, without refusing. */
@@ -478,6 +520,10 @@ int kore_lua_host_call(unsigned op, unsigned long long arg0,
       return HOST_FS_OK;
 
     case HOST_FS_OP_OPEN:
+      /* The route's authority, before anything about the handle: a
+         spelling the far side would not open a route with is `usage`. */
+      if (!host_fs_rights(arg1, host_fs.last_rights))
+        return host_fs_refuse("usage", text, text_len);
       return host_fs_do_open(arg0, path, input_len, result, result2, text,
                              text_len);
 

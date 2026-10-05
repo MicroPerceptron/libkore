@@ -925,6 +925,28 @@ static void kore_lua_file_drop(kore_lua_file *file) {
 }
 
 /*
+ * Pack a rights spelling into one argument word: ASCII, NUL-padded, which
+ * `src/files.rs` unpacks and hands to the store's own `rights_parse`.
+ *
+ * The letters are deliberately **not** interpreted here.  What a letter
+ * means is the store's to say — `rights_label` prints what `rights_parse`
+ * reads — and a copy of that mapping in C would be a second authority over
+ * one set of bits, which is exactly what `kore.fs.rights` avoids by
+ * deriving its booleans from the store's own answer.
+ *
+ * `rights_parse` implies READ, so an empty spelling is a read-only route.
+ */
+#define KORE_LUA_RIGHTS_BYTES 8
+
+static unsigned long long kore_lua_rights_word(const char *spelling,
+                                               size_t len) {
+  unsigned long long word = 0;
+  for (size_t i = 0; i < len && i < KORE_LUA_RIGHTS_BYTES; i++)
+    word |= (unsigned long long)(unsigned char)spelling[i] << (8 * i);
+  return word;
+}
+
+/*
  * Parse an `io.open` mode string into the bits src/files.rs reads.
  * Returns 0 when the spelling is not one Lua defines.
  */
@@ -961,15 +983,23 @@ static unsigned long long kore_lua_mode(const char *mode) {
  * after it, and `io.input(name)` has only the name.  Answers 1 with the
  * file pushed, or `render`'s failure count.
  */
-static int kore_lua_open_named(lua_State *L, const char *path, size_t path_len,
-                               const char *mode, int mode_index,
-                               kore_lua_render_fail render) {
-  unsigned long long flags = kore_lua_mode(mode);
+/*
+ * The one open.  `flags` are the *handle's* permissions and the open's
+ * behaviour; `rights` is the *route's* authority, packed above.
+ *
+ * Two questions, not one.  A write route must be able to read to take a
+ * step, so `io.open(p, "w")` opens a readable route and still answers an
+ * object that refuses `f:read` — the mode governs the object, the rights
+ * govern the route (`docs/kore-fs-vocabulary.md`).
+ */
+static int kore_lua_open_with(lua_State *L, const char *path, size_t path_len,
+                              unsigned long long flags,
+                              unsigned long long rights,
+                              kore_lua_render_fail render, const char **why,
+                              size_t *why_len) {
   unsigned long long handle = 0, length = 0;
-  int n;
-  if (flags == 0) return luaL_argerror(L, mode_index, "invalid file mode");
-  n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_OPEN, flags, 0, 0, path, path_len,
-                          &handle, &length, NULL, NULL, render);
+  int n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_OPEN, flags, rights, 0, path,
+                              path_len, &handle, &length, why, why_len, render);
   if (n) return n;
   /* An append stream starts at the end, so `f:seek()` before the first
      write answers where those bytes will actually land. */
@@ -987,8 +1017,26 @@ static int kore_lua_open_named(lua_State *L, const char *path, size_t path_len,
   return 1;
 }
 
-/* `kore.fs.open` and `io.open`'s spelling: the path and mode are the call's
-   own first two arguments; `render` picks the surface's failure shape. */
+/*
+ * `io`'s spelling, translated.  A mode string is a POSIX projection of a
+ * right set plus three behaviours, so it is unpacked into both here —
+ * which is what keeps the capability default documented in `docs/lua.md`
+ * in exactly one place rather than derived again on the far side.
+ */
+static int kore_lua_open_named(lua_State *L, const char *path, size_t path_len,
+                               const char *mode, int mode_index,
+                               kore_lua_render_fail render) {
+  unsigned long long flags = kore_lua_mode(mode);
+  const char *spelling;
+  if (flags == 0) return luaL_argerror(L, mode_index, "invalid file mode");
+  /* A route that may write must also be able to read to take a step. */
+  spelling = (flags & KORE_LUA_O_WRITE) ? "rw" : "r";
+  return kore_lua_open_with(L, path, path_len, flags,
+                            kore_lua_rights_word(spelling, strlen(spelling)),
+                            render, NULL, NULL);
+}
+
+/* `io.open`: the path and mode are the call's own first two arguments. */
 static int kore_lua_open_file(lua_State *L, kore_lua_render_fail render) {
   size_t path_len = 0;
   const char *path = luaL_checklstring(L, 1, &path_len);
@@ -1702,8 +1750,96 @@ static void kore_lua_file_metatable(lua_State *L) {
  * `kore.fs`: the same object, the kebab-code failure table, and the
  * positional verbs the stream surface is built out of.
  */
+/* The options `kore.fs.open` accepts; anything else is a typo, not a
+   silently ignored request. */
+static const char *const kore_lua_open_option_names[] = {
+  "create", "truncate", "append", "exclusive", NULL
+};
+
+static int kore_lua_open_option(lua_State *L, int index, const char *name) {
+  int on;
+  lua_getfield(L, index, name);
+  on = lua_toboolean(L, -1);
+  lua_pop(L, 1);
+  return on;
+}
+
+/*
+ * `kore.fs.open(path [, rights [, options]])`.
+ *
+ * Authority is the rights string; behaviour is the options table.  The mode
+ * string `io.open` takes is a POSIX projection that fuses the two — `"w"`
+ * is write *and* create *and* truncate — and the whole reason this surface
+ * exists is to say what the store says.
+ *
+ * Every mistake here **raises**: a malformed spelling, an unknown option, a
+ * combination that cannot mean anything.  Rule 1 divides a programming
+ * error from an expected failure, and none of these is a condition of the
+ * store.  A right the store would refuse is the other thing, and that comes
+ * back as `nil, err` like any refusal.
+ */
 static int kore_lua_fs_open(lua_State *L) {
-  return kore_lua_open_file(L, kore_lua_fail_table);
+  size_t path_len = 0, rights_len = 0;
+  const char *path = luaL_checklstring(L, 1, &path_len);
+  const char *rights = luaL_optlstring(L, 2, "r", &rights_len);
+  unsigned long long flags = KORE_LUA_O_READ;   /* `rights_parse` implies READ */
+  const char *why = NULL;
+  size_t why_len = 0;
+  int n;
+  if (rights_len > KORE_LUA_RIGHTS_BYTES)
+    return luaL_argerror(L, 2, "rights spelling is too long");
+  /*
+   * The handle's own permission, which is not the route's.  `w` in the
+   * spelling is the only thing that makes the object writable; everything
+   * else about what a letter means is decided on the far side.
+   */
+  if (memchr(rights, 'w', rights_len) != NULL) flags |= KORE_LUA_O_WRITE;
+  if (!lua_isnoneornil(L, 3)) {
+    luaL_checktype(L, 3, LUA_TTABLE);
+    /* An unknown key is a typo the script wants to hear about now. */
+    lua_pushnil(L);
+    while (lua_next(L, 3) != 0) {
+      int known = 0;
+      if (lua_type(L, -2) == LUA_TSTRING) {
+        const char *key = lua_tostring(L, -2);
+        for (int i = 0; kore_lua_open_option_names[i] != NULL; i++)
+          if (strcmp(key, kore_lua_open_option_names[i]) == 0) known = 1;
+        if (!known)
+          return luaL_error(L, "unknown open option '%s'", key);
+      } else {
+        return luaL_argerror(L, 3, "options are named keys");
+      }
+      lua_pop(L, 1);
+    }
+    if (kore_lua_open_option(L, 3, "create")) flags |= KORE_LUA_O_CREATE;
+    if (kore_lua_open_option(L, 3, "truncate")) flags |= KORE_LUA_O_TRUNCATE;
+    if (kore_lua_open_option(L, 3, "append")) flags |= KORE_LUA_O_APPEND;
+    if (kore_lua_open_option(L, 3, "exclusive")) flags |= KORE_LUA_O_EXCLUSIVE;
+  }
+  /* Combinations that cannot mean anything, named before the round trip. */
+  if ((flags & (KORE_LUA_O_TRUNCATE | KORE_LUA_O_APPEND)) &&
+      !(flags & KORE_LUA_O_WRITE))
+    return luaL_argerror(L, 3, "truncate and append need 'w' in the rights");
+  if ((flags & KORE_LUA_O_EXCLUSIVE) && !(flags & KORE_LUA_O_CREATE))
+    return luaL_argerror(L, 3, "exclusive is about creating; it needs create");
+  n = kore_lua_open_with(L, path, path_len, flags,
+                         kore_lua_rights_word(rights, rights_len),
+                         kore_lua_fail_table, &why, &why_len);
+  /*
+   * `usage` is the far side saying the spelling is not one it will open a
+   * route with — malformed, or naming a right this surface cannot yet
+   * exercise.  Either way the script is wrong, so it raises rather than
+   * arriving as a refusal a caller might reasonably retry.
+   */
+  if (n == 2 && why != NULL && why_len == 5 && memcmp(why, "usage", 5) == 0) {
+    lua_pop(L, 2);
+    return luaL_argerror(
+        L, 2,
+        "rights are a subset of 'rw', each letter at most once; "
+        "'n' and 's' are not reachable from this surface yet, and "
+        "io.open takes the POSIX mode string");
+  }
+  return n;
 }
 
 /* One shape for every path verb that answers `true` or a failure. */
@@ -1726,8 +1862,9 @@ static int kore_lua_fs_mkdir(lua_State *L) {
   size_t len = 0;
   const char *path = luaL_checklstring(L, 1, &len);
   unsigned long long r = 0, r2 = 0;
-  int n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_OPEN, KORE_LUA_O_DIRECTORY, 0, 0,
-                              path, len, &r, &r2, NULL, NULL, kore_lua_fail_table);
+  int n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_OPEN, KORE_LUA_O_DIRECTORY,
+                              kore_lua_rights_word("r", 1), 0, path, len, &r, &r2,
+                              NULL, NULL, kore_lua_fail_table);
   if (n) return n;
   lua_pushboolean(L, 1);
   return 1;
@@ -2052,8 +2189,9 @@ static int kore_lua_fs_write_file(lua_State *L) {
   const char *bytes = luaL_checklstring(L, 2, &bytes_len);
   unsigned long long handle = 0, length = 0, written = 0, end = 0;
   int n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_OPEN,
-                              KORE_LUA_O_WRITE | KORE_LUA_O_CREATE, 0, 0, path,
-                              path_len, &handle, &length, NULL, NULL,
+                              KORE_LUA_O_WRITE | KORE_LUA_O_CREATE,
+                              kore_lua_rights_word("rw", 2), 0, path, path_len,
+                              &handle, &length, NULL, NULL,
                               kore_lua_fail_table);
   if (n) return n;
   n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_SAVE, handle, 0, 0, bytes,
@@ -2263,11 +2401,13 @@ static unsigned long long kore_lua_tempfile(char *dst, size_t *len_out,
       dst[len++] = digits[draw[i] & 15];
     }
     dst[len] = '\0';
+    /* Both callers write to what they draw, so the route carries WRITE
+       whatever `flags` says about the handle. */
     status = kore_lua_host_call(KORE_LUA_OP_FS_OPEN,
                                 flags | KORE_LUA_O_CREATE |
                                     KORE_LUA_O_EXCLUSIVE,
-                                0, 0, dst, len, &handle, &length, why,
-                                &why_len);
+                                kore_lua_rights_word("rw", 2), 0, dst, len,
+                                &handle, &length, why, &why_len);
     if (status == KORE_LUA_STATUS_OK) {
       if (len_out != NULL) *len_out = len;
       return handle + 1;   /* biased so 0 means failure */

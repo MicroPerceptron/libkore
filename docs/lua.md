@@ -26,9 +26,16 @@ revision, a subtype, the rights it actually holds.
 
 ## The capability default
 
-DagFS authority is a right set on a route, not a mode bit on a file. The stock
-surface has no way to say that, so it says it by convention instead: a mode
-string picks the rights, and the surface never asks for more.
+DagFS authority is a right set on a route, not a mode bit on a file.
+
+`kore.fs.open` says so directly — it takes a **rights spelling**, and
+behaviour (create, truncate, append, exclusive) moves to an options table where
+it belongs. The stock surface has no way to say any of that, so it says it by
+convention instead: a mode string picks the rights, and the surface never asks
+for more.
+
+Both reach the same place. A mode string is translated to a spelling and a set
+of options before it crosses, so this table is the whole of the convention:
 
 | Spelling | Rights requested | On the parent |
 |---|---|---|
@@ -44,6 +51,9 @@ The *route* carries `READ` in every row; the *file object* still remembers what
 the mode asked for, so `f:read` on a `"w"` file is `access-denied` rather than a
 read the route would in fact have permitted. The mode governs the object, the
 rights govern the route, and they are not the same question.
+
+`kore.fs.open(path, "rw")` asks for both and gets an object that permits both,
+which is the difference the two spellings exist to express.
 
 **`READ` is always requested**, because a route that cannot read cannot take a
 single step. Two rights are **never** requested by this surface: `SHARE` and
@@ -62,7 +72,7 @@ Every verb, both spellings. `—` means the surface has no spelling for it.
 
 | What | `kore.*` | stock |
 |---|---|---|
-| Open a file | `kore.fs.open(path, mode)` | `io.open(path, mode)` |
+| Open a file | `kore.fs.open(path, rights [, options])` | `io.open(path, mode)` |
 | Read a whole file | `kore.fs.read_file(path)` | — |
 | Write a whole file | `kore.fs.write_file(path, bytes)` | — |
 | Read from a handle | `f:read(...)` | `f:read(...)`, `io.read(...)` |
@@ -109,12 +119,37 @@ Every verb answers `value, err` on failure, where `err` is a table (see
 [Errors](#errors)). Paths resolve inside the task's endowed view; there is no
 global root.
 
-### `kore.fs.open(path, mode) -> file | nil, err`
+### `kore.fs.open(path [, rights [, options]]) -> file | nil, err`
 
-The same object `io.open` answers, with the table failure spelling. `mode` is
-the stock Lua mode string ([the capability default](#the-capability-default)).
-Opening a directory is `is-directory`; use `mkdir` to make one and `entries` or
-`list` to read one.
+The same object `io.open` answers, with the table failure spelling — but asked
+for in the store's vocabulary rather than POSIX's.
+
+```lua
+local f = assert(kore.fs.open("/etc/hosts"))                       -- "r"
+local g = assert(kore.fs.open("/var/log", "rw", {create = true}))
+```
+
+`rights` is a subset of the store's own `rwns` spelling, each letter at most
+once, defaulting to `"r"`. `READ` is implied, so `"w"` is a readable write
+route. **`n` and `s` are refused for now** — a route carrying authority nothing
+here can exercise would be a claim this surface cannot make — and unlock with
+the verbs that use them.
+
+`options` are `create`, `truncate`, `append`, `exclusive`.
+
+Everything that can only be a mistake **raises**: a malformed spelling, a right
+that is not reachable, an unknown option key, `truncate` or `append` without
+`w`, `exclusive` without `create`. A refusal from the store — `not-found`,
+`access-denied` — is the other thing, and arrives as `nil, err`.
+
+Rights alone do not create: a missing file is `not-found` until `create` is
+asked for. Opening a directory is `is-directory`; use `mkdir` to make one and
+`entries` or `list` to read one.
+
+> **This moved.** `kore.fs.open(p, "r")` is unchanged, and `io.open` is
+> untouched. Every other mode string now either means something different —
+> `"w"` is a read-write route that does not create — or raises, because `a`,
+> `+` and `b` are not rights letters. The argument error names the syntax.
 
 ### `kore.fs.read_file(path) -> string | nil, err`
 
@@ -387,9 +422,6 @@ is visible, not as a promise of spelling.
 
 Unblocked, and wanted:
 
-- `kore.fs.open` by **rights** (`"rwn"`) rather than a POSIX mode — the
-  surface's clearest remaining POSIX-ism, now that `rights` reports the same
-  vocabulary
 - `search` — the query vocabulary is settled in the native export
 - grant **listing** (what this task has shared out) — reporting, like `rights`
 - creating a file with a subtype, so a Lua installer can write what `require`
@@ -409,5 +441,6 @@ Blocked on the `index` feature, an image-size decision for this target:
 
 - index publication on save, and derived-version queries
 
-See `docs/pack-backed-reads.md` for the storage-transport work these sit beside,
-and `docs/filesystem.md` for the Rust facade underneath all of it.
+See `docs/kore-fs-vocabulary.md` for the plan these sit in,
+`docs/pack-backed-reads.md` for the storage-transport work they sit beside, and
+`docs/filesystem.md` for the Rust facade underneath all of it.

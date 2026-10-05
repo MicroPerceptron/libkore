@@ -273,6 +273,42 @@ pub mod mode {
     pub const DIRECTORY: u64 = 1 << 6;
 }
 
+/// How many ASCII letters of a rights spelling one argument word carries.
+///
+/// `rights_label` spells four bits, so eight is already twice what the
+/// store's vocabulary can need. The spelling crosses as bytes rather than
+/// as a bit pattern so that [`rights_parse`] stays the one thing that
+/// decides what a letter means — the C half packs characters it does not
+/// interpret.
+///
+/// [`rights_parse`]: kore::fs::dag::rights_parse
+const RIGHTS_SPELLING_BYTES: usize = 8;
+
+/// The route rights a spelling asks for.
+///
+/// `None` is a spelling this surface will not open a route with, which the
+/// caller renders as an argument error rather than a refusal: both a
+/// malformed spelling and an unreachable right are mistakes in the script,
+/// not conditions of the store.
+///
+/// Unreachable, for now, is `MUTATE_NAMESPACE` and `SHARE`. A route
+/// carrying either is useless while no verb here can link or share, and
+/// accepting the letter would claim a reach this surface does not have.
+/// They unlock with the verbs, not before (`docs/kore-fs-vocabulary.md`).
+fn route_rights(word: u64) -> Option<Rights> {
+    let bytes = word.to_le_bytes();
+    let spelling = match bytes.iter().position(|byte| *byte == 0) {
+        Some(end) => &bytes[..end],
+        None => &bytes[..RIGHTS_SPELLING_BYTES],
+    };
+    let rights = kore::fs::dag::rights_parse(spelling)?;
+    let unreachable = Rights::MUTATE_NAMESPACE.union(Rights::SHARE);
+    if rights.intersection(unreachable) != Rights::NONE {
+        return None;
+    }
+    Some(rights)
+}
+
 /// Split a path into its parent and final component.
 ///
 /// `None` when the path names the root itself, which has no parent to
@@ -294,17 +330,24 @@ fn name(bytes: &[u8]) -> Result<Name, FsError> {
 }
 
 /// Open — the one verb that creates a handle.
-pub async fn open(fs: &mut Fs<'_, '_>, files: &mut Files, path: &[u8], flags: u64) -> Answer {
+pub async fn open(
+    fs: &mut Fs<'_, '_>,
+    files: &mut Files,
+    path: &[u8],
+    flags: u64,
+    spelling: u64,
+) -> Answer {
     let readable = flags & mode::READ != 0;
     let writable = flags & mode::WRITE != 0;
     let append = flags & mode::APPEND != 0;
-    let mut rights = Rights::NONE;
-    if readable {
-        rights = rights.union(Rights::READ);
-    }
-    if writable {
-        rights = rights.union(Rights::WRITE);
-    }
+    // Two questions, not one. `rights` is what the *route* may do, from the
+    // caller's spelling; `readable`/`writable` are what the *handle* may do,
+    // from the mode or the same spelling. A write route must be able to
+    // read to take a step, which is why `io.open(p, "w")` opens a readable
+    // route and still answers an object that refuses `f:read`.
+    let Some(rights) = route_rights(spelling) else {
+        return Answer::Refused(String::from("usage"));
+    };
     // A directory is made, never opened for bytes: `kore.fs.mkdir` is this
     // verb with DIRECTORY set, so one arm creates both kinds and the
     // already-exists answer is identical for each.
@@ -317,7 +360,7 @@ pub async fn open(fs: &mut Fs<'_, '_>, files: &mut Files, path: &[u8], flags: u6
             Err(error) => refusal(error),
         };
     }
-    let existing = fs.open(path, rights.union(Rights::READ)).await;
+    let existing = fs.open(path, rights).await;
     let view = match existing {
         Ok(view) if flags & mode::EXCLUSIVE != 0 => {
             // The file is there and the caller demanded it not be. Close
@@ -1079,6 +1122,76 @@ mod tests {
         assert_eq!((written, stopped.is_none()), (0, true));
         // `Scripted` panics when asked past its script, so reaching here
         // is the assertion: neither loop made a round trip.
+    }
+
+    /// Pack a spelling the way the C half does, so these tests exercise
+    /// the same word the bridge actually carries.
+    fn word(spelling: &str) -> u64 {
+        let mut packed = 0u64;
+        for (index, byte) in spelling.bytes().enumerate() {
+            packed |= u64::from(byte) << (8 * index);
+        }
+        packed
+    }
+
+    #[test]
+    fn a_spelling_means_what_the_store_says_it_means() {
+        assert_eq!(route_rights(word("r")), Some(Rights::READ));
+        assert_eq!(
+            route_rights(word("rw")),
+            Some(Rights::READ.union(Rights::WRITE))
+        );
+        // `rights_parse` implies READ — a route that cannot read cannot
+        // take a step — so `w` alone is a readable write route. That rule
+        // is the store's, which is the whole reason this does not parse
+        // the letters itself.
+        assert_eq!(
+            route_rights(word("w")),
+            Some(Rights::READ.union(Rights::WRITE))
+        );
+    }
+
+    #[test]
+    fn an_empty_spelling_is_a_read_only_route() {
+        // Zero is what an all-NUL word unpacks to, and it must mean the
+        // least authority rather than the most.
+        assert_eq!(route_rights(0), Some(Rights::READ));
+    }
+
+    #[test]
+    fn a_right_this_surface_cannot_exercise_is_refused() {
+        // The rule the whole slice turns on: a route carrying SHARE is
+        // useless while nothing here can share, and accepting the letter
+        // would claim a reach this surface does not have. These unlock
+        // with their verbs, not before.
+        assert_eq!(route_rights(word("rn")), None);
+        assert_eq!(route_rights(word("rs")), None);
+        assert_eq!(route_rights(word("rwns")), None);
+    }
+
+    #[test]
+    fn a_posix_mode_is_not_a_rights_spelling() {
+        // Each of these is a mode string someone might reach for out of
+        // habit. None may quietly open something: `+`, `b` and `a` are not
+        // rights letters, so the caller is told rather than surprised.
+        for spelling in ["w+", "r+", "a", "rb", "a+"] {
+            assert_eq!(route_rights(word(spelling)), None, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_letter_may_not_repeat_and_a_stray_one_is_not_guessed() {
+        assert_eq!(route_rights(word("rr")), None);
+        assert_eq!(route_rights(word("x")), None);
+    }
+
+    #[test]
+    fn a_full_word_without_a_terminator_is_read_whole() {
+        // Eight letters and no NUL: the unpack must stop at the word's end
+        // rather than run past it. Eight distinct rights letters do not
+        // exist, so this can only be a refusal — the point is that it is
+        // a refusal and not a read of whatever followed.
+        assert_eq!(route_rights(u64::from_le_bytes(*b"rwrwrwrw")), None);
     }
 
     #[test]

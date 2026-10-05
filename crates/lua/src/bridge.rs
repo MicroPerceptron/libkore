@@ -1044,7 +1044,10 @@ async fn serve_fs(
         }
     };
     match op {
-        OP_FS_OPEN => crate::files::open(fs, files, input, args[0]).await,
+        // `arg0` is the handle's permissions and the open's behaviour;
+        // `arg1` is the route's rights, as packed ASCII the far side parses
+        // with the store's own `rights_parse`.
+        OP_FS_OPEN => crate::files::open(fs, files, input, args[0], args[1]).await,
         OP_FS_CLOSE => crate::files::close(fs, files, args[0]).await,
         OP_FS_READ => crate::files::read(fs, files, args[0], args[1], args[2]).await,
         OP_FS_READ_FILE => crate::files::read_file(fs, input).await,
