@@ -54,7 +54,9 @@ enum {
   HOST_FS_OP_LIST = 28,
   HOST_FS_OP_PROC_EXIT = 29,
   HOST_FS_OP_READ_FILE = 30,
-  HOST_FS_OP_SAVE = 31
+  HOST_FS_OP_SAVE = 31,
+  HOST_FS_OP_ENTRIES = 32,
+  HOST_FS_OP_RIGHTS = 33
 };
 
 enum {
@@ -89,6 +91,13 @@ struct host_fs_object {
   size_t len;
   int directory;
   int used;
+  /* The graph facts a stat answers.  Modelled rather than invented: a
+     revision that moves on every commit, a stable identity that is not the
+     slot, and a subtype carried verbatim — which is the behaviour worth
+     testing, because an unknown subtype must survive the round trip. */
+  unsigned long long revision;
+  unsigned long long stable;
+  unsigned char subtype;
 };
 
 struct host_fs_handle {
@@ -104,6 +113,7 @@ static struct {
   struct host_fs_object objects[HOST_FS_MAX_OBJECTS];
   struct host_fs_handle handles[HOST_FS_MAX_HANDLES];
   unsigned next_generation;
+  unsigned next_stable;
   /* The reply window.  One buffer, overwritten by each call, exactly as
      the bridge's `cell.text` is: C copies it into a Lua string before it
      makes another call.  The poison byte is the point — see the header. */
@@ -147,6 +157,16 @@ static struct {
      success and two on a refusal. */
   int refuse_close;
 } host_fs;
+
+/* ---------------------------------------------------- little-endian out */
+
+static void host_fs_put_le64(unsigned char *at, unsigned long long value) {
+  for (int i = 0; i < 8; i++) at[i] = (unsigned char)(value >> (8 * i));
+}
+
+static void host_fs_put_le32(unsigned char *at, unsigned long value) {
+  for (int i = 0; i < 4; i++) at[i] = (unsigned char)(value >> (8 * i));
+}
 
 /* ------------------------------------------------------------- replies */
 
@@ -241,6 +261,11 @@ static int host_fs_make(const char *path, size_t len, int directory) {
     host_fs.objects[i].path[len] = '\0';
     host_fs.objects[i].len = 0;
     host_fs.objects[i].directory = directory;
+    /* Not the slot: a stable id must not be reconstructible from position,
+       or a test could pass while the real one was being read wrong. */
+    host_fs.objects[i].stable = 0x51ab1e00ull + (unsigned long long)(++host_fs.next_stable);
+    host_fs.objects[i].revision = 1;
+    host_fs.objects[i].subtype = 0;
     host_fs.objects[i].used = 1;
     return i;
   }
@@ -316,6 +341,15 @@ void host_fs_reset_max_read_want(void) { host_fs.max_read_want = 0; }
 void host_fs_short_writes(int cap) {
   host_fs.writes_armed = cap >= 0;
   host_fs.write_cap = cap > 0 ? cap : 0;
+}
+
+/* Stamp an object's subtype, so a test can reach one this build names and
+   one it deliberately does not. */
+int host_fs_set_subtype(const char *path, int subtype) {
+  int at = host_fs_find(path, strlen(path));
+  if (at < 0) return 0;
+  host_fs.objects[at].subtype = (unsigned char)subtype;
+  return 1;
 }
 
 int host_fs_exists(const char *path) {
@@ -533,6 +567,7 @@ int kore_lua_host_call(unsigned op, unsigned long long arg0,
       if (store == NULL) return host_fs_refuse("out-of-storage", text, text_len);
       if (input_len != 0) memcpy(store, input, input_len);
       object->len = input_len;
+      object->revision++;
       *result = (unsigned long long)input_len;
       *result2 = (unsigned long long)input_len;
       return HOST_FS_OK;
@@ -560,6 +595,7 @@ int kore_lua_host_call(unsigned op, unsigned long long arg0,
         memset(store + object->len, 0, at - object->len);
       if (taken != 0) memcpy(store + at, input, taken);
       if (at + taken > object->len) object->len = at + taken;
+      if (taken != 0) object->revision++;
       *result = taken;
       *result2 = at + taken;
       return HOST_FS_OK;
@@ -585,6 +621,7 @@ int kore_lua_host_call(unsigned op, unsigned long long arg0,
       if (length > object->len)
         memset(store + object->len, 0, length - object->len);
       object->len = length;
+      object->revision++;
       *result = length;
       return HOST_FS_OK;
     }
@@ -601,8 +638,70 @@ int kore_lua_host_call(unsigned op, unsigned long long arg0,
         if (at < 0) return host_fs_refuse("not-found", text, text_len);
         object = &host_fs.objects[at];
       }
+      /* The fixed record src/files.rs encodes, little-endian; the C half
+         checks its length before reading a field. */
+      unsigned char record[34];
+      host_fs_put_le64(record, object->len);
+      host_fs_put_le64(record + 8, object->revision);
+      host_fs_put_le64(record + 16, object->stable);
+      host_fs_put_le32(record + 24, 1);            /* one name per object here */
+      host_fs_put_le32(record + 28, 0);            /* the harness grants nothing */
+      record[32] = (unsigned char)(object->directory != 0);
+      record[33] = object->subtype;
+      host_fs_reply(record, sizeof record, text, text_len);
       *result = object->len;
-      *result2 = (unsigned long long)object->directory;
+      *result2 = sizeof record;
+      return HOST_FS_OK;
+    }
+
+    /* A directory's edges, each with its target's class and subtype. */
+    case HOST_FS_OP_ENTRIES: {
+      int at = host_fs_find(path, input_len);
+      if (at < 0) return host_fs_refuse("not-found", text, text_len);
+      if (!host_fs.objects[at].directory)
+        return host_fs_refuse("not-directory", text, text_len);
+      unsigned char records[HOST_FS_READ_MAX];
+      size_t len = 0;
+      unsigned long long count = 0;
+      for (int i = 0; i < HOST_FS_MAX_OBJECTS; i++) {
+        if (!host_fs.objects[i].used || i == at) continue;
+        char parent[HOST_FS_PATH_MAX];
+        size_t parent_len = 0;
+        size_t whole = strlen(host_fs.objects[i].path);
+        host_fs_parent(host_fs.objects[i].path, whole, parent, &parent_len);
+        if (parent_len != input_len || memcmp(parent, path, input_len) != 0)
+          continue;
+        size_t cut = whole;
+        while (cut > 0 && host_fs.objects[i].path[cut - 1] != '/') cut--;
+        size_t leaf = whole - cut;
+        if (len + leaf + 3 > sizeof records)
+          return host_fs_refuse("range", text, text_len);
+        records[len++] = (unsigned char)(host_fs.objects[i].directory != 0);
+        records[len++] = host_fs.objects[i].subtype;
+        memcpy(records + len, host_fs.objects[i].path + cut, leaf);
+        len += leaf;
+        records[len++] = '\0';
+        count++;
+      }
+      host_fs_reply(records, len, text, text_len);
+      *result = count;
+      *result2 = len;
+      return HOST_FS_OK;
+    }
+
+    /*
+     * The rights the task holds at a path, in the store's own `rwns`
+     * spelling.  The harness grants `rwn` on everything it holds and
+     * nothing on what it does not: enough for the C half's derivation of
+     * booleans from letters to be exercised, including a letter it must
+     * report as absent.
+     */
+    case HOST_FS_OP_RIGHTS: {
+      int at = host_fs_find(path, input_len);
+      if (at < 0) return host_fs_refuse("not-found", text, text_len);
+      host_fs_reply("rwn", 3, text, text_len);
+      *result = 7;
+      *result2 = 3;
       return HOST_FS_OK;
     }
 

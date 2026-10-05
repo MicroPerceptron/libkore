@@ -709,6 +709,45 @@ pub async fn resize(fs: &mut Fs<'_, '_>, files: &mut Files, handle: u64, length:
     }
 }
 
+/// The fixed record [`stat`] answers, little-endian:
+///
+/// ```text
+///   0  u64  len          the object's size in bytes
+///   8  u64  revision     monotonic, committed; 0 is the any-revision sentinel
+///  16  u64  stable       volume-stable identity, 0 when the store has none
+///  24  u32  links        names pointing at this object
+///  28  u32  grants       grants outstanding on it
+///  32  u8   kind         0 file, 1 directory
+///  33  u8   subtype      carried verbatim, known to this build or not
+/// ```
+///
+/// A record rather than result words because there are eight facts and the
+/// transport carries two. The C half checks the length before decoding, so
+/// a bridge whose halves disagree refuses rather than reading a field that
+/// moved.
+const STAT_RECORD_BYTES: usize = 34;
+
+/// The store's own answer, whole.
+///
+/// `Stat` carries eight facts and this surface used to answer two of them,
+/// which is the sense in which it hid the graph: a script could not see
+/// the revision it raced, the links that kept an object alive, or the
+/// grants outstanding on it. None of this is authority — `StableObjectId`
+/// "conveys no authority" and a subtype "gates nothing" — so reporting it
+/// widens what a script can know without widening what it can do.
+fn stat_record(stat: &kore::fs::Stat) -> Vec<u8> {
+    let mut record = Vec::with_capacity(STAT_RECORD_BYTES);
+    record.extend_from_slice(&stat.len.to_le_bytes());
+    record.extend_from_slice(&stat.revision.to_le_bytes());
+    record.extend_from_slice(&stat.stable_object.get().to_le_bytes());
+    record.extend_from_slice(&stat.links.to_le_bytes());
+    record.extend_from_slice(&stat.grants.to_le_bytes());
+    record.push(u8::from(stat.kind.is_dir()));
+    record.push(stat.subtype.to_bits());
+    debug_assert_eq!(record.len(), STAT_RECORD_BYTES);
+    record
+}
+
 /// `stat`, by open handle when `path` is empty and by path otherwise.
 ///
 /// Both spellings are needed and neither is redundant: `f:seek("end")` has
@@ -722,9 +761,8 @@ pub async fn stat(fs: &mut Fs<'_, '_>, files: &mut Files, handle: u64, path: &[u
             Ok(file) => &file.view,
             Err(error) => return refused(error),
         };
-        let directory = view.is_directory();
         return match fs.stat(view).await {
-            Ok(stat) => Answer::Value(stat.len, u64::from(directory)),
+            Ok(stat) => Answer::Bytes(stat.len, stat_record(&stat)),
             Err(error) => refusal(error),
         };
     }
@@ -732,9 +770,8 @@ pub async fn stat(fs: &mut Fs<'_, '_>, files: &mut Files, handle: u64, path: &[u
         Ok(view) => view,
         Err(error) => return refusal(error),
     };
-    let directory = view.is_directory();
     let answer = match fs.stat(&view).await {
-        Ok(stat) => Answer::Value(stat.len, u64::from(directory)),
+        Ok(stat) => Answer::Bytes(stat.len, stat_record(&stat)),
         Err(error) => refusal(error),
     };
     fs.close(view).await;
@@ -770,6 +807,74 @@ pub async fn remove(fs: &mut Fs<'_, '_>, path: &[u8]) -> Answer {
 pub async fn rename(fs: &mut Fs<'_, '_>, from: &[u8], to: &[u8]) -> Answer {
     match fs.move_path(from, to).await {
         Ok(_) => Answer::Value(0, 0),
+        Err(error) => refusal(error),
+    }
+}
+
+/// A directory's edges, with what each one points at.
+///
+/// [`list`] answers the *namespace* — the names a directory holds — and is
+/// the right question most of the time. This answers the *graph*: each
+/// edge with its target's class and subtype, so a script can tell a
+/// directory from a file, or a native module from a plain file, without
+/// opening and statting every name in turn.
+///
+/// One record per entry: a kind byte, a subtype byte, then the name and a
+/// NUL. A name is UTF-8 and may contain neither NUL nor `/`, so the
+/// terminator is unambiguous.
+///
+/// The target's `ObjectId` is deliberately **not** here. It is a
+/// service-local slot key — "possessing this naming value conveys no
+/// authority", and a stale one is a refusal rather than a mistake — but it
+/// is also not stable across a restart, and a script that stored one as an
+/// identity would be wrong in a way nothing would tell it. The stable
+/// identity is [`stat`]'s, where it is named as such.
+pub async fn entries(fs: &mut Fs<'_, '_>, path: &[u8]) -> Answer {
+    let mut records: Vec<u8> = Vec::new();
+    let mut overflow = false;
+    let listed = fs
+        .list_directory(path, |entry| {
+            let name = entry.name.as_bytes();
+            if records.len() + name.len() + 3 > MAX_READ_BYTES {
+                overflow = true;
+                return Err(Refusal::Fs(FsError::Range));
+            }
+            records.push(u8::from(entry.kind.is_dir()));
+            records.push(entry.subtype.to_bits());
+            records.extend_from_slice(name);
+            records.push(0);
+            Ok(())
+        })
+        .await;
+    match listed {
+        _ if overflow => refused(FsError::Range),
+        Ok(()) => {
+            let count = records.iter().filter(|byte| **byte == 0).count() as u64;
+            Answer::Bytes(count, records)
+        }
+        Err(error) => refusal(error),
+    }
+}
+
+/// The rights this task actually holds on `path`.
+///
+/// Answered as the store's own compact spelling — a subset of `rwns`, the
+/// vocabulary `kore_dagfs::rights_label` prints and `rights_parse` reads —
+/// rather than a set of booleans invented here. That matters beyond
+/// tidiness: what a listing prints is what a `share` accepts, so a script
+/// that reads rights here and hands them back later is speaking the same
+/// language the store does. The letters are the contract; the booleans the
+/// C half derives from them are a convenience over it.
+///
+/// This reports authority, it never confers any: `effective_rights` walks
+/// to the object with the rights the task already holds, and answers what
+/// survived the walk.
+pub async fn rights(fs: &mut Fs<'_, '_>, path: &[u8]) -> Answer {
+    match fs.effective_rights(path).await {
+        Ok(rights) => Answer::Bytes(
+            u64::from(rights.bits()),
+            kore::fs::dag::rights_label(rights).to_vec(),
+        ),
         Err(error) => refusal(error),
     }
 }

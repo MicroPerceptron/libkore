@@ -314,7 +314,12 @@ enum {
      a positional write once per window; this is its own replacement under
      one held commit, so a save is one commit however many windows it
      takes. */
-  KORE_LUA_OP_FS_SAVE = 31
+  KORE_LUA_OP_FS_SAVE = 31,
+  /* A directory's edges with each target's class and subtype, where
+     `KORE_LUA_OP_FS_LIST` answers only the names. */
+  KORE_LUA_OP_FS_ENTRIES = 32,
+  /* The rights this task holds at a path, in the store's `rwns` spelling. */
+  KORE_LUA_OP_FS_RIGHTS = 33
 };
 /* The error `os.exit` raises to unwind the evaluation.  `luaL_error` puts
    the chunk and line in front of it, so the host matches this as a *suffix*
@@ -1782,26 +1787,188 @@ static int kore_lua_fs_resize(lua_State *L) {
   return 1;
 }
 
+/*
+ * The fixed record `src/files.rs` answers a stat with, little-endian.  The
+ * length is checked before anything is read: a bridge whose halves
+ * disagree about the layout must refuse, not decode a field that moved.
+ */
+#define KORE_LUA_STAT_RECORD 34
+
+static unsigned long long kore_lua_le64(const unsigned char *at) {
+  unsigned long long value = 0;
+  for (int i = 7; i >= 0; i--) value = (value << 8) | at[i];
+  return value;
+}
+
+static unsigned long kore_lua_le32(const unsigned char *at) {
+  unsigned long value = 0;
+  for (int i = 3; i >= 0; i--) value = (value << 8) | at[i];
+  return value;
+}
+
+/*
+ * What an object *contains*, as `ObjectSubtype` spells it.
+ *
+ * An unknown byte is carried, never flattened to "plain": the store's own
+ * rule is that "a newer writer's subtype is data an older reader passes
+ * through intact".  So a subtype this build does not know leaves `subtype`
+ * nil while `subtype_bits` still reports it, and a script can round-trip
+ * or forward a value it cannot name.
+ */
+static const char *kore_lua_subtype_name(unsigned char bits) {
+  switch (bits) {
+    case 0: return "plain";
+    case 1: return "executable-image";
+    case 2: return "package-manifest";
+    default: return NULL;
+  }
+}
+
+/*
+ * `kore.fs.stat` — the store's answer whole, not the two fields of it this
+ * surface used to pass on.
+ *
+ * None of the added facts is authority: a stable id "conveys no authority"
+ * and a subtype "gates nothing".  They are what a script needs to see the
+ * graph it is standing in — the revision it may be racing, the links
+ * keeping an object alive, the grants outstanding on it.
+ */
 static int kore_lua_fs_stat(lua_State *L) {
   size_t len = 0;
   const char *path = luaL_checklstring(L, 1, &len);
-  unsigned long long length = 0, kind = 0;
+  unsigned long long length = 0, record_len = 0;
+  const char *bytes = NULL;
+  size_t bytes_len = 0;
   int n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_STAT, 0, 0, 0, path, len,
-                              &length, &kind, NULL, NULL, kore_lua_fail_table);
+                              &length, &record_len, &bytes, &bytes_len,
+                              kore_lua_fail_table);
   if (n) return n;
-  lua_createtable(L, 0, 3);
-  /* Rule 5: a size carries its unit in the name. */
-  lua_pushinteger(L, (lua_Integer)length);
-  lua_setfield(L, -2, "size_bytes");
-  lua_pushstring(L, kind ? "directory" : "file");
-  lua_setfield(L, -2, "kind");
-  lua_pushboolean(L, kind != 0);
-  lua_setfield(L, -2, "directory");
+  if (bytes == NULL || bytes_len != KORE_LUA_STAT_RECORD) {
+    return kore_lua_fail_table(L, KORE_LUA_STATUS_UNAVAILABLE,
+                               "stat record is not this build's layout",
+                               sizeof "stat record is not this build's layout" - 1);
+  }
+  {
+    const unsigned char *at = (const unsigned char *)bytes;
+    unsigned char kind = at[32], subtype = at[33];
+    const char *named = kore_lua_subtype_name(subtype);
+    lua_createtable(L, 0, 8);
+    /* Rule 5: a size carries its unit in the name. */
+    lua_pushinteger(L, (lua_Integer)kore_lua_le64(at));
+    lua_setfield(L, -2, "size_bytes");
+    lua_pushinteger(L, (lua_Integer)kore_lua_le64(at + 8));
+    lua_setfield(L, -2, "revision");
+    lua_pushinteger(L, (lua_Integer)kore_lua_le64(at + 16));
+    lua_setfield(L, -2, "id");
+    lua_pushinteger(L, (lua_Integer)kore_lua_le32(at + 24));
+    lua_setfield(L, -2, "links");
+    lua_pushinteger(L, (lua_Integer)kore_lua_le32(at + 28));
+    lua_setfield(L, -2, "grants");
+    lua_pushstring(L, kind ? "directory" : "file");
+    lua_setfield(L, -2, "kind");
+    lua_pushboolean(L, kind != 0);
+    lua_setfield(L, -2, "directory");
+    lua_pushinteger(L, (lua_Integer)subtype);
+    lua_setfield(L, -2, "subtype_bits");
+    if (named != NULL) {
+      lua_pushstring(L, named);
+      lua_setfield(L, -2, "subtype");
+    }
+  }
   return 1;
 }
 
-/* `exists` is a question, not a failure, so it answers a boolean and never
-   a `nil, err` pair a caller would have to unpack to learn "no". */
+/*
+ * `kore.fs.entries` — a directory's edges, each with what it points at.
+ *
+ * `kore.fs.list` answers the namespace and is the right question most of
+ * the time; this answers the graph, so telling a directory from a file, or
+ * a native module from a plain one, costs one call instead of a stat per
+ * name.  One record per entry: a kind byte, a subtype byte, the name, a
+ * NUL.  A name is UTF-8 containing neither NUL nor `/`, so the terminator
+ * cannot be part of one.
+ */
+static int kore_lua_fs_entries(lua_State *L) {
+  size_t len = 0;
+  const char *path = luaL_checklstring(L, 1, &len);
+  unsigned long long count = 0, record_len = 0;
+  const char *bytes = NULL;
+  size_t bytes_len = 0;
+  int n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_ENTRIES, 0, 0, 0, path, len,
+                              &count, &record_len, &bytes, &bytes_len,
+                              kore_lua_fail_table);
+  if (n) return n;
+  lua_createtable(L, (int)count, 0);
+  {
+    lua_Integer index = 0;
+    size_t at = 0;
+    while (at + 2 < bytes_len) {
+      unsigned char kind = (unsigned char)bytes[at];
+      unsigned char subtype = (unsigned char)bytes[at + 1];
+      const char *name = bytes + at + 2;
+      size_t name_len = 0;
+      const char *named;
+      while (at + 2 + name_len < bytes_len && name[name_len] != '\0') name_len++;
+      named = kore_lua_subtype_name(subtype);
+      lua_createtable(L, 0, 4);
+      lua_pushlstring(L, name, name_len);
+      lua_setfield(L, -2, "name");
+      lua_pushstring(L, kind ? "directory" : "file");
+      lua_setfield(L, -2, "kind");
+      lua_pushboolean(L, kind != 0);
+      lua_setfield(L, -2, "directory");
+      lua_pushinteger(L, (lua_Integer)subtype);
+      lua_setfield(L, -2, "subtype_bits");
+      if (named != NULL) {
+        lua_pushstring(L, named);
+        lua_setfield(L, -2, "subtype");
+      }
+      lua_rawseti(L, -2, ++index);
+      at += 2 + name_len + 1;
+    }
+  }
+  return 1;
+}
+
+/*
+ * `kore.fs.rights` — what this task may actually do at a path.
+ *
+ * The store's own compact spelling is the answer, and the booleans are
+ * derived from it rather than beside it: `rights_label` prints what
+ * `rights_parse` reads, so the letters a script sees here are the letters
+ * a `share` will accept.  Inventing a second vocabulary in C would be a
+ * second authority over one set of bits.
+ *
+ * Reports authority; confers none.
+ */
+static int kore_lua_fs_rights(lua_State *L) {
+  size_t len = 0;
+  const char *path = luaL_checklstring(L, 1, &len);
+  unsigned long long bits = 0, label_len = 0;
+  const char *label = NULL;
+  size_t bytes_len = 0;
+  int n = kore_lua_host_bytes(L, KORE_LUA_OP_FS_RIGHTS, 0, 0, 0, path, len,
+                              &bits, &label_len, &label, &bytes_len,
+                              kore_lua_fail_table);
+  if (n) return n;
+  lua_createtable(L, 0, 5);
+  lua_pushlstring(L, label != NULL ? label : "", label != NULL ? bytes_len : 0);
+  lua_setfield(L, -2, "spelling");
+  {
+    static const char letters[] = "rwns";
+    static const char *const names[] = {"read", "write", "mutate_namespace",
+                                        "share"};
+    for (size_t i = 0; i < sizeof letters - 1; i++) {
+      int held = 0;
+      for (size_t j = 0; j < bytes_len; j++)
+        if (label[j] == letters[i]) held = 1;
+      lua_pushboolean(L, held);
+      lua_setfield(L, -2, names[i]);
+    }
+  }
+  return 1;
+}
+
 static int kore_lua_fs_exists(lua_State *L) {
   size_t len = 0;
   const char *path = luaL_checklstring(L, 1, &len);
@@ -1916,6 +2083,8 @@ static const luaL_Reg kore_lua_fs_lib[] = {
   {"mkdir", kore_lua_fs_mkdir},
   {"resize", kore_lua_fs_resize},
   {"stat", kore_lua_fs_stat},
+  {"entries", kore_lua_fs_entries},
+  {"rights", kore_lua_fs_rights},
   {"exists", kore_lua_fs_exists},
   {"list", kore_lua_fs_list},
   {NULL, NULL}

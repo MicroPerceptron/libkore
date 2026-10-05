@@ -149,6 +149,12 @@ const OP_FS_READ_FILE: u32 = 30;
 /// replacement under one held commit, which is the difference between one
 /// image/flush/root/flush chain for a save and one per window.
 const OP_FS_SAVE: u32 = 31;
+/// `kore.fs.entries(path)` — a directory's edges with each target's class
+/// and subtype, where [`OP_FS_LIST`] answers only the names.
+const OP_FS_ENTRIES: u32 = 32;
+/// `kore.fs.rights(path)` — the rights this task holds there, in the
+/// store's own `rwns` spelling.  Reports authority; confers none.
+const OP_FS_RIGHTS: u32 = 33;
 
 /// Host-call outcomes: the value(s) are good; the service refused (the
 /// text names the refusal); the call could not be made at all (the text
@@ -964,7 +970,12 @@ async fn serve_value<E: Extension>(services: &mut Services<'_, '_>, extension: &
         }
     };
     // The contiguous block, plus the one verb numbered past `os.exit`.
-    if (OP_FS_OPEN..=OP_FS_LIST).contains(&op) || matches!(op, OP_FS_READ_FILE | OP_FS_SAVE) {
+    if (OP_FS_OPEN..=OP_FS_LIST).contains(&op)
+        || matches!(
+            op,
+            OP_FS_READ_FILE | OP_FS_SAVE | OP_FS_ENTRIES | OP_FS_RIGHTS
+        )
+    {
         let answer = serve_fs(services, op, args, input).await;
         return finish_answer(answer);
     }
@@ -1050,6 +1061,8 @@ async fn serve_fs(
             None => Answer::Refused(alloc::string::String::from("invalid-name")),
         },
         OP_FS_LIST => crate::files::list(fs, input).await,
+        OP_FS_ENTRIES => crate::files::entries(fs, input).await,
+        OP_FS_RIGHTS => crate::files::rights(fs, input).await,
         _ => Answer::Unavailable(alloc::string::String::from("unknown filesystem call")),
     }
 }

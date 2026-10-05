@@ -18,13 +18,41 @@
 //! kore.random.bytes(32)
 //! kore.proc.args                       -- a 1-based array, read once
 //! kore.fs.read_file "/etc/hosts"       -- value, err
-//! kore.fs.stat "/etc/hosts"            -- size_bytes, kind, directory
+//! kore.fs.stat "/etc/hosts"            -- the object's record, as a table
+//! kore.fs.entries "/libs"              -- the directory's edges
+//! kore.fs.rights "/etc"                -- what this task may do there
 //! kore.has "fs"  kore.caps()           -- honest provisioning
 //! ```
 //!
 //! `kore.fs` adds only what the stock surface has no spelling for —
-//! `read_file`, `write_file`, `mkdir`, `resize`, `stat`, `exists`, `list`
-//! — and never changes a stock member.
+//! `read_file`, `write_file`, `mkdir`, `resize`, `stat`, `exists`, `list`,
+//! `entries`, `rights` — and never changes a stock member.
+//!
+//! # The graph, not a POSIX projection
+//!
+//! `io` answers the questions POSIX can ask. `kore.fs` answers the ones
+//! the store can, and the difference is not cosmetic: DagFS is a graph
+//! whose objects carry a committed revision, a volume-stable identity, a
+//! link count, outstanding grants and a subtype, and a surface that
+//! reported only a size and a kind was hiding all of it.
+//!
+//! - [`files::stat`] answers the object's whole record. `revision` moves
+//!   on every commit, so a script can tell that a write landed underneath
+//!   it; `id` is stable across a service restart, so it is the identity to
+//!   remember where a path is not.
+//! - [`files::entries`] answers a directory's *edges* — each name with its
+//!   target's class and subtype — where [`files::list`] answers the names.
+//!   Telling a native module from a plain file costs one call, not a stat
+//!   per name.
+//! - [`files::rights`] answers what this task may do at a path, in the
+//!   store's own `rwns` spelling.
+//!
+//! None of it is authority. A stable id "conveys no authority", a subtype
+//! "gates nothing", and `rights` reports what a walk already found rather
+//! than conferring anything. Deriving a view, delegating one, and the
+//! grant vocabulary are deliberately **absent** until MicroPerceptron/kore
+//! #986 and #991 rule the capability model for a userland authority
+//! domain — a surface invented here first would have to be retracted.
 //!
 //! ```lua
 //! local f = assert(io.open("/tmp/log", "a"))   -- the SAME object

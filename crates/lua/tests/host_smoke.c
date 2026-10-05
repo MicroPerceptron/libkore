@@ -176,6 +176,13 @@ static int test_short_writes(lua_State *L) {
   return 0;
 }
 
+/* Stamp a subtype, including one this build deliberately cannot name. */
+static int test_set_subtype(lua_State *L) {
+  lua_pushboolean(L, host_fs_set_subtype(luaL_checkstring(L, 1),
+                                         (int)luaL_checkinteger(L, 2)));
+  return 1;
+}
+
 static int test_open_library(lua_State *L) {
   static const luaL_Reg entries[] = {
     {"fail_reads_after", test_fail_reads_after},
@@ -183,6 +190,7 @@ static int test_open_library(lua_State *L) {
     {"max_read_want", test_max_read_want},
     {"reset_max_read_want", test_reset_max_read_want},
     {"short_writes", test_short_writes},
+    {"set_subtype", test_set_subtype},
     {NULL, NULL}
   };
   luaL_newlib(L, entries);
@@ -652,6 +660,110 @@ static int filesystem_smoke(void) {
 
 
 /*
+ * The graph a script can see.
+ *
+ * `kore.fs` answered a size and a kind where the store answers eight
+ * facts, which is the sense in which it hid the graph: a script could not
+ * see the revision it was racing, the links keeping an object alive, or
+ * the grants outstanding on it.  None of that is authority — a stable id
+ * "conveys no authority", a subtype "gates nothing" — so this widens what
+ * a script may know without widening what it may do, which is the only
+ * reason it can land before the rights/grant rulings do.
+ */
+static int graph_smoke(void) {
+  static const char suite[] =
+      "assert(kore.fs.write_file('/g.txt','abc')==3)\n"
+      "local st = assert(kore.fs.stat('/g.txt'))\n"
+      "assert(st.size_bytes==3 and st.kind=='file' and st.directory==false)\n"
+      /* The facts this surface used to drop. */
+      "assert(math.type(st.revision)=='integer' and st.revision>0)\n"
+      "assert(math.type(st.id)=='integer' and st.id>0)\n"
+      "assert(st.links==1 and st.grants==0)\n"
+      "assert(st.subtype=='plain' and st.subtype_bits==0)\n"
+
+      /* A revision moves when the object commits, which is what makes it
+         usable for detecting a write that landed underneath you. */
+      "local before = st.revision\n"
+      "assert(kore.fs.write_file('/g.txt','defg')==4)\n"
+      "local after = assert(kore.fs.stat('/g.txt'))\n"
+      "assert(after.revision>before, 'a commit must move the revision')\n"
+      /* The identity does not move with it: same object, later revision. */
+      "assert(after.id==st.id, 'a write is not a new object')\n"
+      /* And a resize is a commit too. */
+      "local h = assert(io.open('/g.txt','r+'))\n"
+      "assert(kore.fs.resize(h,2))\n"
+      "assert(h:close())\n"
+      "assert(assert(kore.fs.stat('/g.txt')).revision>after.revision)\n"
+
+      /* A subtype this build names, and one it does not.  The unknown one
+         must survive intact rather than be flattened to `plain`: a newer
+         writer's subtype is data an older reader passes through. */
+      "assert(kore.test.set_subtype('/g.txt',1))\n"
+      "local exe = assert(kore.fs.stat('/g.txt'))\n"
+      "assert(exe.subtype=='executable-image' and exe.subtype_bits==1)\n"
+      "assert(kore.test.set_subtype('/g.txt',200))\n"
+      "local odd = assert(kore.fs.stat('/g.txt'))\n"
+      "assert(odd.subtype==nil, 'an unnamed subtype must not be guessed')\n"
+      "assert(odd.subtype_bits==200, 'but it must still be reported')\n"
+      "assert(kore.test.set_subtype('/g.txt',0))\n"
+
+      /* A directory stats as one. */
+      "assert(kore.fs.mkdir('/gd'))\n"
+      "local d = assert(kore.fs.stat('/gd'))\n"
+      "assert(d.kind=='directory' and d.directory==true and d.subtype=='plain')\n"
+
+      /* ------------------------------------------------------- entries */
+      "assert(kore.fs.write_file('/gd/one','1')==1)\n"
+      "assert(kore.fs.mkdir('/gd/sub'))\n"
+      "assert(kore.test.set_subtype('/gd/one',1))\n"
+      "local e = assert(kore.fs.entries('/gd'))\n"
+      "assert(#e==2, 'two edges')\n"
+      "local by = {}\n"
+      "for _,row in ipairs(e) do by[row.name]=row end\n"
+      "assert(by.one and by.one.kind=='file' and by.one.directory==false)\n"
+      "assert(by.one.subtype=='executable-image' and by.one.subtype_bits==1)\n"
+      "assert(by.sub and by.sub.kind=='directory' and by.sub.directory==true)\n"
+      /* The namespace verb still answers names, and the two agree. */
+      "local names = assert(kore.fs.list('/gd'))\n"
+      "assert(#names==#e)\n"
+      "for _,name in ipairs(names) do assert(by[name], name) end\n"
+      /* An empty directory has no edges, which is not a failure. */
+      "assert(kore.fs.mkdir('/empty'))\n"
+      "assert(#assert(kore.fs.entries('/empty'))==0)\n"
+      /* Asking a file for its edges, or a path that is not there. */
+      "local ne, nerr = kore.fs.entries('/gd/one')\n"
+      "assert(ne==nil and nerr.code=='not-directory', tostring(nerr))\n"
+      "local me, merr = kore.fs.entries('/nowhere')\n"
+      "assert(me==nil and merr.code=='not-found', tostring(merr))\n"
+
+      /* -------------------------------------------------------- rights */
+      /* The store's own spelling is the answer; the booleans are derived
+         from it, so the letters a script reads are the letters a share
+         would accept. */
+      "local r = assert(kore.fs.rights('/g.txt'))\n"
+      "assert(r.spelling=='rwn', tostring(r.spelling))\n"
+      "assert(r.read==true and r.write==true and r.mutate_namespace==true)\n"
+      "assert(r.share==false, 'a right not held must read false, not nil')\n"
+      "local rr, rerr = kore.fs.rights('/nowhere')\n"
+      "assert(rr==nil and rerr.code=='not-found', tostring(rerr))\n"
+      "return true\n";
+
+  host_fs_reset("");
+  struct capture capture = {{0}, 0};
+  lua_State *L = kore_lua_new(host_alloc, NULL, 0x4b4f5245u, test_libraries,
+                              sizeof test_libraries / sizeof test_libraries[0]);
+  if (L == NULL) return 1;
+  if (kore_lua_install_print(L, capture_append, &capture) != LUA_OK) {
+    kore_lua_close(L); return 2;
+  }
+  if (!run_reporting(L, suite, "graph suite")) { kore_lua_close(L); return 3; }
+  kore_lua_set_top(L, 0);
+  if (host_fs_open_handles() != 0) { kore_lua_close(L); return 4; }
+  kore_lua_close(L);
+  return 0;
+}
+
+/*
  * The write path: a whole-file save, and what a short write answers.
  *
  * Two rules, and the store has to be made to break for either to be
@@ -1047,6 +1159,8 @@ int main(void) {
   host_fs_reset("");
   int fs_status = filesystem_smoke();
   if (fs_status != 0) return 30 + fs_status;
+  int graph_status = graph_smoke();
+  if (graph_status != 0) return 90 + graph_status;
   int write_status = write_smoke();
   if (write_status != 0) return 50 + write_status;
   int stream_status = streaming_smoke();
