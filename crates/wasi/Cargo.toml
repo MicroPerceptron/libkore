@@ -15,16 +15,16 @@ kore = { package = "kore-std", path = "../..", features = ["heap"] }
 # Components, and async host imports: a guest's call into WASI suspends its
 # fiber and the Kore executor runs until the import's future is ready. The
 # engine's platform (memory, fibers, ISA) is the embedding program's choice.
-wasmtime = { version = "48.0.3", default-features = false, features = [
+wasmtime = { version = "48.0.5", default-features = false, features = [
     "runtime",
     "component-model",
     "async",
 ] }
 # WASI 0.2's `wasi:io` (pollables, input and output streams) as traits the
 # native process stream implements; `no_std` by design.
-wasmtime-wasi-io = { version = "48.0.3", default-features = false }
+wasmtime-wasi-io = { version = "48.0.5", default-features = false }
 
 # Host tests resolve the guest fixture against the linker with a std
 # Wasmtime: the Kore-side engine has no host to run on.
 [dev-dependencies]
-wasmtime = { version = "48.0.3", features = ["std", "cranelift", "component-model"] }
+wasmtime = { version = "48.0.5", features = ["std", "cranelift", "component-model"] }
