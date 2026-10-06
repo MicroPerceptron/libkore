@@ -11,6 +11,7 @@ and `kore.*` when it needs something the store knows and POSIX cannot say — a
 revision, a subtype, the rights it actually holds.
 
 - [The capability default](#the-capability-default)
+- [Capabilities in practice](#capabilities-in-practice)
 - [Quick reference](#quick-reference)
 - [`kore.fs`](#korefs)
 - [The file object](#the-file-object)
@@ -63,6 +64,102 @@ itself holds.
 
 `kore.fs.rights(path)` reports what the task actually has, which is not the
 same question as what a mode string asked for.
+
+## Capabilities in practice
+
+### Four ways to hold one
+
+A DagFS route is reached through a `View`, which is **affine**: it has one
+owner, and using it after it moves is not a thing that may happen. Only one of
+the four surfaces can hold one, because only one has a language that enforces
+it.
+
+| Surface | What you hold | What stops a second use | Rights you can name |
+|---|---|---|---|
+| `io` / `os` | a file object | `__close`/`__gc`, plus a generation check | none; inferred from the mode string |
+| `kore.fs` | the same file object | the same | `r`, `w` today; `n`, `s` as their verbs land |
+| C (`kore-ffi`) | a `KoreFsHandle` | the adapter, at run time | `uint32_t`; `KORE_FS_READ`, `KORE_FS_WRITE` |
+| Rust (`kore::fs`) | the `View` itself | the borrow checker, at compile time | the whole `Rights` type, and `fs::dag` |
+
+Lua and C are in the same position for the same reason: a Lua value can be
+copied into a table or captured by a closure, and a C struct can be memcpy'd,
+so neither language can be handed something affine. Both get a *handle* — an
+index and a generation into a table thread 0 owns — and a stale one is
+`invalid-handle` rather than a read of whatever took the slot. Rust is the only
+surface that holds the capability itself, and `src/fs.rs` keeps a
+`compile_fail` doctest to prove it.
+
+No surface can forge authority: the store resolves every route through a
+generational slot, so fabricated or stale bits fail there whatever language
+produced them. What differs between the four is how much of the vocabulary you
+can say, how much ceremony saying it costs, and how early a mistake is caught —
+Rust at compile time, the other three at run time, with C additionally carrying
+the pointer lifetimes the adapter has to preserve by hand.
+
+### What `io` cannot say
+
+`io` is not a smaller filesystem. It is the same one with the capability
+questions answered for you by convention:
+
+```lua
+local f = assert(io.open("/var/log/app", "a"))   -- rights: READ WRITE, create, append
+```
+
+That line asks for a write route and gets one. What it cannot do is ask for
+*less*, ask for *more*, or find out what it got.
+
+```lua
+-- Least authority, on purpose: a read route to a file this task may well
+-- be able to write. `io.open(p, "r")` asks for the same thing, but the
+-- rights are a consequence of the mode rather than the point of the call.
+local f = assert(kore.fs.open("/etc/hosts", "r"))
+
+-- What does this task actually hold here?
+local held = assert(kore.fs.rights("/var/log"))
+if not held.write then
+  return nil, "this task was not endowed with write authority there"
+end
+```
+
+`kore.fs` can express every route `io` can — the mapping is the table above —
+and three things `io` has no spelling for: rights asked for by name, rights
+reported back, and behaviour chosen separately from authority.
+
+```lua
+-- io's "w" is three decisions fused into one letter. Taken apart:
+local f = assert(kore.fs.open(path, "rw", {create = true, truncate = true}))
+
+-- ...so you can take only two of them. No io mode string means this.
+local g = assert(kore.fs.open(path, "rw", {create = true}))  -- keep what is there
+```
+
+### Lifetime
+
+A handle is retired deterministically or not at all. `<close>` is the idiom on
+both surfaces, and `__gc` is the backstop:
+
+```lua
+do
+  local f <close> = assert(kore.fs.open("/tmp/scratch", "rw", {create = true}))
+  f:write(payload)
+end   -- retired here, whether the block ended or threw
+```
+
+### Noticing someone else
+
+`revision` moves on every commit, so a script can tell that a write landed
+underneath it. Nothing on the `io` surface can see this:
+
+```lua
+local before = assert(kore.fs.stat("/conf")).revision
+-- ... do work that depends on /conf ...
+if assert(kore.fs.stat("/conf")).revision ~= before then
+  return nil, "/conf changed under us"
+end
+```
+
+`id` is the companion: volume-stable, so it answers "is this the same object"
+where a path only answers "is this the same name".
 
 ## Quick reference
 
