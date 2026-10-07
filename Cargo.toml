@@ -8,7 +8,7 @@ repository = "https://github.com/MicroPerceptron/libkore"
 
 [workspace]
 resolver = "3"
-members = ["tests/consumer", "crates/ffi", "crates/entry", "crates/wasi"]
+members = ["tests/consumer", "crates/ffi", "crates/entry", "crates/wasi", "crates/lua"]
 exclude = ["native"]
 
 [features]
@@ -31,4 +31,4 @@ kore-driver = { path = "native/crates/driver", optional = true }
 
 [package.metadata.kore]
 # Used by tools/local-kore.py to construct one coherent local source override.
-owner-paths = { kore-start = "crates/start", kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver" }
+owner-paths = { kore-start = "crates/start", kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver", kore-late = "crates/late" }

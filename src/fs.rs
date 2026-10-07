@@ -32,8 +32,17 @@ pub enum TransferStop {
 
 /// An acknowledged prefix followed by a failure.
 ///
-/// On a transport failure the current write may also have committed. `completed`
-/// is a confirmed prefix, not a safe replay offset. No automatic retries occur.
+/// `completed` is what the owner acknowledged, on either direction. It is not
+/// a safe replay offset and no automatic retries occur.
+///
+/// On a write, the current unacknowledged chunk may also have committed.
+///
+/// On a read, the destination may hold bytes *past* `completed`: a transfer
+/// large enough to stream through the storage ring writes into the caller's
+/// destination as it lands, and a refusal part way leaves that prefix behind
+/// without counting it. So `completed` bounds what was *read*, and says
+/// nothing about which bytes of the destination are still the caller's own.
+/// Treat everything past it as clobbered, not as retained.
 #[derive(Debug)]
 pub struct TransferError {
     pub completed: usize,
@@ -53,8 +62,16 @@ fn range() -> TransferError {
     }
 }
 
-/// Fill `dst` from `offset`, reporting the initialized prefix on early EOF/error.
-/// Allocation-free; each round trip uses the owner's existing bounded window.
+/// Fill `dst` from `offset`, reporting the acknowledged prefix on early
+/// EOF/error — see [`TransferError`], which is the acknowledged count and not
+/// necessarily the initialized one.
+///
+/// Allocation-free, but not necessarily one round trip per window: a `dst` of
+/// at least 256 KiB is one the owner may stream through this launch's storage
+/// ring instead, from a single pinned version. That is a property of the
+/// destination's size, so a caller that loops over a small buffer never gets
+/// it however large the range is.
+///
 /// Cancellation can leave the current request outstanding; keep its owner alive.
 pub async fn read_exact_at(
     fs: &mut Fs<'_, '_>,
