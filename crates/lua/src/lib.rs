@@ -209,6 +209,65 @@ pub enum Answer {
 /// without this crate learning that the library exists.
 pub const OP_EMBEDDER_BASE: u32 = 64;
 
+/// Opt-in limits for a one-shot, read-only Lua worker. The default keeps the
+/// existing interactive REPL surface and limits unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Policy {
+    restricted: bool,
+    heap_bytes: usize,
+    instructions: u64,
+    output_bytes: usize,
+    fs_result_bytes: usize,
+}
+
+impl Policy {
+    pub const INTERACTIVE: Self = Self {
+        restricted: false,
+        heap_bytes: usize::MAX,
+        instructions: u64::MAX,
+        output_bytes: usize::MAX,
+        fs_result_bytes: usize::MAX,
+    };
+
+    /// Exposes pure Lua libraries and read-only `kore.fs` queries. `require`
+    /// can load bounded source modules, never native images. The embedder
+    /// must also provide a read-only filesystem face to the worker task.
+    pub const fn read_only_worker(
+        heap_bytes: usize,
+        instructions: u64,
+        output_bytes: usize,
+        fs_result_bytes: usize,
+    ) -> Self {
+        Self {
+            restricted: true,
+            heap_bytes,
+            instructions,
+            output_bytes,
+            fs_result_bytes,
+        }
+    }
+
+    pub const fn is_restricted(self) -> bool {
+        self.restricted
+    }
+
+    pub const fn heap_bytes(self) -> usize {
+        self.heap_bytes
+    }
+
+    pub const fn instructions(self) -> u64 {
+        self.instructions
+    }
+
+    pub const fn output_bytes(self) -> usize {
+        self.output_bytes
+    }
+
+    pub const fn fs_result_bytes(self) -> usize {
+        self.fs_result_bytes
+    }
+}
+
 /// Libraries and ops the embedding program adds to the VM.
 ///
 /// The split is deliberate: this crate owns the engine, the transport and
@@ -231,6 +290,10 @@ pub const OP_EMBEDDER_BASE: u32 = 64;
 pub trait Extension {
     /// Registered beneath `kore` at VM construction, in this order.
     const LIBRARIES: &'static [Library] = &[];
+
+    /// A one-shot worker may opt into restricted libraries and resource
+    /// budgets. Existing embedders inherit the interactive policy.
+    const POLICY: Policy = Policy::INTERACTIVE;
 
     /// Serve one op at or above [`OP_EMBEDDER_BASE`], on the executor
     /// thread, with the cell's three argument words.

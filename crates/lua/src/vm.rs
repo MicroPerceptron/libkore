@@ -8,8 +8,8 @@ use core::{
 };
 use kore::abi::process::PROCESS_OUTPUT_BYTES;
 
-use crate::Library;
 use crate::shim;
+use crate::{Library, Policy};
 
 const LUA_OK: c_int = 0;
 const LUA_MULTRET: c_int = -1;
@@ -41,6 +41,15 @@ unsafe extern "C" {
         libraries: *const Library,
         library_count: usize,
     ) -> *mut LuaState;
+    fn kore_lua_new_with_policy(
+        alloc: LuaAlloc,
+        ud: *mut c_void,
+        seed: u32,
+        libraries: *const Library,
+        library_count: usize,
+        restricted: c_int,
+    ) -> *mut LuaState;
+    fn kore_lua_set_instruction_budget(state: *mut LuaState, budget: *mut InstructionBudget);
     fn kore_lua_install_print(state: *mut LuaState, append: LuaAppend, ud: *mut c_void) -> c_int;
     fn kore_lua_load(
         state: *mut LuaState,
@@ -60,6 +69,14 @@ unsafe extern "C" {
 struct Capture {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    limit: usize,
+    exhausted: bool,
+}
+
+#[repr(C)]
+struct InstructionBudget {
+    remaining: u64,
+    exhausted: c_int,
 }
 
 unsafe extern "C" fn append(
@@ -79,7 +96,8 @@ unsafe extern "C" fn append(
             .len()
             .saturating_add((*capture).stderr.len())
     };
-    if bytes.len() > PROCESS_OUTPUT_BYTES.saturating_sub(used) {
+    if bytes.len() > unsafe { (*capture).limit }.saturating_sub(used) {
+        unsafe { (*capture).exhausted = true };
         return 0;
     }
     let output = if stderr == 0 {
@@ -88,6 +106,7 @@ unsafe extern "C" fn append(
         unsafe { &mut (*capture).stderr }
     };
     if output.try_reserve(bytes.len()).is_err() {
+        unsafe { (*capture).exhausted = true };
         return 0;
     }
     output.extend_from_slice(bytes);
@@ -106,6 +125,7 @@ pub enum ReplResult {
 pub enum EvalResult {
     Ok,
     Failed,
+    BudgetExceeded,
     /// The chunk ran `os.exit`: the sentinel unwound every `<close>` on the
     /// way out and the recorded code is the answer, not the raise.
     Exited,
@@ -114,25 +134,61 @@ pub enum EvalResult {
 pub struct Vm {
     state: NonNull<LuaState>,
     capture: Box<Capture>,
+    budget: Option<Box<shim::Budget>>,
+    instructions: Option<Box<InstructionBudget>>,
+    policy: Policy,
 }
 
 impl Vm {
     /// Build a VM, registering `libraries` beneath the `kore` table
     /// after this crate's own modules.
-    pub fn new(libraries: &'static [Library]) -> Option<Self> {
-        let mut capture = Box::try_new(Capture::default()).ok()?;
+    pub fn new_with_policy(libraries: &'static [Library], policy: Policy) -> Option<Self> {
+        let mut capture = Box::try_new(Capture {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            limit: PROCESS_OUTPUT_BYTES.min(policy.output_bytes()),
+            exhausted: false,
+        })
+        .ok()?;
+        let mut budget = if policy.is_restricted() {
+            Some(Box::try_new(shim::Budget::new(policy.heap_bytes())).ok()?)
+        } else {
+            None
+        };
+        let instructions = if policy.is_restricted() {
+            Some(
+                Box::try_new(InstructionBudget {
+                    remaining: policy.instructions(),
+                    exhausted: 0,
+                })
+                .ok()?,
+            )
+        } else {
+            None
+        };
         // Seed from the CPU, not from a constant: this word decides string
         // hashing and table iteration order, and a fixed one made every
         // boot's ordering identical.  `math.random`'s own seed comes from
         // the same source, through `luai_makeseed` (`kore_lua.c`).
         let state = NonNull::new(unsafe {
-            kore_lua_new(
-                shim::allocate,
-                ptr::null_mut(),
-                crate::bridge::seed(),
-                libraries.as_ptr(),
-                libraries.len(),
-            )
+            if let Some(ref mut budget) = budget {
+                kore_lua_new_with_policy(
+                    shim::allocate_bounded,
+                    (&mut **budget as *mut shim::Budget).cast(),
+                    crate::bridge::seed(),
+                    libraries.as_ptr(),
+                    libraries.len(),
+                    1,
+                )
+            } else {
+                kore_lua_new(
+                    shim::allocate,
+                    ptr::null_mut(),
+                    crate::bridge::seed(),
+                    libraries.as_ptr(),
+                    libraries.len(),
+                )
+            }
         })?;
         let status = unsafe {
             kore_lua_install_print(
@@ -147,7 +203,13 @@ impl Vm {
             unsafe { kore_lua_close(state.as_ptr()) };
             return None;
         }
-        Some(Self { state, capture })
+        Some(Self {
+            state,
+            capture,
+            budget,
+            instructions,
+            policy,
+        })
     }
 
     fn clear_stack(&mut self) {
@@ -215,6 +277,15 @@ impl Vm {
     }
 
     fn execute_loaded(&mut self, print_results: bool) -> EvalResult {
+        self.capture.exhausted = false;
+        if let Some(ref mut budget) = self.budget {
+            budget.exhausted = false;
+        }
+        if let Some(ref mut remaining) = self.instructions {
+            remaining.remaining = self.policy.instructions();
+            remaining.exhausted = 0;
+            unsafe { kore_lua_set_instruction_budget(self.state.as_ptr(), &mut **remaining) };
+        }
         if unsafe { kore_lua_call(self.state.as_ptr(), 0, LUA_MULTRET) } != LUA_OK {
             // `os.exit`'s unwind reaches here as an error, because that is
             // how it ran the `<close>` handlers on its way out. It is not
@@ -223,8 +294,18 @@ impl Vm {
                 self.clear_stack();
                 return EvalResult::Exited;
             }
+            let budget_hit = self
+                .instructions
+                .as_ref()
+                .is_some_and(|budget| budget.exhausted != 0)
+                || self.capture.exhausted
+                || self.budget.as_ref().is_some_and(|budget| budget.exhausted);
             self.publish_error();
-            return EvalResult::Failed;
+            return if budget_hit {
+                EvalResult::BudgetExceeded
+            } else {
+                EvalResult::Failed
+            };
         }
         if print_results
             && unsafe { kore_lua_top(self.state.as_ptr()) } > 0
@@ -255,6 +336,7 @@ impl Vm {
         match result {
             EvalResult::Ok => ReplResult::Complete(true),
             EvalResult::Failed => ReplResult::Complete(false),
+            EvalResult::BudgetExceeded => ReplResult::ResourceRefused,
             EvalResult::Exited => ReplResult::Exited,
         }
     }

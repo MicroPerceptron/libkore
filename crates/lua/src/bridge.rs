@@ -73,7 +73,7 @@ use kore::runtime::{
 use kore_late::{LoadError, Loader, Search};
 
 use crate::vm::{EvalResult, ReplResult, Vm};
-use crate::{Answer, Extension, OP_EMBEDDER_BASE};
+use crate::{Answer, Extension, OP_EMBEDDER_BASE, Policy};
 
 /// The bound on a source module (`<name>.lua`).  Sized like a generous
 /// script, not like a library: the whole buffer is staged in the task's
@@ -292,7 +292,7 @@ unsafe fn payload<'a>() -> &'a mut Payload {
 
 /// The worker's entry: build the VM, then serve evaluations until `QUIT`.
 fn vm_thread<E: Extension>() {
-    let Some(mut vm) = Vm::new(E::LIBRARIES) else {
+    let Some(mut vm) = Vm::new_with_policy(E::LIBRARIES, E::POLICY) else {
         // SAFETY: the worker owns the cell while the word reads EVAL_DONE
         // and thread 0 has not yet posted (it posts only after spawn).
         unsafe { payload().outcome = Outcome::Startup };
@@ -355,6 +355,7 @@ fn run_eval(vm: &mut Vm) {
             match vm.eval(script, name) {
                 EvalResult::Ok => Outcome::Ok,
                 EvalResult::Failed => Outcome::Failed,
+                EvalResult::BudgetExceeded => Outcome::ResourceRefused,
                 EvalResult::Exited => Outcome::Exited,
             }
         }
@@ -908,21 +909,21 @@ async fn serve_call<E: Extension>(services: &mut Services<'_, '_>, extension: &m
     // SAFETY: CALL_POSTED.
     let op = unsafe { payload() }.op;
     if op == OP_REQUIRE {
-        serve_require(services).await;
+        serve_require(services, E::POLICY).await;
     } else {
-        serve_value(services, extension, op).await;
+        serve_value(services, extension, op, E::POLICY).await;
     }
 }
 
 /// Answer the `require` the cell holds: read the source, or link the
 /// native module and look its opener up.
-async fn serve_require(services: &mut Services<'_, '_>) {
+async fn serve_require(services: &mut Services<'_, '_>, policy: Policy) {
     let (name, len) = {
         // SAFETY: CALL_POSTED.
         let cell = unsafe { payload() };
         (cell.name, cell.name_len)
     };
-    let reply = resolve(services, &name[..len.min(FS_NAME_BYTES)]).await;
+    let reply = resolve(services, &name[..len.min(FS_NAME_BYTES)], policy).await;
     // SAFETY: CALL_POSTED.
     let cell = unsafe { payload() };
     match reply {
@@ -949,7 +950,22 @@ async fn serve_require(services: &mut Services<'_, '_>) {
 
 /// Answer every value-returning op.  The outcome is written back as a
 /// status, up to two words, and a text; nothing here panics on a refusal.
-async fn serve_value<E: Extension>(services: &mut Services<'_, '_>, extension: &mut E, op: u32) {
+async fn serve_value<E: Extension>(
+    services: &mut Services<'_, '_>,
+    extension: &mut E,
+    op: u32,
+    policy: Policy,
+) {
+    if policy.is_restricted()
+        && !matches!(
+            op,
+            OP_FS_READ_FILE | OP_FS_STAT | OP_FS_LIST | OP_FS_ENTRIES | OP_FS_RIGHTS
+        )
+    {
+        return finish_answer(Answer::Unavailable(alloc::string::String::from(
+            "host operation unavailable to read-only worker",
+        )));
+    }
     let args = {
         // SAFETY: CALL_POSTED.
         unsafe { payload() }.args
@@ -976,7 +992,7 @@ async fn serve_value<E: Extension>(services: &mut Services<'_, '_>, extension: &
             OP_FS_READ_FILE | OP_FS_SAVE | OP_FS_ENTRIES | OP_FS_RIGHTS
         )
     {
-        let answer = serve_fs(services, op, args, input).await;
+        let answer = serve_fs(services, op, args, input, policy).await;
         return finish_answer(answer);
     }
     let answer = match op {
@@ -1028,6 +1044,7 @@ async fn serve_fs(
     op: u32,
     args: [u64; 3],
     input: &[u8],
+    policy: Policy,
 ) -> Answer {
     // Split the borrow: `files` and `fs` are distinct fields, and every
     // verb below needs both at once.
@@ -1050,7 +1067,9 @@ async fn serve_fs(
         OP_FS_OPEN => crate::files::open(fs, files, input, args[0], args[1]).await,
         OP_FS_CLOSE => crate::files::close(fs, files, args[0]).await,
         OP_FS_READ => crate::files::read(fs, files, args[0], args[1], args[2]).await,
-        OP_FS_READ_FILE => crate::files::read_file(fs, input).await,
+        OP_FS_READ_FILE => {
+            crate::files::read_file_with_limit(fs, input, policy.fs_result_bytes()).await
+        }
         OP_FS_SAVE => crate::files::save(fs, files, args[0], input).await,
         OP_FS_WRITE => crate::files::write(fs, files, args[0], args[1], input).await,
         OP_FS_SYNC => crate::files::sync(fs, files, args[0]).await,
@@ -1063,8 +1082,10 @@ async fn serve_fs(
             Some(cut) => crate::files::rename(fs, &input[..cut], &input[cut + 1..]).await,
             None => Answer::Refused(alloc::string::String::from("invalid-name")),
         },
-        OP_FS_LIST => crate::files::list(fs, input).await,
-        OP_FS_ENTRIES => crate::files::entries(fs, input).await,
+        OP_FS_LIST => crate::files::list_with_limit(fs, input, policy.fs_result_bytes()).await,
+        OP_FS_ENTRIES => {
+            crate::files::entries_with_limit(fs, input, policy.fs_result_bytes()).await
+        }
         OP_FS_RIGHTS => crate::files::rights(fs, input).await,
         _ => Answer::Unavailable(alloc::string::String::from("unknown filesystem call")),
     }
@@ -1086,16 +1107,17 @@ enum Reply {
     Error(&'static CStr),
 }
 
-async fn resolve(services: &mut Services<'_, '_>, stem: &[u8]) -> Reply {
+async fn resolve(services: &mut Services<'_, '_>, stem: &[u8], policy: Policy) -> Reply {
     let search = Search { prefixes: SEARCH };
     let Some(fs) = services.fs().await else {
         return Reply::Error(c"filesystem face is unavailable");
     };
     let mut buf = Vec::new();
-    if buf.try_reserve_exact(MAX_SOURCE_MODULE_BYTES).is_err() {
+    let source_limit = MAX_SOURCE_MODULE_BYTES.min(policy.fs_result_bytes());
+    if buf.try_reserve_exact(source_limit).is_err() {
         return Reply::Error(c"source buffer allocation refused");
     }
-    buf.resize(MAX_SOURCE_MODULE_BYTES, 0);
+    buf.resize(source_limit, 0);
     match Loader::read_source(fs, search, stem, &mut buf).await {
         Ok(len) => {
             buf.truncate(len);
@@ -1105,6 +1127,9 @@ async fn resolve(services: &mut Services<'_, '_>, stem: &[u8]) -> Reply {
         Err(error) => return Reply::Error(describe(error)),
     }
     drop(buf);
+    if policy.is_restricted() {
+        return Reply::Error(c"source-only worker cannot load native modules");
+    }
     if services.loader.is_none() {
         match Loader::new(services.rt) {
             Ok(loader) => services.loader = Some(loader),

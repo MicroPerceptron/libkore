@@ -1,5 +1,26 @@
 # Lua on Kore
 
+## Read-only worker policy
+
+An embedding program can set `Extension::POLICY` to
+`Policy::read_only_worker(heap_bytes, instructions, output_bytes,
+fs_result_bytes)`. The default policy remains the existing interactive REPL.
+The restricted policy opens pure Lua base, table, string, math and UTF-8
+libraries and a small `kore.fs` table (`read_file`, `stat`, `exists`, `list`,
+`entries`, `rights`). It omits `io`, `os`, coroutine, time, random, process and
+embedder libraries. Its `require` loads bounded source modules only; the
+bridge rejects native modules and every non-read host operation even if a
+script reaches an internal C function. `load`, `loadfile`, `dofile` and Lua
+bytecode remain unavailable.
+
+The Lua allocator accounts live bytes per VM, the instruction hook bounds
+executed Lua instructions, and the bridge bounds captured output and read
+results. The embedding task must hold only a delegated read-only filesystem
+face: this policy does not mint or attenuate that capability. A wall-time
+deadline and Stop must terminate and reap the *whole task*. `Host::eval`
+borrows the script across the worker-thread execution and cannot be safely
+cancelled by dropping its future while the VM may still read that pointer.
+
 Lua 5.5, freestanding, over the task's own filesystem face. A script sees two
 surfaces and they are one implementation: **`kore.*` is the store's vocabulary
 spelled for Lua, and `io`/`os` is the same code with the capabilities

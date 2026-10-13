@@ -18,6 +18,13 @@
 typedef struct { const char *name; lua_CFunction opener; } kore_lua_library;
 extern lua_State *kore_lua_new(lua_Alloc, void *, unsigned,
                                const kore_lua_library *, size_t);
+extern lua_State *kore_lua_new_with_policy(lua_Alloc, void *, unsigned,
+                                           const kore_lua_library *, size_t,
+                                           int);
+typedef struct { unsigned long long remaining; int exhausted; }
+    kore_lua_instruction_budget;
+extern void kore_lua_set_instruction_budget(lua_State *,
+                                             kore_lua_instruction_budget *);
 typedef int (*kore_lua_append)(void *, const char *, size_t, int);
 extern int kore_lua_install_print(lua_State *, kore_lua_append, void *);
 extern int kore_lua_load(lua_State *, const char *, size_t, const char *);
@@ -88,6 +95,44 @@ static int run(lua_State *L, const char *source, int print_results) {
   if (kore_lua_call(L, 0, LUA_MULTRET) != LUA_OK)
     return 0;
   return !print_results || kore_lua_print_results(L) == LUA_OK;
+}
+
+static int restricted_smoke(void) {
+  lua_State *L = kore_lua_new_with_policy(host_alloc, NULL, 0x4b4f5245u,
+                                          NULL, 0, 1);
+  if (L == NULL) return 1;
+  const char *surface =
+      "assert(io==nil and os==nil and coroutine==nil)\n"
+      "assert(kore.time==nil and kore.random==nil and kore.proc==nil)\n"
+      "assert(kore.fs and kore.fs.read_file and kore.fs.stat)\n"
+      "assert(kore.fs.list and kore.fs.entries and kore.fs.rights)\n"
+      "assert(kore.fs.open==nil and kore.fs.write_file==nil)\n"
+      "assert(kore.fs.remove==nil and kore.fs.rename==nil)\n"
+      "assert(kore.fs.mkdir==nil and kore.fs.resize==nil)\n"
+      "assert(load==nil and loadfile==nil and dofile==nil)\n";
+  if (!run(L, surface, 0)) { kore_lua_close(L); return 2; }
+  kore_lua_instruction_budget budget = {128, 0};
+  kore_lua_set_instruction_budget(L, &budget);
+  if (kore_lua_load(L, "while true do end", 17, "=quota") != LUA_OK) {
+    kore_lua_close(L); return 3;
+  }
+  if (kore_lua_call(L, 0, LUA_MULTRET) == LUA_OK) {
+    kore_lua_close(L); return 4;
+  }
+  if (!budget.exhausted) { kore_lua_close(L); return 5; }
+  size_t len = 0;
+  const char *error = lua_tolstring(L, -1, &len);
+  if (error == NULL || strstr(error, "kore:instruction-limit") == NULL) {
+    kore_lua_close(L); return 6;
+  }
+  kore_lua_set_top(L, 0);
+  budget.remaining = 128;
+  budget.exhausted = 0;
+  if (!run(L, "assert(6*7==42)", 0)) {
+    kore_lua_close(L); return 7;
+  }
+  kore_lua_close(L);
+  return 0;
 }
 
 static int protected_setup_smoke(void) {
@@ -1272,6 +1317,8 @@ int main(void) {
       "print(6*7)\n";
   int setup_status = protected_setup_smoke();
   if (setup_status != 0) return 10 + setup_status;
+  int restricted_status = restricted_smoke();
+  if (restricted_status != 0) return 120 + restricted_status;
   /* A store with nothing in it: the selftest below asserts what an absent
      path answers, and the pass after it fills one in. */
   host_fs_reset("");

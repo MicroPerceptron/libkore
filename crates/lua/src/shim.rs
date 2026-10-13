@@ -8,6 +8,56 @@ use core::{
 
 const LUA_ALIGNMENT: usize = 16;
 
+/// Per-VM live Lua allocation accounting. The callback's `ud` points to
+/// this value for the lifetime of the state; no process-wide allocator is
+/// installed and host-side bridge buffers remain separately bounded.
+pub struct Budget {
+    pub limit: usize,
+    pub used: usize,
+    pub exhausted: bool,
+}
+
+impl Budget {
+    pub const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: 0,
+            exhausted: false,
+        }
+    }
+}
+
+pub unsafe extern "C" fn allocate_bounded(
+    ud: *mut c_void,
+    ptr: *mut c_void,
+    old_size: usize,
+    new_size: usize,
+) -> *mut c_void {
+    let Some(budget) = (unsafe { ud.cast::<Budget>().as_mut() }) else {
+        return ptr::null_mut();
+    };
+    let old = if ptr.is_null() { 0 } else { old_size };
+    let Some(next) = budget
+        .used
+        .checked_sub(old)
+        .and_then(|used| used.checked_add(new_size))
+    else {
+        budget.exhausted = true;
+        return ptr::null_mut();
+    };
+    if next > budget.limit {
+        budget.exhausted = true;
+        return ptr::null_mut();
+    }
+    let result = unsafe { allocate(ptr::null_mut(), ptr, old_size, new_size) };
+    if new_size == 0 || !result.is_null() {
+        budget.used = next;
+    } else {
+        budget.exhausted = true;
+    }
+    result
+}
+
 /// Lua's per-state allocator, backed by this task's capability-grown heap.
 pub unsafe extern "C" fn allocate(
     _ud: *mut c_void,
