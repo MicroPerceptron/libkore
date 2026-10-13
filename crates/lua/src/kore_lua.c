@@ -2228,6 +2228,18 @@ static const luaL_Reg kore_lua_fs_lib[] = {
   {NULL, NULL}
 };
 
+/* Only verbs whose bridge arm cannot mutate the store. The worker receives
+   a READ-only face as a second, independent authority boundary. */
+static const luaL_Reg kore_lua_fs_read_only_lib[] = {
+  {"read_file", kore_lua_fs_read_file},
+  {"stat", kore_lua_fs_stat},
+  {"entries", kore_lua_fs_entries},
+  {"rights", kore_lua_fs_rights},
+  {"exists", kore_lua_fs_exists},
+  {"list", kore_lua_fs_list},
+  {NULL, NULL}
+};
+
 /*
  * ----------------------------------------------------------------- io
  *
@@ -3081,27 +3093,32 @@ static int luaopen_kore(lua_State *L) {
   const kore_lua_library *libraries =
       (const kore_lua_library *)lua_touserdata(L, lua_upvalueindex(1));
   size_t count = (size_t)lua_tointeger(L, lua_upvalueindex(2));
+  int restricted = lua_toboolean(L, lua_upvalueindex(3));
   lua_newtable(L);           /* the kore table */
   lua_newtable(L);           /* the caps array, in registration order */
   lua_Integer listed = 0;
 
-  luaL_newlib(L, kore_lua_time_lib);
-  kore_lua_module(L, "time", &listed);
+  if (!restricted) {
+    luaL_newlib(L, kore_lua_time_lib);
+    kore_lua_module(L, "time", &listed);
+    luaL_newlib(L, kore_lua_random_lib);
+    kore_lua_module(L, "random", &listed);
+  }
 
-  luaL_newlib(L, kore_lua_random_lib);
-  kore_lua_module(L, "random", &listed);
-
-  luaL_newlib(L, kore_lua_fs_lib);
+  if (restricted) luaL_newlib(L, kore_lua_fs_read_only_lib);
+  else luaL_newlib(L, kore_lua_fs_lib);
   kore_lua_module(L, "fs", &listed);
 
-  luaL_newlib(L, kore_lua_proc_lib);
-  lua_newtable(L);
-  lua_pushcfunction(L, kore_lua_proc_index);
-  lua_setfield(L, -2, "__index");
-  lua_setmetatable(L, -2);
-  kore_lua_module(L, "proc", &listed);
+  if (!restricted) {
+    luaL_newlib(L, kore_lua_proc_lib);
+    lua_newtable(L);
+    lua_pushcfunction(L, kore_lua_proc_index);
+    lua_setfield(L, -2, "__index");
+    lua_setmetatable(L, -2);
+    kore_lua_module(L, "proc", &listed);
+  }
 
-  for (size_t i = 0; libraries != NULL && i < count; i++) {
+  for (size_t i = 0; !restricted && libraries != NULL && i < count; i++) {
     const kore_lua_library *library = &libraries[i];
     if (library->name == NULL || library->opener == NULL) continue;
     lua_pushcfunction(L, library->opener);
@@ -3245,6 +3262,7 @@ static int luaopen_kore_os(lua_State *L) {
 }
 
 static int kore_lua_open_libraries(lua_State *L) {
+  int restricted = lua_toboolean(L, 3);
   luaL_requiref(L, LUA_GNAME, luaopen_base, 1);
   /* Omit inert stdio/warning APIs and the unverified binary-chunk loader. */
   static const char *const omitted_base[] = {
@@ -3257,7 +3275,10 @@ static int kore_lua_open_libraries(lua_State *L) {
   lua_pushcfunction(L, kore_lua_require);
   lua_setfield(L, -2, "require");
   lua_pop(L, 1);
-  luaL_requiref(L, LUA_COLIBNAME, luaopen_coroutine, 1); lua_pop(L, 1);
+  /* Coroutines do not inherit the main state's instruction hook. */
+  if (!restricted) {
+    luaL_requiref(L, LUA_COLIBNAME, luaopen_coroutine, 1); lua_pop(L, 1);
+  }
   luaL_requiref(L, LUA_TABLIBNAME, luaopen_table, 1); lua_pop(L, 1);
   luaL_requiref(L, LUA_STRLIBNAME, luaopen_string, 1);
   /* No partial printf and no producer for unsupported binary chunks. */
@@ -3267,9 +3288,11 @@ static int kore_lua_open_libraries(lua_State *L) {
   luaL_requiref(L, LUA_MATHLIBNAME, luaopen_math, 1); lua_pop(L, 1);
   luaL_requiref(L, LUA_UTF8LIBNAME, luaopen_utf8, 1); lua_pop(L, 1);
   /* The file object's metatable, before anything that can create one. */
-  kore_lua_file_metatable(L);
-  luaL_requiref(L, LUA_IOLIBNAME, luaopen_kore_io, 1); lua_pop(L, 1);
-  luaL_requiref(L, LUA_OSLIBNAME, luaopen_kore_os, 1); lua_pop(L, 1);
+  if (!restricted) {
+    kore_lua_file_metatable(L);
+    luaL_requiref(L, LUA_IOLIBNAME, luaopen_kore_io, 1); lua_pop(L, 1);
+    luaL_requiref(L, LUA_OSLIBNAME, luaopen_kore_os, 1); lua_pop(L, 1);
+  }
   /* kore's own standard library, provisioned from this process's faces.
      One table rather than a scatter of globals: `require "kore"` answers
      it, and an embedder's own libraries sit beside them.  Registered by
@@ -3278,7 +3301,8 @@ static int kore_lua_open_libraries(lua_State *L) {
      requiref does once the opener has run. */
   lua_pushlightuserdata(L, lua_touserdata(L, 1));
   lua_pushvalue(L, 2);
-  lua_pushcclosure(L, luaopen_kore, 2);
+  lua_pushboolean(L, restricted);
+  lua_pushcclosure(L, luaopen_kore, 3);
   lua_call(L, 0, 1);
   luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
   lua_pushvalue(L, -2);
@@ -3288,18 +3312,50 @@ static int kore_lua_open_libraries(lua_State *L) {
   return 0;
 }
 
-lua_State *kore_lua_new(lua_Alloc alloc, void *ud, unsigned seed,
-                        const kore_lua_library *libraries, size_t count) {
+lua_State *kore_lua_new_with_policy(lua_Alloc alloc, void *ud, unsigned seed,
+                                    const kore_lua_library *libraries,
+                                    size_t count, int restricted) {
   lua_State *L = lua_newstate(alloc, ud, seed);
   if (L == NULL) return NULL;
   lua_pushcfunction(L, kore_lua_open_libraries);
   lua_pushlightuserdata(L, (void *)(uintptr_t)libraries);
   lua_pushinteger(L, (lua_Integer)count);
-  if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
+  lua_pushboolean(L, restricted);
+  if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
     lua_close(L);
     return NULL;
   }
   return L;
+}
+
+lua_State *kore_lua_new(lua_Alloc alloc, void *ud, unsigned seed,
+                        const kore_lua_library *libraries, size_t count) {
+  return kore_lua_new_with_policy(alloc, ud, seed, libraries, count, 0);
+}
+
+/* The counter lives in the Rust VM, not a process-global. Restricted VMs
+   omit coroutines so every instruction runs under this one state hook. */
+typedef struct {
+  unsigned long long remaining;
+  int exhausted;
+} kore_lua_instruction_budget;
+
+static void kore_lua_instruction_hook(lua_State *L, lua_Debug *ar) {
+  (void)ar;
+  kore_lua_instruction_budget *budget =
+      *(kore_lua_instruction_budget **)lua_getextraspace(L);
+  if (budget == NULL || budget->remaining == 0) {
+    if (budget != NULL) budget->exhausted = 1;
+    luaL_error(L, "kore:instruction-limit");
+  }
+  --budget->remaining;
+}
+
+void kore_lua_set_instruction_budget(lua_State *L,
+                                      kore_lua_instruction_budget *budget) {
+  *(kore_lua_instruction_budget **)lua_getextraspace(L) = budget;
+  lua_sethook(L, budget != NULL ? kore_lua_instruction_hook : NULL,
+              LUA_MASKCOUNT, 1);
 }
 
 static int kore_lua_install_print_inner(lua_State *L) {

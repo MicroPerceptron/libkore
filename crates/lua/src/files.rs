@@ -596,11 +596,17 @@ pub async fn read(
 /// Bounded by `MAX_FILE_BYTES` (16 MiB), refused as `range` rather than
 /// grown without a ceiling.
 pub async fn read_file(fs: &mut Fs<'_, '_>, path: &[u8]) -> Answer {
+    read_file_with_limit(fs, path, MAX_FILE_BYTES).await
+}
+
+/// Read a whole file with the caller's additional result ceiling.
+pub async fn read_file_with_limit(fs: &mut Fs<'_, '_>, path: &[u8], limit: usize) -> Answer {
+    let limit = limit.min(MAX_FILE_BYTES);
     let mut bytes: Vec<u8> = Vec::new();
     let mut overflow = false;
     let read = fs
         .read_file(path, |chunk| {
-            if bytes.len() + chunk.len() > MAX_FILE_BYTES {
+            if chunk.len() > limit.saturating_sub(bytes.len()) {
                 overflow = true;
                 return Err(Refusal::Fs(FsError::Range));
             }
@@ -873,12 +879,18 @@ pub async fn rename(fs: &mut Fs<'_, '_>, from: &[u8], to: &[u8]) -> Answer {
 /// identity would be wrong in a way nothing would tell it. The stable
 /// identity is [`stat`]'s, where it is named as such.
 pub async fn entries(fs: &mut Fs<'_, '_>, path: &[u8]) -> Answer {
+    entries_with_limit(fs, path, MAX_READ_BYTES).await
+}
+
+/// Enumerate directory edges with the caller's additional result ceiling.
+pub async fn entries_with_limit(fs: &mut Fs<'_, '_>, path: &[u8], limit: usize) -> Answer {
+    let limit = limit.min(MAX_READ_BYTES);
     let mut records: Vec<u8> = Vec::new();
     let mut overflow = false;
     let listed = fs
         .list_directory(path, |entry| {
             let name = entry.name.as_bytes();
-            if records.len() + name.len() + 3 > MAX_READ_BYTES {
+            if name.len().saturating_add(3) > limit.saturating_sub(records.len()) {
                 overflow = true;
                 return Err(Refusal::Fs(FsError::Range));
             }
@@ -928,13 +940,19 @@ pub async fn rights(fs: &mut Fs<'_, '_>, path: &[u8]) -> Answer {
 /// kind of thing a script iterates once, and paging it would put a second
 /// piece of mutable state in the handle table for no gain at these sizes.
 pub async fn list(fs: &mut Fs<'_, '_>, path: &[u8]) -> Answer {
+    list_with_limit(fs, path, MAX_READ_BYTES).await
+}
+
+/// Enumerate directory names with the caller's additional result ceiling.
+pub async fn list_with_limit(fs: &mut Fs<'_, '_>, path: &[u8], limit: usize) -> Answer {
+    let limit = limit.min(MAX_READ_BYTES);
     let mut names: Vec<u8> = Vec::new();
     let mut overflow = false;
     let listed = fs
         .list_directory(path, |entry| {
             // Stop at the cap rather than growing without bound; the
             // caller is told by `Range` that the listing was not complete.
-            if names.len() + entry.name.len() + 1 > MAX_READ_BYTES {
+            if entry.name.len().saturating_add(1) > limit.saturating_sub(names.len()) {
                 overflow = true;
                 return Err(Refusal::Fs(FsError::Range));
             }
