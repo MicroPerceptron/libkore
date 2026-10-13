@@ -12,7 +12,7 @@ edition-specific prelude:
 
 ```toml
 [dependencies]
-std = { package = "kore-entry", git = "https://github.com/MicroPerceptron/libkore", branch = "alpha" }
+std = { package = "kore-entry", git = "https://github.com/MicroPerceptron/libkore", rev = "06cddb199eee59739841887bca843d8ce493de7b" }
 ```
 
 ```rust
@@ -22,6 +22,10 @@ fn main() -> Result<std::ExitCode, std::ExitCode> {
     Ok(std::ExitCode::OK)
 }
 ```
+
+This is a source-only Git dependency (`publish = false`); choose a newer
+reviewed commit when updating, and use the matching Kore runtime described
+above.
 
 There is no `no_main`, handwritten `_start`, entry attribute, or application
 language-item feature. `fn main() {}` also works. The alias does not claim full
