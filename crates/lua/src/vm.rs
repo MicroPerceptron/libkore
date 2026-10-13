@@ -59,6 +59,7 @@ unsafe extern "C" {
         name: *const c_char,
     ) -> c_int;
     fn kore_lua_call(state: *mut LuaState, arguments: c_int, results: c_int) -> c_int;
+    fn kore_lua_call_traceback(state: *mut LuaState, arguments: c_int, results: c_int) -> c_int;
     fn kore_lua_print_results(state: *mut LuaState) -> c_int;
     fn kore_lua_top(state: *mut LuaState) -> c_int;
     fn kore_lua_set_top(state: *mut LuaState, top: c_int);
@@ -88,6 +89,7 @@ unsafe extern "C" fn append(
 
 pub enum ReplResult {
     Complete(bool),
+    CompileFailed,
     /// The chunk ran `os.exit`.
     Exited,
     Incomplete,
@@ -97,6 +99,7 @@ pub enum ReplResult {
 /// How one chunk ended.
 pub enum EvalResult {
     Ok,
+    CompileFailed,
     Failed,
     BudgetExceeded,
     /// The chunk ran `os.exit`: the sentinel unwound every `<close>` on the
@@ -243,7 +246,12 @@ impl Vm {
             remaining.exhausted = 0;
             unsafe { kore_lua_set_instruction_budget(self.state.as_ptr(), &mut **remaining) };
         }
-        if unsafe { kore_lua_call(self.state.as_ptr(), 0, LUA_MULTRET) } != LUA_OK {
+        let call = if self.policy.is_restricted() {
+            unsafe { kore_lua_call_traceback(self.state.as_ptr(), 0, LUA_MULTRET) }
+        } else {
+            unsafe { kore_lua_call(self.state.as_ptr(), 0, LUA_MULTRET) }
+        };
+        if call != LUA_OK {
             // `os.exit`'s unwind reaches here as an error, because that is
             // how it ran the `<close>` handlers on its way out. It is not
             // one, so it is not reported as one.
@@ -283,7 +291,7 @@ impl Vm {
         self.clear_stack();
         if self.load(bytes, name) != LUA_OK {
             self.publish_error();
-            EvalResult::Failed
+            EvalResult::CompileFailed
         } else {
             self.execute_loaded(false)
         }
@@ -292,6 +300,7 @@ impl Vm {
     fn repl_result(result: EvalResult) -> ReplResult {
         match result {
             EvalResult::Ok => ReplResult::Complete(true),
+            EvalResult::CompileFailed => ReplResult::CompileFailed,
             EvalResult::Failed => ReplResult::Complete(false),
             EvalResult::BudgetExceeded => ReplResult::ResourceRefused,
             EvalResult::Exited => ReplResult::Exited,
@@ -327,7 +336,7 @@ impl Vm {
             ReplResult::Incomplete
         } else {
             self.publish_error();
-            ReplResult::Complete(false)
+            ReplResult::CompileFailed
         }
     }
 

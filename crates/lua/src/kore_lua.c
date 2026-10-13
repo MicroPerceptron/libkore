@@ -3408,6 +3408,25 @@ int kore_lua_call(lua_State *L, int arguments, int results) {
   return lua_pcall(L, arguments, results, 0);
 }
 
+/* The restricted tool reports a Lua stack while the failing call's frames
+   still exist. The message handler itself runs inside lua_pcall's recovery
+   frame, so even a quota or allocation failure cannot longjmp through Rust. */
+static int kore_lua_traceback(lua_State *L) {
+  const char *message = lua_type(L, 1) == LUA_TSTRING
+                            ? lua_tostring(L, 1) : "Lua error";
+  luaL_traceback(L, L, message, 1);
+  return 1;
+}
+
+int kore_lua_call_traceback(lua_State *L, int arguments, int results) {
+  int function = lua_gettop(L) - arguments;
+  lua_pushcfunction(L, kore_lua_traceback);
+  lua_insert(L, function);
+  int status = lua_pcall(L, arguments, results, function);
+  lua_remove(L, function);
+  return status;
+}
+
 static int kore_lua_print_results_inner(lua_State *L) {
   int results = lua_gettop(L);
   lua_getglobal(L, "print");

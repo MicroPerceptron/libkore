@@ -29,6 +29,7 @@ typedef int (*kore_lua_append)(void *, const char *, size_t, int);
 extern int kore_lua_install_print(lua_State *, kore_lua_append, void *);
 extern int kore_lua_load(lua_State *, const char *, size_t, const char *);
 extern int kore_lua_call(lua_State *, int, int);
+extern int kore_lua_call_traceback(lua_State *, int, int);
 extern int kore_lua_print_results(lua_State *);
 extern void kore_lua_set_top(lua_State *, int);
 extern void kore_lua_close(lua_State *);
@@ -1413,6 +1414,19 @@ int main(int argc, char **argv) {
   /* Protected errors must return through the selected setjmp seam. */
   if (kore_lua_load(L, "error('expected')", 17, "=error") != LUA_OK) return 4;
   if (kore_lua_call(L, 0, LUA_MULTRET) == LUA_OK) return 5;
+  kore_lua_set_top(L, 0);
+  static const char traced_script[] =
+      "local function broken() error('tool failure') end\n"
+      "broken()\n";
+  if (kore_lua_load(L, traced_script, sizeof traced_script - 1,
+                    "=qwen-tool") != LUA_OK) return 14;
+  if (kore_lua_call_traceback(L, 0, LUA_MULTRET) == LUA_OK) return 15;
+  {
+    const char *why = lua_tostring(L, -1);
+    if (why == NULL || strstr(why, "qwen-tool:1: tool failure") == NULL ||
+        strstr(why, "stack traceback:") == NULL ||
+        strstr(why, "qwen-tool:2") == NULL) return 16;
+  }
   kore_lua_set_top(L, 0);
   if (!run(L, "return 6*7", 1)) return 6;
   if (capture.len != 6 || memcmp(capture.bytes + 3, "42\n", 3) != 0) return 7;
