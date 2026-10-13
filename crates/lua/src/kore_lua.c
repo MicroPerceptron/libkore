@@ -3447,6 +3447,14 @@ int kore_lua_print_results(lua_State *L) {
   return lua_pcall(L, results, 0, 0);
 }
 
+int kore_lua_print_results_traceback(lua_State *L) {
+  int results = lua_gettop(L);
+  if (results == 0) return LUA_OK;
+  lua_pushcfunction(L, kore_lua_print_results_inner);
+  lua_insert(L, 1);
+  return kore_lua_call_traceback(L, results, 0);
+}
+
 int kore_lua_top(lua_State *L) { return lua_gettop(L); }
 void kore_lua_set_top(lua_State *L, int top) { lua_settop(L, top); }
 int kore_lua_type(lua_State *L, int index) { return lua_type(L, index); }

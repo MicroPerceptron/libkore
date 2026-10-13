@@ -61,6 +61,7 @@ unsafe extern "C" {
     fn kore_lua_call(state: *mut LuaState, arguments: c_int, results: c_int) -> c_int;
     fn kore_lua_call_traceback(state: *mut LuaState, arguments: c_int, results: c_int) -> c_int;
     fn kore_lua_print_results(state: *mut LuaState) -> c_int;
+    fn kore_lua_print_results_traceback(state: *mut LuaState) -> c_int;
     fn kore_lua_top(state: *mut LuaState) -> c_int;
     fn kore_lua_set_top(state: *mut LuaState, top: c_int);
     fn kore_lua_error_string(state: *mut LuaState, len: *mut usize) -> *const c_char;
@@ -236,6 +237,14 @@ impl Vm {
         self.clear_stack();
     }
 
+    fn budget_hit(&self) -> bool {
+        self.instructions
+            .as_ref()
+            .is_some_and(|budget| budget.exhausted != 0)
+            || self.capture.exhausted
+            || self.budget.as_ref().is_some_and(|budget| budget.exhausted)
+    }
+
     fn execute_loaded(&mut self, print_results: bool) -> EvalResult {
         self.capture.exhausted = false;
         if let Some(ref mut budget) = self.budget {
@@ -259,12 +268,7 @@ impl Vm {
                 self.clear_stack();
                 return EvalResult::Exited;
             }
-            let budget_hit = self
-                .instructions
-                .as_ref()
-                .is_some_and(|budget| budget.exhausted != 0)
-                || self.capture.exhausted
-                || self.budget.as_ref().is_some_and(|budget| budget.exhausted);
+            let budget_hit = self.budget_hit();
             self.publish_error();
             return if budget_hit {
                 EvalResult::BudgetExceeded
@@ -272,16 +276,25 @@ impl Vm {
                 EvalResult::Failed
             };
         }
-        if print_results
-            && unsafe { kore_lua_top(self.state.as_ptr()) } > 0
-            && unsafe { kore_lua_print_results(self.state.as_ptr()) } != LUA_OK
-        {
+        let printed = !print_results
+            || unsafe { kore_lua_top(self.state.as_ptr()) } == 0
+            || if self.policy.is_restricted() {
+                (unsafe { kore_lua_print_results_traceback(self.state.as_ptr()) }) == LUA_OK
+            } else {
+                (unsafe { kore_lua_print_results(self.state.as_ptr()) }) == LUA_OK
+            };
+        if !printed {
             if self.error_is_exit() {
                 self.clear_stack();
                 return EvalResult::Exited;
             }
+            let budget_hit = self.budget_hit();
             self.publish_error();
-            return EvalResult::Failed;
+            return if budget_hit {
+                EvalResult::BudgetExceeded
+            } else {
+                EvalResult::Failed
+            };
         }
         self.clear_stack();
         EvalResult::Ok

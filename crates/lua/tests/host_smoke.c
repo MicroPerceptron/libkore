@@ -31,6 +31,7 @@ extern int kore_lua_load(lua_State *, const char *, size_t, const char *);
 extern int kore_lua_call(lua_State *, int, int);
 extern int kore_lua_call_traceback(lua_State *, int, int);
 extern int kore_lua_print_results(lua_State *);
+extern int kore_lua_print_results_traceback(lua_State *);
 extern void kore_lua_set_top(lua_State *, int);
 extern void kore_lua_close(lua_State *);
 /* The sizes the read path turns on, as src/kore_lua.c compiled them. */
@@ -134,6 +135,18 @@ static int restricted_smoke(void) {
   budget.exhausted = 0;
   if (!run(L, "assert(6*7==42)", 0)) {
     kore_lua_close(L); return 7;
+  }
+  kore_lua_set_top(L, 0);
+  budget.remaining = 128;
+  budget.exhausted = 0;
+  static const char print_spin[] =
+      "print=function() while true do end end; return 42";
+  if (kore_lua_load(L, print_spin, sizeof print_spin - 1,
+                    "=print-quota") != LUA_OK ||
+      kore_lua_call_traceback(L, 0, LUA_MULTRET) != LUA_OK ||
+      kore_lua_print_results_traceback(L) == LUA_OK ||
+      !budget.exhausted) {
+    kore_lua_close(L); return 8;
   }
   kore_lua_close(L);
   return 0;
@@ -1437,6 +1450,20 @@ int main(int argc, char **argv) {
           "return 6*7",
           1))
     return 8;
+  kore_lua_set_top(L, 0);
+  static const char print_error[] =
+      "print=function() error('print result sentinel') end; return 42";
+  if (kore_lua_load(L, print_error, sizeof print_error - 1,
+                    "=print-result") != LUA_OK ||
+      kore_lua_call(L, 0, LUA_MULTRET) != LUA_OK ||
+      kore_lua_print_results_traceback(L) == LUA_OK)
+    return 17;
+  {
+    const char *why = lua_tostring(L, -1);
+    if (why == NULL || strstr(why, "print result sentinel") == NULL ||
+        strstr(why, "stack traceback:") == NULL ||
+        strstr(why, "print-result:1") == NULL) return 18;
+  }
   kore_lua_close(L);
   return 0;
 }
