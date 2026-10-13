@@ -8,6 +8,7 @@ use core::{
 };
 use kore::abi::process::PROCESS_OUTPUT_BYTES;
 
+use crate::output::Capture;
 use crate::shim;
 use crate::{Library, Policy};
 
@@ -65,14 +66,6 @@ unsafe extern "C" {
     fn kore_lua_close(state: *mut LuaState);
 }
 
-#[derive(Default)]
-struct Capture {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    limit: usize,
-    exhausted: bool,
-}
-
 #[repr(C)]
 struct InstructionBudget {
     remaining: u64,
@@ -90,27 +83,7 @@ unsafe extern "C" fn append(
         return 0;
     }
     let bytes = unsafe { slice::from_raw_parts(bytes.cast::<u8>(), len) };
-    let used = unsafe {
-        (*capture)
-            .stdout
-            .len()
-            .saturating_add((*capture).stderr.len())
-    };
-    if bytes.len() > unsafe { (*capture).limit }.saturating_sub(used) {
-        unsafe { (*capture).exhausted = true };
-        return 0;
-    }
-    let output = if stderr == 0 {
-        unsafe { &mut (*capture).stdout }
-    } else {
-        unsafe { &mut (*capture).stderr }
-    };
-    if output.try_reserve(bytes.len()).is_err() {
-        unsafe { (*capture).exhausted = true };
-        return 0;
-    }
-    output.extend_from_slice(bytes);
-    1
+    i32::from(unsafe { &mut *capture }.append(bytes, stderr != 0))
 }
 
 pub enum ReplResult {
@@ -254,25 +227,9 @@ impl Vm {
 
     fn publish_error(&mut self) {
         let (error, len) = self.error_parts();
-        let used = self
-            .capture
-            .stdout
-            .len()
-            .saturating_add(self.capture.stderr.len());
-        let remaining = PROCESS_OUTPUT_BYTES.saturating_sub(used);
-        if remaining != 0 {
-            // Always reserve the final byte for one deterministic line
-            // terminator. An attacker-controlled Lua error therefore cannot
-            // bypass the aggregate ProcessIo output bound or trigger a large
-            // temporary allocation while it is being reported.
-            let error = unsafe { slice::from_raw_parts(error, len) };
-            let body = error.strip_suffix(b"\n").unwrap_or(error);
-            let copied = body.len().min(remaining - 1);
-            if self.capture.stderr.try_reserve(copied + 1).is_ok() {
-                self.capture.stderr.extend_from_slice(&body[..copied]);
-                self.capture.stderr.push(b'\n');
-            }
-        }
+        // The Lua string stays live until clear_stack below.
+        self.capture
+            .append_error(unsafe { slice::from_raw_parts(error, len) });
         self.clear_stack();
     }
 

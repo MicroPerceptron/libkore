@@ -103,6 +103,9 @@ static int restricted_smoke(void) {
   if (L == NULL) return 1;
   const char *surface =
       "assert(io==nil and os==nil and coroutine==nil)\n"
+      "assert(pcall==nil and xpcall==nil)\n"
+      "assert(setmetatable==nil and getmetatable==nil)\n"
+      "assert(rawset==nil and collectgarbage==nil)\n"
       "assert(kore.time==nil and kore.random==nil and kore.proc==nil)\n"
       "assert(kore.fs and kore.fs.read_file and kore.fs.stat)\n"
       "assert(kore.fs.list and kore.fs.entries and kore.fs.rights)\n"
@@ -131,6 +134,57 @@ static int restricted_smoke(void) {
   if (!run(L, "assert(6*7==42)", 0)) {
     kore_lua_close(L); return 7;
   }
+  kore_lua_close(L);
+  return 0;
+}
+
+/* Run under build.rs's hard child-process deadline. If a removed base entry
+   accidentally comes back, the hostile Lua closure can spin in a callback
+   whose debug hook is disabled; the build cannot be allowed to hang. */
+static int restricted_adversary(void) {
+  lua_State *L = kore_lua_new_with_policy(host_alloc, NULL, 0x4b4f5245u,
+                                          NULL, 0, 1);
+  if (L == NULL) return 1;
+  kore_lua_instruction_budget budget = {128, 0};
+  kore_lua_set_instruction_budget(L, &budget);
+  static const char *const hostile[] = {
+    "xpcall(function() while true do end end, function() while true do end end)",
+    "pcall(function() while true do end end)",
+    "setmetatable({}, {__gc=function() while true do end end}); collectgarbage()",
+    NULL
+  };
+  for (const char *const *source = hostile; *source != NULL; source++) {
+    if (kore_lua_load(L, *source, strlen(*source), "=adversary") != LUA_OK) {
+      kore_lua_close(L); return 2;
+    }
+    if (kore_lua_call(L, 0, LUA_MULTRET) == LUA_OK || budget.exhausted) {
+      kore_lua_close(L); return 3;
+    }
+    kore_lua_set_top(L, 0);
+  }
+  if (kore_lua_load(L, "while true do end", 17, "=quota") != LUA_OK) {
+    kore_lua_close(L); return 4;
+  }
+  if (kore_lua_call(L, 0, LUA_MULTRET) == LUA_OK || !budget.exhausted) {
+    kore_lua_close(L); return 5;
+  }
+  kore_lua_close(L);
+  return 0;
+}
+
+static int restricted_teardown_adversary(void) {
+  lua_State *L = kore_lua_new_with_policy(host_alloc, NULL, 0x4b4f5245u,
+                                          NULL, 0, 1);
+  if (L == NULL) return 1;
+  /* The chunk itself succeeds. If metatable installation returns to this
+     restricted surface, close runs a finalizer with hooks disabled and the
+     supervising build process terminates this child at its deadline. */
+  const char *source =
+      "local t={}\n"
+      "if setmetatable then setmetatable(t,{__gc=function() while true do end end}) end\n"
+      "_G.keep=t\n";
+  int good = run(L, source, 0);
+  if (!good) { kore_lua_close(L); return 2; }
   kore_lua_close(L);
   return 0;
 }
@@ -1143,7 +1197,11 @@ static int streaming_smoke(void) {
 #if defined(KORE_LUA_USE_TARGET_NUMERIC)
 int kore_lua_host_smoke(void) {
 #else
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "quota-adversary") == 0)
+    return restricted_adversary();
+  if (argc == 2 && strcmp(argv[1], "teardown-adversary") == 0)
+    return restricted_teardown_adversary();
 #endif
   static const char selftest[] =
       "local co=coroutine.create(function() coroutine.yield(6) end)\n"

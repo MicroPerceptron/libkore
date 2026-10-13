@@ -13,8 +13,16 @@ bridge rejects native modules and every non-read host operation even if a
 script reaches an internal C function. `load`, `loadfile`, `dofile` and Lua
 bytecode remain unavailable.
 
+The restricted base library also omits `pcall`, `xpcall`, `setmetatable`,
+`getmetatable`, `rawset`, and `collectgarbage`. Lua disables instruction hooks
+while running an `xpcall` error handler or a `__gc` finalizer; those callbacks
+could loop after the counter expired. With no protected-call entry or way to
+install a script finalizer, a quota error escapes the one-shot chunk to its
+host. The ordinary interactive REPL retains these Lua functions.
+
 The Lua allocator accounts live bytes per VM, the instruction hook bounds
-executed Lua instructions, and the bridge bounds captured output and read
+executed Lua instructions on that restricted surface. The bridge bounds the
+*combined* captured stdout, stderr, and error text, as well as read
 results. The embedding task must hold only a delegated read-only filesystem
 face: this policy does not mint or attenuate that capability. A wall-time
 deadline and Stop must terminate and reap the *whole task*. `Host::eval`

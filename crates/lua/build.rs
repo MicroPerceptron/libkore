@@ -4,6 +4,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
+    time::{Duration, Instant},
 };
 
 const SUPPORTED_ZIG_MAJOR: u64 = 0;
@@ -38,6 +39,29 @@ fn run(mut command: Command, what: &str) -> ExitStatus {
         panic!("{what} failed with {status}");
     }
     status
+}
+
+fn run_supervised_adversary(binary: &Path, name: &str) {
+    let mut child = Command::new(binary)
+        .arg(name)
+        .spawn()
+        .expect("could not start supervised Lua adversary");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child
+            .try_wait()
+            .expect("could not observe Lua adversary")
+        {
+            Some(status) if status.success() => return,
+            Some(status) => panic!("Lua {name} adversary failed with {status}"),
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Lua {name} adversary exceeded its supervised deadline");
+            }
+        }
+    }
 }
 
 fn zig_command(zig: &OsStr, out: &Path) -> Command {
@@ -90,6 +114,8 @@ fn host_smoke(out: &Path, host: &str) -> bool {
         Command::new(&host_smoke),
         "native Lua protected-call smoke execution",
     );
+    run_supervised_adversary(&host_smoke, "quota-adversary");
+    run_supervised_adversary(&host_smoke, "teardown-adversary");
 
     // Compile the C engine a second time without its libc numeric oracle, then
     // link it beneath the target's exact Rust numeric source. This exercises
