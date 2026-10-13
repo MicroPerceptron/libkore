@@ -181,6 +181,8 @@ use core::ffi::c_void;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Ok,
+    /// Lua source failed to compile; stderr includes the chunk and line.
+    CompileFailed,
     Failed,
     /// The chunk ran `os.exit`. The sentinel it raised unwound every
     /// `<close>` handler on the way out, so this is a completed evaluation
@@ -342,6 +344,7 @@ fn run_eval(vm: &mut Vm) {
         KIND_REPL => match vm.eval_repl(script) {
             ReplResult::Complete(true) => Outcome::Ok,
             ReplResult::Complete(false) => Outcome::Failed,
+            ReplResult::CompileFailed => Outcome::CompileFailed,
             ReplResult::Exited => Outcome::Exited,
             ReplResult::Incomplete => Outcome::Incomplete,
             ReplResult::ResourceRefused => Outcome::ResourceRefused,
@@ -354,6 +357,7 @@ fn run_eval(vm: &mut Vm) {
                 unsafe { core::slice::from_raw_parts(cell.chunk_name, cell.chunk_name_len) };
             match vm.eval(script, name) {
                 EvalResult::Ok => Outcome::Ok,
+                EvalResult::CompileFailed => Outcome::CompileFailed,
                 EvalResult::Failed => Outcome::Failed,
                 EvalResult::BudgetExceeded => Outcome::ResourceRefused,
                 EvalResult::Exited => Outcome::Exited,
