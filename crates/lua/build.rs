@@ -41,21 +41,27 @@ fn run(mut command: Command, what: &str) -> ExitStatus {
     status
 }
 
-fn run_supervised_adversary(binary: &Path, name: &str) {
-    let mut child = Command::new(binary)
-        .arg(name)
+fn run_supervised(binary: &Path, name: &str, argument: Option<&str>, timeout: Duration) {
+    let mut command = Command::new(binary);
+    if let Some(argument) = argument {
+        command.arg(argument);
+    }
+    let mut child = command
         .spawn()
-        .expect("could not start supervised Lua adversary");
-    let deadline = Instant::now() + Duration::from_secs(2);
+        .unwrap_or_else(|error| panic!("could not start supervised Lua {name}: {error}"));
+    let deadline = Instant::now() + timeout;
     loop {
-        match child.try_wait().expect("could not observe Lua adversary") {
+        match child
+            .try_wait()
+            .expect("could not observe supervised Lua test")
+        {
             Some(status) if status.success() => return,
-            Some(status) => panic!("Lua {name} adversary failed with {status}"),
+            Some(status) => panic!("Lua {name} failed with {status}"),
             None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("Lua {name} adversary exceeded its supervised deadline");
+                panic!("Lua {name} exceeded its supervised deadline");
             }
         }
     }
@@ -107,12 +113,19 @@ fn host_smoke(out: &Path, host: &str) -> bool {
         .args(["src/kore_lua.c", "tests/host_smoke.c", "-lm", "-o"])
         .arg(&host_smoke);
     run(smoke_cc, "native Lua protected-call smoke compilation");
-    run(
-        Command::new(&host_smoke),
-        "native Lua protected-call smoke execution",
+    run_supervised(&host_smoke, "host smoke", None, Duration::from_secs(30));
+    run_supervised(
+        &host_smoke,
+        "quota-adversary",
+        Some("quota-adversary"),
+        Duration::from_secs(2),
     );
-    run_supervised_adversary(&host_smoke, "quota-adversary");
-    run_supervised_adversary(&host_smoke, "teardown-adversary");
+    run_supervised(
+        &host_smoke,
+        "teardown-adversary",
+        Some("teardown-adversary"),
+        Duration::from_secs(2),
+    );
 
     // Compile the C engine a second time without its libc numeric oracle, then
     // link it beneath the target's exact Rust numeric source. This exercises
@@ -175,9 +188,11 @@ fn host_smoke(out: &Path, host: &str) -> bool {
         .arg(format!("link-arg={}", target_smoke_object.display()))
         .args(["-C", "link-arg=-lm"]);
     run(shim_rustc, "native Lua target-shim smoke compilation");
-    run(
-        Command::new(&target_shim_smoke),
-        "native Lua target-shim smoke execution",
+    run_supervised(
+        &target_shim_smoke,
+        "target-shim smoke",
+        None,
+        Duration::from_secs(30),
     );
 
     true
