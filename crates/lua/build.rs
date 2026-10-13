@@ -48,10 +48,7 @@ fn run_supervised_adversary(binary: &Path, name: &str) {
         .expect("could not start supervised Lua adversary");
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        match child
-            .try_wait()
-            .expect("could not observe Lua adversary")
-        {
+        match child.try_wait().expect("could not observe Lua adversary") {
             Some(status) if status.success() => return,
             Some(status) => panic!("Lua {name} adversary failed with {status}"),
             None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
