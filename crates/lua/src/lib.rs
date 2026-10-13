@@ -137,6 +137,8 @@ pub mod bridge;
 pub mod files;
 #[cfg(target_os = "none")]
 mod numeric;
+#[cfg(any(target_os = "none", test))]
+mod output;
 #[cfg(target_os = "none")]
 mod shim;
 #[cfg(target_os = "none")]

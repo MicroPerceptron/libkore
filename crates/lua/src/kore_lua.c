@@ -3271,6 +3271,20 @@ static int kore_lua_open_libraries(lua_State *L) {
   for (const char *const *name = omitted_base; *name != NULL; name++) {
     lua_pushnil(L); lua_setfield(L, -2, *name);
   }
+  if (restricted) {
+    /* Lua runs xpcall's message handler while the count hook is disabled,
+       and __gc finalizers run with hooks disabled too. There is no safe
+       in-process instruction ceiling for either callback. A restricted VM
+       has no way to catch the count-hook error or install a finalizer. Keep
+       the unrestricted REPL's base library intact. */
+    static const char *const unsafe_callbacks[] = {
+      "pcall", "xpcall", "setmetatable", "getmetatable", "rawset",
+      "collectgarbage", NULL
+    };
+    for (const char *const *name = unsafe_callbacks; *name != NULL; name++) {
+      lua_pushnil(L); lua_setfield(L, -2, *name);
+    }
+  }
   /* The one loader the host offers: over the store, through the executor. */
   lua_pushcfunction(L, kore_lua_require);
   lua_setfield(L, -2, "require");
