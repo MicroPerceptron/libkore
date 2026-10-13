@@ -1,5 +1,49 @@
 # Lua on Kore
 
+`kore-lua` is an embeddable Lua 5.5 library, not a hosted `lua` executable.
+Its VM, bridge and service calls run in a founded Kore process
+(`target_os = "none"`); host builds test the pure Rust logic and linked C
+engine harness. The embedding program owns the process, service faces and
+executor.
+
+## Choose a mode
+
+| Mode | Selection | Script surface | Lifecycle |
+| --- | --- | --- | --- |
+| Interactive REPL | `Extension::POLICY` default (`Policy::INTERACTIVE`) | `io`, `os`, coroutine and the task's `kore.*` libraries | Embedder may evaluate successive chunks |
+| Read-only worker | Opt in with `Policy::read_only_worker(...)` | Pure Lua libraries and read-only `kore.fs` queries | Embedder launches a delegated worker task, then terminates and reaps it on Stop/deadline |
+
+For example, an embedder can select a restricted policy without registering
+additional service operations:
+
+```rust
+use alloc::string::String;
+use kore_lua::{Answer, Extension, Policy};
+
+struct ReadOnly;
+impl Extension for ReadOnly {
+    const POLICY: Policy = Policy::read_only_worker(
+        8 * 1024 * 1024, // live Lua heap bytes per VM
+        1_000_000,       // instructions per evaluation
+        2_048,           // combined captured output bytes
+        4_096,           // bytes in one filesystem result
+    );
+
+    async fn serve(&mut self, _op: u32, _args: [u64; 3]) -> Answer {
+        Answer::Unavailable(String::from("no extension operation delegated"))
+    }
+}
+```
+
+On Kore, `Host::start::<ReadOnly>(&transport)` starts the VM worker. The
+embedder then awaits `host.eval(&mut services, &mut extension, script,
+b"=worker\0", false)`, which returns `(Outcome, stdout, stderr)` on a live
+bridge. For a first script, `print(6 * 7)` uses no service capability and
+prints `42`; with `repl = false`, a bare `return 6 * 7` does not automatically
+print the returned value. `repl = true` selects the interactive
+expression-then-statement grammar. Host tests do not establish that a founded
+worker has run on hardware.
+
 ## Read-only worker policy
 
 An embedding program can set `Extension::POLICY` to
@@ -20,14 +64,25 @@ could loop after the counter expired. With no protected-call entry or way to
 install a script finalizer, a quota error escapes the one-shot chunk to its
 host. The ordinary interactive REPL retains these Lua functions.
 
-The Lua allocator accounts live bytes per VM, the instruction hook bounds
-executed Lua instructions on that restricted surface. The bridge bounds the
-*combined* captured stdout, stderr, and error text, as well as read
-results. The embedding task must hold only a delegated read-only filesystem
-face: this policy does not mint or attenuate that capability. A wall-time
+The Lua allocator accounts live bytes per VM, and the instruction hook bounds
+executed Lua instructions on that restricted surface. The instruction allowance
+resets for each evaluation; it is not a cumulative session budget. The bridge
+bounds the *combined* captured stdout, stderr, and error text, as well as each
+filesystem result. A source module is limited to the smaller of 64 KiB and
+`fs_result_bytes`. The embedding task must hold only a delegated read-only
+filesystem face: this policy does not mint or attenuate that capability. A wall-time
 deadline and Stop must terminate and reap the *whole task*. `Host::eval`
 borrows the script across the worker-thread execution and cannot be safely
 cancelled by dropping its future while the VM may still read that pointer.
+
+`Host::eval` distinguishes successful evaluation, compile failure, runtime
+failure, REPL continuation (`Incomplete`), REPL allocation refusal
+(`ResourceRefused`), VM startup failure and `os.exit` (`Exited`) in `Outcome`.
+Compile diagnostics include the chunk and line; restricted runtime failures
+use a protected traceback. The returned stdout and stderr stay separate and
+share the capture bound. A broken bridge is a `Fatal` error, not a Lua result.
+
+## Interactive Lua surface
 
 Lua 5.5, freestanding, over the task's own filesystem face. A script sees two
 surfaces and they are one implementation: **`kore.*` is the store's vocabulary
