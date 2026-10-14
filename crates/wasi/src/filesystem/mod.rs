@@ -1048,68 +1048,73 @@ impl types::HostDirectoryEntryStream for WasiCtxView<'_> {
     }
 }
 
+/// The trap a refused preopen is answered with: `get-directories` has no
+/// error to return, and an empty list would read as "no files" where the
+/// service said why.
+fn refused_preopens(refused: host::PreopensRefused) -> wasmtime::Error {
+    use host::{GrantsRefused, PreopensRefused};
+    match refused {
+        PreopensRefused::Root(refusal) => {
+            wasmtime::format_err!("the task's root could not be opened for the guest: {refusal:?}")
+        }
+        PreopensRefused::Grants(GrantsRefused::Listing(refusal)) => wasmtime::format_err!(
+            "the task's named grants could not be listed for the guest: {refusal:?}"
+        ),
+        PreopensRefused::Grants(GrantsRefused::Grant(name, refusal)) => wasmtime::format_err!(
+            "the task's grant `{}` could not be opened for the guest: {refusal:?}",
+            name.as_str()
+        ),
+    }
+}
+
 impl preopens::Host for WasiCtxView<'_> {
     /// `.` — the task's root view — then, when the embedder offers them,
     /// the task's named grants under their names
-    /// ([`Filesystem::with_named_grants`]); or nothing, for a task without
-    /// a filesystem or whose root could not be opened.
+    /// ([`Filesystem::with_named_grants`]); nothing for a task without a
+    /// filesystem; a trap naming the refusal when one could not be opened.
+    /// Every call answers descriptors on the views the first call opened.
     async fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
         let Some(filesystem) = self.ctx.filesystem.as_ref() else {
             return Ok(Vec::new());
         };
-        let preopen = match Pinned::new(async move {
-            let host = filesystem.host().ok_or_else(off_thread)?;
-            let (root, rights) = host::preopen(host).await.map_err(|refusal| {
-                FsError::trap(wasmtime::format_err!(
-                    "the task's root could not be opened for the guest: {refusal:?}"
-                ))
-            })?;
-            Descriptor::new(host.clone(), root, Origin::Root, Vec::new(), preopen_flags(rights))
-                .ok_or_else(off_thread)
-        }) {
-            Ok(preopen) => preopen,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let root = preopen.await.map_err(FsError::into_trap)?;
-        let mut directories = vec![(self.table.push(root)?, String::from("."))];
-        let offers_grants = filesystem.host().is_some_and(|host| host.offers_grants());
-        if !offers_grants {
-            return Ok(directories);
-        }
         // Bound by a `match`, not awaited in one: the scrutinee's `Err` side
         // is the unpinned future, which must not live across the await.
-        let grants = match Pinned::new(async move {
+        let opened = match Pinned::new(async move {
             let host = filesystem.host().ok_or_else(off_thread)?;
-            let mut grants = Vec::new();
-            let offered = host::preopen_grants(host).await.map_err(|refused| {
-                FsError::trap(match refused {
-                    host::GrantsRefused::Listing(refusal) => wasmtime::format_err!(
-                        "the task's named grants could not be listed for the guest: {refusal:?}"
-                    ),
-                    host::GrantsRefused::Grant(name, refusal) => wasmtime::format_err!(
-                        "the task's grant `{}` could not be opened for the guest: {refusal:?}",
-                        name.as_str()
-                    ),
-                })
-            })?;
-            for (name, grant, view, rights) in offered {
+            let preopens = host
+                .preopens()
+                .await
+                .map_err(|refused| FsError::trap(refused_preopens(refused)))?;
+            let mut directories = Vec::with_capacity(1 + preopens.grants.len());
+            let (root, rights) = &preopens.root;
+            let root = Descriptor::new(
+                host.clone(),
+                root.clone(),
+                Origin::Root,
+                Vec::new(),
+                preopen_flags(*rights),
+            )
+            .ok_or_else(off_thread)?;
+            directories.push((String::from("."), root));
+            for (name, grant, view, rights) in &preopens.grants {
                 let descriptor = Descriptor::new(
                     host.clone(),
-                    view,
-                    Origin::Grant(grant),
+                    view.clone(),
+                    Origin::Grant(*grant),
                     Vec::new(),
-                    preopen_flags(rights),
+                    preopen_flags(*rights),
                 )
                 .ok_or_else(off_thread)?;
-                grants.push((name, descriptor));
+                directories.push((String::from(name.as_str()), descriptor));
             }
-            Ok::<_, FsError>(grants)
+            Ok::<_, FsError>(directories)
         }) {
-            Ok(grants) => grants,
-            Err(_) => return Ok(directories),
+            Ok(opened) => opened,
+            Err(_) => return Ok(Vec::new()),
         };
-        for (name, descriptor) in grants.await.map_err(FsError::into_trap)? {
-            directories.push((self.table.push(descriptor)?, String::from(name.as_str())));
+        let mut directories = Vec::new();
+        for (name, descriptor) in opened.await.map_err(FsError::into_trap)? {
+            directories.push((self.table.push(descriptor)?, name));
         }
         Ok(directories)
     }
