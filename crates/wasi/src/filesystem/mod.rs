@@ -42,7 +42,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use kore::fs::dag::bounds::MAX_DIR_ENTRIES;
-use kore::fs::dag::{ObjectKind, ProviderError};
+use kore::fs::dag::{GrantId, ObjectKind, ProviderError};
 use kore::fs::{DirEntry, FsError as Refused, Name, Refusal, Rights, Stat, View};
 use kore::runtime::Pinned;
 use wasmtime::component::{Resource, ResourceTableError};
@@ -204,13 +204,27 @@ fn preopen_flags(rights: Rights) -> DescriptorFlags {
 }
 
 /// An open file or directory: a Kore view the guest holds, with the path
-/// it was opened by (from the preopen) and the flags it was opened with.
+/// it was opened by (from its preopen) and the flags it was opened with.
 pub struct Descriptor(Pinned<Open>);
+
+/// The preopen a descriptor descends from: what its path is relative to,
+/// and what reopening it by that path starts from. A view has no
+/// duplicate verb, so `open-at` of `.` reopens the directory from here.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// `.`, the task's root view.
+    Root,
+    /// One of the task's named grants the embedder offered
+    /// ([`Filesystem::with_named_grants`]).
+    Grant(GrantId),
+}
 
 struct Open {
     /// Shared with the streams and listings made from this descriptor.
     file: Shared,
     host: Rc<FsHost>,
+    origin: Origin,
+    /// From `origin`; empty for the preopen itself.
     path: Vec<Name>,
     flags: DescriptorFlags,
 }
@@ -219,12 +233,14 @@ impl Descriptor {
     fn new(
         host: Rc<FsHost>,
         file: Shared,
+        origin: Origin,
         path: Vec<Name>,
         flags: DescriptorFlags,
     ) -> Option<Self> {
         let open = Open {
             file,
             host,
+            origin,
             path,
             flags,
         };
@@ -395,6 +411,7 @@ impl Open {
         } else {
             rights
         };
+        let origin = self.origin;
         let from_preopen = self.path.clone();
         let mut path_of = self.path.clone();
         path_of.extend_from_slice(&names);
@@ -406,13 +423,16 @@ impl Open {
                 // awaited must not leave it a bare view.
                 let file = match names.split_last() {
                     // `.`: this directory again, reopened by its own path
-                    // from the preopen (a view has no duplicate verb).
+                    // from its preopen (a view has no duplicate verb).
                     None => {
                         if create && exclusive {
                             return Err(Refusal::Fs(Refused::AlreadyExists));
                         }
                         let root = pair
-                            .call(async |fs: &mut Face| fs.open_root(rights).await)
+                            .call(async |fs: &mut Face| match origin {
+                                Origin::Root => fs.open_root(rights).await,
+                                Origin::Grant(grant) => fs.open_grant(grant, rights).await,
+                            })
                             .await?;
                         let root = pair.own(root);
                         if from_preopen.is_empty() {
@@ -463,7 +483,7 @@ impl Open {
                 Ok(file)
             })
             .await?;
-        Descriptor::new(self.host.clone(), file, path_of, flags).ok_or_else(off_thread)
+        Descriptor::new(self.host.clone(), file, origin, path_of, flags).ok_or_else(off_thread)
     }
 
     /// The directory holding `path`'s last component, and that component.
@@ -1031,7 +1051,7 @@ impl preopens::Host for WasiCtxView<'_> {
         let preopen = match Pinned::new(async move {
             let host = filesystem.host()?;
             let (root, rights) = host::preopen(host).await?;
-            Descriptor::new(host.clone(), root, Vec::new(), preopen_flags(rights))
+            Descriptor::new(host.clone(), root, Origin::Root, Vec::new(), preopen_flags(rights))
         }) {
             Ok(preopen) => preopen,
             Err(_) => return Ok(Vec::new()),
@@ -1049,10 +1069,14 @@ impl preopens::Host for WasiCtxView<'_> {
         let grants = match Pinned::new(async move {
             let host = filesystem.host()?;
             let mut grants = Vec::new();
-            for (name, view, rights) in host::preopen_grants(host).await {
-                if let Some(descriptor) =
-                    Descriptor::new(host.clone(), view, Vec::new(), preopen_flags(rights))
-                {
+            for (name, grant, view, rights) in host::preopen_grants(host).await {
+                if let Some(descriptor) = Descriptor::new(
+                    host.clone(),
+                    view,
+                    Origin::Grant(grant),
+                    Vec::new(),
+                    preopen_flags(rights),
+                ) {
                     grants.push((name, descriptor));
                 }
             }

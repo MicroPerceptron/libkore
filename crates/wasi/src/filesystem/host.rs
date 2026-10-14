@@ -391,7 +391,7 @@ const PREOPEN_RIGHTS: [Rights; 4] = {
 /// root is not among them (it is `.`), nor is a grant without a name (a
 /// guest could not spell it). A grant the service refuses outright is left
 /// out; one it refuses only at a width is tried at the next.
-pub(crate) async fn preopen_grants(host: &FsHost) -> Vec<(Name, Shared, Rights)> {
+pub(crate) async fn preopen_grants(host: &FsHost) -> Vec<(Name, GrantId, Shared, Rights)> {
     host.exec(async |pair: &mut Custody| {
         // The listing lands in the pair's window, which the next request
         // reuses: read every entry before opening any.
@@ -420,7 +420,7 @@ pub(crate) async fn preopen_grants(host: &FsHost) -> Vec<(Name, Shared, Rights)>
                     .await;
                 match root {
                     Ok(root) => {
-                        preopens.push((name, pair.own(root), rights));
+                        preopens.push((name, grant, pair.own(root), rights));
                         break;
                     }
                     Err(Refusal::Fs(FsError::AccessDenied)) => {}
