@@ -385,7 +385,8 @@ impl Filesystem {
     /// embedder decides: a grant it holds for itself — a private data
     /// grant — is never offered unless it says so, and the grants offered
     /// are the task's, named as the task names them, with the rights the
-    /// service answers for each.
+    /// service answers for each. A grant of a single file is not offered:
+    /// a preopen is a directory.
     pub fn with_named_grants(self) -> Self {
         if let Some(host) = self.0.get() {
             host.grants.set(true);
@@ -426,8 +427,11 @@ const PREOPEN_RIGHTS: [Rights; 4] = {
 /// answers for it, in the order the store lists them: what
 /// [`Filesystem::with_named_grants`] offers beside the root. The private
 /// root is not among them (it is `.`), nor is a grant without a name (a
-/// guest could not spell it). A grant the service refuses outright is left
-/// out; one it refuses only at a width is tried at the next.
+/// guest could not spell it), nor a grant of a single file: a preopen is a
+/// directory (`get-directories`), so a file grant's view is closed and left
+/// out, not refused — the guest asked for nothing it lacks. A grant refused
+/// only at a width is tried at the next; one refused at every width, or for
+/// another reason, refuses them all.
 pub(crate) async fn preopen_grants(
     host: &FsHost,
 ) -> Result<Vec<(Name, GrantId, Shared, Rights)>, GrantsRefused> {
@@ -454,22 +458,27 @@ pub(crate) async fn preopen_grants(
         let mut preopens = Vec::with_capacity(named.len());
         for (name, grant) in named {
             let mut refused = Refusal::Pair;
+            let mut opened = None;
             for rights in PREOPEN_RIGHTS {
                 let root = pair
                     .call(async move |fs: &mut Face| fs.open_grant(grant, rights).await)
                     .await;
                 match root {
                     Ok(root) => {
-                        preopens.push((name, grant, pair.own(root), rights));
-                        refused = Refusal::Fs(FsError::AccessDenied);
+                        opened = Some((root, rights));
                         break;
                     }
                     Err(error @ Refusal::Fs(FsError::AccessDenied)) => refused = error,
                     Err(error) => return Err(GrantsRefused::Grant(name, error)),
                 }
             }
-            if preopens.last().is_none_or(|(last, ..)| *last != name) {
+            let Some((root, rights)) = opened else {
                 return Err(GrantsRefused::Grant(name, refused));
+            };
+            if root.is_directory() {
+                preopens.push((name, grant, pair.own(root), rights));
+            } else {
+                pair.close(root).await;
             }
         }
         Ok(preopens)
