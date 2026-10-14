@@ -391,7 +391,9 @@ const PREOPEN_RIGHTS: [Rights; 4] = {
 /// root is not among them (it is `.`), nor is a grant without a name (a
 /// guest could not spell it). A grant the service refuses outright is left
 /// out; one it refuses only at a width is tried at the next.
-pub(crate) async fn preopen_grants(host: &FsHost) -> Vec<(Name, GrantId, Shared, Rights)> {
+pub(crate) async fn preopen_grants(
+    host: &FsHost,
+) -> Result<Vec<(Name, GrantId, Shared, Rights)>, GrantsRefused> {
     host.exec(async |pair: &mut Custody| {
         // The listing lands in the pair's window, which the next request
         // reuses: read every entry before opening any.
@@ -411,9 +413,10 @@ pub(crate) async fn preopen_grants(host: &FsHost) -> Vec<(Name, GrantId, Shared,
                 Ok(named)
             })
             .await
-            .unwrap_or_default();
+            .map_err(GrantsRefused::Listing)?;
         let mut preopens = Vec::with_capacity(named.len());
         for (name, grant) in named {
+            let mut refused = Refusal::Pair;
             for rights in PREOPEN_RIGHTS {
                 let root = pair
                     .call(async move |fs: &mut Face| fs.open_grant(grant, rights).await)
@@ -421,35 +424,51 @@ pub(crate) async fn preopen_grants(host: &FsHost) -> Vec<(Name, GrantId, Shared,
                 match root {
                     Ok(root) => {
                         preopens.push((name, grant, pair.own(root), rights));
+                        refused = Refusal::Fs(FsError::AccessDenied);
                         break;
                     }
-                    Err(Refusal::Fs(FsError::AccessDenied)) => {}
-                    Err(_) => break,
+                    Err(error @ Refusal::Fs(FsError::AccessDenied)) => refused = error,
+                    Err(error) => return Err(GrantsRefused::Grant(name, error)),
                 }
             }
+            if preopens.last().is_none_or(|(last, ..)| *last != name) {
+                return Err(GrantsRefused::Grant(name, refused));
+            }
         }
-        preopens
+        Ok(preopens)
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or(Err(GrantsRefused::Listing(Refusal::Pair)))
+}
+
+/// Why the task's named grants could not be offered.
+pub(crate) enum GrantsRefused {
+    /// The listing itself was refused (`Pair` when the pair is gone).
+    Listing(Refusal),
+    /// This grant could not be opened at any width: the service's refusal
+    /// of the narrowest probe, or the first for a reason other than width.
+    Grant(Name, Refusal),
 }
 
 /// The task root with the widest of the rights a preopen may carry; each
-/// probe is the service's own answer.
-pub(crate) async fn preopen(host: &FsHost) -> Option<(Shared, Rights)> {
+/// probe is the service's own answer. `Err` is the service's refusal of
+/// the narrowest probe, or of the first one it refused for a reason other
+/// than width; `Pair` when the pair is gone.
+pub(crate) async fn preopen(host: &FsHost) -> Result<(Shared, Rights), Refusal> {
     host.exec(async |pair: &mut Custody| {
+        let mut refused = Refusal::Pair;
         for rights in PREOPEN_RIGHTS {
             let root = pair
                 .call(async move |fs: &mut Face| fs.open_root(rights).await)
                 .await;
             match root {
-                Ok(root) => return Some((pair.own(root), rights)),
-                Err(Refusal::Fs(FsError::AccessDenied)) => {}
-                Err(_) => return None,
+                Ok(root) => return Ok((pair.own(root), rights)),
+                Err(error @ Refusal::Fs(FsError::AccessDenied)) => refused = error,
+                Err(error) => return Err(error),
             }
         }
-        None
+        Err(refused)
     })
     .await
-    .flatten()
+    .unwrap_or(Err(Refusal::Pair))
 }

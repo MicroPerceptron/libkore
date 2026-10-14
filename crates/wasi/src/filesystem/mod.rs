@@ -80,6 +80,15 @@ impl FsError {
             Failure::Trap(_) => None,
         }
     }
+
+    /// As a trap: an error code where the interface has no error to answer
+    /// with becomes one naming the code.
+    fn into_trap(self) -> wasmtime::Error {
+        match self.0 {
+            Failure::Code(code) => wasmtime::format_err!("{code:?}"),
+            Failure::Trap(error) => error,
+        }
+    }
 }
 
 impl From<ErrorCode> for FsError {
@@ -1049,16 +1058,19 @@ impl preopens::Host for WasiCtxView<'_> {
             return Ok(Vec::new());
         };
         let preopen = match Pinned::new(async move {
-            let host = filesystem.host()?;
-            let (root, rights) = host::preopen(host).await?;
+            let host = filesystem.host().ok_or_else(off_thread)?;
+            let (root, rights) = host::preopen(host).await.map_err(|refusal| {
+                FsError::trap(wasmtime::format_err!(
+                    "the task's root could not be opened for the guest: {refusal:?}"
+                ))
+            })?;
             Descriptor::new(host.clone(), root, Origin::Root, Vec::new(), preopen_flags(rights))
+                .ok_or_else(off_thread)
         }) {
             Ok(preopen) => preopen,
             Err(_) => return Ok(Vec::new()),
         };
-        let Some(root) = preopen.await else {
-            return Ok(Vec::new());
-        };
+        let root = preopen.await.map_err(FsError::into_trap)?;
         let mut directories = vec![(self.table.push(root)?, String::from("."))];
         let offers_grants = filesystem.host().is_some_and(|host| host.offers_grants());
         if !offers_grants {
@@ -1067,25 +1079,36 @@ impl preopens::Host for WasiCtxView<'_> {
         // Bound by a `match`, not awaited in one: the scrutinee's `Err` side
         // is the unpinned future, which must not live across the await.
         let grants = match Pinned::new(async move {
-            let host = filesystem.host()?;
+            let host = filesystem.host().ok_or_else(off_thread)?;
             let mut grants = Vec::new();
-            for (name, grant, view, rights) in host::preopen_grants(host).await {
-                if let Some(descriptor) = Descriptor::new(
+            let offered = host::preopen_grants(host).await.map_err(|refused| {
+                FsError::trap(match refused {
+                    host::GrantsRefused::Listing(refusal) => wasmtime::format_err!(
+                        "the task's named grants could not be listed for the guest: {refusal:?}"
+                    ),
+                    host::GrantsRefused::Grant(name, refusal) => wasmtime::format_err!(
+                        "the task's grant `{}` could not be opened for the guest: {refusal:?}",
+                        name.as_str()
+                    ),
+                })
+            })?;
+            for (name, grant, view, rights) in offered {
+                let descriptor = Descriptor::new(
                     host.clone(),
                     view,
                     Origin::Grant(grant),
                     Vec::new(),
                     preopen_flags(rights),
-                ) {
-                    grants.push((name, descriptor));
-                }
+                )
+                .ok_or_else(off_thread)?;
+                grants.push((name, descriptor));
             }
-            Some(grants)
+            Ok::<_, FsError>(grants)
         }) {
             Ok(grants) => grants,
             Err(_) => return Ok(directories),
         };
-        for (name, descriptor) in grants.await.unwrap_or_default() {
+        for (name, descriptor) in grants.await.map_err(FsError::into_trap)? {
             directories.push((self.table.push(descriptor)?, String::from(name.as_str())));
         }
         Ok(directories)
