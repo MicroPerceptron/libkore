@@ -31,6 +31,7 @@ use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+use kore::fs::dag::GrantId;
 use kore::fs::{Fs, FsError, Name, Refusal, Rights, View};
 use kore::runtime::Pinned;
 
@@ -208,11 +209,18 @@ pub(crate) struct FsHost {
     /// The largest transfer, fixed at attach: what one stream write may
     /// carry.
     chunk: usize,
+    /// Whether the task's named grants are offered as preopens of their
+    /// names beside `.` ([`Filesystem::with_named_grants`]).
+    grants: Cell<bool>,
 }
 
 impl FsHost {
     pub(crate) fn chunk(&self) -> usize {
         self.chunk
+    }
+
+    pub(crate) fn offers_grants(&self) -> bool {
+        self.grants.get()
     }
 
     /// Drive the op in the slot; `Ready` once the slot is empty.
@@ -305,7 +313,11 @@ impl FsHost {
 
 /// A task's filesystem, given to a guest as one preopen, `.`: the task's
 /// own root view (on Kore, the directory it was launched in). The guest
-/// resolves paths only beneath it — never through the task's named grants.
+/// resolves paths only beneath it — never through the task's named grants
+/// from there. An embedder that wants the guest to see those grants names
+/// them ([`with_named_grants`](Self::with_named_grants)): each is then a
+/// preopen of its own, under the name the task's store gives it, and the
+/// guest resolves beneath it the same way.
 ///
 /// `Send`, as a store's data must be; the pair is thread-bound and usable
 /// only on the thread that pinned it.
@@ -325,8 +337,25 @@ impl Filesystem {
             }),
             slot: RefCell::new(None),
             chunk,
+            grants: Cell::new(false),
         });
         Pinned::new(host).ok().map(Self)
+    }
+
+    /// Offer the task's named grants to the guest too, each as a preopen
+    /// under its store name beside `.`: a program launched as
+    /// `shared/wasm/python.wasm` then finds `shared/wasm/lib/` where its
+    /// launcher does, since `shared` is a grant the launcher's own walk
+    /// resolves and the guest's one-step walk from `.` cannot. The
+    /// embedder decides: a grant it holds for itself — a private data
+    /// grant — is never offered unless it says so, and the grants offered
+    /// are the task's, named as the task names them, with the rights the
+    /// service answers for each.
+    pub fn with_named_grants(self) -> Self {
+        if let Some(host) = self.0.get() {
+            host.grants.set(true);
+        }
+        self
     }
 
     pub(crate) fn host(&self) -> Option<&Rc<FsHost>> {
@@ -348,13 +377,68 @@ impl Filesystem {
     }
 }
 
+/// Widest first: the rights a preopen may carry, probed in order until
+/// the service answers one — the task root's, and each named grant's.
+const PREOPEN_RIGHTS: [Rights; 4] = {
+    const MUTATE: Rights = Rights::READ.union(Rights::MUTATE_NAMESPACE);
+    const WRITE: Rights = Rights::READ.union(Rights::WRITE);
+    [MUTATE.union(Rights::WRITE), MUTATE, WRITE, Rights::READ]
+};
+
+/// The task's named grants, each opened with the widest rights the service
+/// answers for it, in the order the store lists them: what
+/// [`Filesystem::with_named_grants`] offers beside the root. The private
+/// root is not among them (it is `.`), nor is a grant without a name (a
+/// guest could not spell it). A grant the service refuses outright is left
+/// out; one it refuses only at a width is tried at the next.
+pub(crate) async fn preopen_grants(host: &FsHost) -> Vec<(Name, Shared, Rights)> {
+    host.exec(async |pair: &mut Custody| {
+        // The listing lands in the pair's window, which the next request
+        // reuses: read every entry before opening any.
+        let named: Vec<(Name, GrantId)> = pair
+            .call(async |fs: &mut Face| {
+                let count = fs.shares().await?;
+                let mut named = Vec::new();
+                for index in 0..count as usize {
+                    let entry = fs.share_entry(index)?;
+                    if entry.is_private_root {
+                        continue;
+                    }
+                    if let Some(name) = entry.display_name {
+                        named.push((name, entry.grant));
+                    }
+                }
+                Ok(named)
+            })
+            .await
+            .unwrap_or_default();
+        let mut preopens = Vec::with_capacity(named.len());
+        for (name, grant) in named {
+            for rights in PREOPEN_RIGHTS {
+                let root = pair
+                    .call(async move |fs: &mut Face| fs.open_grant(grant, rights).await)
+                    .await;
+                match root {
+                    Ok(root) => {
+                        preopens.push((name, pair.own(root), rights));
+                        break;
+                    }
+                    Err(Refusal::Fs(FsError::AccessDenied)) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        preopens
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// The task root with the widest of the rights a preopen may carry; each
 /// probe is the service's own answer.
 pub(crate) async fn preopen(host: &FsHost) -> Option<(Shared, Rights)> {
-    const MUTATE: Rights = Rights::READ.union(Rights::MUTATE_NAMESPACE);
-    const WRITE: Rights = Rights::READ.union(Rights::WRITE);
     host.exec(async |pair: &mut Custody| {
-        for rights in [MUTATE.union(Rights::WRITE), MUTATE, WRITE, Rights::READ] {
+        for rights in PREOPEN_RIGHTS {
             let root = pair
                 .call(async move |fs: &mut Face| fs.open_root(rights).await)
                 .await;
