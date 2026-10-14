@@ -17,6 +17,10 @@
 //! the task root regardless of the descriptor: both are refused before any
 //! request ([`components`]). A descriptor cannot reach above its preopen.
 //!
+//! A named grant the embedder offers (`Filesystem::with_named_grants`) is a
+//! preopen of its own, under the grant's name: the guest walks beneath it
+//! exactly as beneath `.`, and still never reaches a grant *through* `.`.
+//!
 //! [`Fs::open`]: kore::fs::Fs::open
 //! [`Fs::open_at`]: kore::fs::Fs::open_at
 //! [`Fs::open_root`]: kore::fs::Fs::open_root

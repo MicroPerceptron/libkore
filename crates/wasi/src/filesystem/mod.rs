@@ -1020,8 +1020,10 @@ impl types::HostDirectoryEntryStream for WasiCtxView<'_> {
 }
 
 impl preopens::Host for WasiCtxView<'_> {
-    /// `.` — the task's root view — or nothing, for a task without a
-    /// filesystem or whose root could not be opened.
+    /// `.` — the task's root view — then, when the embedder offers them,
+    /// the task's named grants under their names
+    /// ([`Filesystem::with_named_grants`]); or nothing, for a task without
+    /// a filesystem or whose root could not be opened.
     async fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
         let Some(filesystem) = self.ctx.filesystem.as_ref() else {
             return Ok(Vec::new());
@@ -1034,9 +1036,34 @@ impl preopens::Host for WasiCtxView<'_> {
             Ok(preopen) => preopen,
             Err(_) => return Ok(Vec::new()),
         };
-        Ok(match preopen.await {
-            Some(root) => vec![(self.table.push(root)?, String::from("."))],
-            None => Vec::new(),
-        })
+        let Some(root) = preopen.await else {
+            return Ok(Vec::new());
+        };
+        let mut directories = vec![(self.table.push(root)?, String::from("."))];
+        let offers_grants = filesystem.host().is_some_and(|host| host.offers_grants());
+        if !offers_grants {
+            return Ok(directories);
+        }
+        // Bound by a `match`, not awaited in one: the scrutinee's `Err` side
+        // is the unpinned future, which must not live across the await.
+        let grants = match Pinned::new(async move {
+            let host = filesystem.host()?;
+            let mut grants = Vec::new();
+            for (name, view, rights) in host::preopen_grants(host).await {
+                if let Some(descriptor) =
+                    Descriptor::new(host.clone(), view, Vec::new(), preopen_flags(rights))
+                {
+                    grants.push((name, descriptor));
+                }
+            }
+            Some(grants)
+        }) {
+            Ok(grants) => grants,
+            Err(_) => return Ok(directories),
+        };
+        for (name, descriptor) in grants.await.unwrap_or_default() {
+            directories.push((self.table.push(descriptor)?, String::from(name.as_str())));
+        }
+        Ok(directories)
     }
 }
