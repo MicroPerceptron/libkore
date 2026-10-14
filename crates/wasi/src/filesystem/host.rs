@@ -212,6 +212,12 @@ pub(crate) struct FsHost {
     /// Whether the task's named grants are offered as preopens of their
     /// names beside `.` ([`Filesystem::with_named_grants`]).
     grants: Cell<bool>,
+    /// The preopens once opened ([`FsHost::preopens`]). A guest asks for
+    /// them more than once — the preview1 adapter once at start and once
+    /// per name it reads back — and every answer shares the views the
+    /// first opened, so a guest's start costs the service one open per
+    /// preopen and holds one route per grant.
+    preopens: RefCell<Option<Rc<Preopens>>>,
 }
 
 impl FsHost {
@@ -221,6 +227,26 @@ impl FsHost {
 
     pub(crate) fn offers_grants(&self) -> bool {
         self.grants.get()
+    }
+
+    /// The guest's preopens: the task root as `.`, then the named grants
+    /// when the embedder offers them — opened on the first call, shared by
+    /// every later one. A refusal is answered each time it is asked.
+    pub(crate) async fn preopens(&self) -> Result<Rc<Preopens>, PreopensRefused> {
+        if let Some(preopens) = self.preopens.borrow().clone() {
+            return Ok(preopens);
+        }
+        let root = preopen(self).await.map_err(PreopensRefused::Root)?;
+        let grants = if self.offers_grants() {
+            preopen_grants(self)
+                .await
+                .map_err(PreopensRefused::Grants)?
+        } else {
+            Vec::new()
+        };
+        let preopens = Rc::new(Preopens { root, grants });
+        *self.preopens.borrow_mut() = Some(preopens.clone());
+        Ok(preopens)
     }
 
     /// Drive the op in the slot; `Ready` once the slot is empty.
@@ -299,7 +325,15 @@ impl FsHost {
                     continue;
                 }
                 let Some(op) = op.take() else {
-                    return Poll::Ready(None);
+                    // The op was installed on an earlier turn and has now
+                    // finished — the slot is empty here only because its poll
+                    // returned `Ready`, which is also what set `out`. When the
+                    // op queued no view to close (the common case: it returns
+                    // the views it opened, owned), the orphan arm above does
+                    // not fire, so this is where its result is handed back.
+                    // Returning `None` here instead would drop it, and the one
+                    // caller reads that as a lost pair.
+                    return Poll::Ready(out.take());
                 };
                 let (cell, out) = (self.cell.clone(), out.clone());
                 self.install(Box::pin(async move {
@@ -338,6 +372,7 @@ impl Filesystem {
             slot: RefCell::new(None),
             chunk,
             grants: Cell::new(false),
+            preopens: RefCell::new(None),
         });
         Pinned::new(host).ok().map(Self)
     }
@@ -371,6 +406,8 @@ impl Filesystem {
     /// left to the service's teardown of this session.
     pub async fn close(self) -> Option<Fs<'static, 'static>> {
         let host = self.0.into_inner().ok()?;
+        // The preopens' views go first: queued now, closed by the settle.
+        drop(host.preopens.take());
         host.settle().await;
         let host = Rc::into_inner(host)?;
         Rc::into_inner(host.cell)?.fs.into_inner()
@@ -439,6 +476,20 @@ pub(crate) async fn preopen_grants(
     })
     .await
     .unwrap_or(Err(GrantsRefused::Listing(Refusal::Pair)))
+}
+
+/// What a guest is given as preopens: the task root, and the named grants
+/// the embedder offered, each as the view opened for it and its rights.
+pub(crate) struct Preopens {
+    pub(crate) root: (Shared, Rights),
+    pub(crate) grants: Vec<(Name, GrantId, Shared, Rights)>,
+}
+
+/// Why the guest's preopens could not be opened.
+pub(crate) enum PreopensRefused {
+    /// The task root, at any width.
+    Root(Refusal),
+    Grants(GrantsRefused),
 }
 
 /// Why the task's named grants could not be offered.
