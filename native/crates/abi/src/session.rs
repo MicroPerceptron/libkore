@@ -5095,7 +5095,11 @@ mod tests {
 
     #[test]
     fn view_map_request_is_a_closed_window_selector() {
-        for window in [ViewMapWindow::Map, ViewMapWindow::Surfaces, ViewMapWindow::Heap] {
+        for window in [
+            ViewMapWindow::Map,
+            ViewMapWindow::Surfaces,
+            ViewMapWindow::Heap,
+        ] {
             let mut bytes = [0u8; ViewMapReq::WIRE];
             bytes[..2].copy_from_slice(&window.role().to_le_bytes());
             let (req, rest) = ViewMapReq::try_ref_from_prefix(&bytes).unwrap();

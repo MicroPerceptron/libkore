@@ -410,12 +410,13 @@ pub const PROCESS_ARG_BYTES: usize = 272;
 /// growing the page or touching the wire. What sets the number is the
 /// largest context anyone builds, which is the bootstrap command catalogue
 /// `help` reads — [`MAX_COMMAND_SNAPSHOT_ENTRIES`](crate::command::MAX_COMMAND_SNAPSHOT_ENTRIES)
-/// rows of name, usage and summary plus four framing bytes each. At the
-/// catalogue's present verbosity a full table needs a little over 1.8 KiB,
-/// and the old 1536 left no room to add a command without deleting another
-/// one's documentation. This keeps a margin over that while staying well
-/// under the payload it borrows.
-pub const PROCESS_CONTEXT_BYTES: usize = 2048;
+/// rows of name, usage and summary plus four framing bytes each. The
+/// catalogue's 35 rows need 2078 bytes at their present verbosity, which
+/// 2048 refused — `wasm` could not join without deleting another command's
+/// documentation. 2560 carries them with room for several more rows, and
+/// still leaves the payload it borrows (3208) most of its width for the
+/// output a command writes back.
+pub const PROCESS_CONTEXT_BYTES: usize = 2560;
 const _: () = assert!(
     PROCESS_CONTEXT_BYTES <= PROCESS_OUTPUT_BYTES,
     "context borrows the output payload and cannot outgrow it"

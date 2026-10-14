@@ -1,0 +1,28 @@
+[package]
+name = "kore-lua"
+version = "0.1.0-alpha.1"
+edition = "2024"
+publish = false
+description = "Lua 5.5 on Kore: the pinned engine, its freestanding host, and the kore.* standard library over native owners"
+build = "build.rs"
+autotests = false
+
+[lib]
+name = "kore_lua"
+path = "src/lib.rs"
+# The host build carries no engine (see lib.rs's gating), but it does carry
+# `files`' logic — path splitting, handle encoding, the error vocabulary —
+# and those are worth a unit test that runs without a machine.
+test = true
+
+[dependencies]
+# The app facade: `kore::fs` for `require`'s source modules, `kore::time`
+# and `kore::random` for the standard library, `kore::runtime` for the
+# worker thread and the doorbell the bridge parks on.
+kore = { package = "kore-std", path = "../..", features = ["fs", "heap"] }
+# Runtime linking for `require "<name>.so"`: a store object stamped
+# EXECUTABLE_IMAGE, checked, placed in this task's JIT arena and bound
+# against the exported Lua C API (Kore `res/IMAGE.md` §8).
+kore-late = { path = "../../native/crates/late" }
+# The engine's libm seam; the C side reaches it through src/shim.rs.
+libm = { version = "0.2.16", default-features = false }

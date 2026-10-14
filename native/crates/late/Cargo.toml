@@ -1,0 +1,17 @@
+[package]
+name = "kore-late"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Late binding: link a DagFS store object into the running task through the JIT arena, and look its symbols up — the `require` bridge (res/IMAGE.md §8)"
+
+[dependencies]
+heapless = { version = "0.9.3", default-features = false }
+kore-abi = { path = "../abi" }
+kore-dagfs = { path = "../dagfs", default-features = false, features = ["runtime"] }
+kore-ld = { path = "../ld", default-features = false }
+kore-rt = { path = "../rt", default-features = false }
+
+[dev-dependencies]
+kore-rt = { path = "../rt", features = ["std"] }
+zerocopy = { version = "0.8", default-features = false }

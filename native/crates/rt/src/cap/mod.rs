@@ -2476,6 +2476,26 @@ impl ReturnedCapability {
         }
     }
 
+    /// An owner whose lineage was already observed dead, for host tests of
+    /// the code that must distinguish a settled component from one still
+    /// closing.
+    ///
+    /// Off metal there is no other way to reach the settled state: the host
+    /// `retire_owned_slot` answers [`RetireOutcome::Retryable`] for every
+    /// live record, so a `test_live` owner never closes. This is the state a
+    /// real abandoned component reaches when its asker's lineage died before
+    /// the bundle completed.
+    #[cfg(test)]
+    pub(crate) fn test_dead_lineage(slot: SlotRef) -> Self {
+        Self {
+            owned: OwnedSlot {
+                slot,
+                state: OwnedSlotState::Released,
+                _thread_bound: core::marker::PhantomData,
+            },
+        }
+    }
+
     /// Reserve a vacant target for a receive post. Kept inside the runtime:
     /// only the generic service machines may turn a bare reservation into
     /// delivered authority.

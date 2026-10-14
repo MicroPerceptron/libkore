@@ -426,14 +426,14 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
     DESKTOP_BOOTSTRAP_WINDOW_SLOTS + 2 * DESKTOP_CONTROLLER_CAPACITY;
 
 /// Live immutable image-generation peers the boot catalogue can hold at once:
-/// the 34-row bootstrap catalogue — the desktop's `editor` and `power-ui`
-/// beside the two native filesystem verbs `append` and `sync`, and
-/// `wasm-witness` — plus the shell, the graphical terminal, and three
-/// extraction parsers.  Named
+/// the 35-row bootstrap catalogue — the desktop's `editor` and `power-ui`
+/// beside the two native filesystem verbs `append` and `sync`, and the two
+/// WebAssembly rows, `wasm-witness` and `wasm` — plus the shell, the
+/// graphical terminal, and three extraction parsers.  Named
 /// separately from the interactive reservation below because the two grow for
 /// unrelated reasons: this one when a row joins the catalogue, that one when
 /// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 39;
+pub const BOOTSTRAP_IMAGE_PEERS: usize = 40;
 
 /// Bootstrap face-supply sizing. Image and runtime grow their face tables and
 /// rings on demand; this reserves enough initial memory for the boot catalogue
