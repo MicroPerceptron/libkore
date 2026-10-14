@@ -523,3 +523,86 @@ pub(crate) async fn preopen(host: &FsHost) -> Result<(Shared, Rights), Refusal> 
     .await
     .unwrap_or(Err(Refusal::Pair))
 }
+
+#[cfg(test)]
+mod tests {
+    use core::pin::pin;
+    use core::task::Waker;
+
+    use super::*;
+
+    /// A host with no face. The ops below run no verb; a `Custody` over an
+    /// absent face would refuse one as a lost pair.
+    fn faceless() -> FsHost {
+        FsHost {
+            cell: Rc::new(FsCell {
+                fs: Cell::new(None),
+                lost: Cell::new(false),
+                orphans: RefCell::new(Vec::new()),
+            }),
+            slot: RefCell::new(None),
+            chunk: 0,
+            grants: Cell::new(false),
+            preopens: RefCell::new(None),
+        }
+    }
+
+    /// Pending once, then ready: an op parked on its reply, as every op
+    /// with a request in flight is on Kore.
+    async fn park_once() {
+        let mut parked = false;
+        poll_fn(|cx| {
+            if parked {
+                Poll::Ready(())
+            } else {
+                parked = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+
+    /// An op that finishes on a later turn than the one that installed it,
+    /// and queues no view to close, is answered with its result. The driver
+    /// once answered `None` there, which the preopens read as a lost pair:
+    /// every guest on Kore was given no preopens.
+    #[test]
+    fn an_op_that_parks_hands_back_its_result() {
+        let host = faceless();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut call = pin!(host.exec(async |_: &mut Custody| {
+            park_once().await;
+            7_u32
+        }));
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Some(7)));
+        assert!(host.slot.borrow().is_none());
+    }
+
+    /// A caller dropped after installing its op leaves the op to finish on
+    /// the next caller's turn, before that caller's own op is installed; the
+    /// next caller is still answered with its own result.
+    #[test]
+    fn a_dropped_callers_op_finishes_first_and_the_next_gets_its_own() {
+        let host = faceless();
+        let mut cx = Context::from_waker(Waker::noop());
+        let finished = Rc::new(Cell::new(false));
+        {
+            let finished = finished.clone();
+            let mut first = pin!(host.exec(async move |_: &mut Custody| {
+                park_once().await;
+                finished.set(true);
+            }));
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(!finished.get());
+        let mut second = pin!(host.exec(async |_: &mut Custody| {
+            park_once().await;
+            11_u32
+        }));
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        assert!(finished.get());
+        assert_eq!(second.as_mut().poll(&mut cx), Poll::Ready(Some(11)));
+    }
+}
