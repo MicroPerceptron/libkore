@@ -149,6 +149,10 @@ pub enum KoreProviderError {
     ReadOnly = 13,
     Backpressure = 14,
     Timeout = 15,
+    /// A DMA window an earlier client lent has not retired from the device and
+    /// the requester-wide retirement failed: no new client window until a retry
+    /// succeeds. Existing lanes keep serving.
+    Retiring = 16,
 }
 
 /// Scoped generational name. Copying its bits does not duplicate native ownership.
