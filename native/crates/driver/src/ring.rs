@@ -80,6 +80,14 @@ impl<E: SqEntry, B: Dma> SubRing<E, B> {
         }
     }
 
+    /// Start over at slot 0 with the producer cycle set — the state a device
+    /// expects after its queue is created again (an NVMe controller reset).
+    /// Entries past the tail are never read, so the slots stay as they are.
+    pub fn reset(&mut self) {
+        self.tail = 0;
+        self.cycle = true;
+    }
+
     /// Usable slots — `capacity` (Modulo) or `capacity - 1` (LinkTrb, the
     /// last slot is the Link entry).
     pub fn usable(&self) -> u16 {
@@ -207,9 +215,29 @@ impl<E: CqEntry, B: Dma> CompRing<E, B> {
         }
     }
 
+    /// Start over at slot 0 expecting phase `true`, with every slot zeroed —
+    /// the state a device expects after its queue is created again. The
+    /// zeroing matters: a slot left from before would carry a validity bit
+    /// that reads as a fresh completion on the next pass.
+    pub fn reset(&mut self) {
+        let bytes = self.capacity as usize * size_of::<E>();
+        // SAFETY: `buf` is this ring's own device-visible buffer of at least
+        // `capacity` entries; the device writes it only while its queue
+        // exists, and the caller resets only once the controller dropped it.
+        unsafe { core::ptr::write_bytes(self.buf.cpu(), 0, bytes.min(self.buf.len())) };
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        self.head = 0;
+        self.phase = true;
+    }
+
     /// The consumer dequeue index.
     pub fn head(&self) -> u16 {
         self.head
+    }
+
+    /// Slots in the ring.
+    pub fn capacity(&self) -> u16 {
+        self.capacity
     }
 
     /// The expected validity phase for the head slot.

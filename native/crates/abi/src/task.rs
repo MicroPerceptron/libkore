@@ -373,6 +373,26 @@ pub mod role {
     /// MM's per-client outstanding-supply policy, in bytes: indices 0 and 1
     /// carry the low and high u32 words. Boot data only; grants no authority.
     pub const SUPPLY_QUOTA: u16 = 43;
+    /// Read-only model-data lease, delivered by exec for PROFILE_MODEL_DATA.
+    /// Index 0 is the lease; data indices 1 and 2 carry the exact byte length
+    /// (low/high u32). The receiver maps it; page padding is not model data.
+    /// Optional data indices 3..=7 report disk-load phase durations in ms:
+    /// setup, source validation, allocation/mapping, read/verify/copy, cleanup.
+    /// u32::MAX means unavailable. These values confer no authority.
+    pub const MODEL_DATA: u16 = 44;
+    /// A filesystem launch's storage-ring window (`res/STORAGE_TRANSPORT.md`
+    /// §4): a `MemLease` of exactly `kore_ring::stor::WINDOW_BYTES`, funded by
+    /// exec from its own mm face and moved in whole at founding, so the child
+    /// attaches a ring without an mm face. Exec-synthesized: a caller row
+    /// naming it is refused.
+    pub const STOR_RING: u16 = 45;
+    /// A filesystem launch's ring read target: a fresh `MemLease` exec funds
+    /// beside [`STOR_RING`] and moves in whole. Nothing maps it before the
+    /// child registers it on the fabric, which a device route requires — a
+    /// range of the launcher's own arena could not be one, since the
+    /// launcher keeps that arena mapped. Exec-synthesized, like
+    /// [`STOR_RING`].
+    pub const STOR_TARGET: u16 = 46;
     /// First caller-assigned role — roles `>=` this are convention-defined.
     pub const USER_BASE: u16 = 0x8000;
 }
@@ -426,14 +446,17 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
     DESKTOP_BOOTSTRAP_WINDOW_SLOTS + 2 * DESKTOP_CONTROLLER_CAPACITY;
 
 /// Live immutable image-generation peers the boot catalogue can hold at once:
-/// the 35-row bootstrap catalogue — the desktop's `editor` and `power-ui`
-/// beside the two native filesystem verbs `append` and `sync`, and the two
-/// WebAssembly rows, `wasm-witness` and `wasm` — plus the shell, the
-/// graphical terminal, and three extraction parsers.  Named
+/// the 40-row bootstrap catalogue — the desktop's `editor` and `power-ui`
+/// beside the native filesystem verbs `append`, `sync` and `pack`, the two
+/// WebAssembly rows, `wasm-witness` and `wasm`, `inference` /
+/// `model-data-witness`, and `shell`, the guest shell `term` opens — plus the
+/// founded shell, the graphical terminal, and three extraction parsers.
+/// Exec asserts this covers its catalogue (`kore-svc-exec`), the one place
+/// that sees both.  Named
 /// separately from the interactive reservation below because the two grow for
 /// unrelated reasons: this one when a row joins the catalogue, that one when
 /// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 40;
+pub const BOOTSTRAP_IMAGE_PEERS: usize = 45;
 
 /// Bootstrap face-supply sizing. Image and runtime grow their face tables and
 /// rings on demand; this reserves enough initial memory for the boot catalogue

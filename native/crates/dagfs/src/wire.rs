@@ -571,6 +571,34 @@ pub fn encode_req(req: &FsRequest) -> FsReqWire {
         FsRequest::ClosePeer => {
             w.op = FsReqWire::OP_CLOSE_PEER;
         }
+        FsRequest::StorAttach { announced } => {
+            w.op = FsReqWire::OP_STOR_ATTACH;
+            w.window_offset = U32::new(announced.index());
+        }
+        FsRequest::StorGrantPack => {
+            w.op = FsReqWire::OP_STOR_GRANT_PACK;
+        }
+        FsRequest::StorTarget { announced } => {
+            w.op = FsReqWire::OP_STOR_TARGET;
+            w.window_offset = U32::new(announced.index());
+        }
+        FsRequest::StorRelease { slot } => {
+            w.op = FsReqWire::OP_STOR_RELEASE;
+            w.handle = U64::new(u64::from(slot));
+        }
+        FsRequest::StorKick => {
+            w.op = FsReqWire::OP_STOR_KICK;
+        }
+        FsRequest::StorDetach => {
+            w.op = FsReqWire::OP_STOR_DETACH;
+        }
+        FsRequest::StorGrantVersion { lease } => {
+            w.op = FsReqWire::OP_STOR_GRANT_VERSION;
+            w.handle = U64::new(lease.to_bits());
+        }
+        FsRequest::StorInspect => {
+            w.op = FsReqWire::OP_STOR_INSPECT;
+        }
     }
     w
 }
@@ -626,10 +654,11 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
     };
 
     // Likewise `kind` (Create/AdmitPeer/Search and the two boolean controls,
-    // whose whole payload rides there) and `session` (Grant only). A verb missing
-    // from this list cannot carry `kind` at all: its own arm never runs, the
-    // record decodes to nothing, and the serve loop drops it without a reply
-    // — which the caller cannot distinguish from a service that hangs.
+    // whose payload rides there) and `session` (Grant
+    // only). A verb missing from this list cannot carry `kind` at all: its own
+    // arm never runs, the record decodes to nothing, and the serve loop drops
+    // it without a reply — which the caller cannot distinguish from a service
+    // that hangs.
     if !matches!(
         w.op,
         FsReqWire::OP_CREATE
@@ -959,6 +988,47 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
             }
             FsRequest::TakeAdmission
         }
+        FsReqWire::OP_STOR_ATTACH | FsReqWire::OP_STOR_TARGET => {
+            if !control_payload_is_empty(w) {
+                return None;
+            }
+            let announced = SlotRef::from_wire(w.window_offset.get());
+            if w.op == FsReqWire::OP_STOR_ATTACH {
+                FsRequest::StorAttach { announced }
+            } else {
+                FsRequest::StorTarget { announced }
+            }
+        }
+        FsReqWire::OP_STOR_GRANT_PACK
+        | FsReqWire::OP_STOR_KICK
+        | FsReqWire::OP_STOR_DETACH
+        | FsReqWire::OP_STOR_INSPECT => {
+            if w.window_offset.get() != 0 || !control_payload_is_empty(w) {
+                return None;
+            }
+            match w.op {
+                FsReqWire::OP_STOR_GRANT_PACK => FsRequest::StorGrantPack,
+                FsReqWire::OP_STOR_KICK => FsRequest::StorKick,
+                FsReqWire::OP_STOR_INSPECT => FsRequest::StorInspect,
+                _ => FsRequest::StorDetach,
+            }
+        }
+        FsReqWire::OP_STOR_GRANT_VERSION => {
+            if w.window_offset.get() != 0 || !control_payload_except_handle_is_empty(w) {
+                return None;
+            }
+            FsRequest::StorGrantVersion {
+                lease: crate::VersionLease::from_bits(w.handle.get()),
+            }
+        }
+        FsReqWire::OP_STOR_RELEASE => {
+            if w.window_offset.get() != 0 || !control_payload_except_handle_is_empty(w) {
+                return None;
+            }
+            FsRequest::StorRelease {
+                slot: u16::try_from(w.handle.get()).ok()?,
+            }
+        }
         FsReqWire::OP_RETIRE_PEER | FsReqWire::OP_CONFIRM_RETIRED => {
             if w.kind != 0
                 || w.window_offset.get() != 0
@@ -1027,13 +1097,70 @@ fn status_of(err: FsError) -> u8 {
     }
 }
 
-/// The refusal for a wire status.
+/// A provider failure's cause, as the refusal's `kind` byte carries it.
+/// Frozen: append, never renumber. Zero is no cause, from an encoder that
+/// predates the byte, and decodes as [`ProviderError::Media`].
+fn provider_code(error: ProviderError) -> u8 {
+    match error {
+        ProviderError::Exhausted => 1,
+        ProviderError::PlacementsFull => 2,
+        ProviderError::UnknownKey => 3,
+        ProviderError::Range => 4,
+        ProviderError::TooLarge => 5,
+        ProviderError::Media => 6,
+        ProviderError::Transport => 7,
+        ProviderError::Integrity => 8,
+        ProviderError::Cancelled => 9,
+        ProviderError::Revoked => 10,
+        ProviderError::Lost => 11,
+        ProviderError::Draining => 12,
+        ProviderError::ReadOnly => 13,
+        ProviderError::Backpressure => 14,
+        ProviderError::Timeout => 15,
+        ProviderError::Retiring => 16,
+    }
+}
+
+/// [`provider_code`]'s inverse; `None` for a byte no encoder writes.
+fn provider_of(code: u8) -> Option<ProviderError> {
+    Some(match code {
+        0 | 6 => ProviderError::Media,
+        1 => ProviderError::Exhausted,
+        2 => ProviderError::PlacementsFull,
+        3 => ProviderError::UnknownKey,
+        4 => ProviderError::Range,
+        5 => ProviderError::TooLarge,
+        7 => ProviderError::Transport,
+        8 => ProviderError::Integrity,
+        9 => ProviderError::Cancelled,
+        10 => ProviderError::Revoked,
+        11 => ProviderError::Lost,
+        12 => ProviderError::Draining,
+        13 => ProviderError::ReadOnly,
+        14 => ProviderError::Backpressure,
+        15 => ProviderError::Timeout,
+        16 => ProviderError::Retiring,
+        _ => return None,
+    })
+}
+
+/// The refusal for a wire status and its `kind` byte.
 ///
-/// `PROVIDER_FAILURE` lands on [`ProviderError::Media`]: the provider's own
-/// distinction between medium, range, and unknown-key does not survive the
-/// boundary, and inventing one back would be a lie. What the client needs to
-/// know — the provider failed and the request had no visible effect — does
-/// survive.
+/// Only `PROVIDER_FAILURE` carries a `kind`: its cause ([`provider_code`]),
+/// so a client sees backpressure or a pending retirement as what it is, not
+/// as a failed medium. Every other refusal's `kind` is zero.
+fn refusal_of(status: u8, kind: u8) -> Option<FsError> {
+    if status == FsRepWire::STATUS_PROVIDER_FAILURE {
+        return provider_of(kind).map(FsError::ProviderFailure);
+    }
+    if kind != 0 {
+        return None;
+    }
+    error_of(status)
+}
+
+/// The refusal for a wire status. `PROVIDER_FAILURE` alone lands on
+/// [`ProviderError::Media`]; [`refusal_of`] reads its cause.
 fn error_of(status: u8) -> Option<FsError> {
     Some(match status {
         FsRepWire::STATUS_NOT_FOUND => FsError::NotFound,
@@ -1211,8 +1338,60 @@ pub fn encode_rep(rep: &FsResponse, grants: u8) -> FsRepWire {
             w.status = FsRepWire::STATUS_OK;
             w.handle = U64::new(u64::from(peer.arrival()));
         }
+        FsResponse::StorAttached {
+            block_size,
+            max_transfer,
+        } => {
+            w.status = FsRepWire::STATUS_OK;
+            w.count = U32::new(block_size);
+            w.cursor = U32::new(max_transfer);
+        }
+        FsResponse::StorGranted { grant, bytes } => {
+            w.status = FsRepWire::STATUS_OK;
+            w.handle = U64::new(u64::from(grant));
+            w.len = U64::new(bytes);
+        }
+        FsResponse::StorTargetAdopted { slot, bytes } => {
+            w.status = FsRepWire::STATUS_OK;
+            w.handle = U64::new(u64::from(slot));
+            w.len = U64::new(bytes);
+        }
+        FsResponse::StorInspected {
+            submissions,
+            completions,
+            in_flight,
+            expired,
+            stale,
+            timeline_refusals,
+            stage_refusals,
+            last_stage_error,
+            aborts,
+            aborts_refused,
+            weighted,
+            rings,
+        } => {
+            w.status = FsRepWire::STATUS_OK;
+            // `reserved1`: stage refusals, the last stage error, and aborts in
+            // the top 24 bits. `kind`: weighted round robin, rings, and the
+            // refused aborts — the only other bytes a non-object reply may
+            // carry.
+            w.reserved1 = U64::new(
+                u64::from(stage_refusals)
+                    | u64::from(last_stage_error) << 32
+                    | u64::from(aborts.min(0xFF_FFFF)) << 40,
+            );
+            w.kind = u8::from(weighted) | rings.min(7) << 1 | aborts_refused.min(15) << 4;
+            w.handle = U64::new(submissions);
+            w.len = U64::new(completions);
+            w.count = U32::new(in_flight);
+            w.cursor = U32::new(expired);
+            w.revision = U64::new(u64::from(stale) | u64::from(timeline_refusals) << 32);
+        }
         FsResponse::Refused(err) => {
             w.status = status_of(err);
+            if let FsError::ProviderFailure(cause) = err {
+                w.kind = provider_code(cause);
+            }
         }
     }
     w
@@ -1252,10 +1431,10 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         return None;
     }
     if w.status != FsRepWire::STATUS_OK {
-        // A refusal carries a status and nothing else; a refusal with payload
-        // is a reply this service did not write.
-        if w.kind != 0
-            || w.flags != 0
+        // A refusal carries a status, a provider failure its cause in `kind`,
+        // and nothing else; a refusal with payload is a reply this service
+        // did not write.
+        if w.flags != 0
             || w.count.get() != 0
             || w.handle.get() != 0
             || w.len.get() != 0
@@ -1265,7 +1444,7 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         {
             return None;
         }
-        return Some((FsResponse::Refused(error_of(w.status)?), 0));
+        return Some((FsResponse::Refused(refusal_of(w.status, w.kind)?), 0));
     }
 
     // Only a listing may set flags, and `FLAG_MORE` is the only defined bit.
@@ -1387,6 +1566,32 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         FsRequest::AttachWindow { .. } => FsResponse::WindowAttached {
             max_transfer: w.count.get(),
         },
+        FsRequest::StorAttach { .. } => FsResponse::StorAttached {
+            block_size: w.count.get(),
+            max_transfer: w.cursor.get(),
+        },
+        FsRequest::StorGrantPack | FsRequest::StorGrantVersion { .. } => FsResponse::StorGranted {
+            grant: u32::try_from(w.handle.get()).ok()?,
+            bytes: w.len.get(),
+        },
+        FsRequest::StorTarget { .. } => FsResponse::StorTargetAdopted {
+            slot: u16::try_from(w.handle.get()).ok()?,
+            bytes: w.len.get(),
+        },
+        FsRequest::StorInspect => FsResponse::StorInspected {
+            submissions: w.handle.get(),
+            completions: w.len.get(),
+            in_flight: w.count.get(),
+            expired: w.cursor.get(),
+            stale: w.revision.get() as u32,
+            timeline_refusals: (w.revision.get() >> 32) as u32,
+            stage_refusals: w.reserved1.get() as u32,
+            last_stage_error: (w.reserved1.get() >> 32) as u8,
+            aborts: (w.reserved1.get() >> 40) as u32,
+            aborts_refused: w.kind >> 4,
+            weighted: w.kind & 1 != 0,
+            rings: (w.kind >> 1) & 7,
+        },
         FsRequest::RegisterSystemView { .. }
         | FsRequest::RegisterPrivateView { .. }
         | FsRequest::ApplyView { .. }
@@ -1408,6 +1613,9 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         | FsRequest::AdmitPeer { .. }
         | FsRequest::RetirePeer { .. }
         | FsRequest::ConfirmRetired { .. }
+        | FsRequest::StorRelease { .. }
+        | FsRequest::StorKick
+        | FsRequest::StorDetach
         | FsRequest::ClosePeer => FsResponse::Done,
     };
     if !matches!(
@@ -1418,6 +1626,7 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
             | FsRequest::Create { .. }
             | FsRequest::Stat { .. }
             | FsRequest::Search { .. }
+            | FsRequest::StorInspect
     ) && w.reserved1.get() != 0
     {
         return None;
@@ -1441,8 +1650,7 @@ pub fn decode_rep_unambiguous(w: &FsRepWire) -> Option<(FsResponse, u8)> {
         return None;
     }
     if w.status != FsRepWire::STATUS_OK {
-        if w.kind != 0
-            || w.flags != 0
+        if w.flags != 0
             || w.count.get() != 0
             || w.handle.get() != 0
             || w.len.get() != 0
@@ -1451,7 +1659,7 @@ pub fn decode_rep_unambiguous(w: &FsRepWire) -> Option<(FsResponse, u8)> {
         {
             return None;
         }
-        return Some((FsResponse::Refused(error_of(w.status)?), 0));
+        return Some((FsResponse::Refused(refusal_of(w.status, w.kind)?), 0));
     }
     // A payload-free success is `Done` and can be nothing else.
     if w.kind == 0
@@ -1513,6 +1721,12 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
         FsRequest::Search { .. } => matches!(response, FsResponse::Searched { .. }),
         FsRequest::TakeAdmission => matches!(response, FsResponse::PeerAdmitted { .. }),
         FsRequest::AttachWindow { .. } => matches!(response, FsResponse::WindowAttached { .. }),
+        FsRequest::StorAttach { .. } => matches!(response, FsResponse::StorAttached { .. }),
+        FsRequest::StorGrantPack | FsRequest::StorGrantVersion { .. } => {
+            matches!(response, FsResponse::StorGranted { .. })
+        }
+        FsRequest::StorTarget { .. } => matches!(response, FsResponse::StorTargetAdopted { .. }),
+        FsRequest::StorInspect => matches!(response, FsResponse::StorInspected { .. }),
         FsRequest::RegisterSystemView { .. }
         | FsRequest::RegisterPrivateView { .. }
         | FsRequest::ApplyView { .. }
@@ -1534,6 +1748,9 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
         | FsRequest::AdmitPeer { .. }
         | FsRequest::RetirePeer { .. }
         | FsRequest::ConfirmRetired { .. }
+        | FsRequest::StorRelease { .. }
+        | FsRequest::StorKick
+        | FsRequest::StorDetach
         | FsRequest::ClosePeer => matches!(response, FsResponse::Done),
     }
 }
@@ -1543,16 +1760,112 @@ mod tests {
     use super::*;
     use zerocopy::IntoBytes as _;
 
-    /// The control verbs that carry no object must survive the round trip.
-    ///
-    /// `DeferCommits` is the reason this module exists: the service's own
-    /// tests call `dispatch` with an `FsRequest` value and never cross the
-    /// codec, so a request that encodes but does not decode passes every
-    /// host test and then hangs the caller on the metal — the serve loop
-    /// drops an unparseable record without replying, which the client
-    /// cannot tell from a service that simply never answers.
-    /// `Create` is the one request whose reserved byte carries data, and
-    /// only there: every other verb still refuses a non-zero byte.
+    // The control verbs that carry no object must survive the round trip.
+    //
+    // `DeferCommits` is the reason this module exists: the service's own
+    // tests call `dispatch` with an `FsRequest` value and never cross the
+    // codec, so a request that encodes but does not decode passes every
+    // host test and then hangs the caller on the metal — the serve loop
+    // drops an unparseable record without replying, which the client
+    // cannot tell from a service that simply never answers.
+    // `Create` is the one request whose reserved byte carries data, and
+    // only there: every other verb still refuses a non-zero byte.
+
+    /// The ring verbs carry control only: each round-trips, and a stray
+    /// operand — a handle on a kick, a slot past `u16` — is refused.
+    #[test]
+    fn stor_verbs_round_trip_and_refuse_stray_operands() {
+        let cases = [
+            (
+                FsRequest::StorAttach {
+                    announced: SlotRef::from_wire(5),
+                },
+                FsResponse::StorAttached {
+                    block_size: 512,
+                    max_transfer: 256 << 10,
+                },
+            ),
+            (
+                FsRequest::StorGrantPack,
+                FsResponse::StorGranted {
+                    grant: 0x0003_0000,
+                    bytes: 24 << 30,
+                },
+            ),
+            (
+                FsRequest::StorTarget {
+                    announced: SlotRef::from_wire(6),
+                },
+                FsResponse::StorTargetAdopted {
+                    slot: 17,
+                    bytes: 1 << 30,
+                },
+            ),
+            (FsRequest::StorRelease { slot: 17 }, FsResponse::Done),
+            (FsRequest::StorKick, FsResponse::Done),
+            (
+                FsRequest::StorGrantVersion {
+                    lease: crate::VersionLease::from_bits(1 << 63 | 9),
+                },
+                FsResponse::StorGranted {
+                    grant: 0x0001_0001,
+                    bytes: 3 << 20,
+                },
+            ),
+            (FsRequest::StorDetach, FsResponse::Done),
+            (
+                FsRequest::StorInspect,
+                FsResponse::StorInspected {
+                    submissions: 1 << 40,
+                    completions: (1 << 40) - 3,
+                    in_flight: 3,
+                    expired: 1,
+                    stale: 2,
+                    timeline_refusals: 0,
+                    stage_refusals: 70_000,
+                    last_stage_error: 6,
+                    aborts: 0xAB_CDEF,
+                    aborts_refused: 15,
+                    weighted: true,
+                    rings: 6,
+                },
+            ),
+        ];
+        for (req, reply) in cases {
+            let wire = encode_req(&req);
+            assert_eq!(decode_req(&wire), Some(req));
+            assert!(reply_matches(&req, &reply));
+            assert_eq!(
+                decode_rep_for(&req, &encode_rep(&reply, 0)),
+                Some((reply, 0))
+            );
+            assert!(!reply_matches(&req, &FsResponse::Transferred { count: 1 }));
+        }
+        let mut stray = encode_req(&FsRequest::StorKick);
+        stray.handle = U64::new(1);
+        assert_eq!(decode_req(&stray), None);
+        let mut stray = encode_req(&FsRequest::StorRelease { slot: 1 });
+        stray.handle = U64::new(1 << 16);
+        assert_eq!(decode_req(&stray), None);
+        let mut stray = encode_req(&FsRequest::StorGrantPack);
+        stray.window_offset = U32::new(1);
+        assert_eq!(decode_req(&stray), None);
+        let mut wide = encode_rep(&FsResponse::StorGranted { grant: 1, bytes: 1 }, 0);
+        wide.handle = U64::new(1 << 32);
+        assert_eq!(decode_rep_for(&FsRequest::StorGrantPack, &wide), None);
+    }
+
+    /// The pack lane's retired op codes decode to nothing: a peer still
+    /// speaking them is refused, never served.
+    #[test]
+    fn retired_pack_ops_are_refused() {
+        for op in FsReqWire::OP_PACK_INFO..=FsReqWire::OP_PACK_KICK {
+            let mut wire = encode_req(&FsRequest::StorKick);
+            wire.op = op;
+            assert_eq!(decode_req(&wire), None, "op {op}");
+        }
+    }
+
     #[test]
     fn atomic_replacement_wire_round_trips() {
         let handle = Handle::from_bits(0x1234);
@@ -1795,15 +2108,88 @@ mod tests {
             );
         }
 
-        // The one deliberately lossy mapping, asserted rather than assumed:
-        // the provider's own cause does not cross the boundary, and inventing
-        // one back would be a lie (see `error_of`).
+        // The status alone cannot name a provider's cause; `kind` does
+        // (`provider_failures_keep_their_cause_across_the_wire`).
         let status = status_of(FsError::ProviderFailure(ProviderError::Transport));
         assert_eq!(status, FsRepWire::STATUS_PROVIDER_FAILURE);
         assert_eq!(
             error_of(status),
             Some(FsError::ProviderFailure(ProviderError::Media))
         );
+    }
+
+    /// Every provider failure reaches the client with its cause, so
+    /// backpressure or a pending retirement no longer reads as a failed
+    /// medium (`res/LIFECYCLE_HARDENING.md` §1). The match is exhaustive: a
+    /// new cause stops compiling until it is named here and given a code.
+    #[test]
+    fn provider_failures_keep_their_cause_across_the_wire() {
+        let witness = |cause: ProviderError| match cause {
+            ProviderError::Exhausted
+            | ProviderError::PlacementsFull
+            | ProviderError::UnknownKey
+            | ProviderError::Range
+            | ProviderError::TooLarge
+            | ProviderError::Media
+            | ProviderError::Transport
+            | ProviderError::Integrity
+            | ProviderError::Cancelled
+            | ProviderError::Revoked
+            | ProviderError::Lost
+            | ProviderError::Draining
+            | ProviderError::ReadOnly
+            | ProviderError::Backpressure
+            | ProviderError::Timeout
+            | ProviderError::Retiring => cause,
+        };
+        let target = FsRequest::StorTarget {
+            announced: SlotRef::from_wire(4),
+        };
+        let mut codes = [false; 256];
+        for cause in [
+            ProviderError::Exhausted,
+            ProviderError::PlacementsFull,
+            ProviderError::UnknownKey,
+            ProviderError::Range,
+            ProviderError::TooLarge,
+            ProviderError::Media,
+            ProviderError::Transport,
+            ProviderError::Integrity,
+            ProviderError::Cancelled,
+            ProviderError::Revoked,
+            ProviderError::Lost,
+            ProviderError::Draining,
+            ProviderError::ReadOnly,
+            ProviderError::Backpressure,
+            ProviderError::Timeout,
+            ProviderError::Retiring,
+        ] {
+            let refused = FsResponse::Refused(FsError::ProviderFailure(witness(cause)));
+            let wire = encode_rep(&refused, 0);
+            let code = usize::from(wire.kind);
+            assert!(code != 0 && !codes[code], "{cause:?} needs its own code");
+            codes[code] = true;
+            assert_eq!(decode_rep_for(&target, &wire), Some((refused, 0)));
+            assert_eq!(decode_rep_unambiguous(&wire), Some((refused, 0)));
+        }
+        // An encoder that predates the byte still decodes, as before.
+        let mut bare = encode_rep(&FsResponse::Refused(FsError::ProviderFailure(ProviderError::Lost)), 0);
+        bare.kind = 0;
+        assert_eq!(
+            decode_rep_for(&target, &bare),
+            Some((
+                FsResponse::Refused(FsError::ProviderFailure(ProviderError::Media)),
+                0
+            ))
+        );
+        // A cause no encoder writes, or a `kind` on any other refusal, is not
+        // a reply this service wrote.
+        bare.kind = 0xff;
+        assert_eq!(decode_rep_for(&target, &bare), None);
+        let mut other = encode_rep(&FsResponse::Refused(FsError::Busy), 0);
+        other.kind = 14;
+        assert_eq!(decode_rep_for(&target, &other), None);
+        assert_eq!(decode_rep_unambiguous(&other), None);
     }
 
     /// A full extent table must not reach a client as "the volume is full".

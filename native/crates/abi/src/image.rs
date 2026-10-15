@@ -161,6 +161,11 @@ pub const PROFILE_ACCELERATOR: u32 = 1 << 10;
 /// bit 12 so the two merge without renumbering.
 pub const PROFILE_GPU: u32 = 1 << 12;
 
+/// Launch with a read-only lease of the archive member `<image>.model`.
+/// Only exec resolves this member through its privileged image face; the child
+/// receives no archive export authority. Missing data refuses the launch.
+pub const PROFILE_MODEL_DATA: u32 = 1 << 13;
+
 pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_FILESYSTEM
     | PROFILE_FS_VIEW_BINDER
@@ -173,7 +178,8 @@ pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_NETWORK
     | PROFILE_ACCELERATOR
     | PROFILE_ENGINE
-    | PROFILE_GPU;
+    | PROFILE_GPU
+    | PROFILE_MODEL_DATA;
 
 /// Validate the profile vocabulary and its dependencies: both filesystem
 /// auxiliary endpoint kinds are meaningful only beside an actual FS face.

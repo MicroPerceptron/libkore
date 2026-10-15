@@ -49,7 +49,7 @@ mod serve;
 
 pub use client::{
     AffineBundleCallError, CallError, CallReply, ClientEndpoints, GrantPin, InvocationAuxiliary,
-    InvocationAuxiliaryCapability, MAX_INVOCATION_AUXILIARIES, RetainedReturnCallError,
+    InvocationAuxiliaryCapability, MAX_INVOCATION_AUXILIARIES, ReplyWaitStats, RetainedReturnCallError,
     ReturnCallError, ReturnCapability, ReturnDeriveError, ReturnDeriver, ReturnLeaseSource,
     StagedReturn, StagedReturnError, SvcClient,
 };
@@ -327,6 +327,8 @@ pub const ACCEL_CAPTURE_WORDS: u64 = (32 + 32 + 32 + 32 + 32) / 8;
 /// Overlap V1: five BLAKE3 identities followed by three rounds, each with
 /// pending/cancel/terminal flags, two event IDs and two canonical output hashes.
 pub const ACCEL_OVERLAP_WORDS: u64 = 20 + 3 * 11;
+/// DSpark Q/K/V V1: graph, artifact, prepared weight and two output digests.
+pub const ACCEL_DSPARK_QKV_WORDS: u64 = 5 * 4;
 pub const ACCEL_CAPTURE_MAX_WORDS: u64 = ACCEL_OVERLAP_WORDS;
 
 /// Versioned capture framing on the existing founded parent channel.
@@ -334,18 +336,21 @@ pub const ACCEL_CAPTURE_MAX_WORDS: u64 = ACCEL_OVERLAP_WORDS;
 pub enum AccelCaptureKind {
     Regions,
     Overlap,
+    DsparkQkv,
 }
 impl AccelCaptureKind {
     pub const fn words(self) -> u64 {
         match self {
             Self::Regions => ACCEL_CAPTURE_WORDS,
             Self::Overlap => ACCEL_OVERLAP_WORDS,
+            Self::DsparkQkv => ACCEL_DSPARK_QKV_WORDS,
         }
     }
     pub const fn prefix(self) -> &'static str {
         match self {
             Self::Regions => "ivpu-capture: V2",
             Self::Overlap => "ivpu-overlap: V1",
+            Self::DsparkQkv => "ivpu-dspark-qkv: V1",
         }
     }
     /// Upper 16 bits select framing; lower 48 preserve PCI vendor/device.
@@ -353,6 +358,7 @@ impl AccelCaptureKind {
         let tag = match self {
             Self::Regions => 0,
             Self::Overlap => 1,
+            Self::DsparkQkv => 2,
         };
         (tag << 48) | ((vendor as u64) << 32) | device as u64
     }
@@ -360,6 +366,7 @@ impl AccelCaptureKind {
         let kind = match payload >> 48 {
             0 => Self::Regions,
             1 => Self::Overlap,
+            2 => Self::DsparkQkv,
             _ => return None,
         };
         Some((kind, payload & 0x0000_ffff_ffff_ffff))
@@ -470,6 +477,11 @@ const _: () = {
     assert!(!kernel_reserved(COOKIE_ACCEL_CAPTURE_SKIPPED));
     assert!(!kernel_reserved(COOKIE_ACCEL_GRAPH_ADMITTED));
     assert!(!kernel_reserved(COOKIE_INIT_CONFIG_PLAN));
+    assert!(!kernel_reserved(COOKIE_EXEC_CLEANUP_A));
+    assert!(!kernel_reserved(COOKIE_EXEC_CLEANUP_B));
+    assert!(!kernel_reserved(COOKIE_EXEC_CLEANUP_C));
+    assert!(COOKIE_EXEC_CLEANUP_A != COOKIE_EXEC_CLEANUP_B);
+    assert!(COOKIE_EXEC_CLEANUP_B != COOKIE_EXEC_CLEANUP_C);
     assert!(!kernel_reserved(COOKIE_INIT_CONFIG_POSTED));
     assert!(!kernel_reserved(COOKIE_SHELL_CONFIG_POSTED));
     assert!(COOKIE_INIT_CONFIG_PLAN != COOKIE_INIT_CONFIG_POSTED);
@@ -689,12 +701,32 @@ pub const fn shell_terminal_failure_detail(rung: u64) -> Option<(u64, bool, u64)
 ///
 /// Layout within `payload >> 8`: bit 55 detail marker, bits 40..47 exec's
 /// stable `TaskRepWire::REFUSE_*` code, bits 32..39 init phase, and bits
-/// 0..31 the legacy rung. The remaining bits stay zero for future detail.
+/// 0..31 the legacy rung. Bits 48..54 carry a bounded `LedgerFull` origin;
+/// zero preserves the historical reply shape. Bit 55 remains the marker.
 pub const fn shell_exec_failure_rung(legacy: u64, phase: u8, refusal: u8) -> u64 {
     SHELL_FAILURE_DETAIL
         | ((refusal as u64) << 40)
         | ((phase as u64) << 32)
         | (legacy & SHELL_FAILURE_LEGACY_MASK)
+}
+
+/// Add the exec service's narrow refusal origin without changing the stable
+/// refusal code or the low legacy rung.
+pub const fn shell_exec_failure_rung_with_site(
+    legacy: u64,
+    phase: u8,
+    refusal: u8,
+    site: u8,
+) -> u64 {
+    shell_exec_failure_rung(legacy, phase, refusal) | (((site & 0x7f) as u64) << 48)
+}
+
+pub const fn shell_exec_failure_site(rung: u64) -> Option<u8> {
+    if rung & SHELL_FAILURE_DETAIL == 0 {
+        None
+    } else {
+        Some(((rung >> 48) & 0x7f) as u8)
+    }
 }
 
 /// Decode the structured exec-refusal extension, retaining a clean fallback
@@ -747,6 +779,7 @@ mod shell_failure_tests {
         SHELL_CONFIG_ERROR_TRANSPORT, SHELL_CONFIG_STAGE_EXACT_AFTER_TRANSFER,
         SHELL_FOUNDING_FAILED, TerminalRendererFailure, shell_config_failure_detail,
         shell_config_failure_rung, shell_exec_failure_detail, shell_exec_failure_rung,
+        shell_exec_failure_rung_with_site, shell_exec_failure_site,
         shell_terminal_failure_detail, shell_terminal_failure_rung,
     };
 
@@ -754,7 +787,12 @@ mod shell_failure_tests {
     fn structured_exec_failure_retains_legacy_phase_and_refusal() {
         let rung = shell_exec_failure_rung(577, 2, 17);
         assert_eq!(shell_exec_failure_detail(rung), Some((577, 2, 17)));
+        assert_eq!(shell_exec_failure_site(rung), Some(0));
+        let tagged = shell_exec_failure_rung_with_site(40_564, 5, 3, 2);
+        assert_eq!(shell_exec_failure_detail(tagged), Some((40_564, 5, 3)));
+        assert_eq!(shell_exec_failure_site(tagged), Some(2));
         assert_eq!(shell_exec_failure_detail(565), None);
+        assert_eq!(shell_exec_failure_site(565), None);
     }
 
     #[test]
@@ -913,6 +951,13 @@ pub const COOKIE_INIT_PHASE: u64 = 0x6B72_5F69_6E69_7450; // "kr_initP"
 /// kernel keeps the latest per kind and the terminal verdict names the row
 /// or the step, so a stall is one call rather than forty.
 pub const COOKIE_INIT_STEP: u64 = 0x6B72_5F69_6E69_7453; // "kr_initS"
+
+/// Three ordered, failure-only words of an exec cleanup-row snapshot. Init
+/// sends A, B, C on its retained founder channel; C completes one bounded
+/// serial record. This is testimony, never a launch or scheduling command.
+pub const COOKIE_EXEC_CLEANUP_A: u64 = 0x6B72_5F65_7843_6C41; // "kr_exClA"
+pub const COOKIE_EXEC_CLEANUP_B: u64 = 0x6B72_5F65_7843_6C42; // "kr_exClB"
+pub const COOKIE_EXEC_CLEANUP_C: u64 = 0x6B72_5F65_7843_6C43; // "kr_exClC"
 
 /// Completion cookie for the boot SPMD validate run (`"kr_spmdW"`),
 /// posted by INIT after the store seed: it launches `spmd-witness`
@@ -1113,7 +1158,11 @@ pub fn split_window<S: SvcProtocol>(
 #[cfg(test)]
 #[test]
 fn accelerator_capture_kind_preserves_identity_and_rejects_unknown_versions() {
-    for kind in [AccelCaptureKind::Regions, AccelCaptureKind::Overlap] {
+    for kind in [
+        AccelCaptureKind::Regions,
+        AccelCaptureKind::Overlap,
+        AccelCaptureKind::DsparkQkv,
+    ] {
         let payload = kind.begin(0x8086, 0x643e);
         assert_eq!(
             AccelCaptureKind::decode_begin(payload),
@@ -1125,6 +1174,6 @@ fn accelerator_capture_kind_preserves_identity_and_rejects_unknown_versions() {
         AccelCaptureKind::Regions.begin(0x8086, 0x643e),
         0x8086_0000_643e
     );
-    assert_eq!(AccelCaptureKind::decode_begin(2 << 48), None);
+    assert_eq!(AccelCaptureKind::decode_begin(3 << 48), None);
     assert_eq!(AccelCaptureKind::decode_begin(u64::MAX), None);
 }

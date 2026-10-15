@@ -34,7 +34,8 @@
 //! every member the intra-chunk kick MESH: the leader's
 //! [`wake_all`](crate::futex::wake_all) kicks a parked chunk sibling in
 //! ONE hop, and only a waiter the caller holds no send for (a
-//! cross-chunk member of a >MESH_CHUNK region) routes through the hub,
+//! cross-chunk member of a region wider than one founding session's
+//! [`MESH_CEILING`](crate::star::MESH_CEILING)) routes through the hub,
 //! leader → hub → member.  The two-hop relay was the original release
 //! path, and the metal terminal priced it: the hub is unpinned and parked,
 //! so a w≤4 release of a parked member averaged ~½·[`PARK_SLICE`] —

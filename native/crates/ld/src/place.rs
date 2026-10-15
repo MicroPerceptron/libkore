@@ -345,7 +345,12 @@ mod tests {
     /// this module's doc says that failure is silent rather than loud.
     #[test]
     fn shared_and_owned_placers_agree() {
-        let requests = [(0x1234, 0x1000), (0x1, 0x1_0000), (0x2000, 0x1000), (0x8, 0x8)];
+        let requests = [
+            (0x1234, 0x1000),
+            (0x1, 0x1_0000),
+            (0x2000, 0x1000),
+            (0x8, 0x8),
+        ];
         let mut owned = Placer::new(0x1000_0000, 0x10_0000);
         let shared = SharedPlacer::new(0x1000_0000, 0x10_0000);
         for (len, align) in requests {
@@ -396,11 +401,18 @@ mod tests {
         assert_eq!(spans.len(), THREADS * EACH);
         spans.sort_unstable();
         spans.dedup();
-        assert_eq!(spans.len(), THREADS * EACH, "an address was handed out twice");
+        assert_eq!(
+            spans.len(),
+            THREADS * EACH,
+            "an address was handed out twice"
+        );
         for pair in spans.windows(2) {
             assert!(pair[0] + LEN <= pair[1], "spans overlap");
         }
-        assert!(spans.iter().all(|at| at % LEN == 0), "a span was misaligned");
+        assert!(
+            spans.iter().all(|at| at % LEN == 0),
+            "a span was misaligned"
+        );
     }
     /// Fail-closed: a `static` placer refuses until its window is known,
     /// rather than answering an address in an unpublished window.

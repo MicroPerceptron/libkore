@@ -113,6 +113,45 @@ pub struct ClientEndpoints {
     pub grants: [Option<GrantPin>; MAX_GRANTS],
 }
 
+/// How this client's reply waits ended, counted since construction: where
+/// a slow call's time went. Counters only. A call whose blocking park
+/// ([`SvcClient::with_reply_wait`]) already waited counts as `ready`, since
+/// its reply is in the ring when it is collected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplyWaitStats {
+    /// The reply was in the ring at the first look.
+    pub ready: u64,
+    /// It arrived after a wake other than the re-kick deadline, normally
+    /// the service's reply kick.
+    pub woken: u64,
+    /// It was first seen only after a re-kick deadline passed: no wake
+    /// brought it, so the call paid at least one [`REPLY_REKICK_NS`].
+    pub ticked: u64,
+    /// Requests re-kicked on that cadence.
+    pub rekicks: u64,
+}
+
+impl ReplyWaitStats {
+    fn record(&mut self, waited: bool, ticked: bool) {
+        let count = match (waited, ticked) {
+            (false, _) => &mut self.ready,
+            (true, false) => &mut self.woken,
+            (true, true) => &mut self.ticked,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    /// The waits counted since `before`.
+    pub fn since(self, before: Self) -> Self {
+        Self {
+            ready: self.ready.saturating_sub(before.ready),
+            woken: self.woken.saturating_sub(before.woken),
+            ticked: self.ticked.saturating_sub(before.ticked),
+            rekicks: self.rekicks.saturating_sub(before.rekicks),
+        }
+    }
+}
+
 /// The re-kick interval inside a reply wait.
 ///
 /// Also the granularity of a bounded reply observation when the clock cannot
@@ -899,7 +938,7 @@ fn classify_request_park_commit(committed: Committed, deadline_armed: bool) -> R
     let raw_status = committed.raw() as u16;
     let status = committed.status();
     let failing = committed.failing_index();
-    if raw_status > Status::Unfounded as u16 || failing != 0 {
+    if raw_status > Status::FabricRouteCapability as u16 || failing != 0 {
         return RequestParkCommit::Terminal(CallError::Refused(Status::Malformed));
     }
     match status {
@@ -915,7 +954,13 @@ fn classify_request_park_commit(committed: Committed, deadline_armed: bool) -> R
         | Status::Irq
         | Status::Exited
         | Status::AltDelivery
-        | Status::Unfounded) => RequestParkCommit::Terminal(CallError::Refused(status)),
+        | Status::Unfounded
+        | Status::FabricRouteConflict
+        | Status::FabricRouteNoEdge
+        | Status::FabricRouteWrongAccess
+        | Status::FabricRouteInfeasible
+        | Status::FabricRouteCapacity
+        | Status::FabricRouteCapability) => RequestParkCommit::Terminal(CallError::Refused(status)),
     }
 }
 
@@ -947,7 +992,7 @@ fn classify_return_commit(
     } else {
         failing >= invocations
     };
-    if invocations == 0 || raw_status > Status::Unfounded as u16 || impossible_index {
+    if invocations == 0 || raw_status > Status::FabricRouteCapability as u16 || impossible_index {
         // Unknown status vocabulary, an empty transfer, or an impossible
         // invocation index cannot prove that the affine move did not run.
         return ReturnCommit::AfterTransfer(CallError::Refused(Status::Malformed));
@@ -978,7 +1023,13 @@ fn classify_return_commit(
         | Status::Irq
         | Status::Exited
         | Status::AltDelivery
-        | Status::Unfounded) => ReturnCommit::AfterTransfer(CallError::Refused(status)),
+        | Status::Unfounded
+        | Status::FabricRouteConflict
+        | Status::FabricRouteNoEdge
+        | Status::FabricRouteWrongAccess
+        | Status::FabricRouteInfeasible
+        | Status::FabricRouteCapacity
+        | Status::FabricRouteCapability) => ReturnCommit::AfterTransfer(CallError::Refused(status)),
     }
 }
 
@@ -1012,7 +1063,13 @@ fn classify_parked_return_commit(committed: Committed, invocations: usize) -> Re
         | Status::Irq
         | Status::Exited
         | Status::AltDelivery
-        | Status::Unfounded) => ReturnCommit::AfterTransfer(CallError::Refused(status)),
+        | Status::Unfounded
+        | Status::FabricRouteConflict
+        | Status::FabricRouteNoEdge
+        | Status::FabricRouteWrongAccess
+        | Status::FabricRouteInfeasible
+        | Status::FabricRouteCapacity
+        | Status::FabricRouteCapability) => ReturnCommit::AfterTransfer(CallError::Refused(status)),
     }
 }
 
@@ -1102,6 +1159,8 @@ pub struct SvcClient<'w, 't, T: Transport, S: SvcProtocol> {
     /// Such a caller has no executor wake registry and must observe the
     /// level-triggered reply/grant rings directly.
     direct_polling: bool,
+    /// How the reply waits ended ([`Self::reply_waits`]).
+    reply_waits: ReplyWaitStats,
     _p: PhantomData<S>,
 }
 
@@ -1174,8 +1233,19 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
             transport,
             reply_wait: None,
             direct_polling: false,
+            reply_waits: ReplyWaitStats {
+                ready: 0,
+                woken: 0,
+                ticked: 0,
+                rekicks: 0,
+            },
             _p: PhantomData,
         }
+    }
+
+    /// How this client's reply waits have ended so far.
+    pub fn reply_waits(&self) -> ReplyWaitStats {
+        self.reply_waits
     }
 
     /// The transport already borrowed by this client. Dynamically minted
@@ -1206,6 +1276,28 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         );
         self.direct_polling = true;
         self
+    }
+
+    /// Switch direct level-triggered polling on or off for a client that
+    /// the executor ordinarily drives but that must, for a bounded region,
+    /// be driven synchronously — a model's expert-cache read callback, say,
+    /// which runs inside a task's poll and completes its filesystem calls
+    /// under [`block_on`](crate::block::block_on).  The executor-clocked
+    /// reply wait would read a clock only the kore waker can answer; direct
+    /// polling re-reads the level-triggered ring instead.  Only lawful
+    /// while the pair is idle and no reply wait is installed, and the caller
+    /// restores the previous mode before the executor polls this client
+    /// again.
+    pub fn set_direct_polling(&mut self, direct: bool) {
+        debug_assert!(
+            self.reply_wait.is_none(),
+            "direct polling and a blocking reply wait are distinct owners"
+        );
+        debug_assert!(
+            self.is_idle(),
+            "the progress mode changes only between calls"
+        );
+        self.direct_polling = direct;
     }
 
     /// Fuse ordinary request notification with a park on the owning
@@ -1834,6 +1926,91 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
         auxiliaries: [Option<InvocationAuxiliary>; MAX_INVOCATION_AUXILIARIES],
         auxiliary_tx: [SlotRef; MAX_INVOCATION_AUXILIARIES],
     ) -> Result<CallReply<S::Response>, AffineBundleCallError<A, B, C>> {
+        self.call_with_invocation_bundle_budgeted(
+            req,
+            first,
+            first_rights,
+            executable,
+            second,
+            second_rights,
+            process_tx,
+            proof_tx,
+            third,
+            third_rights,
+            third_tx,
+            auxiliaries,
+            auxiliary_tx,
+            None,
+        )
+        .await
+    }
+
+    /// Observe an atomic invocation for one bounded slice. On timeout the
+    /// transferred bundle and exact request remain owned by this pair; the
+    /// caller must resume it, or quarantine the pair and its external backing.
+    pub async fn call_with_invocation_bundle_bounded<
+        A: ReturnCapability,
+        B: ReturnCapability,
+        C: ReturnCapability,
+    >(
+        &mut self,
+        req: &S::Request,
+        first: A,
+        first_rights: Rights,
+        executable: SlotRef,
+        second: B,
+        second_rights: Rights,
+        process_tx: SlotRef,
+        proof_tx: SlotRef,
+        third: C,
+        third_rights: Rights,
+        third_tx: SlotRef,
+        auxiliaries: [Option<InvocationAuxiliary>; MAX_INVOCATION_AUXILIARIES],
+        auxiliary_tx: [SlotRef; MAX_INVOCATION_AUXILIARIES],
+        budget_ns: u64,
+    ) -> Result<CallReply<S::Response>, AffineBundleCallError<A, B, C>> {
+        self.call_with_invocation_bundle_budgeted(
+            req,
+            first,
+            first_rights,
+            executable,
+            second,
+            second_rights,
+            process_tx,
+            proof_tx,
+            third,
+            third_rights,
+            third_tx,
+            auxiliaries,
+            auxiliary_tx,
+            Some(budget_ns),
+        )
+        .await
+    }
+
+    /// Shared invocation implementation for an optional audited observation
+    /// slice. A timed-out caller must retain the exact pair and backing.
+    pub async fn call_with_invocation_bundle_budgeted<
+        A: ReturnCapability,
+        B: ReturnCapability,
+        C: ReturnCapability,
+    >(
+        &mut self,
+        req: &S::Request,
+        first: A,
+        first_rights: Rights,
+        executable: SlotRef,
+        second: B,
+        second_rights: Rights,
+        process_tx: SlotRef,
+        proof_tx: SlotRef,
+        third: C,
+        third_rights: Rights,
+        third_tx: SlotRef,
+        auxiliaries: [Option<InvocationAuxiliary>; MAX_INVOCATION_AUXILIARIES],
+        auxiliary_tx: [SlotRef; MAX_INVOCATION_AUXILIARIES],
+        budget_ns: Option<u64>,
+    ) -> Result<CallReply<S::Response>, AffineBundleCallError<A, B, C>> {
         macro_rules! not_moved {
             ($error:expr) => {
                 AffineBundleCallError::NotMoved {
@@ -1848,6 +2025,9 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
 
         if let Err(error) = self.require_idle() {
             return Err(not_moved!(error));
+        }
+        if budget_ns.is_some() && self.is_direct_progress() {
+            return Err(not_moved!(CallError::Wiring));
         }
         // An absent or locally retired rendezvous destination is a
         // deterministic local refusal. Check every endpoint that this bundle
@@ -1954,6 +2134,11 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
             return Err(not_moved!(CallError::Refused(Status::Malformed)));
         }
 
+        // Begin before publishing, so the kick and every reply wait share
+        // the same observation deadline. The grant posts and transfer setup
+        // above cannot consume a published request.
+        let observation = ReplyObservation::begin(budget_ns).await;
+
         // Exclusive producer ownership plus the capacity preflight makes
         // this infallible. Crucially, every deterministic rights, liveness,
         // duplicate-source, and descriptor-shape check completed before this
@@ -1993,7 +2178,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                 self.kick_published_request()
                     .await
                     .map_err(AffineBundleCallError::AfterTransfer)?;
-                self.collect_reply(None)
+                self.collect_reply(observation)
                     .await
                     .map_err(AffineBundleCallError::AfterTransfer)
             }
@@ -2250,6 +2435,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                 // Preserve that immediately-ready shape for executor-free
                 // blocking adapters; only an empty ring may enter the
                 // executor-clocked re-kick loop below.
+                self.reply_waits.record(false, false);
                 wire
             } else {
                 // An explicit bounded observation prefers an absolute
@@ -2268,8 +2454,12 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                 let absolute_clock = crate::clock::uptime().is_ok();
                 let mut ticks: u64 = 0;
                 let mut rekick = ReplyRekickCadence::after(crate::executor::clock_ns().await);
+                // Whether this wait parked at all, and whether a re-kick
+                // deadline passed before the reply showed.
+                let (mut waited, mut ticked) = (false, false);
                 loop {
                     if let Some(wire) = self.rings.rep.pop() {
+                        self.reply_waits.record(waited, ticked);
                         break wire;
                     }
                     let executor_now_ns = crate::executor::clock_ns().await;
@@ -2281,7 +2471,12 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                     let wait_deadline = observation.map_or(rekick.deadline(), |slice| {
                         slice.next_deadline(rekick.deadline())
                     });
-                    crate::executor::next_wake_until(wait_deadline).await;
+                    let reason = crate::executor::next_wake_until(wait_deadline).await;
+                    waited = true;
+                    // A deadline wake is the one no delivery brought. Counting
+                    // every wait that outlasted the cadence instead filed slow
+                    // replies the service's kick did deliver under the re-kick.
+                    ticked |= reason == crate::executor::WakeReason::Deadline;
                     let executor_now_ns = crate::executor::clock_ns().await;
                     let elapsed_tick = rekick.due(executor_now_ns);
                     let expired = observation.is_some_and(|slice| slice.expired(executor_now_ns))
@@ -2298,6 +2493,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                         return Err(CallError::Timeout);
                     }
                     if reply_rekick_needed(elapsed_tick, absolute_clock) {
+                        self.reply_waits.rekicks = self.reply_waits.rekicks.saturating_add(1);
                         self.kick_published_request().await?;
                     }
                     if elapsed_tick {
@@ -2857,7 +3053,9 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
             };
             let committed =
                 commit(self.transport, &session, &spec).map_err(|_| CallError::Transport)?;
-            if committed.raw() as u16 > Status::Unfounded as u16 || committed.failing_index() != 0 {
+            if committed.raw() as u16 > Status::FabricRouteCapability as u16
+                || committed.failing_index() != 0
+            {
                 return Err(CallError::Refused(Status::Malformed));
             }
             match committed.status() {
@@ -2896,7 +3094,13 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                 | Status::Irq
                 | Status::Exited
                 | Status::AltDelivery
-                | Status::Unfounded) => return Err(CallError::Refused(status)),
+                | Status::Unfounded
+                | Status::FabricRouteConflict
+                | Status::FabricRouteNoEdge
+                | Status::FabricRouteWrongAccess
+                | Status::FabricRouteInfeasible
+                | Status::FabricRouteCapacity
+                | Status::FabricRouteCapability) => return Err(CallError::Refused(status)),
             }
         }
         Err(CallError::Backpressure)

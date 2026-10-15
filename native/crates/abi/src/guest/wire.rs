@@ -1,49 +1,15 @@
-//! Guest exit/control wire records — the **per-vCPU window vocabulary**
-//! (#487/#481), frozen here because kernel and hypervisor are two
-//! endpoints of one contract and can never drift on a layout.
-//!
-//! One page per vCPU carries **two SPSC rings** (`kore-ring`'s frozen
-//! `SPSC_ABI = 1` format, one ring per direction):
-//!
-//! ```text
-//! offset 0:                     exit ring    (kernel → hypervisor,
-//!                                             capacity 2, GuestExitRecord)
-//! offset EXIT_RING_BYTES:       control ring (hypervisor → kernel,
-//!                                             capacity 4, GuestCtrlRecord)
-//! ```
-//!
-//! The exit capacity is **2 by proof, not by tuning** (#487 §5): the
-//! producer is the vCPU run loop, which parks after every publish, so at
-//! most one ordinary exit plus one terminal record can ever be
-//! outstanding.  `Full` on the exit ring is therefore a protocol
-//! violation and the kernel's response is the fail-closed poisoned-window
-//! retire — never a drop, never a wait.  The control capacity (4) is the
-//! largest sane batch (`WriteState + Inject + Resume` and headroom); the
-//! run loop drains it to empty at its top-of-loop safe point, so `Full`
-//! there is ordinary backpressure on an awake producer.
-//!
-//! Records are **bytes and indices only** — no capability ever rides a
-//! ring (the standing doctrine).  Every field is any-bit-valid on read:
-//! the peer is untrusted, and a record must decode from arbitrary bytes
-//! (unknown kinds refuse at the consumer, they do not trap).
-//!
-//! The register image rides as a fixed `[u64; GUEST_STATE_QWORDS]` in
-//! the **executing architecture's own frozen wire order** — the kernel's
-//! per-arch `state_to_wire`/`state_from_wire` seam owns which physical
-//! register sits at which index, and is the only place those names may
-//! appear.  This object stays architecture-agnostic: the protocol cites
-//! registers exclusively through the semantic roles in [`state_index`],
-//! which every architecture's wire order is required to satisfy.  The
-//! array is the contract, never a field list.
-
+//! Architecture-neutral guest window records and frozen semantic roles.
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::cap::Rights;
 
 /// Quadwords in the guest register image — sized once, for every
-/// architecture, by the largest supported image; a smaller image
-/// zero-fills its tail.  Frozen with the record layout.
-pub const GUEST_STATE_QWORDS: usize = 18;
+/// architecture, by the largest image any of them publishes: AArch64's
+/// thirty-one general registers, two stack pointers, the program counter
+/// and PSTATE make thirty-five, so forty leaves headroom.  x86-64 fills
+/// eighteen and zero-fills the tail.  Frozen with the record layout: a
+/// smaller image never shrinks it, a larger one is a wire break.
+pub const GUEST_STATE_QWORDS: usize = 40;
 
 /// The **semantic roles** the guest protocol cites in the register
 /// image — the only register vocabulary this agnostic object carries.
@@ -66,10 +32,33 @@ pub mod state_index {
     };
 }
 
-/// Bytes of one record slot, both directions — frozen.  Exit + full
-/// register image + kind/sequence/instr_len fit with headroom; the pad
-/// is reserved-zero on write, ignored on read.
-pub const GUEST_RECORD_BYTES: usize = 256;
+/// Bytes of one record slot, both directions — frozen.  Kind, sequence,
+/// two payload words, the full register image and the decode-assist tail
+/// fit with headroom; the pad is reserved-zero on write, ignored on read.
+///
+/// **Why 512, and what would reopen it (#765).**  The slot was 256 bytes
+/// while the image was x86-64's eighteen quadwords (168 bytes used).  The
+/// image is now sized for the largest architecture any port will publish
+/// — AArch64's thirty-five ([`GUEST_STATE_QWORDS`]) — and the 24-byte
+/// head + 320-byte image + 32-byte assist tail does not fit 256, so the
+/// slot doubled: one wire break taken now, in place of one on the day an
+/// Arm arm lands.  The cost is paid per forwarded exit and per
+/// `WriteState`, about four more cache lines each way, invisible beside
+/// the world switch itself; both rings still fit the one-page window
+/// (3456 of 4096 bytes).  Weighed and declined: a role-indexed *partial*
+/// image (every consumer would then carry a per-arch register map, which
+/// is the leak this object exists to prevent) and a per-arch slot size
+/// (the window geometry would stop being one frozen vocabulary).  Revisit
+/// only against a measured exit-path cost on metal, and shrink the
+/// *return* copy first — a lighter "advance the instruction pointer by
+/// `n`" control kind ([`CTRL_KIND_WRITE_STATE`]'s note) spares most
+/// completions the full image write-back — before touching the slot.
+pub const GUEST_RECORD_BYTES: usize = 512;
+
+/// The longest instruction any supported ISA can trap on — x86's fifteen
+/// bytes; a fixed 4-byte Arm or RISC-V word fits with room.  Sizes the
+/// exit record's raw-bytes assist form.
+pub const GUEST_INSN_BYTES_MAX: usize = 15;
 
 /// Exit-ring capacity — **2 by the #487 §5 proof** (publish-then-park
 /// bounds ordinary exits to one; the terminal record is the only
@@ -116,11 +105,13 @@ pub const GUEST_VCPU_HANDLE_RIGHTS: Rights = Rights::ACCESS
 // at compile time below, the report-roster discipline.
 
 /// Guest touched an address the hypervisor models as a device.
-/// **Producer-less today, deliberately** (#481): neither vendor decoder
-/// can produce it — device-vs-RAM is knowledge only the hypervisor has
-/// (it chose the device windows), so the kernel forwards
-/// [`EXIT_KIND_STAGE_FAULT`] and the hypervisor classifies.  The number
-/// is reserved for a future decode-assist fast path.
+/// **Producer-less, deliberately — still, after #765** (#481): device-
+/// vs-RAM is knowledge only the hypervisor has (it chose the device
+/// windows), so the kernel forwards [`EXIT_KIND_STAGE_FAULT`] *with the
+/// decode-assist tail attached* and the hypervisor's device-window table
+/// classifies.  The number stays reserved for a kernel-classified fast
+/// path — a fault the kernel's own stage-2 ledger already places outside
+/// guest RAM — should one ever pay for itself.
 pub const EXIT_KIND_MMIO: u16 = 0x4701;
 /// A programmed-I/O access trapped (x86-64's port `in`/`out` family;
 /// an architecture without a port space never raises it): payload `a`
@@ -140,7 +131,9 @@ pub const EXIT_KIND_HLT: u16 = 0x4705;
 /// CPU's own walk of the guest's page tables (an accessed/dirty update
 /// against a read-only mapping reads as WRITE plus this bit), `4` a
 /// reserved bit refused the walk.  The one fault the kernel forwards
-/// (#481).
+/// (#481).  The record's decode-assist tail (module docs, [`assist`])
+/// carries what the hardware knew about the trapped instruction, so a
+/// device-window fault can be completed without a second exit.
 pub const EXIT_KIND_STAGE_FAULT: u16 = 0x4706;
 /// Arch-specific exit token the shared taxonomy does not name: `a` =
 /// the raw token, decoded by the owning backend's vocabulary.
@@ -181,6 +174,13 @@ const EXIT_KINDS: [u16; 9] = [
 // ── Control-record kinds (hypervisor → kernel) ──────────────────────────
 
 /// Install the carried register image before the next entry.
+///
+/// Every completion today ships the **full** image back through this
+/// record, even when only the instruction pointer and one datum register
+/// changed (an MMIO or port completion).  A lighter "advance by `n`"
+/// control kind is the obvious optimization once exit latency is measured
+/// on metal (the rationale under [`GUEST_RECORD_BYTES`]); it takes the
+/// next free `CTRL_KIND_*` number and never renumbers this one.
 pub const CTRL_KIND_WRITE_STATE: u16 = 0x4801;
 /// Queue an interrupt/exception: `a` packs vector/kind, `b` packs the
 /// optional error code (see [`GuestCtrlRecord`] docs).
@@ -230,6 +230,45 @@ const _: () = {
         i += 1;
     }
 };
+
+/// The **decode-assist form** an exit record's tail carries — the
+/// [`GuestExitRecord::assist`] discriminant.  Plain values, any-bit-valid
+/// on read: an unknown form is "no help" to the consumer, never a trap.
+///
+/// The three shapes mirror what hardware actually provides (module docs):
+/// nothing, the raw instruction bytes, or the access already decoded.  A
+/// producing architecture fills the richest form it has; a consumer lifts
+/// whichever arrives into one decoded access, running an ISA decoder only
+/// over [`INSN`](Self::INSN).
+pub mod assist {
+    /// No assist: `insn`, `insn_len`, `access` and `data` are zero and
+    /// meaningless.  The consumer may still refuse the fault fail-closed
+    /// or fetch and decode by other means.
+    pub const NONE: u8 = 0;
+    /// The trapped instruction's raw bytes are in `insn[..insn_len]`
+    /// (`1..=GUEST_INSN_BYTES_MAX`), fetched by the hardware (AMD decode
+    /// assists) or by the kernel through the guest's own page tables
+    /// (Intel).  `access` and `data` are zero.
+    pub const INSN: u8 = 1;
+    /// The access is already decoded in `access` (and `data`), by the
+    /// hardware's own syndrome (`ESR_EL2.ISS` on Arm, `htinst` on
+    /// RISC-V).  `insn` is zero.  **Reserved — no producer yet**: the
+    /// packing below is fixed now so the first architecture that
+    /// decodes in hardware fills a slot rather than reshaping the record.
+    ///
+    /// ```text
+    /// access[3:0]    width of the memory access in bytes: 1, 2, 4, 8
+    /// access[4]      1 = the guest wrote (data flows guest → device)
+    /// access[5]      1 = a read sign-extends into the register
+    /// access[15:8]   wire-image index of the datum register; 0xff = none
+    /// access[23:16]  bytes of the register a read overwrites: 8 = all,
+    ///                4 = the low dword with the upper cleared, 1 or 2 =
+    ///                merged into the low bytes; zero when `[15:8]` is 0xff
+    /// access[63:24]  reserved, zero
+    /// data           the value written when no register carries it
+    /// ```
+    pub const ACCESS: u8 = 2;
+}
 
 /// Why a guest retired — the [`EXIT_KIND_RETIRED`] record's `a` payload.
 /// A plain discriminant (any-bit-valid on read; unknown values are
@@ -346,10 +385,20 @@ pub mod refusal {
     pub const BAD_PAYLOAD: u64 = 4;
 }
 
+/// Bytes of an exit record ahead of its reserved pad: the 24-byte head,
+/// the register image, then the decode-assist tail (`insn` + `insn_len`
+/// = 16, `access` + `data` = 16).
+const GUEST_EXIT_RECORD_USED: usize = 24 + 8 * GUEST_STATE_QWORDS + 16 + 16;
+
+/// Bytes of a control record ahead of its reserved pad: the 24-byte head
+/// and the register image.
+const GUEST_CTRL_RECORD_USED: usize = 24 + 8 * GUEST_STATE_QWORDS;
+
 /// One **exit record** (kernel → hypervisor): the exit, the guest's full
-/// register image, and the producer's sequence — everything the
-/// hypervisor needs, shipped once, so the `read_state` round trip #484
-/// measured is dead.  Fixed 256-byte slot, `#[repr(C)]`, frozen.
+/// register image, the producer's sequence, and the decode-assist tail —
+/// everything the hypervisor needs, shipped once, so the `read_state`
+/// round trip #484 measured is dead and an MMIO completion needs no
+/// second exit.  Fixed 512-byte slot, `#[repr(C)]`, frozen.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
 pub struct GuestExitRecord {
@@ -358,11 +407,13 @@ pub struct GuestExitRecord {
     pub kind: u16,
     /// Length in bytes of the instruction that caused the exit, when the
     /// backend exposes a decoded next-instruction length;
-    /// `0` = not provided.  Frozen now so emulators can stop re-decoding
-    /// the moment backends fill it (the Intel-diff dowry, #487).
+    /// `0` = not provided.  Filled for the intercepts whose length the
+    /// hardware reports (port I/O on both x86 vendors); for a stage-2
+    /// fault the decoder over the assist bytes is authoritative and this
+    /// is at most a cross-check.
     pub instr_len: u8,
-    /// Reserved, zero.
-    pub _rsvd: u8,
+    /// The decode-assist form the tail carries — an [`assist`] value.
+    pub assist: u8,
     /// The producer's free-running publish count — lets the consumer name
     /// a record (e.g. in an `OpRefused` conversation) and detect its own
     /// bookkeeping drift.
@@ -373,10 +424,23 @@ pub struct GuestExitRecord {
     /// Second payload word — meaning per kind (access bits, write/size
     /// packing, refusal discriminant).
     pub b: u64,
-    /// The full register image, x86-64 wire order (see module docs).
+    /// The full register image in the architecture's wire order (see
+    /// module docs); the tail past the architecture's image is zero.
     pub state: [u64; GUEST_STATE_QWORDS],
+    /// [`assist::INSN`]: the trapped instruction's raw bytes, the first
+    /// `insn_len` meaningful, the rest zero.  Zero for every other form.
+    pub insn: [u8; GUEST_INSN_BYTES_MAX],
+    /// [`assist::INSN`]: how many of `insn` are the instruction
+    /// (`1..=GUEST_INSN_BYTES_MAX`).  Zero for every other form.
+    pub insn_len: u8,
+    /// [`assist::ACCESS`]: the decoded access word (packing in [`assist`]).
+    /// Zero for every other form.
+    pub access: u64,
+    /// [`assist::ACCESS`]: the written value when no register carries it.
+    /// Zero for every other form.
+    pub data: u64,
     /// Reserved, zero on write, ignored on read.
-    pub _pad: [u8; GUEST_RECORD_BYTES - 24 - 8 * GUEST_STATE_QWORDS],
+    pub _pad: [u8; GUEST_RECORD_BYTES - GUEST_EXIT_RECORD_USED],
 }
 
 /// One **control record** (hypervisor → kernel).  Same frozen slot size;
@@ -401,7 +465,7 @@ pub struct GuestCtrlRecord {
     /// The register image for `WriteState`; ignored otherwise.
     pub state: [u64; GUEST_STATE_QWORDS],
     /// Reserved, zero on write, ignored on read.
-    pub _pad: [u8; GUEST_RECORD_BYTES - 24 - 8 * GUEST_STATE_QWORDS],
+    pub _pad: [u8; GUEST_RECORD_BYTES - GUEST_CTRL_RECORD_USED],
 }
 
 const _: () = {
@@ -409,6 +473,17 @@ const _: () = {
     assert!(size_of::<GuestCtrlRecord>() == GUEST_RECORD_BYTES);
     assert!(align_of::<GuestExitRecord>() <= 64);
     assert!(align_of::<GuestCtrlRecord>() <= 64);
+    // The frozen offsets a peer written against this layout relies on:
+    // the head is 24 bytes on both records, the image follows it, and the
+    // exit record's assist tail sits right behind the image, its two
+    // words naturally aligned.
+    assert!(core::mem::offset_of!(GuestExitRecord, state) == 24);
+    assert!(core::mem::offset_of!(GuestCtrlRecord, state) == 24);
+    assert!(core::mem::offset_of!(GuestExitRecord, insn) == 24 + 8 * GUEST_STATE_QWORDS);
+    assert!(core::mem::offset_of!(GuestExitRecord, insn_len) == 24 + 8 * GUEST_STATE_QWORDS + 15);
+    assert!(core::mem::offset_of!(GuestExitRecord, access) == 24 + 8 * GUEST_STATE_QWORDS + 16);
+    assert!(core::mem::offset_of!(GuestExitRecord, data) == 24 + 8 * GUEST_STATE_QWORDS + 24);
+    assert!(GUEST_INSN_BYTES_MAX + 1 == 16);
 };
 
 /// Byte offset of the **exit ring** within the per-vCPU window.

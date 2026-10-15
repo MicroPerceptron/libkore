@@ -397,6 +397,11 @@ impl<S: EventState, R: RingRecord> EventSink<'_, S, R> {
         self.records.pop()
     }
 
+    /// The oldest record, left in place.
+    pub fn peek(&self) -> Option<R> {
+        self.records.peek()
+    }
+
     /// Records the producer dropped on a full ring — the counter lives in
     /// the shared window, so a consumer can see it fell behind without the
     /// producer having to encode that into state.

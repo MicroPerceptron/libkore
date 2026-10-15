@@ -1038,6 +1038,27 @@ impl SessionBuilder {
         self.map_view_request(view, window, 0, result)
     }
 
+    /// Map a held view into the `MAP` window as a **sink** mapping
+    /// ([`VIEW_MAP_SINK`](kore_abi::session::VIEW_MAP_SINK)): should the
+    /// lessor's lease die under it, its pages are repointed at this space's
+    /// sink page rather than unmapped.
+    pub fn map_view_sink(
+        &mut self,
+        view: impl Into<SlotRef>,
+        result: SlotRef,
+    ) -> Result<Staged, BuildError> {
+        let mut req = [0u8; kore_abi::session::ViewMapReq::WIRE];
+        req[..2].copy_from_slice(&kore_abi::session::ViewMapWindow::Map.role().to_le_bytes());
+        req[3] = kore_abi::session::VIEW_MAP_SINK;
+        self.derive_raw(
+            view.into(),
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_VIEW_MAP,
+            result,
+            Some(&req),
+        )
+    }
+
     /// Map one surface into a fixed reusable lane. The lane controls VA
     /// placement only; authority and geometry still come from the held view.
     pub fn map_view_surface_lane(
@@ -1539,7 +1560,8 @@ impl SessionBuilder {
     /// the kernel moves into the new vCPU task only after the complete session
     /// commits.  The caller retains the guest-space owner and receives the
     /// ordinary lifecycle `Task` handle in `handle`.  Like process `Found`,
-    /// this is terminal: no later invocation may be staged in the session.
+    /// this begins a terminal Found tail: only guest Founds for this same
+    /// owner may follow, up to `MAX_SESSION_FOUNDS` members.
     #[allow(clippy::too_many_arguments)]
     pub fn found_guest(
         &mut self,
@@ -2446,13 +2468,33 @@ impl SessionBuilder {
         view: impl Into<SlotRef>,
         parent: impl Into<SlotRef>,
     ) -> Result<(), BuildError> {
+        self.unshare_iova_kind(view, parent, kore_abi::session::REVOKE_KIND_UNSHARE_IOVA)
+    }
+
+    /// `Revoke × REVOKE_KIND_UNSHARE_IOVA_LIVE` — [`unshare_iova`](Self::unshare_iova)
+    /// for a requester that keeps running: its DMA latch stays open, and
+    /// the window's completed invalidation is what cuts the device off.
+    pub fn unshare_iova_live(
+        &mut self,
+        view: impl Into<SlotRef>,
+        parent: impl Into<SlotRef>,
+    ) -> Result<(), BuildError> {
+        self.unshare_iova_kind(view, parent, kore_abi::session::REVOKE_KIND_UNSHARE_IOVA_LIVE)
+    }
+
+    fn unshare_iova_kind(
+        &mut self,
+        view: impl Into<SlotRef>,
+        parent: impl Into<SlotRef>,
+        kind: u8,
+    ) -> Result<(), BuildError> {
         let mut req = [0u8; 8];
         req[0..4].copy_from_slice(&parent.into().index().to_le_bytes());
         let arg = self.stage_arg(&req)?;
         self.push(Inv {
             op: OpCode::Revoke as u16,
             requested: 0,
-            kind: kore_abi::session::REVOKE_KIND_UNSHARE_IOVA,
+            kind,
             subject: view.into().index(),
             result: 0,
             arg,

@@ -189,7 +189,11 @@ mod tests {
             drop(pinned);
         });
         back.join().unwrap();
-        assert_eq!(drops.load(Ordering::SeqCst), 0, "leaked, never dropped off-owner");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "leaked, never dropped off-owner"
+        );
     }
 
     #[test]

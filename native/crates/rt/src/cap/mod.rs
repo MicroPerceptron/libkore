@@ -2651,6 +2651,16 @@ impl ReturnedCapability {
         Ok(self.into_stashed_lease_after_check())
     }
 
+    /// Observe the geometry of a received fabric route before accepting its
+    /// custody. The kernel authenticates the possessed subject; no new route
+    /// or mapping is created and wrong species return the ordinary refusal.
+    pub fn describe_fabric_route(
+        &self,
+    ) -> Result<kore_abi::session::FabricRouteInfo, verbs::FabricRegistrationFault> {
+        let slot = self.slot().ok_or(verbs::FabricRegistrationFault::Slot)?;
+        verbs::describe_fabric_route(slot)
+    }
+
     /// Authenticate a received mapping route without converting it into a
     /// physical allocation lease or changing its ancestry.
     pub fn try_into_fabric_route(self, required: Rights) -> Result<FabricRouteToken, Self> {
@@ -3965,7 +3975,13 @@ impl DmaWindow {
             return RetireOutcome::Retryable;
         }
         let Some(view) = self.cpu_view.as_mut() else {
-            return RetireOutcome::Retryable;
+            // A device-only import never had a CPU leaf; an anonymous pool
+            // window's CPU leaf cannot prove this separate transition.
+            return if self.cpu.is_null() {
+                RetireOutcome::AlreadyDead
+            } else {
+                RetireOutcome::Retryable
+            };
         };
         let parent = view.lease;
         let outcome = view.owned.retire_via(|slot| retire(slot, parent));
@@ -3982,6 +3998,16 @@ impl DmaWindow {
     /// prove this separate transition and refuse it.
     pub fn try_retire_device(&mut self) -> RetireOutcome {
         self.retire_device_via(crate::cap::verbs::retire_owned_iova)
+    }
+
+    /// [`try_retire_device`](Self::try_retire_device) while the device keeps
+    /// running: the requester's DMA latch stays open for its other windows.
+    /// The driver must first prove no command still names this window and
+    /// reap those that did; the kernel completes the window's invalidation
+    /// before its identity goes, so an access it missed is a recorded IOMMU
+    /// fault rather than a write into memory that has moved on.
+    pub fn try_retire_device_live(&mut self) -> RetireOutcome {
+        self.retire_device_via(crate::cap::verbs::retire_owned_iova_live)
     }
 
     fn retire_device_via(

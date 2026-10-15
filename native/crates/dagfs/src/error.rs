@@ -98,6 +98,11 @@ pub enum ProviderError {
     ReadOnly,
     /// A bounded queue, tracker, buffer, or placement table is full.
     Backpressure,
+    /// A DMA window an earlier client lent has not retired from the device,
+    /// and the requester-wide retirement that would clear it failed, so the
+    /// controller admits no new client window until a retry succeeds
+    /// (`res/LIFECYCLE_HARDENING.md` §6). Existing lanes keep serving.
+    Retiring,
     /// A completion exceeded its budget while the backend remained healthy.
     Timeout,
 }
@@ -119,6 +124,7 @@ impl From<ProviderError> for FsError {
             | ProviderError::Draining
             | ProviderError::ReadOnly
             | ProviderError::Backpressure
+            | ProviderError::Retiring
             | ProviderError::Timeout => Self::ProviderFailure(error),
         }
     }
@@ -161,6 +167,7 @@ mod tests {
             ProviderError::Draining,
             ProviderError::ReadOnly,
             ProviderError::Backpressure,
+            ProviderError::Retiring,
             ProviderError::Timeout,
         ] {
             assert_eq!(FsError::from(cause), FsError::ProviderFailure(cause));

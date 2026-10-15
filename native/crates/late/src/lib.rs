@@ -9,16 +9,33 @@
 //! grants; the executable authority is the task's own writable→executable
 //! finalization (§6); the placement is a window the task owns.
 //!
-//! **The gate.**  A native load refuses unless the store object carries
-//! [`ObjectSubtype::EXECUTABLE_IMAGE`] (the stamp exec's seeder writes)
-//! *and* its bytes pass [`check_image`].  The stamp is a fact the store
-//! carries, never authority — a plain file that happens to parse as an ELF
-//! is still refused, and the subtype still grants nothing.
+//! **Where native code comes from.**  A native module runs with the task's
+//! whole authority, so it enters only with the provenance a native image
+//! needs, and the loader — not each caller — holds that rule on two
+//! independent counts:
 //!
-//! **The search list is a capability list.**  `require "x"` walks an
-//! ordered set of path prefixes the task can already open — its own tree
-//! (`""`) and the `libs` view — and "not found" is "no route".  Source
-//! modules are `<x>.lua`, native ones `<x>.so`.
+//! - *The route.*  `<x>.so` resolves only in the task's library view
+//!   ([`LIBS_VIEW`]), entered as the granted authority edge it is — never by
+//!   walking the path `libs/…`, which a `libs` child of the task's own root
+//!   would answer first — and [`library_grant`] refuses that edge if it
+//!   would let the task write or rename beneath it.  Never the task's own
+//!   tree: a tree the task can write is exactly where native code must not
+//!   come from, and a squatting `<x>.so` there must not shadow the library.
+//! - *The stamp.*  The object must carry
+//!   [`ObjectSubtype::EXECUTABLE_IMAGE`] *and* its bytes must pass
+//!   [`check_image`].  The store takes that stamp — and any later change to
+//!   the stamped bytes — only through `BIND_EXECUTABLE`
+//!   (`ObjectSubtype::stamp_rights`), the install authority's right, which
+//!   no task's home face carries.  So the stamp is the store's word that the
+//!   installer wrote these bytes; it still grants the reader nothing, and a
+//!   plain file that happens to parse as an ELF is refused.
+//!
+//! **Source modules search; native modules do not.**  A source module
+//! `<x>.lua` runs inside the interpreter's VM with only what the VM grants,
+//! so `Loader::read_source` walks the caller's [`Search`] — an ordered set
+//! of path prefixes the task can already open, typically its own tree
+//! (`""`) then `libs` — and "not found" is "no route".  `Loader::load_native`
+//! takes no search list.
 //!
 //! **Placement.**  Modules go above everything the startup stub mapped
 //! ([`ModulePage::high_water`]) inside `geom::LINK`, each at a 64 KiB
@@ -40,7 +57,11 @@
 extern crate alloc;
 
 use kore_abi::image::{ModuleDescriptor, ModulePage, seg};
-use kore_dagfs::{FsError, Name, Refusal, bounds::MAX_NAME_LEN, bounds::MAX_PATH_DEPTH};
+pub use kore_dagfs::LIBS_VIEW;
+use kore_dagfs::{
+    FsError, GrantEntry, GrantId, Name, Refusal, Rights, bounds::MAX_NAME_LEN,
+    bounds::MAX_PATH_DEPTH,
+};
 use kore_ld::apply::ApplyError;
 use kore_ld::check::CheckError;
 use kore_ld::late::LateError;
@@ -91,8 +112,14 @@ impl ModuleKind {
 pub enum LoadError {
     /// The stem does not spell a store name once suffixed.
     Name,
-    /// No prefix of the search list holds the object.
+    /// No prefix of the search list holds the object — for a native module,
+    /// the task has no [`LIBS_VIEW`] edge or the library holds no
+    /// `<stem>.so`.
     NotFound,
+    /// The task's [`LIBS_VIEW`] edge would let it write bytes or names
+    /// beneath it: a native module never comes from a route its loader can
+    /// change.
+    LibsWritable,
     /// The object is not stamped `EXECUTABLE_IMAGE`.
     NotExecutableImage,
     /// The object exceeds [`MAX_MODULE_BYTES`], or the caller's buffer.
@@ -147,11 +174,34 @@ impl From<Refusal> for LoadError {
     }
 }
 
-/// The ordered prefixes a load may resolve under — each one a directory
-/// the task can already open; `b""` is its own tree.
+/// The ordered prefixes a *source* load may resolve under — each one a
+/// directory the task can already open; `b""` is its own tree.  A native
+/// load takes none: it resolves only through [`library_grant`].
 #[derive(Clone, Copy, Debug)]
 pub struct Search<'a> {
     pub prefixes: &'a [&'a [u8]],
+}
+
+/// Rights a native module's route must not carry: either would let the
+/// loading task change what it is about to link.
+const LIBRARY_ROUTE_FORBIDS: Rights = Rights::WRITE.union(Rights::MUTATE_NAMESPACE);
+
+/// Admit the task's library edge — the grant its view lists under
+/// [`LIBS_VIEW`], if any — as the one place native modules come from.
+///
+/// No edge is no route ([`LoadError::NotFound`]).  An edge that would let
+/// this task write a byte or a name beneath it is refused
+/// ([`LoadError::LibsWritable`]) rather than trusted for its name: the
+/// system view is minted `READ` alone, so a writable `libs` is some other
+/// edge wearing the name (a self-share where the view's install collided,
+/// say).  `SHARE` and `BIND_EXECUTABLE` change nothing the loader reads and
+/// are not this check's business.
+pub fn library_grant(entry: Option<GrantEntry>) -> Result<GrantId, LoadError> {
+    let entry = entry.ok_or(LoadError::NotFound)?;
+    if entry.is_private_root || !entry.rights.intersection(LIBRARY_ROUTE_FORBIDS).is_empty() {
+        return Err(LoadError::LibsWritable);
+    }
+    Ok(entry.grant)
 }
 
 /// `<stem><suffix>` as a store name, or `None` past [`MAX_NAME_LEN`] or
@@ -191,7 +241,6 @@ pub fn compose_path<'b>(
     out[len..end].copy_from_slice(name);
     Some(&out[..end])
 }
-
 
 /// The host image as the late scope's module 0: its base from the passive
 /// page's first record (verified against the executable's own name), its
@@ -280,6 +329,58 @@ mod tests {
         assert!(object_name(ModuleKind::Native, &over).is_none());
     }
 
+    fn libs_entry(rights: Rights, is_private_root: bool) -> GrantEntry {
+        GrantEntry {
+            grant: GrantId::from_bits(7),
+            rights,
+            is_private_root,
+            display_name: Name::from_bytes(LIBS_VIEW.as_bytes()).ok(),
+        }
+    }
+
+    /// The system library view is minted `READ` alone, and that is what a
+    /// native module may come through.  Re-sharing or install authority on
+    /// the edge changes nothing the loader reads.
+    #[test]
+    fn the_read_only_library_edge_is_where_native_modules_come_from() {
+        for rights in [
+            Rights::READ_ONLY,
+            Rights::READ.union(Rights::SHARE),
+            Rights::READ.union(Rights::BIND_EXECUTABLE),
+        ] {
+            assert_eq!(
+                library_grant(Some(libs_entry(rights, false))),
+                Ok(GrantId::from_bits(7))
+            );
+        }
+    }
+
+    /// A task with no library view has no route to native code — and a
+    /// `libs` edge the task could write through, or its own tree, is never
+    /// trusted for its name: that would load code from where the loader
+    /// itself can put it.
+    #[test]
+    fn a_missing_or_writable_library_edge_is_refused() {
+        assert_eq!(library_grant(None), Err(LoadError::NotFound));
+        for rights in [
+            Rights::READ.union(Rights::WRITE),
+            Rights::READ.union(Rights::MUTATE_NAMESPACE),
+            Rights::HOME,
+            Rights::ALL,
+        ] {
+            assert_eq!(
+                library_grant(Some(libs_entry(rights, false))),
+                Err(LoadError::LibsWritable),
+                "{rights:?}"
+            );
+        }
+        assert_eq!(
+            library_grant(Some(libs_entry(Rights::READ_ONLY, true))),
+            Err(LoadError::LibsWritable),
+            "the task's own root is never the library"
+        );
+    }
+
     #[test]
     fn paths_compose_under_a_prefix_or_stand_alone() {
         let name = object_name(ModuleKind::Native, b"demo").unwrap();
@@ -301,10 +402,16 @@ mod tests {
 
         let limit = 0x5800_0000u64;
         let mut from_unaligned = Placer::new(0x5001_0001, limit - 0x5001_0001);
-        assert_eq!(from_unaligned.choose(0x3000, LATE_BASE_ALIGN), Ok(0x5002_0000));
+        assert_eq!(
+            from_unaligned.choose(0x3000, LATE_BASE_ALIGN),
+            Ok(0x5002_0000)
+        );
 
         let mut from_aligned = Placer::new(0x5002_0000, limit - 0x5002_0000);
-        assert_eq!(from_aligned.choose(0x3000, LATE_BASE_ALIGN), Ok(0x5002_0000));
+        assert_eq!(
+            from_aligned.choose(0x3000, LATE_BASE_ALIGN),
+            Ok(0x5002_0000)
+        );
 
         let mut exact = Placer::new(0x57ff_0000, limit - 0x57ff_0000);
         assert_eq!(exact.choose(0x1_0000, LATE_BASE_ALIGN), Ok(0x57ff_0000));
@@ -316,7 +423,10 @@ mod tests {
         );
 
         let mut ceiling = Placer::new(u64::MAX - 1, 1);
-        assert_eq!(ceiling.choose(1, LATE_BASE_ALIGN), Err(PlaceError::Exhausted));
+        assert_eq!(
+            ceiling.choose(1, LATE_BASE_ALIGN),
+            Err(PlaceError::Exhausted)
+        );
     }
 
     #[test]

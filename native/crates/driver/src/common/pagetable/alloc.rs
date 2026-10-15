@@ -73,10 +73,18 @@ pub trait TableSource {
     /// this source allocated (a corrupted tree or a caller bug — the walker
     /// propagates it as [`MmuError::UnknownTableFrame`]; never a null
     /// sentinel). A `Some` pointer is valid for [`table_bytes`] bytes; the
-    /// walker reads/writes it as a `[u64]`.
+    /// walker reads it as a `[u64]`. Writers use
+    /// [`resolve_for_write`](Self::resolve_for_write) before each mutation.
     ///
     /// [`table_bytes`]: Self::table_bytes
     fn resolve(&self, addr: Self::Addr) -> Option<*mut u8>;
+
+    /// Resolve a frame before writing its entries. Sources with explicit
+    /// cache publication can retain this write intent; coherent sources use
+    /// the default. The pointer must not be retained across publication.
+    fn resolve_for_write(&self, addr: Self::Addr) -> Option<*mut u8> {
+        self.resolve(addr)
+    }
 
     /// Release a frame during teardown. Best-effort — a source that cannot free
     /// individually may no-op and reclaim in bulk.
@@ -99,16 +107,25 @@ pub trait TableSource {
 #[cfg(feature = "alloc")]
 mod dma_pool {
     use alloc::vec::Vec;
+    use core::cell::Cell;
 
     use kore_abi::device::IovaAddr;
 
     use super::{MmuError, MmuResult, TableSource};
     use crate::seam::{Dma, DmaPool};
 
+    struct TableFrame<B> {
+        buffer: B,
+        dirty: Cell<bool>,
+    }
+
     /// [`TableSource`] backed by a [`DmaPool`]. See the module note.
     pub struct DmaPoolTables<P: DmaPool> {
         pool: P,
-        frames: Vec<P::Buf>,
+        // Sorted by the buffer's device address, including after release and
+        // reuse. Walks resolve on every table read/write: a linear search here
+        // multiplies their cost by the entire resident tree's frame count.
+        frames: Vec<TableFrame<P::Buf>>,
         frame_bytes: usize,
     }
 
@@ -134,6 +151,11 @@ mod dma_pool {
             &self.pool
         }
 
+        fn frame_index(&self, addr: IovaAddr) -> Result<usize, usize> {
+            self.frames
+                .binary_search_by_key(&addr.0, |frame| frame.buffer.iova().0)
+        }
+
         /// Visit every live table frame's CPU window.
         ///
         /// This is the cache-maintenance enumeration hook: a device whose
@@ -143,8 +165,29 @@ mod dma_pool {
         /// frame length; it must not retain the pointer beyond the call.
         pub fn for_each_frame(&self, mut visit: impl FnMut(*mut u8, usize)) {
             for frame in &self.frames {
-                visit(frame.cpu(), self.frame_bytes);
+                visit(frame.buffer.cpu(), self.frame_bytes);
             }
+        }
+
+        /// Publish allocated or written frames, retaining dirtiness if either
+        /// cache maintenance or its completion barrier fails. Callbacks must
+        /// not mutate this source or retain its pointers. Read-only resolution
+        /// never dirties a frame. This is cache publication, not TLB invalidation.
+        pub fn publish_dirty_frames<E>(
+            &self,
+            mut publish: impl FnMut(*mut u8, usize) -> Result<(), E>,
+            complete: impl FnOnce() -> Result<(), E>,
+        ) -> Result<(), E> {
+            for frame in &self.frames {
+                if frame.dirty.get() {
+                    publish(frame.buffer.cpu(), self.frame_bytes)?;
+                }
+            }
+            complete()?;
+            for frame in &self.frames {
+                frame.dirty.set(false);
+            }
+            Ok(())
         }
 
         /// Recover the affine DMA supply after every table frame was released.
@@ -169,7 +212,17 @@ mod dma_pool {
                 .alloc(self.frame_bytes)
                 .ok_or(MmuError::OutOfTables)?;
             let iova = buf.iova();
-            self.frames.push(buf);
+            let index = self
+                .frame_index(iova)
+                .err()
+                .ok_or(MmuError::InvalidTableGeometry)?;
+            self.frames.insert(
+                index,
+                TableFrame {
+                    buffer: buf,
+                    dirty: Cell::new(true),
+                },
+            );
             Ok(iova)
         }
 
@@ -177,16 +230,24 @@ mod dma_pool {
             // A miss (a frame this source never allocated) is a typed `None`
             // the walker turns into `MmuError::UnknownTableFrame` — in every
             // build profile, never a null sentinel.
-            self.frames
-                .iter()
-                .find(|frame| frame.iova() == addr)
-                .map(|frame| frame.cpu())
+            self.frame_index(addr)
+                .ok()
+                .map(|index| self.frames[index].buffer.cpu())
+        }
+
+        fn resolve_for_write(&self, addr: IovaAddr) -> Option<*mut u8> {
+            self.frame_index(addr).ok().map(|index| {
+                let frame = &self.frames[index];
+                frame.dirty.set(true);
+                frame.buffer.cpu()
+            })
         }
 
         fn release(&mut self, addr: IovaAddr) {
-            if let Some(pos) = self.frames.iter().position(|f| f.iova() == addr) {
-                // Drop returns the buffer to the pool.
-                self.frames.swap_remove(pos);
+            if let Ok(pos) = self.frame_index(addr) {
+                // Drop returns the buffer to the pool. Preserve address order
+                // so the hot read/write lookup needs no separate index.
+                self.frames.remove(pos);
             }
         }
 
@@ -205,6 +266,7 @@ mod dma_pool {
         struct TestBuf {
             words: Box<[u64; 512]>,
             iova: IovaAddr,
+            address_reads: Cell<usize>,
         }
 
         impl Dma for TestBuf {
@@ -213,6 +275,7 @@ mod dma_pool {
             }
 
             fn iova(&self) -> IovaAddr {
+                self.address_reads.set(self.address_reads.get() + 1);
                 self.iova
             }
 
@@ -237,8 +300,85 @@ mod dma_pool {
                 Some(TestBuf {
                     words: Box::new([0; 512]),
                     iova: IovaAddr(index << 12),
+                    address_reads: Cell::new(0),
                 })
             }
+        }
+
+        #[test]
+        fn table_lookup_preserves_identity_across_nonmonotonic_allocation_and_reuse() {
+            let mut tables = DmaPoolTables::new(TestPool { next: Cell::new(1) }, 0x1000);
+            // Sparse, descending allocations exercise the pool's freedom to
+            // recycle addresses; table order is not allocation order.
+            for page in [9, 5, 1, 7, 3] {
+                tables.pool().next.set(page);
+                let addr = tables.alloc_table().unwrap();
+                // SAFETY: this test owns the live, zeroed frame; no device
+                // accesses it, and the one-byte write is within its backing.
+                unsafe { tables.resolve_for_write(addr).unwrap().write(page as u8) };
+            }
+            tables
+                .publish_dirty_frames(|_, _| Ok::<_, ()>(()), || Ok(()))
+                .unwrap();
+            tables.release(IovaAddr(5 << 12));
+            tables.pool().next.set(5);
+            let reused = tables.alloc_table().unwrap();
+            // SAFETY: resolution returns the owned live test frame's start.
+            assert_eq!(unsafe { tables.resolve(reused).unwrap().read() }, 0);
+            for page in [1, 3, 7, 9] {
+                assert_eq!(
+                    // SAFETY: these frames remain owned and have no device.
+                    unsafe { tables.resolve(IovaAddr(page << 12)).unwrap().read() },
+                    page as u8
+                );
+            }
+            assert!(tables.resolve(IovaAddr(2 << 12)).is_none());
+            assert!(tables.resolve(IovaAddr((3 << 12) + 1)).is_none());
+            tables.pool().next.set(5);
+            assert_eq!(tables.alloc_table(), Err(MmuError::InvalidTableGeometry));
+            assert_eq!(tables.frame_count(), 5);
+            tables.release(IovaAddr(2 << 12));
+            assert_eq!(tables.frame_count(), 5);
+            let mut dirty = 0;
+            tables
+                .publish_dirty_frames(
+                    |_, _| {
+                        dirty += 1;
+                        Ok::<_, ()>(())
+                    },
+                    || Ok(()),
+                )
+                .unwrap();
+            assert_eq!(dirty, 1, "only the recycled frame needs publication");
+        }
+
+        #[test]
+        fn table_resolution_cost_grows_logarithmically_with_residency() {
+            const FRAMES: usize = 1024;
+            let mut tables = DmaPoolTables::new(TestPool { next: Cell::new(1) }, 0x1000);
+            for _ in 0..FRAMES {
+                tables.alloc_table().unwrap();
+            }
+            let probes = |tables: &DmaPoolTables<TestPool>| {
+                tables
+                    .frames
+                    .iter()
+                    .map(|frame| frame.buffer.address_reads.get())
+                    .sum::<usize>()
+            };
+            // The previous linear scan touched every frame on these lookups.
+            // Allow two comparisons beyond ceil(log2(n)) for search endpoints.
+            let ceiling = (usize::BITS - (FRAMES - 1).leading_zeros()) as usize + 2;
+            let before = probes(&tables);
+            assert!(tables.resolve(IovaAddr((FRAMES as u64) << 12)).is_some());
+            assert!(probes(&tables) - before <= ceiling);
+            let before = probes(&tables);
+            assert!(
+                tables
+                    .resolve_for_write(IovaAddr(((FRAMES + 1) as u64) << 12))
+                    .is_none()
+            );
+            assert!(probes(&tables) - before <= ceiling);
         }
 
         #[test]

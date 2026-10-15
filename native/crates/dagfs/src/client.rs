@@ -101,6 +101,11 @@ impl LentVersion {
     pub const fn identity(&self) -> InputIdentity {
         self.identity
     }
+
+    /// The lease's wire name — for a request that names it, never authority.
+    pub(crate) const fn lease(&self) -> VersionLease {
+        self.lease
+    }
 }
 
 /// Identity readback failed after the filesystem had already installed the
@@ -246,6 +251,16 @@ pub struct RingReleasePendingVersionFailure {
     pub version: PendingVersion,
 }
 
+/// Rights a ring target route must arrive with. The service maps the route
+/// into its controller's DMA domain (deriving the IOVA child) and retires
+/// that mapping on detach or peer death, which needs all four; the caller
+/// keeps its own CPU child of the same route, so lending these rights to the
+/// filesystem never moves the caller's view.
+pub const RING_TARGET_RIGHTS: CapRights = CapRights::ACCESS
+    .union(CapRights::MODIFY)
+    .union(CapRights::DERIVE)
+    .union(CapRights::REVOKE);
+
 /// Rights of the detached data-window view received by the filesystem.
 pub const DATA_WINDOW_RIGHTS: CapRights = CapRights::ACCESS.union(CapRights::MODIFY);
 /// The launcher-local staged view must additionally carry DERIVE so the
@@ -312,6 +327,14 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         self.pair.is_idle()
     }
 
+    /// Drive replies by re-polling the ring rather than the executor's clock
+    /// — see [`SvcClient::set_direct_polling`].  For a caller that completes
+    /// its calls under `block_on` from inside a task's poll; restored before
+    /// the executor drives this client again.
+    pub fn set_direct_polling(&mut self, direct: bool) {
+        self.pair.set_direct_polling(direct);
+    }
+
     /// Resume the one already-published administration request.
     ///
     /// Callers retain the operation phase in their affine lifecycle owner;
@@ -337,6 +360,20 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         } else {
             self.pair.resume_exact(request).await?
         };
+        self.finish(reply)
+    }
+
+    /// Give one exact administration request a bounded observation slice.
+    /// Expiry leaves its request correlated on this pair for a later pass.
+    async fn call_exact_bounded(
+        &mut self,
+        request: &FsRequest,
+        budget_ns: u64,
+    ) -> Result<FsResponse, CallError> {
+        let reply = match self.pair.resume_exact_bounded(request, budget_ns).await {
+            Err(CallError::NoOutstanding) => self.pair.call_bounded(request, budget_ns).await,
+            result => result,
+        }?;
         self.finish(reply)
     }
 
@@ -544,7 +581,10 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
     }
 
     /// Create an object stamped with `subtype` — data the object carries for
-    /// its life, never authority. A directory refuses any but `PLAIN`.
+    /// its life, never authority over it. A directory refuses any but
+    /// `PLAIN`, and an attesting stamp needs its
+    /// [`stamp_rights`](crate::ObjectSubtype::stamp_rights) on `parent`'s
+    /// route (`AccessDenied` otherwise).
     pub async fn create_typed(
         &mut self,
         parent: Handle,
@@ -589,6 +629,25 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
                 self.pair.poison();
                 Err(RingFsError::Wire)
             }
+        }
+    }
+
+    /// Observe one status request for at most `budget_ns`. A timeout retains
+    /// that exact request on the pair; the next call to this method resumes
+    /// it rather than publishing a second request.
+    pub async fn system_status_bounded(
+        &mut self,
+        window_offset: u32,
+        budget_ns: u64,
+    ) -> Result<u32, RingFsError> {
+        match self
+            .call_exact_bounded(&FsRequest::SystemStatus { window_offset }, budget_ns)
+            .await
+            .map_err(RingFsError::Infrastructure)?
+        {
+            FsResponse::SystemStatusReported { len } => Ok(len),
+            FsResponse::Refused(error) => Err(RingFsError::Refused(error)),
+            _ => Err(RingFsError::Wire),
         }
     }
 
@@ -989,6 +1048,47 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         self.finish(reply).map_err(StagedReturnError::AfterTransfer)
     }
 
+    /// Lend this session's storage-ring window ([`FsRequest::StorAttach`]):
+    /// a view derived from `source` over its first `bytes`, as the data
+    /// window is lent. The caller keeps its own mapping of the parent.
+    pub async fn lend_ring_window<S: ReturnLeaseSource>(
+        &mut self,
+        source: &S,
+        bytes: u32,
+    ) -> Result<FsResponse, RingFsError> {
+        let request = FsRequest::StorAttach {
+            announced: self.return_land,
+        };
+        let reply = self
+            .pair
+            .call_with_staged_return(&request, self.return_tx, DATA_WINDOW_RIGHTS, |derive| {
+                derive.lease_window(source, DATA_WINDOW_STAGED_RIGHTS, 0, u64::from(bytes))
+            })
+            .await
+            .map_err(|error| match error {
+                StagedReturnError::NotTransferred(error)
+                | StagedReturnError::AfterTransfer(error) => RingFsError::Infrastructure(error),
+            })?;
+        self.finish(reply).map_err(RingFsError::Infrastructure)
+    }
+
+    /// Lend one device-mapping route over caller-funded memory as a target
+    /// of this session's ring ([`FsRequest::StorTarget`]), with
+    /// [`RING_TARGET_RIGHTS`]'s custody.
+    pub async fn lend_ring_target<C: ReturnCapability>(
+        &mut self,
+        route: C,
+    ) -> Result<FsResponse, ReturnCallError<C>> {
+        let request = FsRequest::StorTarget {
+            announced: self.return_land,
+        };
+        let reply = self
+            .pair
+            .call_with_return(&request, self.return_tx, route, RING_TARGET_RIGHTS)
+            .await?;
+        self.finish(reply).map_err(ReturnCallError::AfterTransfer)
+    }
+
     pub async fn bind_view<C: ReturnCapability>(
         &mut self,
         handle: Handle,
@@ -1093,12 +1193,29 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         self.call(&FsRequest::TakeAdmission).await
     }
 
+    pub async fn take_admission_bounded(
+        &mut self,
+        budget_ns: u64,
+    ) -> Result<FsResponse, CallError> {
+        self.call_exact_bounded(&FsRequest::TakeAdmission, budget_ns)
+            .await
+    }
+
     /// Ask the service host to retire one exact dynamic generation.
     pub async fn retire_peer(
         &mut self,
         peer: kore_rt::svc::PeerId,
     ) -> Result<FsResponse, CallError> {
         self.call_exact(&FsRequest::RetirePeer { peer }).await
+    }
+
+    pub async fn retire_peer_bounded(
+        &mut self,
+        peer: kore_rt::svc::PeerId,
+        budget_ns: u64,
+    ) -> Result<FsResponse, CallError> {
+        self.call_exact_bounded(&FsRequest::RetirePeer { peer }, budget_ns)
+            .await
     }
 
     /// Fence one targeted retirement. Success means the host no longer owns
@@ -1109,6 +1226,15 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         peer: kore_rt::svc::PeerId,
     ) -> Result<FsResponse, CallError> {
         self.call_exact(&FsRequest::ConfirmRetired { peer }).await
+    }
+
+    pub async fn confirm_retired_bounded(
+        &mut self,
+        peer: kore_rt::svc::PeerId,
+        budget_ns: u64,
+    ) -> Result<FsResponse, CallError> {
+        self.call_exact_bounded(&FsRequest::ConfirmRetired { peer }, budget_ns)
+            .await
     }
 }
 
@@ -2019,6 +2145,30 @@ mod exact_attach_tests {
             serve.req.pop().is_none(),
             "retry must not publish another Close"
         );
+    }
+
+    #[test]
+    fn status_request_identity_rejects_a_late_reply_for_another_window() {
+        let transport = RecordingTransport::refusing();
+        let (mut fs, mut serve) = ring_fs(&transport, SlotRef::from_wire(0x41));
+        let status = FsRequest::SystemStatus { window_offset: 0 };
+        assert_eq!(crate::block_on(fs.call_exact(&status)), Err(CallError::Transport));
+        assert_eq!(take_request(&mut serve), status);
+        let reply = <crate::DagfsProtocol as SvcProtocol>::encode_rep(
+            &FsResponse::SystemStatusReported { len: 402 }, 0,
+        );
+        assert!(serve.rep.push(reply).is_ok());
+        assert_eq!(
+            crate::block_on(fs.call_exact(&FsRequest::SystemStatus { window_offset: 1 })),
+            Err(CallError::Outstanding),
+        );
+        transport.succeed.set(true);
+        assert_eq!(
+            crate::block_on(fs.call_exact(&status)),
+            Ok(FsResponse::SystemStatusReported { len: 402 }),
+        );
+        assert!(fs.is_idle());
+        assert!(serve.req.pop().is_none());
     }
 
     #[test]

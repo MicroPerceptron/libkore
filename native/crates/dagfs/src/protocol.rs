@@ -68,7 +68,9 @@ pub enum FsRequest {
         name: Name,
         kind: ObjectKind,
         /// Data stamped at creation; [`ObjectSubtype::PLAIN`] for a directory
-        /// and for every ordinary file.
+        /// and for every ordinary file. An attesting stamp is refused
+        /// unless `parent`'s route carries its
+        /// [`stamp_rights`](ObjectSubtype::stamp_rights).
         subtype: ObjectSubtype,
     },
     Read {
@@ -314,6 +316,50 @@ pub enum FsRequest {
     },
     /// Retire the exact recyclable pair on which this request arrived.
     ClosePeer,
+    /// Attach this session's storage ring (`res/STORAGE_TRANSPORT.md` §4):
+    /// a window of `kore_ring::stor::WINDOW_BYTES` the caller funded,
+    /// formatted (`kore_ring::stor::format`) and lent as a view. `announced`
+    /// is return-post correlation only; the view rides the retained return
+    /// leg. A session holds at most one ring. From here the caller submits
+    /// by writing its own window: the pair carries only control.
+    StorAttach {
+        announced: kore_abi::session::SlotRef,
+    },
+    /// Install a read grant over the designated pack region into this
+    /// session's ring: Demand for reads a thread is blocked on, Stream for
+    /// read-ahead. Answers the grant's id and length.
+    StorGrantPack,
+    /// Adopt one device-mapping fabric route over caller-funded memory as a
+    /// target of this session's ring, with [`RING_TARGET_RIGHTS`]'s custody.
+    /// Answers the target slot a submission names in `buf_index`.
+    ///
+    /// [`RING_TARGET_RIGHTS`]: crate::RING_TARGET_RIGHTS
+    StorTarget {
+        announced: kore_abi::session::SlotRef,
+    },
+    /// Hand ring target `slot` back. Refused `Busy` while a command uses it;
+    /// its device mapping retires once the controller is idle.
+    StorRelease {
+        slot: u16,
+    },
+    /// The notice a parked row is owed: the caller published submissions
+    /// and its publish found the row's park intent. Answered once the row
+    /// has advanced the ring.
+    StorKick,
+    /// Install a read grant over lent version `lease` into this session's
+    /// ring: the version's whole blocks, pinned by the lease for as long as
+    /// the lease is held. Answers the grant's id and the bytes it covers; a
+    /// partial last block is read through the lease. Releasing the lease is
+    /// refused `Busy` while a read under the grant is in flight.
+    StorGrantVersion {
+        lease: crate::VersionLease,
+    },
+    /// Read the transport engine's counters: what a stalled wait reports.
+    StorInspect,
+    /// Detach this session's ring, release its targets and retire it.
+    /// Refused `Busy` while commands are still in flight — the ring stops
+    /// taking submissions at the first ask; ask again.
+    StorDetach,
 }
 
 impl FsRequest {
@@ -439,6 +485,56 @@ pub enum FsResponse {
     /// generation. This ticket is lifecycle routing data, not authority.
     PeerAdmitted {
         peer: PeerId,
+    },
+    /// The session's ring is attached: the geometry every submission obeys.
+    StorAttached {
+        /// Logical block size — every offset and length is a multiple.
+        block_size: u32,
+        /// Largest single device command, in bytes; the row splits longer
+        /// submissions itself.
+        max_transfer: u32,
+    },
+    /// A grant was installed into the session's ring. `grant` is the
+    /// `kore_abi::stor::GrantId` bit pattern a submission carries in `fd`;
+    /// it names the grant only inside that ring.
+    StorGranted {
+        grant: u32,
+        bytes: u64,
+    },
+    /// A target was adopted into the session's ring as `slot`.
+    StorTargetAdopted {
+        slot: u16,
+        bytes: u64,
+    },
+    /// The transport engine's counters, every ring together.
+    StorInspected {
+        /// Submissions popped.
+        submissions: u64,
+        /// Completions posted.
+        completions: u64,
+        /// Device commands in flight now.
+        in_flight: u32,
+        /// Ops reported past their deadline.
+        expired: u32,
+        /// Device completions naming no live command.
+        stale: u32,
+        /// Completions a timeline refused (each stops a fence for good).
+        timeline_refusals: u32,
+        /// Device commands the queue set refused to stage.
+        stage_refusals: u32,
+        /// Abort commands sent for expired device commands (saturating at
+        /// 2^24 − 1 on the wire).
+        aborts: u32,
+        /// Aborts the controller refused (saturating at 15 on the wire).
+        aborts_refused: u8,
+        /// The controller arbitrates by weighted round robin.
+        weighted: bool,
+        /// Rings attached: the row's own lanes and every client's (at most 7
+        /// on the wire).
+        rings: u8,
+        /// The last stage refusal, as `kore_driver::block::BlockError`'s
+        /// discriminant plus one; zero for none.
+        last_stage_error: u8,
     },
     /// The operation was refused. The engine's vocabulary crosses intact.
     Refused(FsError),

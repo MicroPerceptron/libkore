@@ -34,7 +34,11 @@ pub struct SystemSnapshot {
     heap_capacity: U64,
     heap_used: U64,
     heap_largest: U64,
-    /// Cumulative IOMMU translation-fault records drained since boot.
+    /// The IOMMU fault census word ([`SystemMetric::IommuFaults`]'s
+    /// value): `[31:0]` records drained since boot, `[47:32]` hardware
+    /// fault-log overflows, `[63:48]` fault-event interrupts landed.
+    ///
+    /// [`SystemMetric::IommuFaults`]: crate::session::SystemMetric::IommuFaults
     iommu_faults: U64,
     /// The LAST fault record, packed: `[15:0]` source-id, `[23:16]`
     /// raw reason, `[24]` write, `[63:25]` faulting-IOVA page.
@@ -311,8 +315,21 @@ impl SystemSnapshot {
     pub fn heap_largest(self) -> u64 {
         self.heap_largest.get()
     }
+    /// Translation-fault records drained since boot.
     pub fn iommu_faults(self) -> u64 {
-        self.iommu_faults.get()
+        self.iommu_faults.get() & 0xffff_ffff
+    }
+    /// Times a unit's hardware fault log overflowed — records discarded
+    /// before any drain saw them, so a count of zero here is what makes
+    /// [`iommu_faults`](Self::iommu_faults) a complete account.
+    pub fn iommu_fault_overflows(self) -> u64 {
+        (self.iommu_faults.get() >> 32) & 0xffff
+    }
+    /// Fault-event interrupts landed since boot: zero means the fault lane
+    /// never fired, and every record was found by a polled drain — the
+    /// record the hardware holds meanwhile is the one that overflows.
+    pub fn iommu_fault_events(self) -> u64 {
+        self.iommu_faults.get() >> 48
     }
     pub fn iommu_last(self) -> u64 {
         self.iommu_last.get()
@@ -1402,6 +1419,12 @@ impl ManifoldSnapshot {
     /// zero the pressure came back `∞` at exactly the load the clamp was meant
     /// to survive.  Clear here means that is happening again.
     const PRESSURE_FINITE: u32 = 1 << 3;
+    /// Two 14-bit rates occupy the previously unused upper flag bits, in
+    /// 100 MB/s units. The fixed process-page ABI remains 40 bytes wide.
+    const TRAFFIC_SHIFT: u32 = 4;
+    const TRAFFIC_PEAK_SHIFT: u32 = 18;
+    const TRAFFIC_MASK: u32 = (1 << 14) - 1;
+    const TRAFFIC_UNIT_BPS: u64 = 100_000_000;
 
     pub const EMPTY: Self = Self {
         flags: U32::new(0),
@@ -1438,6 +1461,32 @@ impl ManifoldSnapshot {
             max_rate_ppm: U32::new(max_rate_ppm),
             node_pressure_milli: U64::new(node_pressure_milli),
         }
+    }
+
+    /// Attach the independently sampled controller rate to the same snapshot.
+    pub fn with_traffic(mut self, bps: u64, peak_bps: u64) -> Self {
+        if peak_bps > 0 {
+            let rate = (bps / Self::TRAFFIC_UNIT_BPS).min(Self::TRAFFIC_MASK as u64) as u32;
+            let peak = (peak_bps / Self::TRAFFIC_UNIT_BPS)
+                .max(1)
+                .min(Self::TRAFFIC_MASK as u64) as u32;
+            self.flags = U32::new(
+                self.flags.get()
+                    | (rate << Self::TRAFFIC_SHIFT)
+                    | (peak << Self::TRAFFIC_PEAK_SHIFT),
+            );
+        }
+        self
+    }
+
+    pub fn traffic(self) -> Option<(u64, u64)> {
+        let flags = self.flags.get();
+        let rate = (flags >> Self::TRAFFIC_SHIFT) & Self::TRAFFIC_MASK;
+        let peak = (flags >> Self::TRAFFIC_PEAK_SHIFT) & Self::TRAFFIC_MASK;
+        (peak > 0).then_some((
+            u64::from(rate) * Self::TRAFFIC_UNIT_BPS,
+            u64::from(peak) * Self::TRAFFIC_UNIT_BPS,
+        ))
     }
 
     pub fn available(self) -> bool {
@@ -1904,6 +1953,16 @@ mod tests {
             !TelemetrySnapshot::new(system, corrupt_memory, exec, ManifoldSnapshot::EMPTY)
                 .validate()
         );
+    }
+
+    #[test]
+    fn manifold_traffic_round_trips_without_growing_the_wire_snapshot() {
+        let base = ManifoldSnapshot::new(1_000_000, 2_000_000, 0, 0, 0, 0, 0, 0, 0);
+        assert_eq!(base.traffic(), None);
+        let observed = base.with_traffic(12_345_678_900, 56_789_123_400);
+        assert_eq!(observed.traffic(), Some((12_300_000_000, 56_700_000_000)));
+        assert!(observed.validate());
+        assert_eq!(core::mem::size_of::<ManifoldSnapshot>(), 40);
     }
 
     #[test]

@@ -52,7 +52,7 @@ use kore_rt::service::{
 };
 
 use crate::seam::{
-    Dma, DmaPool, DmaReleaseFailure, Regs, Regs64, RegsNarrow, RegsRegion, RegsWindowError,
+    Dma, DmaPool, DmaReleaseFailure, Quiet, Regs, Regs64, RegsNarrow, RegsRegion, RegsWindowError,
 };
 
 /// Page granularity — DMA buffers are page-aligned (rings and list pages
@@ -119,14 +119,21 @@ impl HostDeviceToken {
         supply: DmaImport,
         iova: u64,
         device_write: bool,
+        cpu_view: bool,
     ) -> Result<DmaWindow, verbs::DmaMapFault> {
         match self {
             Self::Pci(device) => match supply {
-                DmaImport::Lease(lease) => {
+                DmaImport::Lease(lease) if cpu_view => {
                     verbs::import_dma_window(lease, device, iova, device_write)
                 }
-                DmaImport::Route { route, bytes } => {
+                // A lease import has no device-only form: it is the CPU
+                // lease itself. Only a route can be lent for the device alone.
+                DmaImport::Lease(_) => Err(verbs::DmaMapFault::Bounds),
+                DmaImport::Route { route, bytes, .. } if cpu_view => {
                     verbs::import_route_dma_window(route, device, iova, bytes, device_write)
+                }
+                DmaImport::Route { route, bytes, .. } => {
+                    verbs::import_route_device_window(route, device, iova, bytes, device_write)
                 }
             },
             Self::Platform(_) => Err(verbs::DmaMapFault::Bounds),
@@ -256,7 +263,10 @@ pub enum IntakeError {
     /// The DMA window refused, stage-coded: `code[2:0]` the
     /// [`DmaMapFault`](kore_rt::cap::verbs::DmaMapFault) stage (1 bounds,
     /// 2 slot exhaustion, 3 carve, 4 CPU-view map, 5 geometry, 6 device
-    /// publish), `code >> 3` the kernel status for the commit stages.
+    /// publish), `code >> 3` the kernel status for legacy commit stages.
+    /// Fabric-route refusals occupy `0x80..=0x97`: the low two bits give
+    /// registration/observation/admission stage (1/2/3) and bits 2..4
+    /// identify the route status (Conflict through Capability).
     DmaMap { code: u8 },
     /// The class's own bring-up refused the realized resources — the
     /// controller is present and mappable but did not come up.
@@ -1200,7 +1210,15 @@ enum CapBacking {
 /// service boundary, after all stage-1 cleanup in that operation has returned.
 struct ImportedAllocation {
     released: bool,
+    // Set only by finish_buffer_export after the backend proves exact-buffer
+    // quiescence and completes stage-1 invalidation. Besides requesting the
+    // return ticket, this permits live retirement of this outer mapping.
     return_requested: bool,
+    // Set only by `retire_quiet` when its live retirement did not complete:
+    // the engine's `Quiet` proof still covers this window (nothing it popped
+    // names it, nothing unpopped can reach it), so the retry is the same
+    // live retirement, with no device idleness needed.
+    quiet: bool,
     returned: Option<kore_rt::cap::StashedMemory>,
     window: Option<DmaWindow>,
 }
@@ -1212,12 +1230,14 @@ pub enum DmaImport {
     Route {
         route: kore_rt::cap::FabricRouteToken,
         bytes: u64,
+        align_log2: u8,
     },
 }
 
 impl DmaImport {
     pub fn claim(
         owner: kore_rt::cap::ReturnedCapability,
+        route_access: kore_abi::session::FabricAccess,
     ) -> Result<Self, kore_rt::cap::ReturnedCapability> {
         let required = kore_abi::cap::Rights::ACCESS
             | kore_abi::cap::Rights::MODIFY
@@ -1228,9 +1248,10 @@ impl DmaImport {
         }
         let route = owner.try_into_fabric_route(required)?;
         match route.describe() {
-            Ok(info) if info.operation == 1 && info.access & 3 == 3 => Ok(Self::Route {
+            Ok(info) if route_can_import(&info, route_access) => Ok(Self::Route {
                 route,
                 bytes: info.bytes,
+                align_log2: info.align_log2,
             }),
             _ => Err(route.into_returned_capability()),
         }
@@ -1241,12 +1262,66 @@ impl DmaImport {
             Self::Route { bytes, .. } => *bytes,
         }
     }
+    /// Authenticated IOVA alignment for this import. Lease callers predate
+    /// route geometry and retain the established 2 MiB placement; routes
+    /// carry the backing class end to end.
+    pub fn align(&self) -> u64 {
+        match self {
+            Self::Lease(_) => 2 << 20,
+            Self::Route { align_log2, .. } => 1 << *align_log2,
+        }
+    }
     pub fn into_returned_capability(self) -> Result<kore_rt::cap::ReturnedCapability, Self> {
         match self {
             Self::Lease(lease) => lease.into_returned_capability().map_err(Self::Lease),
             Self::Route { route, .. } => Ok(route.into_returned_capability()),
         }
     }
+}
+
+/// The outcome of [`DeviceResources::retire_quiet`].
+#[must_use]
+pub enum QuietRetire {
+    /// The window's device mapping is gone and its allocation handed back.
+    Retired,
+    /// The live retirement did not complete. The allocation is marked
+    /// released for the idle-boundary retirement to finish.
+    Deferred,
+    /// Not an import of this resource set, or already released: the buffer
+    /// rides back to its owner.
+    Refused(CapBuf),
+}
+
+fn route_can_import(
+    info: &kore_abi::session::FabricRouteInfo,
+    required: kore_abi::session::FabricAccess,
+) -> bool {
+    use kore_abi::session::{FabricAccess, FabricOp};
+    required.contains(FabricAccess::READ)
+        && FabricAccess::from_bits(info.access)
+            .is_some_and(|access| access.contains(required))
+        && info.operation == FabricOp::IommuMap as u8
+}
+
+#[cfg(test)]
+#[test]
+fn route_import_requires_the_requested_device_access() {
+    use kore_abi::session::{FabricAccess, FabricRouteInfo};
+    let mut info = FabricRouteInfo {
+        bytes: 4096,
+        access: FabricAccess::READ.bits(),
+        operation: 1,
+        align_log2: kore_abi::session::LEASE_ALIGN_4K,
+    };
+    assert!(route_can_import(&info, FabricAccess::READ));
+    assert!(!route_can_import(&info, FabricAccess::READ | FabricAccess::WRITE));
+    info.access = (FabricAccess::READ | FabricAccess::WRITE).bits();
+    assert!(route_can_import(&info, FabricAccess::READ | FabricAccess::WRITE));
+    info.operation = 0;
+    assert!(!route_can_import(&info, FabricAccess::READ));
+    info.operation = 1;
+    info.access = 0x80 | FabricAccess::READ.bits();
+    assert!(!route_can_import(&info, FabricAccess::READ));
 }
 
 /// Affine custody of a detached buffer awaiting the native serving boundary.
@@ -1323,36 +1398,80 @@ fn retire_imports_and_resume<T, A: Allocator>(
     imports: &mut Vec<T, A>,
     device_idle: bool,
     released: impl Fn(&T) -> bool,
+    live: impl Fn(&T) -> bool,
     mut retire: impl FnMut(&T) -> bool,
     activate: impl FnOnce() -> bool,
 ) -> bool {
-    // Exact IOVA retirement closes the entire requester's DMA latch. Keep
-    // every detached owner until the backend proves its admissions quiescent.
-    if !device_idle {
-        return true;
-    }
+    // An ordinary released import needs requester-wide DMA retirement: it
+    // waits until every backend admission is quiescent, and a refusal leaves
+    // the latch unproven, which fails the whole epoch.
+    //
+    // A `live` one carries its own quiescence proof (an exact export, a
+    // storage engine's `Quiet` target). It retires whenever it is reached,
+    // idle or not, and a refusal touched no latch: its owner stays for the
+    // next boundary instead of failing the requester
+    // (`res/LIFECYCLE_HARDENING.md` §6).
     let mut changed = false;
     let mut index = 0;
     while index < imports.len() {
-        if !released(&imports[index]) {
+        let entry = &imports[index];
+        let proven = live(entry);
+        if !released(entry) || !(device_idle || proven) {
             index += 1;
             continue;
         }
-        if !retire(&imports[index]) {
+        if retire(entry) {
+            imports.remove(index);
+            // Activation replays the latch only at the idle boundary; a
+            // running requester's latch rests on a surviving window.
+            changed |= device_idle;
+            continue;
+        }
+        if !proven {
             return false;
         }
-        imports.remove(index);
-        changed = true;
+        index += 1;
     }
     !changed || activate()
 }
 
 impl ImportedAllocation {
     fn retire(&mut self) -> bool {
+        self.retire_as(DmaWindow::try_retire_device)
+    }
+
+    /// [`retire`](Self::retire) with the device still running: the window's
+    /// device mapping goes through the live unshare.
+    fn retire_live(&mut self) -> bool {
+        self.retire_as(DmaWindow::try_retire_device_live)
+    }
+
+    /// Export's guarded detach already proves this exact mapping quiet.
+    /// Ordinary release does not carry that proof and retains the requester
+    /// retirement path. A failed live retirement retains the owner for the
+    /// caller's containment path; it never grants a return ticket early.
+    fn retire_released(&mut self) -> bool {
+        if self.retires_live() {
+            self.retire_live()
+        } else {
+            self.retire()
+        }
+    }
+
+    /// Whether this released window's own quiescence proof lets it retire
+    /// with the requester running.
+    fn retires_live(&self) -> bool {
+        self.return_requested || self.quiet
+    }
+
+    fn retire_as(
+        &mut self,
+        retire_device: fn(&mut DmaWindow) -> kore_rt::cap::RetireOutcome,
+    ) -> bool {
         // The named IOVA child closes first. Keep registration and CPU-backed
         // allocation custody until device access is proved retired.
         if let Some(window) = self.window.as_mut() {
-            if !window.try_retire_device().is_closed() {
+            if !retire_device(window).is_closed() {
                 return false;
             }
         }
@@ -1677,7 +1796,23 @@ struct DmaOwner {
     /// window owner, so there is no separate parent token to retain.
     _pool: Option<SupplyToken>,
     device: Option<HostDeviceToken>,
+    /// The lowest IOVA the next import may take: past every range any import
+    /// has ever occupied, not only the live ones. Import IOVAs never move
+    /// back, for two reasons:
+    ///
+    /// - a window retired with the device running (§11) is safe only while
+    ///   its IOVA stays unmapped: a stray access then faults at the IOMMU
+    ///   instead of landing in whatever reused the range;
+    /// - retirement unmaps leaves but keeps the domain's intermediate tables,
+    ///   so a 2 MiB leaf cannot be installed where a 4 KiB mapping once lived
+    ///   — the kernel's map refuses with `AlreadyMapped` and fail-stops.
+    import_floor: u64,
 }
+
+/// Imports stop here, refused typed, rather than reach an IOVA the domain
+/// cannot address — where the kernel's map would fail-stop. `1 << 39` is the
+/// narrowest second-level address width in use (three-level VT-d / AMD-Vi).
+const IMPORT_IOVA_CEILING: u64 = 1 << 39;
 
 impl DmaOwner {
     fn activate(&mut self) -> bool {
@@ -1980,8 +2115,11 @@ impl DeviceResources<DmaActive> {
     /// serving more work. Only a
     /// healthy driver epoch may call this; terminal teardown never reactivates
     /// the requester. `device_idle` must reflect all backend admissions, not
-    /// only the released buffer. False defers retirement without dropping any
-    /// owner. A false return requires containment of the entire epoch.
+    /// only the released buffer. A released import whose own proof lets it
+    /// retire live (an exact export, a `Quiet` storage target) retires even
+    /// with the device busy, and one whose live retirement is refused stays
+    /// owned for the next call ([`Self::deferred_retirements`]) without
+    /// failing. A false return requires containment of the entire epoch.
     pub fn resume_retired_dma(&self, device_idle: bool) -> bool {
         let Some(dma) = self.dma.as_ref() else {
             return false;
@@ -1991,13 +2129,64 @@ impl DeviceResources<DmaActive> {
             &mut imports,
             device_idle,
             |owner| owner.borrow().released,
-            |owner| owner.borrow_mut().retire(),
+            |owner| owner.borrow().retires_live(),
+            |owner| owner.borrow_mut().retire_released(),
             || match (dma.device.as_ref(), dma.window.as_ref()) {
                 (Some(device), Some(window)) => device.activate_window(window),
                 _ => false,
             },
         );
         healthy && dma.retire_pool_loans()
+    }
+
+    /// Retire one imported window while the device keeps running — the
+    /// per-window counterpart of [`resume_retired_dma`](Self::resume_retired_dma),
+    /// keyed on the engine's proof instead of device idleness
+    /// (`res/STORAGE_TRANSPORT.md` §11). Only the buffer's own mapping goes:
+    /// the requester's latch stays open and every other window stays live,
+    /// so nothing needs reactivating.
+    ///
+    /// [`QuietRetire::Deferred`] keeps the allocation owned, marked released
+    /// and still covered by its proof: the next
+    /// [`resume_retired_dma`](Self::resume_retired_dma), idle or not, retries
+    /// the same live retirement.
+    pub fn retire_quiet(&self, buffer: Quiet<CapBuf>) -> QuietRetire {
+        let buffer = buffer.into_inner();
+        let Some(dma) = self.dma.as_ref() else {
+            return QuietRetire::Refused(buffer);
+        };
+        let CapBacking::Imported(owner) = &buffer.backing else {
+            return QuietRetire::Refused(buffer);
+        };
+        let mut imports = dma.imports.borrow_mut();
+        let Some(index) = imports.iter().position(|entry| Rc::ptr_eq(entry, owner)) else {
+            return QuietRetire::Refused(buffer);
+        };
+        if owner.borrow().released {
+            return QuietRetire::Refused(buffer);
+        }
+        if owner.borrow_mut().retire_live() {
+            imports.remove(index);
+            QuietRetire::Retired
+        } else {
+            let mut owner = owner.borrow_mut();
+            owner.released = true;
+            owner.quiet = true;
+            QuietRetire::Deferred
+        }
+    }
+
+    /// Released imports still owned because their retirement has not
+    /// completed: live ones [`Self::resume_retired_dma`] retries on every
+    /// call, the rest at the next idle boundary.
+    pub fn deferred_retirements(&self) -> usize {
+        self.dma.as_ref().map_or(0, |dma| {
+            dma.imports
+                .borrow()
+                .iter()
+                .filter(|owner| owner.borrow().released)
+                .count()
+        })
     }
 
     /// Reserve loan custody before the backend removes its stage-1 mapping.
@@ -2264,12 +2453,37 @@ impl DeviceResources<DmaActive> {
         supply: DmaImport,
         device_write: bool,
     ) -> Result<CapBuf, IntakeError> {
+        self.import_dma_with(supply, device_write, true)
+    }
+
+    /// [`import_dma`](Self::import_dma) for the device alone: a lent route is
+    /// published into the device's domain and nothing is mapped into this
+    /// task, so the returned buffer's [`cpu`](CapBuf) pointer is null and the
+    /// consumer must never read or write it through the CPU. For a streaming
+    /// target — the device fills it, its owner reads it — the importing
+    /// service's address space and page tables then stay independent of how
+    /// large the client's allocation is.
+    pub fn import_dma_device(
+        &mut self,
+        supply: DmaImport,
+        device_write: bool,
+    ) -> Result<CapBuf, IntakeError> {
+        self.import_dma_with(supply, device_write, false)
+    }
+
+    fn import_dma_with(
+        &mut self,
+        supply: DmaImport,
+        device_write: bool,
+        cpu_view: bool,
+    ) -> Result<CapBuf, IntakeError> {
         if matches!(&supply, DmaImport::Lease(lease) if !lease.is_returned()) {
             return Err(IntakeError::DmaUnavailable);
         }
         let dma = self.dma.as_mut().ok_or(IntakeError::DmaUnavailable)?;
         let device = dma.device.as_ref().ok_or(IntakeError::DmaUnavailable)?;
         let len = supply.len();
+        let align = supply.align();
         let bytes = usize::try_from(len).map_err(|_| IntakeError::DmaUnavailable)?;
         if len == 0 || len % PAGE != 0 {
             return Err(IntakeError::DmaUnavailable);
@@ -2285,6 +2499,7 @@ impl DeviceResources<DmaActive> {
         let owner = Rc::try_new(RefCell::new(ImportedAllocation {
             released: false,
             return_requested: false,
+            quiet: false,
             returned: None,
             window: None,
         }))
@@ -2295,7 +2510,8 @@ impl DeviceResources<DmaActive> {
             .chain(dma.extensions.iter().map(|entry| &entry.0))
             .map(|window| window.iova() + window.len())
             .max()
-            .ok_or(IntakeError::DmaUnavailable)?;
+            .ok_or(IntakeError::DmaUnavailable)?
+            .max(dma.import_floor);
         for imported in imports.iter() {
             if let Some(window) = imported.borrow().window.as_ref() {
                 end = end.max(
@@ -2307,12 +2523,18 @@ impl DeviceResources<DmaActive> {
             }
         }
         let iova = end
-            .checked_add((2 << 20) - 1)
+            .checked_add(align - 1)
             .ok_or(IntakeError::DmaUnavailable)?
-            & !((2 << 20) - 1);
-        iova.checked_add(len).ok_or(IntakeError::DmaUnavailable)?;
+            & !(align - 1);
+        let import_end = iova.checked_add(len).ok_or(IntakeError::DmaUnavailable)?;
+        if import_end > IMPORT_IOVA_CEILING {
+            return Err(IntakeError::DmaUnavailable);
+        }
+        // Claimed before the map is attempted: a map that fails part way
+        // may have touched the range, so it is never offered again either.
+        dma.import_floor = import_end;
         let window = device
-            .import_window(supply, iova, device_write)
+            .import_window(supply, iova, device_write, cpu_view)
             .map_err(|fault| IntakeError::DmaMap { code: fault.code() })?;
         let cpu = window.cpu();
         owner.borrow_mut().window = Some(window);
@@ -3170,6 +3392,7 @@ fn realize_host_resources<B: DeviceBinding>(
             loans: RefCell::new(Vec::new()),
             _pool: pool,
             device: Some(device),
+            import_floor: 0,
         }),
         pool: Some(cap_pool),
         bars,
@@ -3296,6 +3519,7 @@ mod tests {
             &mut owners,
             false,
             |released| *released,
+            |_| false,
             |_| panic!("unrelated device work excludes outer retirement"),
             || panic!("deferred retirement must not touch activation")
         ));
@@ -3308,6 +3532,7 @@ mod tests {
             &mut owners,
             true,
             |released| *released,
+            |_| false,
             |_| {
                 retired.set(retired.get() + 1);
                 true
@@ -3322,6 +3547,7 @@ mod tests {
             &mut owners,
             true,
             |released| *released,
+            |_| false,
             |_| panic!("live import must not retire"),
             || panic!("no retirement means no activation")
         ));
@@ -3330,6 +3556,7 @@ mod tests {
             &mut owners,
             true,
             |released| *released,
+            |_| false,
             |_| false,
             || panic!("refused retirement requires containment")
         ));
@@ -3343,12 +3570,63 @@ mod tests {
                 &mut owners,
                 true,
                 |released| *released,
+                |_| false,
                 |_| true,
                 || false
             ),
             "failed activation cannot acknowledge success"
         );
         assert_eq!(owners, [false]);
+    }
+
+    /// A window carrying its own quiescence proof retires with the device
+    /// busy, and a refusal of that live retirement keeps its owner without
+    /// failing the requester (`res/LIFECYCLE_HARDENING.md` §6).
+    #[test]
+    fn proven_imports_retire_live_and_a_refusal_never_fails_the_requester() {
+        let arena = test_arena::TestArena::<4096>::new();
+        let mut owners = Vec::new_in(&arena);
+        // (released, proven live, id)
+        owners.extend([(true, true, 0u8), (true, false, 1), (false, true, 2), (true, true, 3)]);
+        let refused = core::cell::Cell::new(3u8);
+        // A busy device: only released, proven windows are attempted. The
+        // refused one stays owned, and the latch is left alone.
+        assert!(super::retire_imports_and_resume(
+            &mut owners,
+            false,
+            |owner| owner.0,
+            |owner| owner.1,
+            |owner| owner.2 != refused.get(),
+            || panic!("a running requester is never reactivated")
+        ));
+        assert_eq!(owners, [(true, false, 1), (false, true, 2), (true, true, 3)]);
+        // The idle boundary retires the ordinary release and reactivates;
+        // the proven window refused again is still no failure.
+        let activated = core::cell::Cell::new(false);
+        assert!(super::retire_imports_and_resume(
+            &mut owners,
+            true,
+            |owner| owner.0,
+            |owner| owner.1,
+            |owner| owner.2 != refused.get(),
+            || {
+                activated.set(true);
+                true
+            }
+        ));
+        assert!(activated.get());
+        assert_eq!(owners, [(false, true, 2), (true, true, 3)]);
+        // Its retirement completes on a later pass, busy or not.
+        refused.set(u8::MAX);
+        assert!(super::retire_imports_and_resume(
+            &mut owners,
+            false,
+            |owner| owner.0,
+            |owner| owner.1,
+            |owner| owner.2 != refused.get(),
+            || panic!("a live retirement needs no reactivation")
+        ));
+        assert_eq!(owners, [(false, true, 2)]);
     }
 
     use super::*;

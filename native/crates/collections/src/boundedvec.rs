@@ -278,7 +278,10 @@ mod tests {
         for value in &mut items {
             *value *= 2;
         }
-        assert_eq!((&items).into_iter().copied().collect::<std::vec::Vec<_>>(), [2, 4, 6]);
+        assert_eq!(
+            (&items).into_iter().copied().collect::<std::vec::Vec<_>>(),
+            [2, 4, 6]
+        );
         assert_eq!(items.into_iter().sum::<u32>(), 12);
     }
 

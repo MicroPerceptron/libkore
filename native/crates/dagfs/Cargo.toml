@@ -12,7 +12,7 @@ default = []
 # the wire codec, the ring and host clients, and the view capability leaves.
 # Pure types — names, ids, bounds, errors, paths — never need it, which is
 # what lets the linker stub and a no-allocator image hold a `Name`.
-runtime = ["dep:kore-rt", "dep:kore-svc-extract", "dep:zerocopy"]
+runtime = ["dep:kore-rt", "dep:kore-ring", "dep:kore-svc-extract", "dep:zerocopy"]
 # Plain-text index publication for the version a client just wrote (the
 # #476 producer seam): the walker's `index` module and its parser.
 index = ["runtime", "dep:kore-svc-extract-worker-rust"]
@@ -22,6 +22,8 @@ heapless = { version = "0.9.3", default-features = false }
 kore-abi = { path = "../abi" }
 kore-collections = { path = "../collections", default-features = false }
 kore-rt = { path = "../rt", default-features = false, optional = true }
+# The storage ring window a client submits through (`stor`).
+kore-ring = { path = "../ring", optional = true }
 kore-svc-extract = { path = "../../services/extract", optional = true }
 kore-svc-extract-worker-rust = { path = "../../services/extract-worker-rust", optional = true }
 # The little-endian field wrappers the frozen records are built from.  No

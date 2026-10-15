@@ -27,7 +27,10 @@ impl<'w, 't> Fs<'w, 't> {
     }
 
     /// [`Fs::create`], stamping `subtype` — data the object carries for its
-    /// life, never authority. A directory refuses any but `PLAIN`.
+    /// life, never authority over it. A directory refuses any but `PLAIN`,
+    /// and an attesting stamp needs its
+    /// [`stamp_rights`](ObjectSubtype::stamp_rights) on `parent`'s route
+    /// (`AccessDenied` otherwise).
     pub async fn create_typed(
         &mut self,
         parent: &View,

@@ -58,6 +58,16 @@ pub const PEAK_HANDLES: usize = 4;
 const _: () = assert!(PEAK_HANDLES <= MAX_HANDLES_PER_SESSION);
 
 /// This process's private filesystem pair.
+impl Fs<'_, '_> {
+    /// Drive replies by re-polling the ring rather than the executor's clock
+    /// ([`RingFs::set_direct_polling`]): for a caller that completes its
+    /// filesystem calls under `block_on` from inside a task's poll, and
+    /// restores the executor mode before the executor drives them again.
+    pub fn set_direct_polling(&mut self, direct: bool) {
+        self.client.set_direct_polling(direct);
+    }
+}
+
 pub struct Fs<'w, 't> {
     pub(crate) client: RingFs<'w, 't, TrapTransport>,
     pub(crate) window: &'static mut [u8],
@@ -75,6 +85,14 @@ pub struct Fs<'w, 't> {
     /// endpoint carries REVOKE only, so it cannot be used as a cwd or further
     /// delegated by the command.
     pub(crate) grant_target: Option<HeldChanSendToken>,
+    /// This launch's storage ring, when its founding delivered one
+    /// ([`role::STOR_RING`] and [`role::STOR_TARGET`]): set up on the first
+    /// read that streams through it ([`crate::stor::FacadeRing`]).
+    pub(crate) ring: crate::stor::FacadeRing,
+    /// Files read whole through that ring.
+    pub(crate) ring_files: u64,
+    /// Why the last whole-file read did or did not take that ring.
+    pub(crate) ring_note: &'static str,
 }
 
 impl<'w, 't> Fs<'w, 't> {
@@ -169,6 +187,14 @@ impl<'w, 't> Fs<'w, 't> {
         if !attached {
             return None;
         }
+        let ring = crate::stor::FacadeRing::delivered(
+            rt.bootstrap()
+                .handle(role::STOR_RING, 0)
+                .and_then(verbs::take_lease),
+            rt.bootstrap()
+                .handle(role::STOR_TARGET, 0)
+                .and_then(verbs::take_lease),
+        );
         Some(Self {
             client,
             window: data,
@@ -176,6 +202,9 @@ impl<'w, 't> Fs<'w, 't> {
             _data_lease: data_lease,
             view_binding,
             grant_target,
+            ring,
+            ring_files: 0,
+            ring_note: "unused",
         })
     }
 
@@ -189,6 +218,26 @@ impl<'w, 't> Fs<'w, 't> {
     /// about to hand the service.
     pub fn window_mut(&mut self) -> &mut [u8] {
         self.window
+    }
+
+    /// A bounded, validated read of the service's aggregate posture. A
+    /// timeout leaves the exact status request pending on this pair.
+    pub async fn system_status_bounded(
+        &mut self,
+        budget_ns: u64,
+    ) -> Result<kore_abi::svc::FsSystemStatusWire, crate::client::RingFsError> {
+        use kore_abi::svc::FsSystemStatusWire;
+        let len = self.client.system_status_bounded(0, budget_ns).await?;
+        if len as usize != FsSystemStatusWire::BYTES {
+            return Err(crate::client::RingFsError::Wire);
+        }
+        crate::client::read_system_status(self.window, 0)
+            .map_err(crate::client::RingFsError::Refused)
+    }
+
+    /// Whether a new filesystem request can safely be published.
+    pub fn status_pair_idle(&self) -> bool {
+        self.client.is_idle()
     }
 
     /// One round trip. A transport failure is [`Refusal::Pair`] — a caller

@@ -1,10 +1,11 @@
 //! Generic foreground-process launch/result and streaming-I/O pages.
 
+pub mod interrupt;
+
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
 
-#[cfg(any(target_os = "none", test))]
 use kore_abi::cap::Rights;
 use kore_abi::monitor::TelemetrySnapshot;
 #[cfg(target_os = "none")]
@@ -154,6 +155,22 @@ pub enum ProcessStdioWaitFor {
     Incoming,
     /// Wake for an incoming record or newly available outgoing capacity.
     IncomingOrCapacity,
+    /// Wake only for newly available outgoing capacity: the caller holds
+    /// output that does not fit, and records arriving meanwhile wait for it.
+    /// Waiting for either would return at once while input sits unread.
+    Capacity,
+}
+
+impl ProcessStdioWaitFor {
+    /// Whether a side with `incoming` records unread and `capacity` free
+    /// outgoing slots has nothing to wait for.
+    const fn satisfied(self, incoming: bool, capacity: bool) -> bool {
+        match self {
+            Self::Incoming => incoming,
+            Self::IncomingOrCapacity => incoming || capacity,
+            Self::Capacity => capacity,
+        }
+    }
 }
 
 /// Why a stream-side park attempt returned.
@@ -175,6 +192,10 @@ pub enum ProcessStdioWaitError {
     InvalidNotice,
     /// The kernel resolved the alternate post but its owner found no notice.
     MissingNotice,
+    /// A stream host has no dedicated receive: its peer's notices land on the
+    /// host's own executor doorbell. Arm with `arm_shared_doorbell` and park
+    /// on the executor instead.
+    SharedDoorbell,
 }
 
 impl From<RecvError> for ProcessStdioWaitError {
@@ -218,12 +239,21 @@ impl Drop for ProcessStdioWaiting<'_> {
     }
 }
 
-struct ProcessStdioPeer<'w, 't, T: Transport> {
-    transport: &'t T,
-    send: ProcessStdioSend,
+/// A dedicated wake receive and the notice machinery bound to its slot.
+struct PeerReceive<'t, T: Transport> {
     /// Retained solely as the affine ownership witness for `notice`'s slot.
     _recv: ProcessStdioRecv,
     notice: NoticeRx<'t, T>,
+}
+
+struct ProcessStdioPeer<'w, 't, T: Transport> {
+    transport: &'t T,
+    send: ProcessStdioSend,
+    /// `None` only for a stream host ([`map_stdio_host`]): the child's output
+    /// wake is a send into the host's own executor doorbell, so the host
+    /// parks with [`ProcessStdioParent::arm_shared_doorbell`] and has no
+    /// receive to arm, consume, or disarm.
+    receive: Option<PeerReceive<'t, T>>,
     /// This side's one-writer signal line: increment after every enqueue or
     /// dequeue that can make work/capacity visible to the peer.
     published: &'w AtomicU32,
@@ -299,16 +329,13 @@ impl<'w, T: Transport> ProcessStdioPeer<'w, '_, T> {
     }
 
     fn close_after_recv_root_revoked(self) {
-        let Self {
-            send,
-            _recv: recv,
-            notice,
-            ..
-        } = self;
-        notice.close_after_root_revoked();
-        // Root revocation made both endpoint records dead before their affine
-        // wrappers release local dynamic-arena names.
-        drop(recv);
+        let Self { send, receive, .. } = self;
+        if let Some(PeerReceive { _recv: recv, notice }) = receive {
+            notice.close_after_root_revoked();
+            // Root revocation made both endpoint records dead before their
+            // affine wrappers release local dynamic-arena names.
+            drop(recv);
+        }
         drop(send);
     }
 
@@ -372,9 +399,13 @@ impl<'w, T: Transport> ProcessStdioPeer<'w, '_, T> {
         // Arm the dedicated receive before publishing `waiting`. If a prior
         // signal already landed, consume it and re-run the caller's drain
         // without parking.
-        match self.notice.try_recv() {
+        let recv_cookie = self.recv_cookie;
+        let Some(receive) = self.receive.as_mut() else {
+            return Err(ProcessStdioWaitError::SharedDoorbell);
+        };
+        match receive.notice.try_recv() {
             Ok(Some(notice)) => {
-                return if self.notice_is_valid(notice) {
+                return if notice.cookie == recv_cookie {
                     Ok(ProcessStdioParkStep::Changed)
                 } else {
                     Err(ProcessStdioWaitError::InvalidNotice)
@@ -386,7 +417,7 @@ impl<'w, T: Transport> ProcessStdioPeer<'w, '_, T> {
             }
             Err(error) => return Err(ProcessStdioWaitError::Receive(error)),
         }
-        let Some(post) = self.notice.standing_post() else {
+        let Some(post) = receive.notice.standing_post() else {
             return Err(ProcessStdioWaitError::Receive(RecvError::Refused(
                 kore_abi::session::Status::Malformed,
             )));
@@ -416,10 +447,13 @@ impl<'w, T: Transport> ProcessStdioPeer<'w, '_, T> {
         reason: WakeReason,
     ) -> Result<ProcessStdioPark, ProcessStdioWaitError> {
         drop(ticket);
+        let Some(receive) = self.receive.as_mut() else {
+            return Err(ProcessStdioWaitError::SharedDoorbell);
+        };
         let delivered = if reason == WakeReason::Delivery {
-            self.notice.settle_delivery()?
+            receive.notice.settle_delivery()?
         } else {
-            self.notice.try_recv()?
+            receive.notice.try_recv()?
         };
         match (reason, delivered) {
             (_, Some(notice)) if self.notice_is_valid(notice) => Ok(ProcessStdioPark::StateChanged),
@@ -477,7 +511,8 @@ impl ProcessStdioParkTicket<'_> {
 /// The rings are private so every successful dequeue also publishes newly
 /// available capacity and every enqueue publishes data before issuing the
 /// directional kick. Construct this only by consuming
-/// [`PreparedProcessStdio::attach_parent`].
+/// [`PreparedProcessStdio::attach_parent`] (the launcher's own end), or, in a
+/// stream host, through [`map_stdio_host`] (an end the launcher delegated).
 #[must_use = "retain the stream endpoint through task quiescence, then close it after both wake roots are revoked"]
 pub struct ProcessStdioParent<'w, 't, T: Transport> {
     stdin: Producer<'w, ProcessInputChunk>,
@@ -544,6 +579,12 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
         self.stdin.capacity_left()
     }
 
+    /// Advisory input records the child has not consumed yet — how a
+    /// launcher learns that the child read an interrupt it sent last.
+    pub fn stdin_unconsumed(&self) -> u32 {
+        self.stdin.capacity().saturating_sub(self.stdin.capacity_left())
+    }
+
     /// Advisory published output events awaiting this parent.
     pub fn output_outstanding(&self) -> u32 {
         self.output.outstanding()
@@ -562,11 +603,7 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
         self.peer
             .park_after_drain_inner(
                 drain,
-                || {
-                    output.outstanding() != 0
-                        || (wait_for == ProcessStdioWaitFor::IncomingOrCapacity
-                            && stdin.capacity_left() != 0)
-                },
+                || wait_for.satisfied(output.outstanding() != 0, stdin.capacity_left() != 0),
                 None,
             )
             .await
@@ -592,11 +629,7 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
         self.peer
             .park_after_drain_inner(
                 drain,
-                || {
-                    output.outstanding() != 0
-                        || (wait_for == ProcessStdioWaitFor::IncomingOrCapacity
-                            && stdin.capacity_left() != 0)
-                },
+                || wait_for.satisfied(output.outstanding() != 0, stdin.capacity_left() != 0),
                 Some(delta_ns),
             )
             .await
@@ -657,7 +690,10 @@ impl<'w, T: Transport> ProcessStdioChild<'w, '_, T> {
     /// [`try_send_output`](Self::try_send_output), with the parent's data
     /// notice committed synchronously. [`Full`] alone means nothing was
     /// published.
-    pub fn send_output_now(&mut self, record: ProcessOutputEvent) -> Result<ProcessStdioWake, Full> {
+    pub fn send_output_now(
+        &mut self,
+        record: ProcessOutputEvent,
+    ) -> Result<ProcessStdioWake, Full> {
         self.output.push(record)?;
         Ok(self.peer.signal_now())
     }
@@ -698,7 +734,11 @@ impl<'w, T: Transport> ProcessStdioChild<'w, '_, T> {
     ) -> Result<ProcessStdioPark, ProcessStdioWaitError> {
         let (stdin, output) = (&self.stdin, &self.output);
         self.peer
-            .park_after_drain_inner(drain, || stdio_ready(stdin, output, wait_for), Some(delta_ns))
+            .park_after_drain_inner(
+                drain,
+                || stdio_ready(stdin, output, wait_for),
+                Some(delta_ns),
+            )
             .await
     }
 
@@ -729,15 +769,14 @@ impl<'w, T: Transport> ProcessStdioChild<'w, '_, T> {
     }
 }
 
-/// Whether a child's park has nothing to wait for: input arrived, or (when
-/// asked) output capacity opened.
+/// Whether a child's park has nothing to wait for: input arrived, or output
+/// capacity opened, as `wait_for` asks.
 fn stdio_ready(
     stdin: &Consumer<'_, ProcessInputChunk>,
     output: &Producer<'_, ProcessOutputEvent>,
     wait_for: ProcessStdioWaitFor,
 ) -> bool {
-    stdin.outstanding() != 0
-        || (wait_for == ProcessStdioWaitFor::IncomingOrCapacity && output.capacity_left() != 0)
+    wait_for.satisfied(stdin.outstanding() != 0, output.capacity_left() != 0)
 }
 
 /// A freshly formatted parent attachment, before its directional wake
@@ -776,7 +815,7 @@ impl<'w> PreparedProcessStdio<'w> {
                 len,
                 transport,
                 ProcessStdioSend::Owned(stdin_send),
-                ProcessStdioRecv::Owned(output_recv),
+                Some(ProcessStdioRecv::Owned(output_recv)),
             )
         }
     }
@@ -876,25 +915,28 @@ pub fn init_stdio(window: &mut [u8]) -> Result<PreparedProcessStdio<'_>, RingErr
     })
 }
 
+/// Bind the parent end. `output_recv` is `None` only for a stream host,
+/// whose child output wake rings the host's own executor doorbell.
 unsafe fn bind_parent<'w, 't, T: Transport>(
     base: *mut u8,
     len: usize,
     transport: &'t T,
     stdin_send: ProcessStdioSend,
-    output_recv: ProcessStdioRecv,
+    output_recv: Option<ProcessStdioRecv>,
 ) -> Result<ProcessStdioParent<'w, 't, T>, RingError> {
     // SAFETY: the caller owns this local mapping attachment for `'w`.
     let window = unsafe { core::slice::from_raw_parts_mut(base, len) };
     let regions = stdio_regions(window)?;
-    let output_recv_slot = output_recv.slot();
     Ok(ProcessStdioParent {
         stdin: spsc::producer::<ProcessInputChunk>(regions.stdin)?,
         output: spsc::consumer::<ProcessOutputEvent>(regions.output)?,
         peer: ProcessStdioPeer {
             transport,
             send: stdin_send,
-            _recv: output_recv,
-            notice: NoticeRx::new(transport, output_recv_slot),
+            receive: output_recv.map(|recv| PeerReceive {
+                notice: NoticeRx::new(transport, recv.slot()),
+                _recv: recv,
+            }),
             published: regions.to_child,
             peer_waiting: regions.child_waiting,
             observed: regions.to_parent,
@@ -916,15 +958,16 @@ unsafe fn bind_child<'w, 't, T: Transport>(
     // SAFETY: the caller owns this local mapping attachment for `'w`.
     let window = unsafe { core::slice::from_raw_parts_mut(base, len) };
     let regions = stdio_regions(window)?;
-    let stdin_recv_slot = stdin_recv.slot();
     Ok(ProcessStdioChild {
         stdin: spsc::consumer::<ProcessInputChunk>(regions.stdin)?,
         output: spsc::producer::<ProcessOutputEvent>(regions.output)?,
         peer: ProcessStdioPeer {
             transport,
             send: output_send,
-            _recv: stdin_recv,
-            notice: NoticeRx::new(transport, stdin_recv_slot),
+            receive: Some(PeerReceive {
+                notice: NoticeRx::new(transport, stdin_recv.slot()),
+                _recv: stdin_recv,
+            }),
             published: regions.to_parent,
             peer_waiting: regions.parent_waiting,
             observed: regions.to_child,
@@ -953,7 +996,7 @@ fn split_stdio<'w, 'p, 'c, P: Transport, C: Transport>(
                 len,
                 parent_transport,
                 ProcessStdioSend::Test(SlotRef::from_wire(41)),
-                ProcessStdioRecv::Test(SlotRef::from_wire(42)),
+                Some(ProcessStdioRecv::Test(SlotRef::from_wire(42))),
             )?,
             bind_child(
                 base,
@@ -1066,6 +1109,125 @@ pub fn map_stdio(rt: &Rt) -> Option<MappedProcessStdioChild> {
     }
 }
 
+/// A stream host's delegated parent end: the stdin producer, the output
+/// consumer, and a send-only peer (`res/SHELL_TERMINAL.md` §6).
+pub type MappedProcessStdioHost =
+    ProcessStdioParent<'static, 'static, crate::transport::TrapTransport>;
+
+/// What a stream host holds at startup: the mapped stream page, not yet a
+/// parent end, and the receive of its **host channel**.
+///
+/// The launcher formatted the page before either end was founded and keeps
+/// every lifecycle pivot: the child's task handle, the channel roots, and the
+/// backing the view is carved from. Over the host channel it delivers the
+/// stdin-wake send, which [`HostStdioView::bind`] turns the page into a
+/// parent end with, and then a delegated handle for each foreground task the
+/// host may end (`res/SHELL_TERMINAL.md` §9).
+pub struct HostStdio {
+    pub view: HostStdioView,
+    /// The host channel's receive: build a [`crate::chan::CapRx`] over its
+    /// slot. Affine, so this task holds exactly one witness to it.
+    pub channel: crate::cap::HeldChanRecvToken,
+}
+
+/// The mapped stream page of a stream host, awaiting its stdin-wake send.
+pub struct HostStdioView {
+    base: *mut u8,
+}
+
+impl HostStdioView {
+    /// Bind the parent end with the stdin-wake send the launcher delivered.
+    ///
+    /// The host has no output receive: the child's output wake is a send
+    /// into this task's own executor doorbell, so the host drains on every
+    /// executor wake and arms with [`ProcessStdioParent::arm_shared_doorbell`];
+    /// `park_after_drain*` answer [`ProcessStdioWaitError::SharedDoorbell`].
+    /// Binding validates both ring headers and never formats: re-running
+    /// [`init_stdio`] here would zero records the child may already have
+    /// published.
+    /// Binding refuses — with the ring's own reason, and the view spent —
+    /// only when the page is not a formatted stream.
+    pub fn bind(self, stdin_send: ChanSendToken) -> Result<MappedProcessStdioHost, RingError> {
+        // SAFETY: the host attachment bit was atomically spent before the
+        // view was taken, and consuming `self` spends this one binding, so
+        // safe code cannot construct a second local parent pair. The mapped
+        // view remains installed for the task's lifetime.
+        unsafe {
+            bind_parent(
+                self.base,
+                kore_abi::process::PROCESS_STDIO_BYTES,
+                crate::entry::transport(),
+                ProcessStdioSend::Owned(stdin_send),
+                None,
+            )
+        }
+    }
+}
+
+/// Why a stream host's delegated capabilities did not map. Each variant
+/// names the one check that refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostStdioError {
+    /// Neither role was staged: an ordinary launch of the same image.
+    Absent,
+    /// Only one of the two roles was staged.
+    Partial,
+    /// This task already spent its one stream-host attachment.
+    AlreadyAttached,
+    /// The view role does not hold a delivered view.
+    ViewMissing,
+    /// The view lacks `ACCESS | MODIFY`; it carries these rights.
+    ViewRights(Rights),
+    /// The channel role does not hold a receive with `ACCESS`.
+    ChannelMissing,
+    /// The kernel refused to map the view.
+    MapRefused,
+    /// The mapping is shorter than a stream page, or not cache-line aligned.
+    Geometry { len: usize, aligned: bool },
+}
+
+/// Map the stream page and host channel a stream host's launcher delegated.
+#[cfg(target_os = "none")]
+pub fn map_stdio_host(rt: &Rt) -> Result<HostStdio, HostStdioError> {
+    use kore_abi::process::{
+        PROCESS_STDIO_HOST_CHANNEL_INDEX, PROCESS_STDIO_HOST_INDEX, PROCESS_STDIO_HOST_ROLE,
+    };
+    let bootstrap = rt.bootstrap();
+    let (view_slot, channel_slot) = match (
+        bootstrap.handle(PROCESS_STDIO_HOST_ROLE, PROCESS_STDIO_HOST_INDEX),
+        bootstrap.handle(PROCESS_STDIO_HOST_ROLE, PROCESS_STDIO_HOST_CHANNEL_INDEX),
+    ) {
+        (Some(view), Some(channel)) => (view, channel),
+        // Absent roles are the ordinary launch, and must not spend the claim.
+        (None, None) => return Err(HostStdioError::Absent),
+        _ => return Err(HostStdioError::Partial),
+    };
+    if !rt.claim_process_stdio_host_attachment() {
+        return Err(HostStdioError::AlreadyAttached);
+    }
+    let view = crate::cap::verbs::take_view(view_slot).ok_or(HostStdioError::ViewMissing)?;
+    // As for the child: both ring halves write their local cursors.
+    if !process_stdio_view_is_writable(view.rights()) {
+        return Err(HostStdioError::ViewRights(view.rights()));
+    }
+    let channel = crate::cap::verbs::take_chan_recv(channel_slot, Rights::ACCESS)
+        .ok_or(HostStdioError::ChannelMissing)?;
+    let mapped = crate::cap::verbs::map_view(view).ok_or(HostStdioError::MapRefused)?;
+    let aligned = (mapped.cast::<u8>().as_ptr() as usize).is_multiple_of(64);
+    if mapped.len() < PROCESS_STDIO_BYTES || !aligned {
+        return Err(HostStdioError::Geometry {
+            len: mapped.len(),
+            aligned,
+        });
+    }
+    Ok(HostStdio {
+        view: HostStdioView {
+            base: mapped.cast::<u8>().as_ptr(),
+        },
+        channel,
+    })
+}
+
 /// Host builds have no mapped capability view.
 #[cfg(not(target_os = "none"))]
 pub fn map(_rt: &Rt) -> Option<&'static mut ProcessIo> {
@@ -1076,6 +1238,12 @@ pub fn map(_rt: &Rt) -> Option<&'static mut ProcessIo> {
 #[cfg(not(target_os = "none"))]
 pub fn map_stdio(_rt: &Rt) -> Option<MappedProcessStdioChild> {
     None
+}
+
+/// Host builds have no mapped capability view.
+#[cfg(not(target_os = "none"))]
+pub fn map_stdio_host(_rt: &Rt) -> Result<HostStdio, HostStdioError> {
+    Err(HostStdioError::Absent)
 }
 
 #[cfg(test)]
@@ -1236,6 +1404,68 @@ mod tests {
         assert!(parent.arm_shared_doorbell(parent.begin_drain()));
     }
 
+    /// A stream host binds the parent end with no dedicated receive: it parks
+    /// only through the shared-doorbell fence, never through a notice post it
+    /// does not hold, and closes without disarming a landing it never armed.
+    #[test]
+    fn a_capacity_wait_ignores_unread_input() {
+        use ProcessStdioWaitFor::{Capacity, Incoming, IncomingOrCapacity};
+        // Output full, input waiting: only a capacity wait still parks.
+        assert!(Incoming.satisfied(true, false));
+        assert!(IncomingOrCapacity.satisfied(true, false));
+        assert!(!Capacity.satisfied(true, false));
+        assert!(Capacity.satisfied(false, true));
+        assert!(!Incoming.satisfied(false, true));
+    }
+
+    #[test]
+    fn a_stream_host_parks_only_through_its_shared_doorbell() {
+        let transport = OkTransport::new();
+        let mut page = Page::zeroed();
+        let prepared = init_stdio(&mut page.0).unwrap();
+        let (base, len) = prepared.into_raw();
+        let (mut host, mut child) = unsafe {
+            (
+                bind_parent(
+                    base,
+                    len,
+                    &transport,
+                    ProcessStdioSend::Test(SlotRef::from_wire(41)),
+                    None,
+                )
+                .unwrap(),
+                bind_child(
+                    base,
+                    len,
+                    &transport,
+                    ProcessStdioSend::Test(SlotRef::from_wire(43)),
+                    ProcessStdioRecv::Test(SlotRef::from_wire(44)),
+                )
+                .unwrap(),
+            )
+        };
+        assert!(host.arm_shared_doorbell(host.begin_drain()));
+        assert_eq!(
+            drive(child.try_send_output(ProcessOutputEvent::input_ready())).unwrap(),
+            ProcessStdioWake::Delivered
+        );
+        assert_eq!(
+            drive(host.try_recv_output()).unwrap().0.kind(),
+            Ok(ProcessOutputKind::InputReady)
+        );
+        let drain = host.begin_drain();
+        assert_eq!(
+            drive(host.park_after_drain(drain, ProcessStdioWaitFor::Incoming)),
+            Err(ProcessStdioWaitError::SharedDoorbell)
+        );
+        drive(host.try_send_stdin(ProcessInputChunk::data(b"ls\n").unwrap())).unwrap();
+        assert_eq!(
+            drive(child.try_recv_stdin()).unwrap().0.bytes(),
+            Ok(b"ls\n".as_slice())
+        );
+        host.close_after_wake_roots_revoked();
+    }
+
     #[test]
     fn affine_stream_methods_publish_both_data_and_capacity_edges() {
         let transport = OkTransport::new();
@@ -1341,6 +1571,28 @@ mod tests {
         );
     }
 
+    /// An interrupt is not input: it crosses with no InputReady outstanding,
+    /// and the launcher learns the child read it from the ring alone.
+    #[test]
+    fn an_unsolicited_interrupt_crosses_and_its_read_is_observable() {
+        let transport = OkTransport::new();
+        let mut page = Page::zeroed();
+        let (mut parent, mut child) = split_stdio(&mut page.0, &transport, &transport).unwrap();
+
+        assert_eq!(parent.stdin_unconsumed(), 0);
+        assert_eq!(
+            drive(parent.try_send_stdin(ProcessInputChunk::interrupt())).unwrap(),
+            ProcessStdioWake::PeerNotWaiting
+        );
+        assert_eq!(parent.stdin_unconsumed(), 1);
+        assert_eq!(child.stdin_outstanding(), 1);
+        let (record, _) = drive(child.try_recv_stdin()).unwrap();
+        assert_eq!(record.kind(), Ok(ProcessInputKind::Interrupt));
+        assert_eq!(parent.stdin_unconsumed(), 0);
+        // The child may still close its stream: nothing was left unanswered.
+        assert!(drive(child.try_send_output(ProcessOutputEvent::closed())).is_ok());
+    }
+
     #[test]
     fn unreachable_kick_never_rolls_back_published_state() {
         let transport = RefusedTransport;
@@ -1370,7 +1622,7 @@ mod tests {
                 page.0.len(),
                 &transport,
                 ProcessStdioSend::Test(SlotRef::from_wire(41)),
-                ProcessStdioRecv::Test(SlotRef::from_wire(42)),
+                Some(ProcessStdioRecv::Test(SlotRef::from_wire(42))),
             )
         };
         assert!(matches!(result, Err(RingError::BadHeader)));
@@ -1385,7 +1637,7 @@ mod tests {
                 len,
                 &transport,
                 ProcessStdioSend::Test(SlotRef::from_wire(41)),
-                ProcessStdioRecv::Test(SlotRef::from_wire(42)),
+                Some(ProcessStdioRecv::Test(SlotRef::from_wire(42))),
             )
         };
         assert!(attached.is_ok());

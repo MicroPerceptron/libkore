@@ -248,6 +248,7 @@ dependencies = [
  "heapless",
  "kore-abi",
  "kore-collections",
+ "kore-ring",
  "kore-rt",
  "kore-svc-extract",
  "kore-svc-extract-worker-rust",
@@ -314,6 +315,7 @@ dependencies = [
 name = "kore-rt"
 version = "0.0.1"
 dependencies = [
+ "heapless",
  "kore-abi",
  "kore-collections",
  "kore-hint",
@@ -598,9 +600,9 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "virtio-accel-core"
-version = "0.3.10"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758d9a32f90f88ae4ae50a7dfb13aa214b20c9a85b797b0eefbe0f77b165840f"
+checksum = "6522497e9e97db9c8cb695987397efb222b78f5279870c929730ad5d14f8fe65"
 dependencies = [
  "bitflags",
  "virtio-accel-transport",
@@ -608,9 +610,9 @@ dependencies = [
 
 [[package]]
 name = "virtio-accel-transport"
-version = "0.3.10"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71764cd76e27b5923526e3e1384a317132319d4150f7263abe57fd3f6809afe5"
+checksum = "c7747200a37db419a82c884730d5c31d1d80a6b4d14cc3de312064e4793dc289"
 
 [[package]]
 name = "winnow"

@@ -62,10 +62,14 @@ impl<'w, 't> Fs<'w, 't> {
         self.window.len().min(self.client.transfer_limit())
     }
 
-    /// Read at most one transfer window into caller-owned storage.
+    /// Read into caller-owned storage: at most one transfer window, or — for
+    /// a destination of at least 256 KiB, when this launch has a storage ring
+    /// — the whole destination, streamed through the ring from one pinned
+    /// version (`res/STORAGE_TRANSPORT.md` §9, S5e).
     ///
     /// A short successful read is not necessarily EOF; only zero is EOF.
-    /// The destination is unchanged on refusal. No allocation or retained borrow.
+    /// On refusal the destination may hold a prefix of the bytes. No
+    /// allocation or retained borrow.
     pub async fn read_at(
         &mut self,
         file: &View,
@@ -74,6 +78,21 @@ impl<'w, 't> Fs<'w, 't> {
     ) -> Result<usize, Refusal> {
         if dst.is_empty() {
             return Ok(0);
+        }
+        if dst.len() as u64 >= crate::stor::FACADE_MIN_BYTES {
+            let mut filled = 0usize;
+            let streamed = self
+                .read_range_by_ring(file, offset, dst.len() as u64, &mut |bytes: &[u8]| {
+                    let end = filled + bytes.len();
+                    let slot = dst.get_mut(filled..end).ok_or(Refusal::Pair)?;
+                    slot.copy_from_slice(bytes);
+                    filled = end;
+                    Ok(())
+                })
+                .await?;
+            if streamed.is_some() {
+                return Ok(filled);
+            }
         }
         let requested = transfer_len(offset, dst.len(), self.chunk())?;
         let reply = self
@@ -176,6 +195,15 @@ impl<'w, 't> Fs<'w, 't> {
         F: FnMut(&[u8]) -> Result<(), Refusal>,
     {
         let file = self.open(path, WALK_READ).await?;
+        // This launch's storage ring, when it has one: one pinned version,
+        // its whole blocks by DMA (`res/STORAGE_TRANSPORT.md` §9, S5d).
+        match self.read_range_by_ring(&file, 0, u64::MAX, &mut consume).await {
+            Ok(None) => {}
+            done => {
+                self.close(file).await;
+                return done.map(|_| ());
+            }
+        }
         let mut offset = 0u64;
         let result = loop {
             let count = match self.read_chunk(&file, offset).await {

@@ -95,6 +95,10 @@ struct Wires {
     completion: Option<
         core::cell::RefCell<crate::chan::NoticeRx<'static, crate::transport::TrapTransport>>,
     >,
+    /// The founder's own doorbell send — its self-kick — when the founder
+    /// is thread 0, endowed to every worker as peer 0 of the kick mesh so a
+    /// resident job's last worker can kick the launcher.
+    founder_kick: Option<kore_abi::session::SlotRef>,
     workers: usize,
 }
 
@@ -155,6 +159,17 @@ pub(crate) fn provision(workers: usize) -> Option<StarPlan> {
         minted(&mut roots, &mut parent_sends);
         return None;
     };
+    // The founder joins the mesh as peer 0 through its self-kick send
+    // (`DOORBELL@PEER_BASE`).  Only thread 0 holds a send into its OWN
+    // doorbell — a spawned thread's `DOORBELL@PEER_BASE` names thread 0's —
+    // so a region founded elsewhere carries no founder kick and its
+    // launcher rides the park's slice (`res/SPMD.md` §14.2).
+    let founder_kick = if crate::entry::geometry::shard_index() == Some(0) {
+        rt.bootstrap()
+            .handle(kore_abi::task::role::DOORBELL, crate::futex::PEER_BASE)
+    } else {
+        None
+    };
 
     Some(StarPlan {
         wires: Wires {
@@ -165,22 +180,41 @@ pub(crate) fn provision(workers: usize) -> Option<StarPlan> {
             hub_send: hub_pair.send,
             hub_recv: Some(hub_pair.recv),
             completion: None,
+            founder_kick,
             workers,
         },
     })
 }
 
-/// The widest gang chunk a FULLY MESHED session can carry.
+/// Descriptor invocations one meshed worker costs its gang session in a
+/// chunk of `chunk`: two views, the boot delegate and the Found, plus its
+/// endowment of `chunk + 2` caps (own recv, hub send, the founder's send,
+/// and a peer send per chunk sibling).
+const fn meshed_worker_invocations(chunk: usize) -> usize {
+    4 + chunk + 2
+}
+
+/// The widest chunk one FULLY MESHED gang session can carry — derived
+/// from the descriptor's bounds, never chosen: a chunk of `n` costs
+/// `n·(n + 6)` invocations against [`MAX_INVOCATIONS`], and no session
+/// founds more than [`MAX_SESSION_FOUNDS`] (seven, at today's 107 and 12).
+/// A wider region founds in several sessions (see [`spmd::launch`]): the
+/// mesh spans a session's chunk, and a cross-chunk waiter is the hub's to
+/// reach — the relay hop the mesh exists to keep OFF the common release
+/// path.
 ///
-/// Per worker the gang session stages `4 + endow` invocations (two
-/// views, the boot delegate, the endow derives, the Found), and a
-/// meshed worker's endow is `chunk + 1` caps (own recv, hub send, and
-/// a peer send per sibling) — so a chunk of `n` costs `n·(n + 5)`
-/// invocations against the descriptor's 107.  `8·13 = 104` fits;
-/// `9·14 = 126` does not.  Wider regions chunk at this width: the mesh
-/// spans a chunk, and a cross-chunk waiter is the hub's to reach —
-/// the relay hop the mesh exists to keep OFF the common release path.
-pub(crate) const MESH_CHUNK: usize = 8;
+/// [`MAX_INVOCATIONS`]: kore_abi::session::MAX_INVOCATIONS
+/// [`MAX_SESSION_FOUNDS`]: kore_abi::session::MAX_SESSION_FOUNDS
+/// [`spmd::launch`]: crate::spmd
+pub(crate) const MESH_CEILING: usize = {
+    let mut chunk = kore_abi::session::MAX_SESSION_FOUNDS;
+    while chunk > 1
+        && chunk * meshed_worker_invocations(chunk) > kore_abi::session::MAX_INVOCATIONS
+    {
+        chunk -= 1;
+    }
+    chunk
+};
 
 #[cfg(target_os = "none")]
 impl StarPlan {
@@ -213,7 +247,7 @@ impl StarPlan {
         out: &mut [crate::thread::WorkerCap],
     ) -> Option<usize> {
         let root = self.wires.roots.get(w)?.as_ref()?;
-        if out.len() < 1 + bands.len() {
+        if out.len() < 2 + bands.len() {
             return None;
         }
         out[0] = crate::thread::WorkerCap {
@@ -231,6 +265,19 @@ impl StarPlan {
             rights: crate::cap::CHANNEL_ENDPOINT_RIGHTS,
         };
         let mut n = 2;
+        // The founder as peer 0 (`DOORBELL@PEER_BASE`): a send derived from
+        // its self-kick, with the notice rights that send carries — the
+        // same derivation `spawn_with_doorbell` makes for `kick_parent`.
+        if let Some(kick) = self.wires.founder_kick {
+            out[n] = crate::thread::WorkerCap {
+                role: kore_abi::task::role::DOORBELL,
+                index: crate::futex::PEER_BASE,
+                subject: kick,
+                kind: kore_abi::cap::ResourceKind::ChanSend as u16 as u8,
+                rights: crate::cap::verbs::NOTICE_RIGHTS,
+            };
+            n += 1;
+        }
         for &(j, band) in bands {
             if j == w {
                 continue;
@@ -325,12 +372,45 @@ impl Star {
     /// sends — the gate release, which must never depend on the hub it
     /// just launched.
     pub(crate) fn kick_all(&self) {
-        for s in self.wires.parent_sends.iter().flatten() {
-            let _ = crate::cap::verbs::post_notice(
-                s.slot(),
-                crate::futex::COOKIE_FUTEX,
-                u64::from(crate::futex::RELAY),
-            );
+        // One session for the whole gang: n notices, one crossing.  The
+        // terminal bench priced the one-post-per-worker form at ~40 µs a
+        // worker, the workers waking one after another in that rhythm.  A
+        // session is atomic, so a send whose post is not standing (that
+        // worker is already awake and its post consumed) refuses the whole
+        // commit; then the posts go one by one, as before, so every parked
+        // worker still gets its kick.  The word is the truth either way.
+        use crate::session::SessionBuilder;
+        use crate::transport::{Transport, TrapTransport};
+        let sends = self.wires.parent_sends.iter().flatten();
+        let mut batch = SessionBuilder::new();
+        let mut staged = 0usize;
+        let mut live = 0usize;
+        for s in sends.clone() {
+            live += 1;
+            if batch
+                .notice(
+                    s.slot(),
+                    crate::futex::COOKIE_FUTEX,
+                    u64::from(crate::futex::RELAY),
+                )
+                .is_ok()
+            {
+                staged += 1;
+            }
+        }
+        let batched = live != 0
+            && staged == live
+            && TrapTransport::new()
+                .commit_now(&batch)
+                .is_ok_and(|c| c.status() == kore_abi::session::Status::Ok);
+        if !batched {
+            for s in sends {
+                let _ = crate::cap::verbs::post_notice(
+                    s.slot(),
+                    crate::futex::COOKIE_FUTEX,
+                    u64::from(crate::futex::RELAY),
+                );
+            }
         }
         // The hub post reaches a consumer only when a hub thread was spawned
         // (it holds the sole recv). A hubless resident retains that recv for
@@ -389,6 +469,8 @@ impl Star {
             hub_send,
             hub_recv,
             completion,
+            // A borrowed name in the founder's own table: nothing to retire.
+            founder_kick: _,
             workers: _,
         } = wires;
         for s in parent_sends.iter_mut() {
@@ -491,5 +573,16 @@ mod tests {
             "the relay slot is one past the last band peer"
         );
         assert_eq!(HUB, u32::MAX, "the hub id can never be a dense worker id");
+    }
+
+    /// The ceiling is the descriptor's arithmetic: the widest meshed
+    /// chunk fits one session, and one worker more would not.
+    #[test]
+    fn the_mesh_ceiling_is_the_widest_session_the_descriptor_carries() {
+        use kore_abi::session::{MAX_INVOCATIONS, MAX_SESSION_FOUNDS};
+        let cost = |chunk: usize| chunk * meshed_worker_invocations(chunk);
+        assert!((1..=MAX_SESSION_FOUNDS).contains(&MESH_CEILING));
+        assert!(cost(MESH_CEILING) <= MAX_INVOCATIONS);
+        assert!(MESH_CEILING == MAX_SESSION_FOUNDS || cost(MESH_CEILING + 1) > MAX_INVOCATIONS);
     }
 }

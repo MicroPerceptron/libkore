@@ -25,20 +25,22 @@ use crate::transport::ParkPost;
 /// Concurrent pending deadlines per executor — a design bound (§8's
 /// posture: refusal on overflow, sized for the declared task set).
 ///
-/// **`MAX_TASKS + 1`, and the `+ 1` is load-bearing.** `register_timer`
-/// re-anchors by task, so the registrant set is exactly "one entry per header
-/// that can hold a deadline" — and that is the admitted tasks *plus the root
-/// future*, whose `TaskHeader` is a frame local in
-/// [`Executor::run`](super::Executor::run) rather than a cell in `self.tasks`.
-/// At a flat `MAX_TASKS` a service that filled its task set and then slept the
-/// root — which is what a serve loop's `next_wake_for` does — overflowed a
-/// table that had no room for the seventeenth registrant, and the overflow is
-/// a panic: on a boot-founded service, a silent permanent park.
-///
-/// Sized to the registrants rather than bounded by a refusal, because the
-/// refusal here has no honest caller: a lost wake is not something a task can
-/// be told about.
+/// `MAX_TASKS + 1` retains room for one wait in every admitted task plus the
+/// root. Registrations belong to individual waits, so composed futures in one
+/// task share this same bounded table instead of replacing each other's alarm.
+/// Callers must keep the total concurrent waits within this bound: inference's
+/// NPU/GPU pair and terminal pump require three, not an unbounded task tree.
+/// Exhaustion remains an invariant failure; silently losing an alarm is not a
+/// valid refusal for these infallible wait APIs.
 pub const MAX_TIMERS: usize = super::MAX_TASKS + 1;
+
+#[derive(Clone, Copy)]
+struct TimerEntry {
+    deadline_ns: u64,
+    task: NonNull<TaskHeader>,
+    /// Identity and teardown backlink of the pinned registering wait.
+    owner: NonNull<Cell<Option<NonNull<ExecCtx>>>>,
+}
 
 /// Why the executor's last idle park returned — what [`next_wake`]
 /// resolves with, so a serve loop can tell a hardware-delivered wake
@@ -82,8 +84,8 @@ pub(crate) struct ExecCtx {
     /// Why the last idle park returned ([`WakeReason`]) — read by
     /// [`next_wake`]'s ready leg.
     last_wake: Cell<WakeReason>,
-    /// `(deadline_ns, task)` entries; `None` = free.
-    timers: [Cell<Option<(u64, NonNull<TaskHeader>)>>; MAX_TIMERS],
+    /// Independently owned pending waits; `None` = free.
+    timers: [Cell<Option<TimerEntry>>; MAX_TIMERS],
     /// At most one task may add an alternate standing post to the executor's
     /// next idle park. The registering future clears it on ready or drop.
     delivery: Cell<
@@ -202,38 +204,48 @@ impl ExecCtx {
         }
     }
 
-    /// Register (or re-anchor) `task`'s pending deadline — one entry per
-    /// task (a task has at most one pending `sleep_until` at a time; a
-    /// re-poll re-registers the same entry).
+    /// Register or re-anchor one pinned wait, independently of other waits
+    /// sharing its task. Only `TimerRegistration` supplies the owner pointer.
     ///
     /// # Panics
     /// When the table is full ([`MAX_TIMERS`]) — the §8 refusal made
     /// loud (a quiet drop would be a lost wake).
-    pub(crate) fn register_timer(&self, deadline_ns: u64, task: NonNull<TaskHeader>) {
-        // Re-anchor an existing entry for this task first…
+    fn register_timer(
+        &self,
+        deadline_ns: u64,
+        task: NonNull<TaskHeader>,
+        owner: NonNull<Cell<Option<NonNull<ExecCtx>>>>,
+    ) {
+        let entry = TimerEntry {
+            deadline_ns,
+            task,
+            owner,
+        };
+        // Re-polling the same wait must not consume another bounded slot.
         for cell in &self.timers {
-            if let Some((_, t)) = cell.get() {
-                if t == task {
-                    cell.set(Some((deadline_ns, task)));
-                    return;
-                }
+            if let Some(previous) = cell.get()
+                && previous.owner == owner
+            {
+                assert_eq!(previous.task, task, "timer wait changed owning task");
+                cell.set(Some(entry));
+                return;
             }
         }
         // …else claim a free one.
         for cell in &self.timers {
             if cell.get().is_none() {
-                cell.set(Some((deadline_ns, task)));
+                cell.set(Some(entry));
                 return;
             }
         }
         panic!("executor timer table full (MAX_TIMERS = {MAX_TIMERS})");
     }
 
-    /// Cancel `task`'s pending timer after another wake source won. A due
-    /// deadline has already removed its entry, so cancellation is idempotent.
-    pub(crate) fn clear_timer(&self, task: NonNull<TaskHeader>) {
+    /// The owner has already cleared its backlink. Remove only its entry;
+    /// neither a sibling wait nor a reused slot belongs to this cancellation.
+    fn clear_timer(&self, owner: NonNull<Cell<Option<NonNull<ExecCtx>>>>) {
         for cell in &self.timers {
-            if cell.get().is_some_and(|(_, registered)| registered == task) {
+            if cell.get().is_some_and(|entry| entry.owner == owner) {
                 cell.set(None);
                 return;
             }
@@ -245,7 +257,7 @@ impl ExecCtx {
     pub(crate) fn timers_min(&self) -> Option<u64> {
         self.timers
             .iter()
-            .filter_map(|c| c.get().map(|(d, _)| d))
+            .filter_map(|c| c.get().map(|entry| entry.deadline_ns))
             .min()
     }
 
@@ -300,13 +312,17 @@ impl ExecCtx {
             self.now.set(now_ns);
         }
         for cell in &self.timers {
-            if let Some((deadline, task)) = cell.get() {
-                if deadline <= self.now.get() {
+            if let Some(entry) = cell.get() {
+                if entry.deadline_ns <= self.now.get() {
                     cell.set(None);
+                    // SAFETY: the pinned wait removes its registration before
+                    // drop. Invalidate its backlink before this slot can be
+                    // reused, so later cancellation cannot touch a successor.
+                    unsafe { entry.owner.as_ref() }.set(None);
                     // SAFETY: registered headers are live for the run
                     // (static storages; the root header outlives every
                     // entry — `clear` runs before `run` returns).
-                    unsafe { task.as_ref() }.mark_ready();
+                    unsafe { entry.task.as_ref() }.mark_ready();
                 }
             }
         }
@@ -316,7 +332,12 @@ impl ExecCtx {
     /// header is a stack local; no entry may outlive the frame).
     pub(crate) fn clear_timers(&self) {
         for cell in &self.timers {
-            cell.set(None);
+            if let Some(entry) = cell.replace(None) {
+                // SAFETY: as in `advance`: every entry belongs to a pinned,
+                // still-live wait. Its later Drop must not follow this context
+                // after `Executor::run_pinned` returns or the executor drops.
+                unsafe { entry.owner.as_ref() }.set(None);
+            }
         }
         if let Some((_, _, _, mut future_owner)) = self.delivery.replace(None) {
             // SAFETY: alternate registration accepts this pointer only from a
@@ -327,6 +348,54 @@ impl ExecCtx {
             unsafe { *future_owner.as_mut() = None };
         }
         self.inline_doorbell.set(false);
+    }
+}
+
+/// A wait's affine registration in the executor's existing bounded table.
+/// The pinned field address identifies it; the context invalidates that field
+/// when the timer fires or execution ends, following `AlternateWake`'s teardown
+/// pattern. No registration can outlive its wait or follow a destroyed context.
+struct TimerRegistration {
+    ctx: Cell<Option<NonNull<ExecCtx>>>,
+    _pin: PhantomPinned,
+}
+
+impl TimerRegistration {
+    const fn new() -> Self {
+        Self {
+            ctx: Cell::new(None),
+            _pin: PhantomPinned,
+        }
+    }
+
+    fn arm(self: Pin<&mut Self>, ctx: &ExecCtx, task: NonNull<TaskHeader>, deadline_ns: u64) {
+        let this = self.as_ref().get_ref();
+        let context = NonNull::from(ctx);
+        if let Some(previous) = this.ctx.get() {
+            assert_eq!(previous, context, "timer wait changed executor");
+        }
+        ctx.register_timer(deadline_ns, task, NonNull::from(&this.ctx));
+        // Store only after successful registration: an exhausted table has
+        // published nothing for this new owner.
+        this.ctx.set(Some(context));
+    }
+
+    fn clear(self: Pin<&mut Self>) {
+        self.as_ref().get_ref().clear_registration();
+    }
+
+    fn clear_registration(&self) {
+        let Some(ctx) = self.ctx.take() else { return };
+        // SAFETY: expiry and executor teardown invalidate this backlink while
+        // the context is live. A remaining backlink therefore names the same
+        // executor that owns this pinned wait, on its poll/drop thread.
+        unsafe { ctx.as_ref() }.clear_timer(NonNull::from(&self.ctx));
+    }
+}
+
+impl Drop for TimerRegistration {
+    fn drop(&mut self) {
+        self.clear_registration();
     }
 }
 
@@ -342,6 +411,7 @@ impl ExecCtx {
 /// needs its executor's timer table, reached through the cookie waker —
 /// there is nothing correct to do under another runtime.
 pub async fn sleep_until(deadline_ns: u64) {
+    let mut timer = core::pin::pin!(TimerRegistration::new());
     poll_fn(move |cx| {
         let hdr =
             header_of(cx.waker()).expect("sleep_until requires the kore executor (foreign waker)");
@@ -356,9 +426,10 @@ pub async fn sleep_until(deadline_ns: u64) {
         // for the duration of the pass.
         let ctx = unsafe { &*ctx };
         if ctx.now() >= deadline_ns {
+            timer.as_mut().clear();
             Poll::Ready(())
         } else {
-            ctx.register_timer(deadline_ns, hdr);
+            timer.as_mut().arm(ctx, hdr, deadline_ns);
             Poll::Pending
         }
     })
@@ -384,6 +455,7 @@ pub async fn sleep_until(deadline_ns: u64) {
 /// As [`sleep_until`]: polled outside the kore executor.
 pub async fn sleep_for(delta_ns: u64) {
     let mut deadline: Option<u64> = None;
+    let mut timer = core::pin::pin!(TimerRegistration::new());
     poll_fn(move |cx| {
         let hdr =
             header_of(cx.waker()).expect("sleep_for requires the kore executor (foreign waker)");
@@ -396,9 +468,10 @@ pub async fn sleep_for(delta_ns: u64) {
         let ctx = unsafe { &*ctx };
         let d = *deadline.get_or_insert_with(|| ctx.now().saturating_add(delta_ns));
         if ctx.now() >= d {
+            timer.as_mut().clear();
             Poll::Ready(())
         } else {
-            ctx.register_timer(d, hdr);
+            timer.as_mut().arm(ctx, hdr, d);
             Poll::Pending
         }
     })
@@ -603,6 +676,7 @@ struct AlternateWake {
     delta_ns: Option<u64>,
     deadline_ns: Option<u64>,
     owner: Option<AlternateOwner>,
+    timer: TimerRegistration,
     _pin: PhantomPinned,
 }
 
@@ -611,7 +685,6 @@ struct AlternateOwner {
     task: NonNull<TaskHeader>,
     ctx: NonNull<ExecCtx>,
     delivery_generation: Option<u64>,
-    timer_registered: bool,
 }
 
 impl AlternateWake {
@@ -621,11 +694,13 @@ impl AlternateWake {
             delta_ns,
             deadline_ns: None,
             owner: None,
+            timer: TimerRegistration::new(),
             _pin: PhantomPinned,
         }
     }
 
     fn clear_registration(&mut self) {
+        self.timer.clear_registration();
         let Some(owner) = self.owner.take() else {
             return;
         };
@@ -635,9 +710,6 @@ impl AlternateWake {
         // leave `run_pinned`; target panics abort rather than unwind. Normal
         // executor exit also clears the complete registry as a backstop.
         let ctx = unsafe { owner.ctx.as_ref() };
-        if owner.timer_registered {
-            ctx.clear_timer(owner.task);
-        }
         if let Some(generation) = owner.delivery_generation {
             ctx.clear_delivery(owner.task, generation);
         }
@@ -685,7 +757,6 @@ impl Future for AlternateWake {
             task: hdr,
             ctx: NonNull::from(ctx),
             delivery_generation: None,
-            timer_registered: false,
         });
         let future_owner = NonNull::from(&mut this.owner);
         let generation = ctx.register_delivery(this.post, hdr, future_owner);
@@ -695,8 +766,9 @@ impl Future for AlternateWake {
             .expect("alternate owner disappeared during registration");
         owner.delivery_generation = Some(generation);
         if let Some(deadline) = this.deadline_ns {
-            ctx.register_timer(deadline, hdr);
-            owner.timer_registered = true;
+            // SAFETY: this field stays pinned with AlternateWake and is
+            // cleared before that parent's Drop can release its storage.
+            unsafe { Pin::new_unchecked(&mut this.timer) }.arm(ctx, hdr, deadline);
         }
         Poll::Pending
     }
@@ -722,6 +794,7 @@ impl Drop for AlternateWake {
 pub async fn next_wake_for(delta_ns: u64) -> WakeReason {
     let mut deadline = None;
     let mut parked = false;
+    let mut timer = core::pin::pin!(TimerRegistration::new());
     poll_fn(move |cx| {
         let hdr = header_of(cx.waker())
             .expect("next_wake_for requires the kore executor (foreign waker)");
@@ -736,14 +809,14 @@ pub async fn next_wake_for(delta_ns: u64) -> WakeReason {
         // the duration of this pass.
         let ctx = unsafe { &*ctx };
         if parked {
-            ctx.clear_timer(hdr);
+            timer.as_mut().clear();
             return Poll::Ready(ctx.last_wake());
         }
         let deadline = *deadline.get_or_insert_with(|| ctx.now().saturating_add(delta_ns));
         if ctx.now() >= deadline {
             return Poll::Ready(WakeReason::Deadline);
         }
-        ctx.register_timer(deadline, hdr);
+        timer.as_mut().arm(ctx, hdr, deadline);
         parked = true;
         Poll::Pending
     })
@@ -757,6 +830,7 @@ pub async fn next_wake_for(delta_ns: u64) -> WakeReason {
 /// new minimum cannot leave the old deadline behind.
 pub async fn next_wake_until(deadline_ns: u64) -> WakeReason {
     let mut parked = false;
+    let mut timer = core::pin::pin!(TimerRegistration::new());
     poll_fn(move |cx| {
         let hdr = header_of(cx.waker())
             .expect("next_wake_until requires the kore executor (foreign waker)");
@@ -769,13 +843,13 @@ pub async fn next_wake_until(deadline_ns: u64) -> WakeReason {
         // SAFETY: the executor installs this pointer for the duration of poll.
         let ctx = unsafe { &*ctx };
         if parked {
-            ctx.clear_timer(hdr);
+            timer.as_mut().clear();
             return Poll::Ready(ctx.last_wake());
         }
         if ctx.now() >= deadline_ns {
             return Poll::Ready(WakeReason::Deadline);
         }
-        ctx.register_timer(deadline_ns, hdr);
+        timer.as_mut().arm(ctx, hdr, deadline_ns);
         parked = true;
         Poll::Pending
     })
@@ -787,6 +861,191 @@ mod tests {
     use super::super::task::waker_for;
     use super::*;
     use kore_abi::session::SlotRef;
+
+    fn task_waker(ctx: &ExecCtx, task: &TaskHeader) -> core::task::Waker {
+        task.exec
+            .store(ctx as *const ExecCtx as *mut ExecCtx, Ordering::Relaxed);
+        waker_for(NonNull::from(task))
+    }
+
+    #[test]
+    fn two_sleeps_in_one_task_keep_both_deadlines_in_either_poll_order() {
+        for reverse in [false, true] {
+            let ctx = ExecCtx::new();
+            let task = TaskHeader::new();
+            let waker = task_waker(&ctx, &task);
+            let mut cx = Context::from_waker(&waker);
+            let mut early = core::pin::pin!(sleep_until(17));
+            let mut late = core::pin::pin!(sleep_until(29));
+            if reverse {
+                assert_eq!(late.as_mut().poll(&mut cx), Poll::Pending);
+                assert_eq!(early.as_mut().poll(&mut cx), Poll::Pending);
+            } else {
+                assert_eq!(early.as_mut().poll(&mut cx), Poll::Pending);
+                assert_eq!(late.as_mut().poll(&mut cx), Poll::Pending);
+            }
+            assert_eq!(ctx.timers_min(), Some(17));
+            ctx.advance(16);
+            assert!(!task.take_ready());
+            ctx.advance(17);
+            assert!(task.take_ready());
+            assert_eq!(ctx.timers_min(), Some(29));
+            // Re-polling the remaining sleep re-anchors its own entry; it
+            // neither acquires a second slot nor restores the expired one.
+            assert_eq!(late.as_mut().poll(&mut cx), Poll::Pending);
+            assert_eq!(early.as_mut().poll(&mut cx), Poll::Ready(()));
+            assert_eq!(
+                ctx.timers
+                    .iter()
+                    .filter(|slot| slot.get().is_some())
+                    .count(),
+                1
+            );
+            ctx.advance(29);
+            assert!(task.take_ready());
+            assert_eq!(late.as_mut().poll(&mut cx), Poll::Ready(()));
+            assert_eq!(ctx.timers_min(), None);
+        }
+    }
+
+    #[test]
+    fn cancelling_either_deadline_preserves_the_other_wait() {
+        for cancelled_deadline in [17, 59] {
+            let ctx = ExecCtx::new();
+            let task = TaskHeader::new();
+            let waker = task_waker(&ctx, &task);
+            let mut cx = Context::from_waker(&waker);
+            let mut retained = core::pin::pin!(sleep_until(41));
+            assert_eq!(retained.as_mut().poll(&mut cx), Poll::Pending);
+            {
+                let mut cancelled = core::pin::pin!(sleep_until(cancelled_deadline));
+                assert_eq!(cancelled.as_mut().poll(&mut cx), Poll::Pending);
+            }
+            assert_eq!(ctx.timers_min(), Some(41));
+            ctx.advance(40);
+            assert!(!task.take_ready());
+            ctx.advance(41);
+            assert!(task.take_ready());
+            assert_eq!(retained.as_mut().poll(&mut cx), Poll::Ready(()));
+        }
+    }
+
+    #[test]
+    fn expired_wait_cleanup_cannot_remove_a_reused_slot() {
+        let ctx = ExecCtx::new();
+        let task = TaskHeader::new();
+        let waker = task_waker(&ctx, &task);
+        let mut cx = Context::from_waker(&waker);
+        let mut replacement = core::pin::pin!(sleep_until(29));
+        {
+            let mut expired = core::pin::pin!(sleep_until(17));
+            assert_eq!(expired.as_mut().poll(&mut cx), Poll::Pending);
+            ctx.advance(17);
+            assert!(task.take_ready());
+            assert_eq!(replacement.as_mut().poll(&mut cx), Poll::Pending);
+            // Drop the expired but not re-polled future after its table slot
+            // has been reused by another wait in the same task.
+        }
+        assert_eq!(ctx.timers_min(), Some(29));
+        ctx.advance(29);
+        assert_eq!(replacement.as_mut().poll(&mut cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn a_deadline_wakes_only_its_owning_task() {
+        let ctx = ExecCtx::new();
+        let first = TaskHeader::new();
+        let second = TaskHeader::new();
+        let first_waker = task_waker(&ctx, &first);
+        let second_waker = task_waker(&ctx, &second);
+        let mut first_cx = Context::from_waker(&first_waker);
+        let mut second_cx = Context::from_waker(&second_waker);
+        let mut early = core::pin::pin!(sleep_for(17));
+        let mut late = core::pin::pin!(sleep_for(29));
+        assert_eq!(early.as_mut().poll(&mut first_cx), Poll::Pending);
+        assert_eq!(late.as_mut().poll(&mut second_cx), Poll::Pending);
+        ctx.advance(17);
+        assert!(first.take_ready());
+        assert!(!second.take_ready());
+        assert_eq!(early.as_mut().poll(&mut first_cx), Poll::Ready(()));
+        ctx.advance(29);
+        assert!(!first.take_ready());
+        assert!(second.take_ready());
+        assert_eq!(late.as_mut().poll(&mut second_cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn alternate_and_ordinary_waits_do_not_cancel_each_other() {
+        for reverse in [false, true] {
+            let ctx = ExecCtx::new();
+            let task = TaskHeader::new();
+            let waker = task_waker(&ctx, &task);
+            let mut cx = Context::from_waker(&waker);
+            let post = ParkPost {
+                chan: 17,
+                land: SlotRef::from_wire(19),
+                recv_tag: 23,
+            };
+            let mut ordinary = core::pin::pin!(next_wake_until(41));
+            {
+                let mut alternate = core::pin::pin!(AlternateWake::new(post, Some(29)));
+                if reverse {
+                    assert_eq!(ordinary.as_mut().poll(&mut cx), Poll::Pending);
+                    assert_eq!(alternate.as_mut().poll(&mut cx), Poll::Pending);
+                } else {
+                    assert_eq!(alternate.as_mut().poll(&mut cx), Poll::Pending);
+                    assert_eq!(ordinary.as_mut().poll(&mut cx), Poll::Pending);
+                }
+                assert_eq!(ctx.timers_min(), Some(29));
+                assert_eq!(ctx.delivery_post(), Some(post));
+                // A completion on the alternate post must remove only the
+                // alternate deadline, regardless of child polling order.
+                ctx.note_wake(WakeReason::Delivery);
+                assert_eq!(
+                    alternate.as_mut().poll(&mut cx),
+                    Poll::Ready(WakeReason::Delivery)
+                );
+            }
+            assert_eq!(ctx.delivery_post(), None);
+            assert_eq!(ctx.timers_min(), Some(41));
+            ctx.advance(41);
+            ctx.note_wake(WakeReason::Deadline);
+            assert_eq!(
+                ordinary.as_mut().poll(&mut cx),
+                Poll::Ready(WakeReason::Deadline)
+            );
+
+            // Conversely, a cancelled ordinary wait cannot remove the
+            // alternate post's later deadline.
+            let mut alternate = core::pin::pin!(AlternateWake::new(post, Some(59)));
+            assert_eq!(alternate.as_mut().poll(&mut cx), Poll::Pending);
+            {
+                let mut cancelled = core::pin::pin!(next_wake_for(17));
+                assert_eq!(cancelled.as_mut().poll(&mut cx), Poll::Pending);
+            }
+            assert_eq!(ctx.timers_min(), Some(100));
+            assert_eq!(ctx.delivery_post(), Some(post));
+        }
+    }
+
+    #[test]
+    fn timer_teardown_allows_future_drop_after_the_context_is_gone() {
+        let mut sleep = core::pin::pin!(sleep_until(17));
+        let mut wake = core::pin::pin!(next_wake_for(29));
+        {
+            let ctx = ExecCtx::new();
+            let task = TaskHeader::new();
+            let waker = task_waker(&ctx, &task);
+            let mut cx = Context::from_waker(&waker);
+            assert_eq!(sleep.as_mut().poll(&mut cx), Poll::Pending);
+            assert_eq!(wake.as_mut().poll(&mut cx), Poll::Pending);
+            // The same cleanup Executor::run_pinned and Executor::drop use.
+            ctx.clear_timers();
+            assert_eq!(ctx.timers_min(), None);
+        }
+        // Both pinned futures now drop after their context and header. Their
+        // invalidated registrations must not dereference either dead object.
+    }
 
     #[test]
     fn cancelling_an_alternate_wait_releases_its_post_and_timer() {
@@ -870,6 +1129,7 @@ mod tests {
         assert!(wait.as_ref().get_ref().owner.is_some());
         ctx.clear_timers();
         assert!(wait.as_ref().get_ref().owner.is_none());
+        assert!(wait.as_ref().get_ref().timer.ctx.get().is_none());
         assert_eq!(ctx.delivery_post(), None);
         assert_eq!(ctx.timers_min(), None);
         // `wait` now drops without following the invalidated context backlink.
@@ -879,15 +1139,19 @@ mod tests {
     fn an_early_wake_cancels_its_folded_deadline() {
         let ctx = ExecCtx::new();
         let task = TaskHeader::new();
-        let task = NonNull::from(&task);
-
-        ctx.register_timer(17, task);
+        let waker = task_waker(&ctx, &task);
+        let mut cx = Context::from_waker(&waker);
+        let mut wait = core::pin::pin!(next_wake_for(17));
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
         assert_eq!(ctx.timers_min(), Some(17));
-        ctx.clear_timer(task);
+        ctx.note_wake(WakeReason::Doorbell);
+        assert_eq!(
+            wait.as_mut().poll(&mut cx),
+            Poll::Ready(WakeReason::Doorbell)
+        );
         assert_eq!(ctx.timers_min(), None);
-        // A deadline win removed the same entry before the future's ready
-        // leg; cancellation must therefore remain harmless.
-        ctx.clear_timer(task);
+        ctx.advance(17);
+        assert!(!task.take_ready());
         assert_eq!(ctx.timers_min(), None);
     }
 
@@ -912,10 +1176,18 @@ mod tests {
         let task = TaskHeader::new();
         let task = NonNull::from(&task);
 
-        ctx.register_timer(90, task);
-        ctx.register_timer(40, task);
+        let mut registration = core::pin::pin!(TimerRegistration::new());
+        registration.as_mut().arm(&ctx, task, 90);
+        registration.as_mut().arm(&ctx, task, 40);
         assert_eq!(ctx.timers_min(), Some(40));
-        ctx.clear_timer(task);
+        assert_eq!(
+            ctx.timers
+                .iter()
+                .filter(|slot| slot.get().is_some())
+                .count(),
+            1
+        );
+        registration.as_mut().clear();
         assert_eq!(ctx.timers_min(), None);
     }
 

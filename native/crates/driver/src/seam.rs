@@ -667,6 +667,43 @@ pub trait DmaRead: Dma {
 
 impl<T: Dma + ?Sized> DmaRead for T {}
 
+/// A DMA target its engine handed back with the proof that retiring it needs
+/// no device idleness: no command it popped still names the target, the
+/// completion of every one that did has been reaped, and no entry not yet
+/// popped can reach it any more.
+///
+/// Only an engine mints one ([`StorEngine::release_target`]). It is the one
+/// input per-window DMA retirement takes, in place of the whole-requester
+/// quiescence an exact retirement otherwise waits for. The proof is the
+/// driver's own correctness: the kernel's live retirement completes the
+/// window's invalidation before the memory can move on, so a proof that
+/// were wrong costs a recorded IOMMU fault, not a stray write.
+///
+/// [`StorEngine::release_target`]: crate::stor::engine::StorEngine::release_target
+#[must_use = "a quiet target is retired, not dropped"]
+pub struct Quiet<T>(T);
+
+impl<T> Quiet<T> {
+    pub(crate) fn witness(target: T) -> Self {
+        Self(target)
+    }
+
+    /// The same memory in another wrapper — a queue's buffer type to the
+    /// allocation beneath it.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Quiet<U> {
+        Quiet(f(self.0))
+    }
+
+    pub fn get(&self) -> &T {
+        &self.0
+    }
+
+    /// Drop the proof, keeping the target.
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
 /// An allocation returned by a DMA release attempt. These states differ in
 /// whether ordinary buffer destruction is known to be safe.
 #[derive(Debug)]
