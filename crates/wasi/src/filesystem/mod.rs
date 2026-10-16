@@ -42,7 +42,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use kore::fs::dag::bounds::MAX_DIR_ENTRIES;
-use kore::fs::dag::{ObjectKind, ProviderError};
+use kore::fs::dag::{GrantId, ObjectKind, ProviderError};
 use kore::fs::{DirEntry, FsError as Refused, Name, Refusal, Rights, Stat, View};
 use kore::runtime::Pinned;
 use wasmtime::component::{Resource, ResourceTableError};
@@ -78,6 +78,15 @@ impl FsError {
         match &self.0 {
             Failure::Code(code) => Some(*code),
             Failure::Trap(_) => None,
+        }
+    }
+
+    /// As a trap: an error code where the interface has no error to answer
+    /// with becomes one naming the code.
+    fn into_trap(self) -> wasmtime::Error {
+        match self.0 {
+            Failure::Code(code) => wasmtime::format_err!("{code:?}"),
+            Failure::Trap(error) => error,
         }
     }
 }
@@ -204,13 +213,27 @@ fn preopen_flags(rights: Rights) -> DescriptorFlags {
 }
 
 /// An open file or directory: a Kore view the guest holds, with the path
-/// it was opened by (from the preopen) and the flags it was opened with.
+/// it was opened by (from its preopen) and the flags it was opened with.
 pub struct Descriptor(Pinned<Open>);
+
+/// The preopen a descriptor descends from: what its path is relative to,
+/// and what reopening it by that path starts from. A view has no
+/// duplicate verb, so `open-at` of `.` reopens the directory from here.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// `.`, the task's root view.
+    Root,
+    /// One of the task's named grants the embedder offered
+    /// ([`Filesystem::with_named_grants`]).
+    Grant(GrantId),
+}
 
 struct Open {
     /// Shared with the streams and listings made from this descriptor.
     file: Shared,
     host: Rc<FsHost>,
+    origin: Origin,
+    /// From `origin`; empty for the preopen itself.
     path: Vec<Name>,
     flags: DescriptorFlags,
 }
@@ -219,12 +242,14 @@ impl Descriptor {
     fn new(
         host: Rc<FsHost>,
         file: Shared,
+        origin: Origin,
         path: Vec<Name>,
         flags: DescriptorFlags,
     ) -> Option<Self> {
         let open = Open {
             file,
             host,
+            origin,
             path,
             flags,
         };
@@ -395,6 +420,7 @@ impl Open {
         } else {
             rights
         };
+        let origin = self.origin;
         let from_preopen = self.path.clone();
         let mut path_of = self.path.clone();
         path_of.extend_from_slice(&names);
@@ -406,13 +432,16 @@ impl Open {
                 // awaited must not leave it a bare view.
                 let file = match names.split_last() {
                     // `.`: this directory again, reopened by its own path
-                    // from the preopen (a view has no duplicate verb).
+                    // from its preopen (a view has no duplicate verb).
                     None => {
                         if create && exclusive {
                             return Err(Refusal::Fs(Refused::AlreadyExists));
                         }
                         let root = pair
-                            .call(async |fs: &mut Face| fs.open_root(rights).await)
+                            .call(async |fs: &mut Face| match origin {
+                                Origin::Root => fs.open_root(rights).await,
+                                Origin::Grant(grant) => fs.open_grant(grant, rights).await,
+                            })
                             .await?;
                         let root = pair.own(root);
                         if from_preopen.is_empty() {
@@ -463,7 +492,7 @@ impl Open {
                 Ok(file)
             })
             .await?;
-        Descriptor::new(self.host.clone(), file, path_of, flags).ok_or_else(off_thread)
+        Descriptor::new(self.host.clone(), file, origin, path_of, flags).ok_or_else(off_thread)
     }
 
     /// The directory holding `path`'s last component, and that component.
@@ -1019,24 +1048,74 @@ impl types::HostDirectoryEntryStream for WasiCtxView<'_> {
     }
 }
 
+/// The trap a refused preopen is answered with: `get-directories` has no
+/// error to return, and an empty list would read as "no files" where the
+/// service said why.
+fn refused_preopens(refused: host::PreopensRefused) -> wasmtime::Error {
+    use host::{GrantsRefused, PreopensRefused};
+    match refused {
+        PreopensRefused::Root(refusal) => {
+            wasmtime::format_err!("the task's root could not be opened for the guest: {refusal:?}")
+        }
+        PreopensRefused::Grants(GrantsRefused::Listing(refusal)) => wasmtime::format_err!(
+            "the task's named grants could not be listed for the guest: {refusal:?}"
+        ),
+        PreopensRefused::Grants(GrantsRefused::Grant(name, refusal)) => wasmtime::format_err!(
+            "the task's grant `{}` could not be opened for the guest: {refusal:?}",
+            name.as_str()
+        ),
+    }
+}
+
 impl preopens::Host for WasiCtxView<'_> {
-    /// `.` — the task's root view — or nothing, for a task without a
-    /// filesystem or whose root could not be opened.
+    /// `.` — the task's root view — then, when the embedder offers them,
+    /// the task's named grants under their names
+    /// ([`Filesystem::with_named_grants`]); nothing for a task without a
+    /// filesystem; a trap naming the refusal when one could not be opened.
+    /// Every call answers descriptors on the views the first call opened.
     async fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
         let Some(filesystem) = self.ctx.filesystem.as_ref() else {
             return Ok(Vec::new());
         };
-        let preopen = match Pinned::new(async move {
-            let host = filesystem.host()?;
-            let (root, rights) = host::preopen(host).await?;
-            Descriptor::new(host.clone(), root, Vec::new(), preopen_flags(rights))
+        // Bound by a `match`, not awaited in one: the scrutinee's `Err` side
+        // is the unpinned future, which must not live across the await.
+        let opened = match Pinned::new(async move {
+            let host = filesystem.host().ok_or_else(off_thread)?;
+            let preopens = host
+                .preopens()
+                .await
+                .map_err(|refused| FsError::trap(refused_preopens(refused)))?;
+            let mut directories = Vec::with_capacity(1 + preopens.grants.len());
+            let (root, rights) = &preopens.root;
+            let root = Descriptor::new(
+                host.clone(),
+                root.clone(),
+                Origin::Root,
+                Vec::new(),
+                preopen_flags(*rights),
+            )
+            .ok_or_else(off_thread)?;
+            directories.push((String::from("."), root));
+            for (name, grant, view, rights) in &preopens.grants {
+                let descriptor = Descriptor::new(
+                    host.clone(),
+                    view.clone(),
+                    Origin::Grant(*grant),
+                    Vec::new(),
+                    preopen_flags(*rights),
+                )
+                .ok_or_else(off_thread)?;
+                directories.push((String::from(name.as_str()), descriptor));
+            }
+            Ok::<_, FsError>(directories)
         }) {
-            Ok(preopen) => preopen,
+            Ok(opened) => opened,
             Err(_) => return Ok(Vec::new()),
         };
-        Ok(match preopen.await {
-            Some(root) => vec![(self.table.push(root)?, String::from("."))],
-            None => Vec::new(),
-        })
+        let mut directories = Vec::new();
+        for (name, descriptor) in opened.await.map_err(FsError::into_trap)? {
+            directories.push((self.table.push(descriptor)?, name));
+        }
+        Ok(directories)
     }
 }

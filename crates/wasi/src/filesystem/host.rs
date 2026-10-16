@@ -31,6 +31,7 @@ use core::future::poll_fn;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+use kore::fs::dag::GrantId;
 use kore::fs::{Fs, FsError, Name, Refusal, Rights, View};
 use kore::runtime::Pinned;
 
@@ -208,11 +209,44 @@ pub(crate) struct FsHost {
     /// The largest transfer, fixed at attach: what one stream write may
     /// carry.
     chunk: usize,
+    /// Whether the task's named grants are offered as preopens of their
+    /// names beside `.` ([`Filesystem::with_named_grants`]).
+    grants: Cell<bool>,
+    /// The preopens once opened ([`FsHost::preopens`]). A guest asks for
+    /// them more than once — the preview1 adapter once at start and once
+    /// per name it reads back — and every answer shares the views the
+    /// first opened, so a guest's start costs the service one open per
+    /// preopen and holds one route per grant.
+    preopens: RefCell<Option<Rc<Preopens>>>,
 }
 
 impl FsHost {
     pub(crate) fn chunk(&self) -> usize {
         self.chunk
+    }
+
+    pub(crate) fn offers_grants(&self) -> bool {
+        self.grants.get()
+    }
+
+    /// The guest's preopens: the task root as `.`, then the named grants
+    /// when the embedder offers them — opened on the first call, shared by
+    /// every later one. A refusal is answered each time it is asked.
+    pub(crate) async fn preopens(&self) -> Result<Rc<Preopens>, PreopensRefused> {
+        if let Some(preopens) = self.preopens.borrow().clone() {
+            return Ok(preopens);
+        }
+        let root = preopen(self).await.map_err(PreopensRefused::Root)?;
+        let grants = if self.offers_grants() {
+            preopen_grants(self)
+                .await
+                .map_err(PreopensRefused::Grants)?
+        } else {
+            Vec::new()
+        };
+        let preopens = Rc::new(Preopens { root, grants });
+        *self.preopens.borrow_mut() = Some(preopens.clone());
+        Ok(preopens)
     }
 
     /// Drive the op in the slot; `Ready` once the slot is empty.
@@ -291,7 +325,15 @@ impl FsHost {
                     continue;
                 }
                 let Some(op) = op.take() else {
-                    return Poll::Ready(None);
+                    // The op was installed on an earlier turn and has now
+                    // finished — the slot is empty here only because its poll
+                    // returned `Ready`, which is also what set `out`. When the
+                    // op queued no view to close (the common case: it returns
+                    // the views it opened, owned), the orphan arm above does
+                    // not fire, so this is where its result is handed back.
+                    // Returning `None` here instead would drop it, and the one
+                    // caller reads that as a lost pair.
+                    return Poll::Ready(out.take());
                 };
                 let (cell, out) = (self.cell.clone(), out.clone());
                 self.install(Box::pin(async move {
@@ -305,7 +347,11 @@ impl FsHost {
 
 /// A task's filesystem, given to a guest as one preopen, `.`: the task's
 /// own root view (on Kore, the directory it was launched in). The guest
-/// resolves paths only beneath it — never through the task's named grants.
+/// resolves paths only beneath it — never through the task's named grants
+/// from there. An embedder that wants the guest to see those grants names
+/// them ([`with_named_grants`](Self::with_named_grants)): each is then a
+/// preopen of its own, under the name the task's store gives it, and the
+/// guest resolves beneath it the same way.
 ///
 /// `Send`, as a store's data must be; the pair is thread-bound and usable
 /// only on the thread that pinned it.
@@ -325,8 +371,27 @@ impl Filesystem {
             }),
             slot: RefCell::new(None),
             chunk,
+            grants: Cell::new(false),
+            preopens: RefCell::new(None),
         });
         Pinned::new(host).ok().map(Self)
+    }
+
+    /// Offer the task's named grants to the guest too, each as a preopen
+    /// under its store name beside `.`: a program launched as
+    /// `shared/wasm/python.wasm` then finds `shared/wasm/lib/` where its
+    /// launcher does, since `shared` is a grant the launcher's own walk
+    /// resolves and the guest's one-step walk from `.` cannot. The
+    /// embedder decides: a grant it holds for itself — a private data
+    /// grant — is never offered unless it says so, and the grants offered
+    /// are the task's, named as the task names them, with the rights the
+    /// service answers for each. A grant of a single file is not offered:
+    /// a preopen is a directory.
+    pub fn with_named_grants(self) -> Self {
+        if let Some(host) = self.0.get() {
+            host.grants.set(true);
+        }
+        self
     }
 
     pub(crate) fn host(&self) -> Option<&Rc<FsHost>> {
@@ -342,30 +407,211 @@ impl Filesystem {
     /// left to the service's teardown of this session.
     pub async fn close(self) -> Option<Fs<'static, 'static>> {
         let host = self.0.into_inner().ok()?;
+        // The preopens' views go first: queued now, closed by the settle.
+        drop(host.preopens.take());
         host.settle().await;
         let host = Rc::into_inner(host)?;
         Rc::into_inner(host.cell)?.fs.into_inner()
     }
 }
 
-/// The task root with the widest of the rights a preopen may carry; each
-/// probe is the service's own answer.
-pub(crate) async fn preopen(host: &FsHost) -> Option<(Shared, Rights)> {
+/// Widest first: the rights a preopen may carry, probed in order until
+/// the service answers one — the task root's, and each named grant's.
+const PREOPEN_RIGHTS: [Rights; 4] = {
     const MUTATE: Rights = Rights::READ.union(Rights::MUTATE_NAMESPACE);
     const WRITE: Rights = Rights::READ.union(Rights::WRITE);
+    [MUTATE.union(Rights::WRITE), MUTATE, WRITE, Rights::READ]
+};
+
+/// The task's named grants, each opened with the widest rights the service
+/// answers for it, in the order the store lists them: what
+/// [`Filesystem::with_named_grants`] offers beside the root. The private
+/// root is not among them (it is `.`), nor is a grant without a name (a
+/// guest could not spell it), nor a grant of a single file: a preopen is a
+/// directory (`get-directories`), so a file grant's view is closed and left
+/// out, not refused — the guest asked for nothing it lacks. A grant refused
+/// only at a width is tried at the next; one refused at every width, or for
+/// another reason, refuses them all.
+pub(crate) async fn preopen_grants(
+    host: &FsHost,
+) -> Result<Vec<(Name, GrantId, Shared, Rights)>, GrantsRefused> {
     host.exec(async |pair: &mut Custody| {
-        for rights in [MUTATE.union(Rights::WRITE), MUTATE, WRITE, Rights::READ] {
+        // The listing lands in the pair's window, which the next request
+        // reuses: read every entry before opening any.
+        let named: Vec<(Name, GrantId)> = pair
+            .call(async |fs: &mut Face| {
+                let count = fs.shares().await?;
+                let mut named = Vec::new();
+                for index in 0..count as usize {
+                    let entry = fs.share_entry(index)?;
+                    if entry.is_private_root {
+                        continue;
+                    }
+                    if let Some(name) = entry.display_name {
+                        named.push((name, entry.grant));
+                    }
+                }
+                Ok(named)
+            })
+            .await
+            .map_err(GrantsRefused::Listing)?;
+        let mut preopens = Vec::with_capacity(named.len());
+        for (name, grant) in named {
+            let mut refused = Refusal::Pair;
+            let mut opened = None;
+            for rights in PREOPEN_RIGHTS {
+                let root = pair
+                    .call(async move |fs: &mut Face| fs.open_grant(grant, rights).await)
+                    .await;
+                match root {
+                    Ok(root) => {
+                        opened = Some((root, rights));
+                        break;
+                    }
+                    Err(error @ Refusal::Fs(FsError::AccessDenied)) => refused = error,
+                    Err(error) => return Err(GrantsRefused::Grant(name, error)),
+                }
+            }
+            let Some((root, rights)) = opened else {
+                return Err(GrantsRefused::Grant(name, refused));
+            };
+            if root.is_directory() {
+                preopens.push((name, grant, pair.own(root), rights));
+            } else {
+                pair.close(root).await;
+            }
+        }
+        Ok(preopens)
+    })
+    .await
+    .unwrap_or(Err(GrantsRefused::Listing(Refusal::Pair)))
+}
+
+/// What a guest is given as preopens: the task root, and the named grants
+/// the embedder offered, each as the view opened for it and its rights.
+pub(crate) struct Preopens {
+    pub(crate) root: (Shared, Rights),
+    pub(crate) grants: Vec<(Name, GrantId, Shared, Rights)>,
+}
+
+/// Why the guest's preopens could not be opened.
+pub(crate) enum PreopensRefused {
+    /// The task root, at any width.
+    Root(Refusal),
+    Grants(GrantsRefused),
+}
+
+/// Why the task's named grants could not be offered.
+pub(crate) enum GrantsRefused {
+    /// The listing itself was refused (`Pair` when the pair is gone).
+    Listing(Refusal),
+    /// This grant could not be opened at any width: the service's refusal
+    /// of the narrowest probe, or the first for a reason other than width.
+    Grant(Name, Refusal),
+}
+
+/// The task root with the widest of the rights a preopen may carry; each
+/// probe is the service's own answer. `Err` is the service's refusal of
+/// the narrowest probe, or of the first one it refused for a reason other
+/// than width; `Pair` when the pair is gone.
+pub(crate) async fn preopen(host: &FsHost) -> Result<(Shared, Rights), Refusal> {
+    host.exec(async |pair: &mut Custody| {
+        let mut refused = Refusal::Pair;
+        for rights in PREOPEN_RIGHTS {
             let root = pair
                 .call(async move |fs: &mut Face| fs.open_root(rights).await)
                 .await;
             match root {
-                Ok(root) => return Some((pair.own(root), rights)),
-                Err(Refusal::Fs(FsError::AccessDenied)) => {}
-                Err(_) => return None,
+                Ok(root) => return Ok((pair.own(root), rights)),
+                Err(error @ Refusal::Fs(FsError::AccessDenied)) => refused = error,
+                Err(error) => return Err(error),
             }
         }
-        None
+        Err(refused)
     })
     .await
-    .flatten()
+    .unwrap_or(Err(Refusal::Pair))
+}
+
+#[cfg(test)]
+mod tests {
+    use core::pin::pin;
+    use core::task::Waker;
+
+    use super::*;
+
+    /// A host with no face. The ops below run no verb; a `Custody` over an
+    /// absent face would refuse one as a lost pair.
+    fn faceless() -> FsHost {
+        FsHost {
+            cell: Rc::new(FsCell {
+                fs: Cell::new(None),
+                lost: Cell::new(false),
+                orphans: RefCell::new(Vec::new()),
+            }),
+            slot: RefCell::new(None),
+            chunk: 0,
+            grants: Cell::new(false),
+            preopens: RefCell::new(None),
+        }
+    }
+
+    /// Pending once, then ready: an op parked on its reply, as every op
+    /// with a request in flight is on Kore.
+    async fn park_once() {
+        let mut parked = false;
+        poll_fn(|cx| {
+            if parked {
+                Poll::Ready(())
+            } else {
+                parked = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+
+    /// An op that finishes on a later turn than the one that installed it,
+    /// and queues no view to close, is answered with its result. The driver
+    /// once answered `None` there, which the preopens read as a lost pair:
+    /// every guest on Kore was given no preopens.
+    #[test]
+    fn an_op_that_parks_hands_back_its_result() {
+        let host = faceless();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut call = pin!(host.exec(async |_: &mut Custody| {
+            park_once().await;
+            7_u32
+        }));
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Some(7)));
+        assert!(host.slot.borrow().is_none());
+    }
+
+    /// A caller dropped after installing its op leaves the op to finish on
+    /// the next caller's turn, before that caller's own op is installed; the
+    /// next caller is still answered with its own result.
+    #[test]
+    fn a_dropped_callers_op_finishes_first_and_the_next_gets_its_own() {
+        let host = faceless();
+        let mut cx = Context::from_waker(Waker::noop());
+        let finished = Rc::new(Cell::new(false));
+        {
+            let finished = finished.clone();
+            let mut first = pin!(host.exec(async move |_: &mut Custody| {
+                park_once().await;
+                finished.set(true);
+            }));
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(!finished.get());
+        let mut second = pin!(host.exec(async |_: &mut Custody| {
+            park_once().await;
+            11_u32
+        }));
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        assert!(finished.get());
+        assert_eq!(second.as_mut().poll(&mut cx), Poll::Ready(Some(11)));
+    }
 }

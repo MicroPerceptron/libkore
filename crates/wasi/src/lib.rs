@@ -84,6 +84,9 @@ pub struct WasiCtx {
     pub(crate) rng: kore::random::SystemRng,
     /// `None`: the stream getters trap.
     pub(crate) streams: Option<Streams>,
+    /// The embedder declared the streams' far end a terminal
+    /// ([`with_terminal`](Self::with_terminal)).
+    pub(crate) terminal: bool,
     /// `None`: `get-directories` is empty.
     pub(crate) filesystem: Option<Filesystem>,
 }
@@ -96,6 +99,7 @@ impl WasiCtx {
             args,
             rng: kore::random::SystemRng::new(),
             streams: None,
+            terminal: false,
             filesystem: None,
         }
     }
@@ -103,6 +107,19 @@ impl WasiCtx {
     /// The guest's standard streams.
     pub fn with_streams(mut self, streams: Streams) -> Self {
         self.streams = Some(streams);
+        self
+    }
+
+    /// Whether the far end of the standard streams is a terminal — the
+    /// guest's `wasi:cli/terminal-*` answers, and so its `isatty`. The
+    /// embedder knows and the streams do not: on Kore it is the profile
+    /// the launcher declared on the stream page
+    /// (`ProcessStdioChild::profile`), a terminal for the shell's
+    /// interactive relay and not for a launcher that captures the output.
+    /// Undeclared, the guest is told it has no terminal, as a program with
+    /// redirected stdio is.
+    pub fn with_terminal(mut self, terminal: bool) -> Self {
+        self.terminal = terminal;
         self
     }
 

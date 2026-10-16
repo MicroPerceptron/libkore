@@ -29,6 +29,8 @@ wasmtime::component::bindgen!({
         "wasi:io/error": wasmtime_wasi_io::bindings::wasi::io::error,
         "wasi:filesystem/types.descriptor": crate::filesystem::Descriptor,
         "wasi:filesystem/types.directory-entry-stream": crate::filesystem::DirectoryEntryStream,
+        "wasi:cli/terminal-input.terminal-input": crate::cli::TerminalInput,
+        "wasi:cli/terminal-output.terminal-output": crate::cli::TerminalOutput,
     },
     require_store_data_send: true,
 });
