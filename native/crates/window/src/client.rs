@@ -386,9 +386,10 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
     /// visibility flip), or `bound` elapses.  Level-triggered: drain
     /// [`pop_event`](Self::pop_event) and re-check state after every
     /// return.
-    pub async fn wait_change(&mut self, bound: core::time::Duration) {
-        let seen = self.channel.seq();
-        if self.sync_status().is_err()
+    /// Work a wait must not sleep past: a failed status sync, unconsumed
+    /// records, or an appearance the caller has not yet observed.
+    fn change_pending(&mut self) -> bool {
+        self.sync_status().is_err()
             || self.channel.outstanding() != 0
             || self.channel.state().is_some_and(|state| {
                 self.observed_scheme
@@ -397,10 +398,31 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
                         .observed_density
                         .is_some_and(|seen| state.density() != seen)
             })
-        {
+    }
+
+    pub async fn wait_change(&mut self, bound: core::time::Duration) {
+        let seen = self.channel.seq();
+        if self.change_pending() {
             return;
         }
         kore_rt::event::wait_past(&self.channel, seen, Some(bound)).await;
+        let _ = self.sync_status();
+    }
+
+    /// [`wait_change`](Self::wait_change) for a window whose task also drains
+    /// other planes woken through the same executor doorbell — a stream host
+    /// whose child rings it (`res/SHELL_TERMINAL.md` §6). It publishes this
+    /// channel's park intent, so a compositor batch still wakes it, and then
+    /// returns on *any* executor wake: a single-plane wait would re-park after
+    /// the other plane's notice and hide it. The caller must have armed every
+    /// other plane before calling, drains all of them on return, and keeps
+    /// its own deadlines.
+    pub async fn wait_any(&mut self, bound: core::time::Duration) {
+        let seen = self.channel.seq();
+        if self.change_pending() {
+            return;
+        }
+        kore_rt::event::wait_once(&self.channel, seen, Some(bound)).await;
         let _ = self.sync_status();
     }
 

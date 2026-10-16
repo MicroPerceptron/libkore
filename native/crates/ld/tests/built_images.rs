@@ -21,8 +21,11 @@
 //! `KORE_USER_IMAGE_ARCH`, when set, closes the walk to exactly one of
 //! `x86_64`, `aarch64`, or `riscv64`. Production packaging uses that
 //! selector so a partial build for another ISA cannot become a prerequisite
-//! merely because its target directory exists. With no selector every ISA
-//! present is checked, as in `make user-verify`.
+//! merely because its target directory exists. `KORE_USER_IMAGE_PROFILE`
+//! further selects the exact baseline/v2/v3/v4 directory produced by that
+//! build, so a stale partial sibling cannot poison a production install. With
+//! no selectors every ISA and profile present is checked, as in
+//! `make user-verify`.
 //!
 //! `KORE_USER_IMAGES` unset ⇒ skip: `make test` stays hermetic. An arch whose
 //! spec dir is absent is skipped (a gated-out ISA), but a set root with *no*
@@ -259,56 +262,73 @@ enum ImageKind {
     },
 }
 
-/// Check one arch across its SIMD profile variants: the baseline spec
-/// dir and its `-v2` / `-v3` / `-v4` siblings.  Today v2 is the Oryon-1
-/// AArch64 profile (`USER_SIMD=v2`), while v3/v4 are the x86-64 psABI
-/// classes (`USER_SIMD=v3|v4`).  Every variant present is checked —
-/// a stale baseline build beside a fresh machine profile both face the
-/// regime; an absent variant is skipped (a gated-out ISA / an unselected
-/// profile).
-fn check_arch<A: RelocArch>(root: &Path, spec: &str) -> usize {
-    let mut checked = 0;
-    for variant in [
+/// Verify one exact profile directory. Aggregate callers may treat absence as
+/// a skipped profile; production callers require the directory they built.
+fn check_variant<A: RelocArch>(root: &Path, variant: &str, required: bool) -> usize {
+    let dir = root.join(variant).join("release");
+    if !dir.is_dir() {
+        assert!(
+            !required,
+            "built_images: required profile {variant} not built"
+        );
+        println!("built_images: {variant} not built — skipped");
+        return 0;
+    }
+    for (name, kind) in [
+        ("libdemo.so", ImageKind::DemoLibrary),
+        ("libpci_names.so", ImageKind::SharedLibrary),
+        ("hello", ImageKind::NeedsLibrary("libdemo.so")),
+        ("time", ImageKind::Executable),
+        ("sleep", ImageKind::Executable),
+        ("status", ImageKind::NeedsLibrary("libpci_names.so")),
+        ("lspci", ImageKind::NeedsLibrary("libpci_names.so")),
+        ("help", ImageKind::Executable),
+        ("window", ImageKind::Executable),
+        ("clear", ImageKind::Executable),
+        ("inference", ImageKind::Executable),
+        ("lua", ImageKind::ExportsApi("lua_pushcclosure")),
+        (
+            "liblua_demo.so",
+            ImageKind::LateModule {
+                opener: "luaopen_lua_demo",
+                host_prefix: "lua_",
+            },
+        ),
+        ("kore-terminal", ImageKind::Executable),
+        ("kore-editor", ImageKind::Executable),
+        ("kore-aftershock", ImageKind::Executable),
+        ("kore-skylilt", ImageKind::Executable),
+    ] {
+        println!("built_images: {variant}/{name}");
+        verify_image::<A>(&dir.join(name), kind);
+    }
+    17
+}
+
+fn profile_belongs_to(profile: &str, spec: &str) -> bool {
+    profile == spec
+        || ["-v2", "-v3", "-v4"]
+            .iter()
+            .any(|suffix| profile == format!("{spec}{suffix}"))
+}
+
+fn check_arch<A: RelocArch>(root: &Path, spec: &str, selected: Option<&str>) -> usize {
+    if let Some(profile) = selected {
+        assert!(
+            profile_belongs_to(profile, spec),
+            "KORE_USER_IMAGE_PROFILE={profile:?} does not belong to {spec}"
+        );
+        return check_variant::<A>(root, profile, true);
+    }
+    [
         String::from(spec),
         format!("{spec}-v2"),
         format!("{spec}-v3"),
         format!("{spec}-v4"),
-    ] {
-        let dir = root.join(&variant).join("release");
-        if !dir.is_dir() {
-            println!("built_images: {variant} not built — skipped");
-            continue;
-        }
-        for (name, kind) in [
-            ("libdemo.so", ImageKind::DemoLibrary),
-            ("libpci_names.so", ImageKind::SharedLibrary),
-            ("hello", ImageKind::NeedsLibrary("libdemo.so")),
-            ("time", ImageKind::Executable),
-            ("sleep", ImageKind::Executable),
-            ("status", ImageKind::NeedsLibrary("libpci_names.so")),
-            ("lspci", ImageKind::NeedsLibrary("libpci_names.so")),
-            ("help", ImageKind::Executable),
-            ("window", ImageKind::Executable),
-            ("clear", ImageKind::Executable),
-            ("lua", ImageKind::ExportsApi("lua_pushcclosure")),
-            (
-                "liblua_demo.so",
-                ImageKind::LateModule {
-                    opener: "luaopen_lua_demo",
-                    host_prefix: "lua_",
-                },
-            ),
-            ("kore-terminal", ImageKind::Executable),
-            ("kore-editor", ImageKind::Executable),
-            ("kore-aftershock", ImageKind::Executable),
-            ("kore-skylilt", ImageKind::Executable),
-        ] {
-            println!("built_images: {variant}/{name}");
-            verify_image::<A>(&dir.join(name), kind);
-        }
-        checked += 16;
-    }
-    checked
+    ]
+    .iter()
+    .map(|variant| check_variant::<A>(root, variant, false))
+    .sum()
 }
 
 #[test]
@@ -319,15 +339,26 @@ fn built_images_satisfy_regime() {
     };
     let root = PathBuf::from(root);
     let requested = std::env::var("KORE_USER_IMAGE_ARCH").ok();
+    let selected = std::env::var("KORE_USER_IMAGE_PROFILE").ok();
+    assert!(
+        requested.is_some() || selected.is_none(),
+        "KORE_USER_IMAGE_PROFILE requires KORE_USER_IMAGE_ARCH"
+    );
     let n = match requested.as_deref() {
         None => {
-            check_arch::<X86_64>(&root, "x86_64-unknown-kore-user")
-                + check_arch::<AArch64>(&root, "aarch64-unknown-kore-user")
-                + check_arch::<Riscv64>(&root, "riscv64gc-unknown-kore-user")
+            check_arch::<X86_64>(&root, "x86_64-unknown-kore-user", None)
+                + check_arch::<AArch64>(&root, "aarch64-unknown-kore-user", None)
+                + check_arch::<Riscv64>(&root, "riscv64gc-unknown-kore-user", None)
         }
-        Some("x86_64") => check_arch::<X86_64>(&root, "x86_64-unknown-kore-user"),
-        Some("aarch64") => check_arch::<AArch64>(&root, "aarch64-unknown-kore-user"),
-        Some("riscv64") => check_arch::<Riscv64>(&root, "riscv64gc-unknown-kore-user"),
+        Some("x86_64") => {
+            check_arch::<X86_64>(&root, "x86_64-unknown-kore-user", selected.as_deref())
+        }
+        Some("aarch64") => {
+            check_arch::<AArch64>(&root, "aarch64-unknown-kore-user", selected.as_deref())
+        }
+        Some("riscv64") => {
+            check_arch::<Riscv64>(&root, "riscv64gc-unknown-kore-user", selected.as_deref())
+        }
         Some(other) => panic!(
             "KORE_USER_IMAGE_ARCH={other:?} is unsupported; expected x86_64, aarch64, or riscv64"
         ),

@@ -51,6 +51,29 @@ pub enum SendError {
     Transport,
 }
 
+/// Why a task-handle delegation ([`ChanTx::delegate_task`]) reports failure.
+///
+/// Every variant keeps what the attempt learned, and each says whether the
+/// peer can hold a delegated child — which decides whether a retry is safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelegateError<E> {
+    /// Staging refused; nothing reached the kernel and no child exists.
+    Build(crate::session::BuildError),
+    /// The transport could not issue the session; nothing reached the kernel
+    /// and no child exists.
+    Transport(E),
+    /// Proven rollback: no receive post stands on the channel. No child
+    /// exists; retry once the peer re-posts.
+    WouldBlock,
+    /// Proven rollback: the gate refused invocation `failing_index` with
+    /// `status`. No child exists.
+    Refused { status: Status, failing_index: u16 },
+    /// The completion does not prove rollback: the peer may hold a delegated
+    /// child. Retrying could delegate a second one; the task's own revocation
+    /// by its holder remains the backstop.
+    Unproven { status: Status, failing_index: u16 },
+}
+
 /// Why a recv refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecvError {
@@ -151,6 +174,16 @@ fn classify_rotating_post(committed: kore_abi::session::Committed) -> RotatingPo
     }
 }
 
+/// Statuses with which the gate proves a transfer session rolled back
+/// entirely: the peer holds nothing from it. Any other refusal leaves custody
+/// unproven.
+const fn proves_rollback(status: Status) -> bool {
+    matches!(
+        status,
+        Status::Denied | Status::Forged | Status::Revoked | Status::WouldBlock | Status::Conflict
+    )
+}
+
 fn classify_derived_transfer(
     committed: kore_abi::session::Committed,
     invocations: usize,
@@ -160,16 +193,7 @@ fn classify_derived_transfer(
     if status == Status::Ok && failing == 0 && invocations != 0 {
         return DerivedTransfer::Moved;
     }
-    if failing < invocations
-        && matches!(
-            status,
-            Status::Denied
-                | Status::Forged
-                | Status::Revoked
-                | Status::WouldBlock
-                | Status::Conflict
-        )
-    {
+    if failing < invocations && proves_rollback(status) {
         return DerivedTransfer::RolledBack(if status == Status::WouldBlock {
             SendError::WouldBlock
         } else {
@@ -177,6 +201,25 @@ fn classify_derived_transfer(
         });
     }
     DerivedTransfer::Indeterminate
+}
+
+/// Classify a one-invocation delegation's completion without discarding the
+/// status or the failing index.
+fn delegation_outcome<E>(committed: kore_abi::session::Committed) -> Result<(), DelegateError<E>> {
+    let status = committed.status();
+    let failing_index = committed.failing_index();
+    match (status, failing_index) {
+        (Status::Ok, 0) => Ok(()),
+        (Status::WouldBlock, 0) => Err(DelegateError::WouldBlock),
+        (status, 0) if proves_rollback(status) => Err(DelegateError::Refused {
+            status,
+            failing_index,
+        }),
+        (status, failing_index) => Err(DelegateError::Unproven {
+            status,
+            failing_index,
+        }),
+    }
 }
 
 /// The **send end** witness — a peer's kick-and-transfer authority over
@@ -238,6 +281,31 @@ impl<'t, T: Transport> ChanTx<'t, T> {
             Status::WouldBlock => Err(SendError::WouldBlock),
             s => Err(SendError::Refused(s)),
         }
+    }
+
+    /// Delegate a held task handle: the peer's posted slot receives a fresh,
+    /// separately revocable child handle over the same task, attenuated to
+    /// `rights`, while `task` stays with the caller unchanged.
+    ///
+    /// A delegated handle carrying `REVOKE` is a kill capability for exactly
+    /// that task: revoking it runs the handle's ordinary teardown (kill, reap,
+    /// joiners woken) — the terminal controller's foreground slot
+    /// (`res/SHELL_TERMINAL.md` §9). The caller's handle needs `DERIVE`; the
+    /// kernel clamps `rights` to a subset of it.
+    pub async fn delegate_task(
+        &self,
+        task: &crate::cap::TaskToken,
+        rights: Rights,
+    ) -> Result<(), DelegateError<T::Error>> {
+        let mut s = SessionBuilder::new();
+        s.send(self.send, task.slot(), rights)
+            .map_err(DelegateError::Build)?;
+        let committed = self
+            .transport
+            .commit(&s)
+            .await
+            .map_err(DelegateError::Transport)?;
+        delegation_outcome(committed)
     }
 
     /// Capability transfer (the landed send): `DERIVE`-gated
@@ -619,7 +687,26 @@ impl<'t, T: Transport> NoticeRx<'t, T> {
                 None => return Ok(None),
             }
         }
+        self.stand().map(|()| None)
+    }
 
+    /// Stand a fresh post now if none stands; never consumes. A consumed
+    /// notice leaves no post until the next [`try_recv`](Self::try_recv),
+    /// and a sender that finds none gets `WouldBlock` and may drop its
+    /// notice. A caller whose handling of a notice spans a round trip
+    /// re-stands right after consuming it, so the next notice cannot fall
+    /// into that gap. Only for a channel that carries notices alone: on one
+    /// that also carries another receiver's posts or capabilities, an
+    /// early post would take what that receiver expects.
+    pub fn restand(&mut self) -> Result<(), RecvError> {
+        if self.standing {
+            return Ok(());
+        }
+        self.stand()
+    }
+
+    /// Stand a fresh post on the receive endpoint; `Ok` once one stands.
+    fn stand(&mut self) -> Result<(), RecvError> {
         // A landing retained by `rearm` is reused: the same slot, scrubbed
         // by the repost, so a post the kernel already resolved cannot leave
         // its reservation stranded.
@@ -636,7 +723,7 @@ impl<'t, T: Transport> NoticeRx<'t, T> {
                 landing.arm_post();
                 self.landing = Some(landing);
                 self.standing = true;
-                Ok(None)
+                Ok(())
             }
             // A refused repost retains the landing (Reserved, never released):
             // after `rearm` it may be the target of a post the kernel still
@@ -894,6 +981,40 @@ impl<'t, T: Transport> ChanRx<'t, T> {
 mod tests {
     use super::*;
     use kore_abi::session::Committed;
+
+    /// A delegation reports exactly what its completion proves: delivered, a
+    /// retryable missing post, a proven refusal, or custody the peer may hold.
+    #[test]
+    fn delegation_outcome_keeps_status_index_and_custody_proof() {
+        let outcome = |status: Status, index| {
+            delegation_outcome::<()>(Committed::from_raw(status.encode(index)))
+        };
+        assert_eq!(outcome(Status::Ok, 0), Ok(()));
+        assert_eq!(outcome(Status::WouldBlock, 0), Err(DelegateError::WouldBlock));
+        assert_eq!(
+            outcome(Status::Revoked, 0),
+            Err(DelegateError::Refused {
+                status: Status::Revoked,
+                failing_index: 0
+            })
+        );
+        // Not a rollback proof: the peer may hold a delegated child.
+        assert_eq!(
+            outcome(Status::Malformed, 0),
+            Err(DelegateError::Unproven {
+                status: Status::Malformed,
+                failing_index: 0
+            })
+        );
+        // A one-invocation session cannot fail past its only invocation.
+        assert_eq!(
+            outcome(Status::Ok, 1),
+            Err(DelegateError::Unproven {
+                status: Status::Ok,
+                failing_index: 1
+            })
+        );
+    }
 
     #[test]
     fn derived_transfer_completion_is_fail_closed() {

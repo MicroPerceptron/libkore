@@ -236,6 +236,8 @@ pub enum ResourceKind {
     /// peer window it sponsored before the epoch may be reclaimed.
     /// Append-only wire.
     DeviceMmu,
+    /// Boot-discovered memory controller; currently kernel-owned.
+    MemoryController,
 }
 
 /// The stamped capability record as it lives in the shared cap arena — the

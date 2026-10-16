@@ -33,6 +33,12 @@ use crate::transport::{ParkPost, Transport, stage_grant};
 
 use super::{COOKIE_REPLY, COOKIE_REPORT, ServeRings};
 
+/// The bounded idle wait of a host that owes teardown (a peer close the
+/// service refused, an admission cleanup, a pending return cleanup): the
+/// period at which [`ServeHost::run`] retries without a doorbell. Only
+/// while something is owed — a host with nothing owed parks unbounded.
+const CLEANUP_RECHECK_NS: u64 = 2_000_000;
+
 use crate::service::SystemService;
 
 /// The affine owner of a bound service.
@@ -2186,6 +2192,7 @@ impl<'w, 't, T: Transport, S: SystemService> ServeHost<'w, 't, T, S> {
             let notify = self.svc.drive_deadlines(now);
             self.notify_pairs(notify).await;
 
+            self.svc.poll_background();
             while self.serve_next().await {}
 
             // A just-served arm may already be due. Settle it before choosing
@@ -2224,12 +2231,28 @@ impl<'w, 't, T: Transport, S: SystemService> ServeHost<'w, 't, T, S> {
             /// The kernel asked this row to quiesce its devices (#809 §L);
             /// the payload is the remaining budget in nanoseconds.
             Quiesce(u64),
+            /// Owed teardown's recheck period elapsed with no ring work:
+            /// loop once so the retries at its top run again.
+            Recheck,
         }
         loop {
             self.retry_peer_cleanup();
             while !self.retry_admission_cleanup() {
                 crate::sleep_for(1_000).await;
             }
+            // A refused peer teardown (a device still finishing the dead
+            // client's work) is retried only at the top of this loop, and an
+            // absent client sends no doorbell to get here again. While any
+            // teardown is owed, the idle wait is therefore bounded; with none
+            // owed it parks on the doorbell (and a route) alone, as before.
+            let owed = self.has_pending_cleanup();
+            let mut recheck = core::pin::pin!(async move {
+                if owed {
+                    crate::sleep_for(CLEANUP_RECHECK_NS).await;
+                } else {
+                    core::future::pending::<()>().await;
+                }
+            });
             let host_action = {
                 let Self {
                     svc,
@@ -2245,6 +2268,9 @@ impl<'w, 't, T: Transport, S: SystemService> ServeHost<'w, 't, T, S> {
                     if let Some(budget_ns) = crate::executor::quiesce_asked(cx) {
                         return core::task::Poll::Ready(Work::Quiesce(budget_ns));
                     }
+                    // Every wake, including a device route's, reaches the
+                    // service's own device progress before the rings.
+                    svc.poll_background();
                     for (k, pair) in pairs.iter_mut().enumerate() {
                         if let Some(w) = pair
                             .as_mut()
@@ -2269,6 +2295,11 @@ impl<'w, 't, T: Transport, S: SystemService> ServeHost<'w, 't, T, S> {
                         if pair.as_mut().is_some_and(|p| p.return_delivery_ready()) {
                             return core::task::Poll::Ready(Work::Return(k));
                         }
+                    }
+                    // Ring work always wins; the recheck only ends an
+                    // otherwise idle wait.
+                    if core::future::Future::poll(recheck.as_mut(), cx).is_ready() {
+                        return core::task::Poll::Ready(Work::Recheck);
                     }
                     core::task::Poll::Pending
                 })
@@ -2304,6 +2335,7 @@ impl<'w, 't, T: Transport, S: SystemService> ServeHost<'w, 't, T, S> {
                             .await;
                         None
                     }
+                    Work::Recheck => None,
                 }
             };
             if let Some((source, action)) = host_action {

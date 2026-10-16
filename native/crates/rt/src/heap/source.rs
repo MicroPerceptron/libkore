@@ -519,7 +519,10 @@ mod window {
 
     /// The next granule off the launch supply (`role::HEAP@0`), reserved:
     /// `(supply, offset, size)`.
-    fn launch_granule(missing: u64, doubling: u64) -> Option<(kore_abi::session::SlotRef, u64, u64)> {
+    fn launch_granule(
+        missing: u64,
+        doubling: u64,
+    ) -> Option<(kore_abi::session::SlotRef, u64, u64)> {
         let supply = crate::entry::geometry::heap_supply_slot()?;
         let total = super::supply_len(supply)?;
         let room = total
@@ -545,7 +548,10 @@ mod window {
     /// The next granule off an adopted supply ([`super::adopt_supply`]),
     /// reserved. Nothing else draws on an adopted lease, so its share is all
     /// that remains of it.
-    fn adopted_granule(missing: u64, doubling: u64) -> Option<(kore_abi::session::SlotRef, u64, u64)> {
+    fn adopted_granule(
+        missing: u64,
+        doubling: u64,
+    ) -> Option<(kore_abi::session::SlotRef, u64, u64)> {
         super::ADOPTED.iter().find_map(|entry| {
             let slot = entry.slot.load(Ordering::Acquire).checked_sub(1)?;
             let room = entry
@@ -579,16 +585,21 @@ mod window {
             Some(kore_abi::session::ViewMapWindow::Heap),
         )?;
         GRANULES.fetch_add(1, Ordering::Relaxed);
-        let start = (granule.as_ptr() as *mut u8 as u64)
-            .checked_sub(BASE.load(Ordering::Relaxed))?
-            / PAGE;
-        let stop = start.checked_add(size / PAGE).filter(|&stop| stop <= u32::MAX as u64)?;
+        let start =
+            (granule.as_ptr() as *mut u8 as u64).checked_sub(BASE.load(Ordering::Relaxed))? / PAGE;
+        let stop = start
+            .checked_add(size / PAGE)
+            .filter(|&stop| stop <= u32::MAX as u64)?;
         // Extend the interval when the granule lands at its end; otherwise
         // the new granule replaces it and the old tail is left unused.
         let mut word = FREE.load(Ordering::Acquire);
         loop {
             let (at, end) = unpack(word);
-            let next = if start == end { pack(at, stop) } else { pack(start, stop) };
+            let next = if start == end {
+                pack(at, stop)
+            } else {
+                pack(start, stop)
+            };
             match FREE.compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return Some(()),
                 Err(actual) => word = actual,

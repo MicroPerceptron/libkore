@@ -98,6 +98,25 @@ pub const KORE_FS_TYPE: Guid = guid!("D673CABE-2DF1-4F42-8B89-B9E56AC86714");
 /// ```
 pub const KORE_SYSTEM_TYPE: Guid = guid!("D9991ABE-2DF1-409E-8416-E05280489E79");
 
+/// The partition type GUID that designates **a kore pack region** — an
+/// immutable, installer-written image (model weights and similar bulk
+/// read-mostly data) that the filesystem row streams at queue depth into
+/// client-funded memory without a filesystem in between.
+///
+/// The designation grants *read* authority only: the pack lane's
+/// `RegionDevice` clamp is read-only by construction, so no kore code path
+/// can write, discard, or format these blocks. The layout inside the region
+/// belongs to whoever produced the image; kore sees block ranges. Write one
+/// from another OS and leave it:
+///
+/// ```text
+/// sgdisk --new=0:0:+24G \
+///        --typecode=0:55287D31-3555-44E8-A6E8-F9F74A225290 \
+///        --change-name=0:"kore pack" /dev/nvme0n1
+/// dd if=model.pack of=/dev/nvme0n1pN bs=4M oflag=direct
+/// ```
+pub const KORE_PACK_TYPE: Guid = guid!("55287D31-3555-44E8-A6E8-F9F74A225290");
+
 /// The LBA the primary GPT header always occupies (LBA 0 is the
 /// protective MBR).
 pub const PRIMARY_HEADER_LBA: u64 = 1;

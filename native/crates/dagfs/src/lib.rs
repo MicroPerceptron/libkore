@@ -27,6 +27,13 @@
 #[cfg(test)]
 extern crate std;
 
+/// The display name of the **library view** every task view carries: the
+/// shared `lib/` directory the store installer seeds, granted `READ` alone —
+/// no `WRITE`, `MUTATE_NAMESPACE`, `SHARE`, or `BIND_EXECUTABLE`. The
+/// service mints the edge under this name and a late loader enters it by
+/// this name, so the two halves share one spelling.
+pub const LIBS_VIEW: &str = "libs";
+
 pub mod bounds;
 #[cfg(feature = "runtime")]
 mod capability;
@@ -52,6 +59,8 @@ pub mod protocol;
 mod refusal;
 #[cfg(feature = "runtime")]
 pub mod search;
+#[cfg(feature = "runtime")]
+pub mod stor;
 pub mod text;
 #[cfg(feature = "runtime")]
 mod view;
@@ -65,10 +74,11 @@ pub use capability::{FS_GRANT_TARGET_DELEGATE_RIGHTS, FS_GRANT_TARGET_RIGHTS, Fs
 #[cfg(feature = "runtime")]
 pub use client::{
     FilesystemFace as ClientFace, FsClient, GrantEntry, IdentifyVersionFailure, LentVersion,
-    Opened, PendingVersion, ReleasePendingVersionFailure, ReleaseVersionFailure, RingFs,
-    RingFsError, RingReleasePendingVersionFailure, RingReleaseVersionFailure, SearchResultPage,
-    Stat, Transport, VERSION_IDENTITY_BYTES, process_face, read_dir_entry, read_grant_entry,
-    read_search_hit, read_system_status, read_version_identity,
+    Opened, RING_TARGET_RIGHTS, PendingVersion, ReleasePendingVersionFailure,
+    ReleaseVersionFailure, RingFs, RingFsError, RingReleasePendingVersionFailure,
+    RingReleaseVersionFailure, SearchResultPage, Stat, Transport, VERSION_IDENTITY_BYTES,
+    process_face, read_dir_entry, read_grant_entry, read_search_hit, read_system_status,
+    read_version_identity,
 };
 pub use entry::DirEntry;
 pub use error::{FsError, FsResult, ProviderError};

@@ -326,6 +326,7 @@ fn provider_class(error: dag::ProviderError) -> KoreProviderError {
         R::ReadOnly => C::ReadOnly,
         R::Backpressure => C::Backpressure,
         R::Timeout => C::Timeout,
+        R::Retiring => C::Retiring,
     }
 }
 

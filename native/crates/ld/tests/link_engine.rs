@@ -1350,7 +1350,11 @@ fn built_executables_link_under_the_stub_caps() {
         "KORE_USER_IMAGES={} selected no linkable executables",
         dir.display()
     );
-    println!("linking {} built executables: {}", executables.len(), executables.join(", "));
+    println!(
+        "linking {} built executables: {}",
+        executables.len(),
+        executables.join(", ")
+    );
 
     // A fresh world per link: the engine consumes leases, so a world that
     // already linked one program is not a clean stand-in for the founding of
@@ -1398,7 +1402,10 @@ fn a_reported_placement_cursor_is_stamped_below_the_page() {
     world.bytes_at(prog.module_page, &mut bytes);
     let page = ModulePage::read_from_bytes(&bytes).unwrap();
     assert_eq!(page.placed.get(), 3);
-    assert_eq!(page.placed_high_water(prog.module_page), Some(page_va - 3 * PAGE));
+    assert_eq!(
+        page.placed_high_water(prog.module_page),
+        Some(page_va - 3 * PAGE)
+    );
 }
 
 /// A world that does not record placement stamps nothing, and the page
@@ -1424,8 +1431,9 @@ fn an_unrepresentable_placement_cursor_refuses_the_link() {
         diamond(&mut world, &X86_RELOCS);
         world.page_at = Some(page_va);
         world.placed_high_water = Some(bad);
-        let err = link_program::<X86_64, _, _>(&mut world, &name("exe"), arena(), LinkCaps::DEFAULT)
-            .expect_err("a lying placement cursor refuses");
+        let err =
+            link_program::<X86_64, _, _>(&mut world, &name("exe"), arena(), LinkCaps::DEFAULT)
+                .expect_err("a lying placement cursor refuses");
         assert!(matches!(err, LinkError::Layout(_)), "{err:?}");
     }
 }

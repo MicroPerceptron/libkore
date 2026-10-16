@@ -12,4 +12,8 @@ pub struct RingStats {
     pub completed: u64,
     /// Completions with a non-success status.
     pub errors: u64,
+    /// Completions naming an id with no command in flight — a device
+    /// answering twice, or answering something never submitted.  Dropped,
+    /// never delivered, and counted so the books show it.
+    pub stray: u64,
 }

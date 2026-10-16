@@ -22,10 +22,8 @@ use kore_abi::monitor::FilesystemLatencySnapshot;
 
 pub mod memory;
 pub mod region;
-pub mod shared;
 
 pub use region::RegionDevice;
-pub use shared::{Lane, SharedBackend, SharedStats};
 
 /// Maximum buffers registered in one direct channel by default.
 pub const DEFAULT_BUFFERS: usize = 8;
@@ -131,6 +129,17 @@ pub struct BufferId {
 impl BufferId {
     pub const fn to_bits(self) -> u32 {
         ((self.generation as u32) << 16) | self.slot as u32
+    }
+
+    /// The inverse of [`to_bits`](Self::to_bits), for a name that crossed a
+    /// process boundary as data.  It conveys nothing by itself: every channel
+    /// operation re-checks the slot's live generation, so a forged or stale
+    /// word answers `UnknownBuffer`.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self {
+            slot: bits as u16,
+            generation: (bits >> 16) as u16,
+        }
     }
 }
 
@@ -466,13 +475,18 @@ pub trait DirectBlockDevice {
     /// a correlated reply.
     ///
     /// The conservative default is `false`, so a backend only claims
-    /// independence deliberately.  [`shared::SharedBackend`] requires it: a
-    /// parking `progress` future would have to hold the shared borrow across
-    /// an `await`, so the sharing constructor refuses such a backend rather
-    /// than leaving that conflict latent.
+    /// independence deliberately.  A composition that shares one backend
+    /// between several drivers needs it: a parking `progress` future would
+    /// have to hold the shared borrow across an `await`.
     const INDEPENDENT_PROGRESS: bool = false;
 
     fn geometry(&self) -> BlockGeometry;
+    /// Where this device's block zero sits in the namespace beneath it — the
+    /// coordinates a storage-transport grant names (`crate::stor`). Zero for
+    /// a whole device; a region clamp adds its first block to its backend's.
+    fn namespace_lba(&self) -> u64 {
+        0
+    }
     /// Largest single registered buffer this backend can accept. The default
     /// is the command-transfer ceiling; bounded test/transport backends may
     /// advertise a smaller allocation limit.
@@ -509,6 +523,27 @@ pub trait DirectBlockDevice {
     /// allocate — it runs on the submit and completion paths.
     fn clock_ns(&self) -> Option<u64> {
         None
+    }
+
+    /// Ask the device to abandon the submitted command `cookie` — the
+    /// escalation for one that outlived its deadline. `true` when the device
+    /// agreed: the command's own completion still follows, failed, through
+    /// the ordinary poll, and only then is its buffer free. `false` (the
+    /// default: a backend with no abort) changes nothing; the command may
+    /// still complete, late. Control plane only, and it may wait on the
+    /// device's own answer.
+    fn abort(&mut self, _cookie: u64) -> bool {
+        false
+    }
+
+    /// Reset the device and bring its queues back — the escalation for a
+    /// command it will not give up (an abort it refused). Every submitted
+    /// command is lost: none of their completions ever arrives, and their
+    /// buffers are free the moment this returns `true`. `false` (the
+    /// default: a backend with no reset, or a reset that failed) changes
+    /// nothing the caller can rely on. Control plane only.
+    fn reset(&mut self) -> bool {
+        false
     }
 
     /// Sample physical-device health on the infrequent control plane.
@@ -608,7 +643,13 @@ struct Pending {
 
 struct Registered<B> {
     generation: u16,
-    busy: bool,
+    /// Commands in flight against this buffer.  An ordinary registered
+    /// buffer admits exactly one; a streaming target admits up to
+    /// `OUTSTANDING`.  CPU access through the channel requires zero.
+    inflight: u16,
+    /// Adopted through [`BlockChannel::adopt_target`]: caller-funded, read
+    /// destination only, many disjoint commands in flight at once.
+    target: bool,
     buffer: B,
 }
 
@@ -645,7 +686,13 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
     BlockChannel<D, BUFFERS, OUTSTANDING>
 {
     pub fn new(device: D, mode: CompletionMode) -> Result<Self, BlockError> {
-        if BUFFERS == 0 || OUTSTANDING == 0 || BUFFERS > u16::MAX as usize {
+        // Both tables are indexed by `u16` (buffer slots, and a target's
+        // in-flight count, which the pending table bounds).
+        if BUFFERS == 0
+            || OUTSTANDING == 0
+            || BUFFERS > u16::MAX as usize
+            || OUTSTANDING > u16::MAX as usize
+        {
             return Err(BlockError::Geometry);
         }
         let geometry = device.geometry().validate()?;
@@ -670,6 +717,12 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
 
     pub const fn geometry(&self) -> BlockGeometry {
         self.geometry
+    }
+
+    /// Where the device's block zero sits in its namespace
+    /// ([`DirectBlockDevice::namespace_lba`]).
+    pub fn namespace_lba(&self) -> u64 {
+        self.device.namespace_lba()
     }
 
     pub fn max_buffer_bytes(&self) -> usize {
@@ -720,7 +773,8 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
         };
         self.buffers[slot] = Some(Registered {
             generation: id.generation,
-            busy: false,
+            inflight: 0,
+            target: false,
             buffer,
         });
         self.stats.registered_bytes = self.stats.registered_bytes.saturating_add(bytes);
@@ -733,10 +787,12 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
 
     pub fn unregister_buffer(&mut self, id: BufferId) -> Result<(), BlockError> {
         let slot = self.buffer_slot(id)?;
-        if self.buffers[slot].as_ref().is_some_and(|b| b.busy) {
+        if self.buffers[slot].as_ref().is_some_and(|b| b.inflight != 0) {
             return Err(BlockError::BufferBusy);
         }
-        if let Some(registered) = self.buffers[slot].take() {
+        if let Some(registered) = self.buffers[slot].take()
+            && !registered.target
+        {
             self.stats.registered_bytes = self
                 .stats
                 .registered_bytes
@@ -744,6 +800,80 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
         }
         self.generations[slot] = self.generations[slot].wrapping_add(1).max(1);
         Ok(())
+    }
+
+    /// Adopt a backend buffer over memory the **caller** funded — a device
+    /// mapping of a client's lease, never the backend's own pool — as a
+    /// **streaming target**.
+    ///
+    /// A target differs from a registered buffer in exactly two ways, both
+    /// following from who owns its bytes:
+    ///
+    /// - It admits many commands in flight at once, each into its own
+    ///   block-aligned range: a multi-GiB destination is one buffer, not one
+    ///   buffer per command.  The channel does not police overlap between
+    ///   in-flight ranges — the bytes are the caller's, so two reads racing
+    ///   into one range can only hand the caller its own data in an
+    ///   unspecified order.  What the channel still guarantees is the
+    ///   exclusion that protects *other* memory: every range is checked
+    ///   against the target's length, and CPU access through the channel is
+    ///   refused while anything is in flight.
+    /// - It is a read destination only.  A write sourcing caller memory is
+    ///   not something a streaming target is for, and refusing it keeps the
+    ///   lane's contract one direction wide.
+    ///
+    /// Target bytes are not the channel's allocation, so they are not
+    /// booked in [`ChannelStats::registered_bytes`].  A refused adoption
+    /// returns the buffer: it is affine custody of a device mapping, and
+    /// dropping it here would strand that mapping without its owner's
+    /// quiescent release.
+    pub fn adopt_target(&mut self, buffer: D::Buffer) -> Result<BufferId, (D::Buffer, BlockError)> {
+        if let Err(error) = self.accepts_control() {
+            return Err((buffer, error));
+        }
+        if buffer.len() == 0 || buffer.len() % self.geometry.block_size as usize != 0 {
+            return Err((buffer, BlockError::Alignment));
+        }
+        let Some(slot) = self.buffers.iter().position(Option::is_none) else {
+            return Err((buffer, BlockError::Backpressure));
+        };
+        let id = BufferId {
+            slot: slot as u16,
+            generation: self.generations[slot],
+        };
+        self.buffers[slot] = Some(Registered {
+            generation: id.generation,
+            inflight: 0,
+            target: true,
+            buffer,
+        });
+        Ok(id)
+    }
+
+    /// Remove an idle buffer and return it to its owner — the release twin
+    /// of [`adopt_target`](Self::adopt_target), for a caller that must
+    /// retire the backend mapping itself rather than drop it.  Works for any
+    /// registered buffer; refused while a command is in flight against it.
+    pub fn release_buffer(&mut self, id: BufferId) -> Result<D::Buffer, BlockError> {
+        let slot = self.buffer_slot(id)?;
+        if self.buffers[slot].as_ref().is_some_and(|b| b.inflight != 0) {
+            return Err(BlockError::BufferBusy);
+        }
+        let registered = self.buffers[slot].take().ok_or(BlockError::UnknownBuffer)?;
+        if !registered.target {
+            self.stats.registered_bytes = self
+                .stats
+                .registered_bytes
+                .saturating_sub(registered.buffer.len());
+        }
+        self.generations[slot] = self.generations[slot].wrapping_add(1).max(1);
+        Ok(registered.buffer)
+    }
+
+    /// Commands in flight against one buffer, or `None` for a stale id.
+    pub fn buffer_inflight(&self, id: BufferId) -> Option<u16> {
+        let slot = self.buffer_slot(id).ok()?;
+        self.buffers[slot].as_ref().map(|b| b.inflight)
     }
 
     pub fn write_buffer(
@@ -756,8 +886,14 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
         let registered = self.buffers[slot]
             .as_mut()
             .ok_or(BlockError::UnknownBuffer)?;
-        if registered.busy {
+        if registered.inflight != 0 {
             return Err(BlockError::BufferBusy);
+        }
+        // A streaming target is the controller's to write and its owner's to
+        // read: the channel may hold no CPU view of it at all (a device-only
+        // import), so it never touches one through the CPU.
+        if registered.target {
+            return Err(BlockError::Range);
         }
         let end = offset.checked_add(src.len()).ok_or(BlockError::Range)?;
         let dst = registered
@@ -779,8 +915,14 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
         let registered = self.buffers[slot]
             .as_ref()
             .ok_or(BlockError::UnknownBuffer)?;
-        if registered.busy {
+        if registered.inflight != 0 {
             return Err(BlockError::BufferBusy);
+        }
+        // A streaming target is the controller's to write and its owner's to
+        // read: the channel may hold no CPU view of it at all (a device-only
+        // import), so it never touches one through the CPU.
+        if registered.target {
+            return Err(BlockError::Range);
         }
         let end = offset.checked_add(dst.len()).ok_or(BlockError::Range)?;
         let src = registered
@@ -798,8 +940,14 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
         let registered = self.buffers[slot]
             .as_mut()
             .ok_or(BlockError::UnknownBuffer)?;
-        if registered.busy {
+        if registered.inflight != 0 {
             return Err(BlockError::BufferBusy);
+        }
+        // A streaming target is the controller's to write and its owner's to
+        // read: the channel may hold no CPU view of it at all (a device-only
+        // import), so it never touches one through the CPU.
+        if registered.target {
+            return Err(BlockError::Range);
         }
         registered.buffer.bytes_mut().fill(value);
         Ok(())
@@ -967,7 +1115,7 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
             && let Ok(buffer_slot) = self.buffer_slot(buffer)
             && let Some(registered) = self.buffers[buffer_slot].as_mut()
         {
-            registered.busy = false;
+            registered.inflight = registered.inflight.saturating_sub(1);
         }
         Completion {
             request: pending.id,
@@ -1161,10 +1309,16 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
         };
         if let Some(slot) = buffer_slot {
             let registered = self.buffers[slot].as_mut().expect("validated buffer");
-            if registered.busy {
+            if registered.target {
+                // A target is a read destination; its pending table bounds
+                // its depth, so the count cannot pass `OUTSTANDING`.
+                if !matches!(command, DeviceCommand::Read { .. }) {
+                    return Err(BlockError::ReadOnly);
+                }
+            } else if registered.inflight != 0 {
                 return Err(BlockError::BufferBusy);
             }
-            registered.busy = true;
+            registered.inflight += 1;
         }
 
         let outcome = match buffer_slot {
@@ -1186,7 +1340,8 @@ impl<D: DirectBlockDevice, const BUFFERS: usize, const OUTSTANDING: usize>
         };
         if let Err(error) = outcome {
             if let Some(slot) = buffer_slot {
-                self.buffers[slot].as_mut().expect("validated buffer").busy = false;
+                let registered = self.buffers[slot].as_mut().expect("validated buffer");
+                registered.inflight -= 1;
             }
             return Err(error);
         }
@@ -1271,6 +1426,12 @@ impl<'a, D: DirectBlockDevice, const B: usize, const O: usize> BlockBatch<'a, D,
 
     pub fn publish(mut self) {
         self.channel.device.publish();
+        self.published = true;
+    }
+
+    /// Release a batch that staged nothing without a doorbell: a poll that
+    /// found no free slot or no queued work should not ring the device.
+    pub fn skip_publish(mut self) {
         self.published = true;
     }
 }

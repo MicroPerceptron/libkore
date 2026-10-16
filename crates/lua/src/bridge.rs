@@ -49,10 +49,16 @@
 //! remote list — or as pointers into a frame the owner keeps alive across
 //! the whole phase (the eval's script).
 //!
-//! Resolution order (`SEARCH`): the task's own tree, then `libs/`; a source
-//! module `<name>.lua` wins over a native `<name>.so`.  Native modules are
-//! store objects stamped `EXECUTABLE_IMAGE` that `kore-late` checks, places
-//! in the JIT arena, and links against this executable's exported C API.
+//! Resolution: a source module `<name>.lua` from `SOURCE_SEARCH` — the
+//! task's own tree, then `libs/` — wins over a native `<name>.so`, which
+//! comes from the READ-only `libs/` view alone.  Source runs inside the VM
+//! with the VM's authority; native code runs with the task's whole
+//! authority, so it is never taken from a tree the task can write (nor can
+//! a squatting `<name>.so` there shadow the library).  `kore-late` holds
+//! that rule: it resolves the library edge itself, refuses a member not
+//! stamped `EXECUTABLE_IMAGE` (a stamp only the install authority can
+//! make), checks it, places it in the JIT arena, and links it against this
+//! executable's exported C API.
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
@@ -81,9 +87,10 @@ use crate::{Answer, Extension, OP_EMBEDDER_BASE, Policy};
 /// engine sees it.  Larger sources belong in the store as several modules.
 pub const MAX_SOURCE_MODULE_BYTES: usize = 64 * 1024;
 
-/// Where `require` looks, in order: the task's own tree (its cwd view),
-/// then the READ-only `libs/` view every task carries.
-const SEARCH: &[&[u8]] = &[b"", b"libs"];
+/// Where `require` looks for a *source* module, in order: the task's own
+/// tree (its cwd view), then the READ-only `libs/` view every task carries.
+/// A native module takes no search list (`Loader::load_native`).
+const SOURCE_SEARCH: &[&[u8]] = &[b"", kore_late::LIBS_VIEW.as_bytes()];
 
 /// The prefix a native module's opener carries: `luaopen_<name>`.
 const OPENER_PREFIX: &[u8] = b"luaopen_";
@@ -1112,7 +1119,9 @@ enum Reply {
 }
 
 async fn resolve(services: &mut Services<'_, '_>, stem: &[u8], policy: Policy) -> Reply {
-    let search = Search { prefixes: SEARCH };
+    let search = Search {
+        prefixes: SOURCE_SEARCH,
+    };
     let Some(fs) = services.fs().await else {
         return Reply::Error(c"filesystem face is unavailable");
     };
@@ -1143,7 +1152,7 @@ async fn resolve(services: &mut Services<'_, '_>, stem: &[u8], policy: Policy) -
     let (Some(fs), Some(loader)) = (services.fs.as_mut(), services.loader.as_mut()) else {
         return Reply::Error(c"filesystem face is unavailable");
     };
-    let id = match loader.load_native(fs, search, stem).await {
+    let id = match loader.load_native(fs, stem).await {
         Ok(id) => id,
         Err(error) => return Reply::Error(describe(error)),
     };
@@ -1165,7 +1174,10 @@ async fn resolve(services: &mut Services<'_, '_>, stem: &[u8], policy: Policy) -
 fn describe(error: LoadError) -> &'static CStr {
     match error {
         LoadError::Name => c"module name is not a store name",
-        LoadError::NotFound => c"no <name>.lua in the task tree and no libs/<name>.so",
+        LoadError::NotFound => {
+            c"no <name>.lua in the task tree or libs/, and no libs/<name>.so (native modules load only from libs/)"
+        }
+        LoadError::LibsWritable => c"libs/ is writable by this task; native modules load only from the READ-only library view",
         LoadError::NotExecutableImage => c"libs/ member is not stamped EXECUTABLE_IMAGE",
         LoadError::TooLarge => c"module exceeds the bounded loader",
         LoadError::TooMany => c"module table is full",

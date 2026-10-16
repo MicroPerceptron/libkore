@@ -155,6 +155,8 @@ pub struct Rt {
 const PROCESS_IO_ATTACHMENT: usize = 1 << 0;
 #[cfg(any(test, target_os = "none"))]
 const PROCESS_STDIO_ATTACHMENT: usize = 1 << 1;
+#[cfg(any(test, target_os = "none"))]
+const PROCESS_STDIO_HOST_ATTACHMENT: usize = 1 << 2;
 
 /// Atomically spend one runtime attachment name.
 ///
@@ -301,6 +303,16 @@ impl Rt {
     #[cfg(target_os = "none")]
     pub(crate) fn claim_process_stdio_attachment(&self) -> bool {
         geometry::claim_runtime_attachment(PROCESS_STDIO_ATTACHMENT)
+    }
+
+    /// Spend this task's sole safe stream-host attachment: the delegated
+    /// parent end of another process's stream. Same scope and one-shot law as
+    /// [`claim_process_stdio_attachment`](Self::claim_process_stdio_attachment),
+    /// and a distinct bit, so a task that is both a stream child and a stream
+    /// host binds each end exactly once.
+    #[cfg(target_os = "none")]
+    pub(crate) fn claim_process_stdio_host_attachment(&self) -> bool {
+        geometry::claim_runtime_attachment(PROCESS_STDIO_HOST_ATTACHMENT)
     }
 
     /// Permanently claim the half-open arena interval `[first, end)` for a
@@ -2266,6 +2278,8 @@ mod runtime_slot_tests {
         assert!(!claim_attachment_word(&claims, PROCESS_IO_ATTACHMENT));
         assert!(claim_attachment_word(&claims, PROCESS_STDIO_ATTACHMENT));
         assert!(!claim_attachment_word(&claims, PROCESS_STDIO_ATTACHMENT));
+        assert!(claim_attachment_word(&claims, PROCESS_STDIO_HOST_ATTACHMENT));
+        assert!(!claim_attachment_word(&claims, PROCESS_STDIO_HOST_ATTACHMENT));
     }
 
     #[test]

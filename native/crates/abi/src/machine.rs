@@ -1,12 +1,10 @@
 //! **The machine-facts block** — the sixth frozen boot-page block, after
 //! the founding record (`kore-rt::entry::MACHINE_BLOCK_AT`).
 //!
-//! What the runtime needs to size a launch to the machine without an IPC
-//! round trip: how many logical CPUs it has, and how many cores of the
-//! founding node's best performance class a fitting SPMD region would be
-//! granted exclusively (the G6c reservation population — `res/SPMD.md`
-//! §7).  A dev otherwise hardcodes a width literal and guesses; with
-//! this, [`kore_rt::spmd::dispatch`] reads the machine and picks.
+//! What the runtime needs to size a launch without an IPC round trip:
+//! logical CPU count, the founding node's best-class population, and an
+//! optional calibrated same-class cohort fit in the flag word. The factual
+//! population remains the fallback when calibration is incomplete.
 //!
 //! **Kernel testimony, like the founding block and unlike the clock and
 //! geometry blocks.**  The clock and geometry blocks are relayed by the
@@ -39,10 +37,10 @@ pub const MACHINE_ABI: u16 = 1;
 pub struct MachineBlock {
     /// Layout version ([`MACHINE_ABI`]); `0` = no record (fail closed).
     pub abi: U16,
-    /// Machine capability flags — see [`MACHINE_FLAG_CPU_ENTROPY`].  An
-    /// additive claim on what was reserved space: an unset bit reads the
-    /// same as the zero a pre-flags founder wrote, so every flag must be
-    /// phrased so that "absent" is the safe answer.
+    /// Machine capability and fit flags — see [`MACHINE_FLAG_CPU_ENTROPY`]
+    /// and [`pack_spmd_fit_width`]. An additive claim on reserved space:
+    /// unset bits read as zero from an older founder, so absence must be a
+    /// safe answer.
     pub flags: U16,
     /// Logical CPU count — `ResourceCatalog::cpu_count()` at the stamp
     /// site.  Machine-global (every founding sees the same value).
@@ -50,10 +48,10 @@ pub struct MachineBlock {
     /// The **best-lane population**: how many cores of the founding
     /// node's best performance class an SPMD region would be granted
     /// exclusively (the G6c batch reservation count — P-cores on a
-    /// hybrid box, all cores on a homogeneous one).  Node-relative, so
+    /// hybrid box, all cores on a homogeneous one). Node-relative, so
     /// stamped per spawn: two foundings on different nodes of a
     /// heterogeneous machine legitimately see different values.  `0`
-    /// only on an empty catalog.
+    /// only on an empty catalog. The optional fit in `flags` may be wider.
     pub best_lane: U32,
     /// The founding NUMA node id (`current_cpu().numa()`) — the node
     /// [`best_lane`](Self::best_lane) counts.  Context for a reader that
@@ -122,6 +120,12 @@ impl MachineBlock {
     /// on an unstamped block.
     pub fn best_lane(&self) -> Option<u32> {
         self.validate().then(|| self.best_lane.get())
+    }
+
+    /// A calibrated SPMD cohort width, when the founder had complete samples.
+    pub fn spmd_fit_width(&self) -> Option<u32> {
+        let width = (self.flags.get() & MACHINE_SPMD_FIT_MASK) >> MACHINE_SPMD_FIT_SHIFT;
+        (self.validate() && width != 0).then_some(u32::from(width))
     }
 
     /// Whether this CPU has an entropy instruction a task may execute at
@@ -194,6 +198,20 @@ pub const MACHINE_FLAG_CPU_ENTROPY: u16 = 1 << 0;
 /// no way to ask the silicon itself.  Absent = the boot measurement alone.
 pub const MACHINE_FLAG_HW_FEEDBACK: u16 = 1 << 1;
 
+/// Flags bits 8..13 carry an optional fit width (1..63). Zero means that
+/// calibration was incomplete and the reader should use `best_lane`. This
+/// additive claim leaves the 20-byte frozen block and existing flags intact.
+const MACHINE_SPMD_FIT_SHIFT: u16 = 8;
+const MACHINE_SPMD_FIT_MAX: u16 = (1 << 6) - 1;
+const MACHINE_SPMD_FIT_MASK: u16 = MACHINE_SPMD_FIT_MAX << MACHINE_SPMD_FIT_SHIFT;
+
+/// Encode a measured fit for the machine flags. The runtime's worker ceiling
+/// is below 63; saturating keeps the field valid if a larger node appears.
+pub const fn pack_spmd_fit_width(width: u32) -> u16 {
+    let max = MACHINE_SPMD_FIT_MAX as u32;
+    (if width > max { max } else { width } as u16) << MACHINE_SPMD_FIT_SHIFT
+}
+
 const _: () = assert!(
     core::mem::size_of::<MachineBlock>() == 20,
     "the machine block is frozen ABI"
@@ -211,6 +229,17 @@ mod tests {
         assert_eq!(b.low_power_cores(), Some(4));
         let old = MachineBlock::new(8, 4, 0, 0, pack_class_census(4, 4, 0));
         assert_eq!(old.low_power_cores(), Some(0));
+    }
+
+    #[test]
+    fn optional_fit_preserves_legacy_best_lane() {
+        let old = MachineBlock::new(16, 4, 0, MACHINE_FLAG_HW_FEEDBACK, 0);
+        assert_eq!(old.spmd_fit_width(), None);
+        let fit = MachineBlock::new(16, 4, 0, pack_spmd_fit_width(8), 0);
+        assert_eq!(fit.best_lane(), Some(4));
+        assert_eq!(fit.spmd_fit_width(), Some(8));
+        let absent = MachineBlock::new(16, 4, 0, pack_spmd_fit_width(0), 0);
+        assert_eq!(absent.spmd_fit_width(), None);
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub mod net;
 pub mod ring;
 pub mod seam;
 pub mod stats;
+pub mod stor;
 /// The completion-wait seam — a `Completion` probe plus an explicitly bounded
 /// spin for bring-up and kernel-internal tests. Userland waits on IRQ routes.
 pub mod wait;

@@ -39,6 +39,10 @@ pub struct MemoryBlockDevice<const DISK_BYTES: usize, const BUFFER_BYTES: usize>
     hold_for: Option<u32>,
     fault: Option<BlockError>,
     fault_after: usize,
+    /// Refuse every abort — a controller that will not give a command up.
+    refuse_aborts: bool,
+    /// Resets taken.
+    resets: u32,
     flushes: u64,
     submissions: u64,
     publishes: u64,
@@ -83,6 +87,8 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize>
             hold_for: None,
             fault: None,
             fault_after: 0,
+            refuse_aborts: false,
+            resets: 0,
             flushes: 0,
             submissions: 0,
             publishes: 0,
@@ -125,6 +131,16 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize>
         self.fault = Some(error);
         self.fault_after = successful_submissions;
     }
+    /// Refuse (or honour again) every abort.
+    pub fn refuse_aborts(&mut self, refuse: bool) {
+        self.refuse_aborts = refuse;
+    }
+
+    /// Resets this device took.
+    pub fn resets(&self) -> u32 {
+        self.resets
+    }
+
     pub fn hold_completions(&mut self, hold: bool) {
         self.hold = hold;
         self.hold_for = None;
@@ -288,6 +304,33 @@ impl<const DISK_BYTES: usize, const BUFFER_BYTES: usize> DirectBlockDevice
         self.queue(DeviceCompletion { cookie, result })
     }
 
+    /// A queued (not yet polled) command is abandoned as a controller that
+    /// honours Abort abandons one: its completion stays queued, now failed
+    /// `Cancelled`, and is delivered by the ordinary poll.
+    fn abort(&mut self, cookie: u64) -> bool {
+        if self.refuse_aborts {
+            return false;
+        }
+        for completion in self.completions.iter_mut().flatten() {
+            if completion.cookie == cookie {
+                completion.result = Err(BlockError::Cancelled);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A reset drops every queued completion, as a controller reset drops
+    /// every command it held: none is ever delivered.
+    fn reset(&mut self) -> bool {
+        self.completions = [None; COMPLETIONS];
+        self.head = 0;
+        self.tail = 0;
+        self.queued = 0;
+        self.resets += 1;
+        true
+    }
+
     fn poll(&mut self) -> Option<DeviceCompletion> {
         if self.hold || self.queued == 0 {
             return None;
@@ -351,6 +394,111 @@ mod tests {
         assert_eq!(channel.poll().unwrap().request, read);
         channel.read_buffer(buffer, 0, &mut bytes).unwrap();
         assert_eq!(bytes, [0; 1024]);
+    }
+
+    /// A streaming target takes several reads in flight at once, each into
+    /// its own range; refuses writes and channel CPU access while busy; and
+    /// comes back to its owner intact on release.
+    #[test]
+    fn a_streaming_target_admits_many_reads_and_returns_on_release() {
+        let mut channel = channel();
+        // Disk blocks 0..4 hold four distinct patterns.
+        let source = channel.register_buffer(2048).unwrap();
+        for block in 0..4u8 {
+            channel
+                .write_buffer(source, block as usize * 512, &[0x10 + block; 512])
+                .unwrap();
+        }
+        let write = channel.submit_write(0, 4, source, 0).unwrap();
+        assert_eq!(channel.poll().unwrap().request, write);
+        channel.unregister_buffer(source).unwrap();
+
+        // The caller-funded buffer (here the double's own allocation stands
+        // in for an imported lease) becomes one 2 KiB target.
+        let funded = channel
+            .control(|device| device.allocate_buffer(2048))
+            .unwrap()
+            .unwrap();
+        let target = channel
+            .adopt_target(funded)
+            .map_err(|(_, error)| error)
+            .unwrap();
+        assert_eq!(
+            channel.stats().registered_bytes,
+            0,
+            "not the channel's bytes"
+        );
+
+        // A target is a read destination only.
+        assert_eq!(
+            channel.submit_write(0, 1, target, 0),
+            Err(BlockError::ReadOnly)
+        );
+        assert_eq!(
+            channel.outstanding(),
+            0,
+            "a refused write leaves nothing pending"
+        );
+
+        // Four reads in flight against one buffer, landing out of disk order
+        // (the double queues completions until they are polled).
+        let mut ids = [RequestId(0); 4];
+        for (i, id) in ids.iter_mut().enumerate() {
+            *id = channel
+                .submit_read(3 - i as u64, 1, target, i * 512)
+                .unwrap();
+        }
+        assert_eq!(channel.buffer_inflight(target), Some(4));
+        assert_eq!(
+            channel.submit_read(0, 1, target, 0),
+            Err(BlockError::Backpressure)
+        );
+        assert_eq!(
+            channel.read_buffer(target, 0, &mut [0; 1]),
+            Err(BlockError::BufferBusy)
+        );
+        assert_eq!(
+            channel.release_buffer(target).err(),
+            Some(BlockError::BufferBusy)
+        );
+
+        let mut done = 0;
+        while let Some(completion) = channel.wait() {
+            assert!(ids.contains(&completion.request));
+            completion.result.unwrap();
+            done += 1;
+        }
+        assert_eq!(done, 4);
+        assert_eq!(channel.buffer_inflight(target), Some(0));
+        // The channel never touches a target through the CPU, idle or not: a
+        // device-only import has no CPU view for it to touch.
+        let mut landed = [0u8; 2048];
+        assert_eq!(
+            channel.read_buffer(target, 0, &mut landed),
+            Err(BlockError::Range)
+        );
+        assert_eq!(
+            channel.write_buffer(target, 0, &[0; 1]),
+            Err(BlockError::Range)
+        );
+        assert_eq!(channel.fill_buffer(target, 0), Err(BlockError::Range));
+
+        // Out of range is refused against the target's own length.
+        assert_eq!(
+            channel.submit_read(0, 1, target, 2048),
+            Err(BlockError::Range)
+        );
+        let returned = channel.release_buffer(target).unwrap();
+        assert_eq!(returned.len(), 2048);
+        // Its owner reads what landed.
+        for (i, chunk) in returned.bytes().chunks(512).enumerate() {
+            assert!(
+                chunk.iter().all(|byte| *byte == 0x13 - i as u8),
+                "range {i}"
+            );
+        }
+        assert_eq!(channel.buffer_inflight(target), None, "the id is stale");
+        assert!(channel.adopt_target(returned).is_ok());
     }
 
     #[test]

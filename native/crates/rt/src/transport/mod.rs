@@ -58,8 +58,9 @@ pub trait Transport {
     /// The transport-level failure — *could not commit* (e.g. the trap
     /// gate is not yet issued).  Per-invocation outcomes ride the
     /// [`Committed`] status word instead, exactly as the gate returns
-    /// them.
-    type Error;
+    /// them. `Debug` so that every caller can report the failure it got
+    /// rather than substitute a guess for it.
+    type Error: core::fmt::Debug;
 
     /// Commit one bounded staged session; resolves when results land.
     /// `TrapTransport` finishes into the architecture's caller-saved GPR

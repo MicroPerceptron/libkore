@@ -154,7 +154,9 @@ where
         {
             return Err(MmuError::InvalidTableGeometry);
         }
-        let base = src.resolve(table).ok_or(MmuError::UnknownTableFrame)? as *mut u64;
+        let base = src
+            .resolve_for_write(table)
+            .ok_or(MmuError::UnknownTableFrame)? as *mut u64;
         if !(base as usize).is_multiple_of(align_of::<u64>()) {
             return Err(MmuError::InvalidTableGeometry);
         }

@@ -542,13 +542,21 @@ remember.
 
 ## `require`
 
-`require "<name>"` resolves against the task's own tree first, then `libs/`; a
-source module `<name>.lua` wins over a native `<name>.so`. Source modules are
-bounded at 64 KiB — larger sources belong in the store as several modules.
+`require "<name>"` looks for a source module `<name>.lua` in the task's own
+tree first, then `libs/`; a source module wins over a native `<name>.so`. Source
+modules run inside the VM with the VM's authority and are bounded at 64 KiB —
+larger sources belong in the store as several modules.
 
-A native module is a store object stamped `EXECUTABLE_IMAGE` that is checked,
-placed in the JIT arena, and linked against this executable's exported C API. It
-must export `luaopen_<name>`.
+A native module runs with the task's whole authority, so it comes from the
+READ-only `libs/` view **alone** — never from a tree the task can write, and a
+`<name>.so` squatting there cannot shadow the library. `kore-late` holds that
+rule: it enters the `libs` grant directly (not by path, which a `libs` child of
+the task's own root would answer first), refuses one the task could write
+beneath, and refuses a member unless it is stamped `EXECUTABLE_IMAGE` — a stamp
+the store takes, and keeps over later byte changes, only through the install
+authority's `BIND_EXECUTABLE`. The member is then checked, placed in the JIT
+arena, and linked against this executable's exported C API. It must export
+`luaopen_<name>`.
 
 ## Errors
 

@@ -91,8 +91,13 @@ pub struct Machine {
     /// The **best lane**: how many cores of this task's founding node's
     /// best performance class an SPMD region is granted exclusively —
     /// the G6c reservation population (P-cores on a hybrid box, all
-    /// cores on a homogeneous one).  The width [`dispatch`] fits to.
+    /// cores on a homogeneous one). This remains a factual fallback.
     pub best_lane: u32,
+    /// A calibrated, node-relative same-class cohort width. `None` means
+    /// one or more CPUs lacked capacity samples at founding; the fit then
+    /// uses `best_lane`. This is a throughput starting point, not a measured
+    /// optimum for a particular workload or dispatch size.
+    pub calibrated_fit: Option<u32>,
     /// Performance-class cores machine-wide (Intel P / AMD Zen / Arm big).
     pub performance_cores: u8,
     /// Efficiency-class cores machine-wide (Intel E / AMD Zen-c / Arm LITTLE).
@@ -108,11 +113,29 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// The width a region should found to run one worker per exclusive
-    /// best-class core: the best lane, clamped to at least one and to
-    /// the runtime's ceiling.  The fit policy [`dispatch`] defaults to.
+    /// Default region width from the best reachable calibrated cohort, or
+    /// the best-class population before calibration. Clamped to the runtime
+    /// worker ceiling; a caller may impose a smaller resource budget.
     pub fn fitting_width(&self) -> u32 {
-        self.best_lane.clamp(1, crate::thread::MAX_THREADS - 1)
+        self.calibrated_fit
+            .unwrap_or(self.best_lane)
+            .clamp(1, crate::thread::MAX_THREADS - 1)
+    }
+
+    /// For a one-shot grid, use the wider cohort only when the grid can
+    /// occupy every worker scored at founding. A partial eight-E cohort
+    /// was never compared against four P cores; for five to seven tiles,
+    /// keep the measured four-P fallback instead of extrapolating.
+    pub fn dispatch_fit(&self, tiles: u32) -> u32 {
+        let width = if self
+            .calibrated_fit
+            .is_some_and(|fit| fit > self.best_lane && fit > tiles)
+        {
+            self.best_lane
+        } else {
+            self.fitting_width()
+        };
+        width.min(tiles).clamp(1, crate::thread::MAX_THREADS - 1)
     }
 }
 
@@ -129,6 +152,7 @@ pub fn machine() -> Option<Machine> {
     Some(Machine {
         logical_cpus: block.logical_cpus()?,
         best_lane: block.best_lane()?,
+        calibrated_fit: block.spmd_fit_width(),
         performance_cores,
         efficient_cores: efficient_cores.saturating_sub(block.low_power_cores()?),
         low_power_cores: block.low_power_cores()?,
@@ -669,37 +693,38 @@ fn launch<const N: usize>(
     // all-or-nothing, degrading to a starless launch rather than
     // refusing one.  Sized to the LAUNCHED width, not the capacity.
     let star_plan = crate::star::provision(active);
-    // The gang founding (G5): whole chunks per session — one trap each
-    // — until the region is founded.  A width the descriptor cannot
-    // carry chunks rather than refuses.  A starred chunk is capped at
-    // [`MESH_CHUNK`](crate::star::MESH_CHUNK): every member's endow
-    // carries the intra-chunk kick mesh (built inside the spawn, where
-    // the bands are known), so a barrier leader wakes a parked sibling
-    // in one hop; starless chunks keep the descriptor's full width.
+    // The gang founding (G5): one chunk per session — one trap each —
+    // until the region is founded.  A width the descriptor cannot carry
+    // in one session chunks rather than refuses.  A starred session
+    // carries at most [`MESH_CEILING`](crate::star::MESH_CEILING)
+    // workers: every member's endow carries the intra-chunk kick mesh
+    // (built inside the spawn, where the bands are known), quadratic in
+    // the chunk, so a barrier leader wakes a parked sibling in one hop;
+    // starless sessions keep the descriptor's full founding width.  The
+    // gang takes as few sessions as that allows, split evenly by this
+    // width rather than filled to the ceiling: eight meshed workers found
+    // as 4 + 4, not 7 + 1 with a member meshed to nobody.
     let mut workers: [Option<crate::thread::Thread>; N] = [const { None }; N];
-    let chunk = if star_plan.is_some() {
-        crate::star::MESH_CHUNK
+    let ceiling = if star_plan.is_some() {
+        crate::star::MESH_CEILING
     } else {
         crate::session::MAX_SESSION_FOUNDS
     };
-    let mut at = 0usize;
     let mut ok = true;
-    while at < active {
-        let end = (at + chunk).min(active);
+    for (at, end) in founding_sessions(active as u32, ceiling as u32) {
         let founded = crate::thread::spawn_gang_workers(
             entry,
             ctx,
-            at as u32,
+            at,
             true,
             &[],
             star_plan.as_ref(),
-            &mut workers[at..end],
+            &mut workers[at as usize..end as usize],
         );
         if !founded {
             ok = false;
             break;
         }
-        at = end;
     }
     // The hub last — its sends are named by the workers' BAND indices,
     // known only now.  A refused hub is the ruled degrade: the workers
@@ -827,9 +852,11 @@ pub fn resident_run<F: Fn(&'static SpmdCtx, u32)>(ctx: &'static SpmdCtx, worker:
     loop {
         // Park until a new job is published or the region is retired.  The
         // wait is the barrier's two-tier slice: a co-resident submit ends
-        // the monitored spin the instant it stores `job`; a descheduled
-        // worker rides `PARK_SLICE` and re-reads.  `kick_all` only trims
-        // the tail — the word is the truth.
+        // the monitored spin the instant it stores `job`; a parked worker
+        // is kicked by the submit over the founder's send.  A long
+        // monitored spin here is NOT an option: a spinning worker holds its
+        // core against the kernel until the tick, and the launcher may be
+        // sharing it (`res/SPMD.md` §14.2).  The word is the truth.
         crate::barrier::wait_while(ctx.job_word(), ran);
         // A retire flips the gate off RUN, THEN steps `job` to wake us; the
         // SeqCst total order makes the DONE visible once the step that woke
@@ -853,11 +880,15 @@ pub fn resident_run<F: Fn(&'static SpmdCtx, u32)>(ctx: &'static SpmdCtx, worker:
         // its participation (or reading `env`) when the next job overwrites
         // `active`/`env` — the generation race the per-job words would
         // otherwise carry. The one that zeroes `done` publishes the
-        // completion generation, then posts the star's existing relay send.
-        // A hubless resident gives its receive end to the submitter. The
-        // shared word remains authoritative if the notice coalesces/refuses.
+        // completion generation, then kicks the launcher: the founder is
+        // peer 0 of the kick mesh, so a launcher parked on `complete` is
+        // reached in one hop like any registered waiter (`res/SPMD.md`
+        // §14.2).  The star's relay send is posted as well for an async
+        // observer on the hubless reverse channel.  The shared word remains
+        // authoritative if a notice coalesces or refuses.
         if ctx.done_word().fetch_sub(1, Ordering::AcqRel) == 1 {
             ctx.complete_word().store(g, Ordering::SeqCst);
+            let _ = crate::futex::wake(ctx.complete_word());
             let _ = crate::futex::notify_resident_completion();
         }
     }
@@ -1111,9 +1142,11 @@ impl<const N: usize> ResidentRegion<N> {
         self.tickets.poll(ticket, complete)
     }
 
-    /// Block until `ticket`'s job completes. Efficient for a co-resident gang
-    /// through the star's reverse completion channel). A missing/refused
-    /// channel falls back to the bounded barrier wait and shared-word recheck.
+    /// Block until `ticket`'s job completes: a short monitored spin on the
+    /// completion word, then the barrier's park on this thread's doorbell,
+    /// which the last worker kicks (the founder is peer 0 of the kick mesh,
+    /// `res/SPMD.md` §14.2).  A launcher no worker holds a send for — a
+    /// region founded off thread 0 — rides the park's slice and re-reads.
     ///
     /// Validation runs before any wait, so an invalid ticket can never park on
     /// a physical generation that this region will not publish.
@@ -1121,11 +1154,7 @@ impl<const N: usize> ResidentRegion<N> {
         match self.tickets.position(ticket)? {
             ResidentTicketPosition::Complete => Ok(()),
             ResidentTicketPosition::Current(generation) => {
-                wait_for_resident_generation(
-                    self.region.ctx(),
-                    generation,
-                    self.region.star.as_ref(),
-                );
+                wait_for_resident_generation(self.region.ctx(), generation);
                 Ok(())
             }
         }
@@ -1208,11 +1237,7 @@ impl<const N: usize> ResidentRegion<N> {
         // Waiting for the last submitted job first makes the region idle, so
         // the teardown abandons nothing. (Idle already ⇒ this returns at once.)
         if self.tickets.last.is_some() {
-            wait_for_resident_generation(
-                self.region.ctx(),
-                self.tickets.generation,
-                self.region.star.as_ref(),
-            );
+            wait_for_resident_generation(self.region.ctx(), self.tickets.generation);
         }
         let ctx = self.region.ctx();
         // Tell the gang to exit: flip the gate off RUN, THEN step `job` to
@@ -1232,40 +1257,21 @@ impl<const N: usize> ResidentRegion<N> {
 /// Wait for the one compact physical generation already proved current by the
 /// opaque ticket layer. Keeping this separate lets `retire` drain its own last
 /// accepted job without manufacturing or re-validating a public token.
-fn wait_for_resident_generation(
-    ctx: &'static SpmdCtx,
-    generation: u32,
-    star: Option<&crate::star::Star>,
-) {
+fn wait_for_resident_generation(ctx: &'static SpmdCtx, generation: u32) {
     let complete = ctx.complete_word();
     let current = complete.load(Ordering::Acquire);
     if current == generation {
         return;
     }
+    // A job that ends inside the handoff budget costs no park at all.
     crate::futex::spin_completion(complete, current);
-    let mut receiver = star.and_then(|star| star.completion_receiver());
+    // Then the barrier's park on this thread's own doorbell, registered on
+    // the completion word so the last worker's `futex::wake` reaches it in
+    // one hop; the slice bounds a launcher no worker can kick.
     loop {
         let current = complete.load(Ordering::Acquire);
         if current == generation {
             return;
-        }
-        if let Some(rx) = receiver.as_mut() {
-            if rx.try_recv().is_ok() {
-                if complete.load(Ordering::Acquire) == generation {
-                    return;
-                }
-                if let Some(post) = rx.standing_post() {
-                    if crate::futex::wait_standing(
-                        post,
-                        core::time::Duration::from_nanos(RESIDENT_WAKE_BACKSTOP_NS),
-                    ) != crate::futex::WaitOutcome::Unsupported
-                    {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
         }
         crate::barrier::wait_while(complete, current);
     }
@@ -1312,15 +1318,221 @@ pub fn found_resident<const N: usize>(
 #[cfg(target_os = "none")]
 const DISPATCH_CAP: usize = (crate::thread::MAX_THREADS - 1) as usize;
 
-/// The one re-armable region every [`dispatch`] launches over. A single
-/// `static` serves every call: each blocks to join before returning and
-/// re-stages the ctx for the next, so a parallel-for in a loop reuses
-/// it. A second CONCURRENT dispatch finds the gate un-staged and refuses
-/// (`None`) rather than corrupting the region — v1 dispatch is one
-/// region at a time per process, the same all-or-nothing gate every
-/// launch respects.
+/// The one re-armable region a [`dispatch`] launches over when the
+/// resident gang below is unavailable. A single `static` serves every
+/// call: each blocks to join before returning and re-stages the ctx for
+/// the next, so a parallel-for in a loop reuses it. A second CONCURRENT
+/// dispatch finds the gate un-staged and refuses (`None`) rather than
+/// corrupting the region — v1 dispatch is one region at a time per
+/// process, the same all-or-nothing gate every launch respects.
 #[cfg(target_os = "none")]
 static DISPATCH_CTX: SpmdCtx = SpmdCtx::new(DISPATCH_CAP as u32);
+
+/// The process-wide **resident dispatch gang** — founded on the first
+/// [`dispatch`] and kept for the task's life, so every later dispatch is
+/// one [`submit`](ResidentRegion::submit) and one completion wait rather
+/// than a founding and a reap.
+///
+/// The one-shot [`launch`] path founds fresh worker threads per call and
+/// joins them through the thread-wait path, whose refusals back off in
+/// 2 ms kernel sleeps.  On the Lunar Lake box that priced a dispatch of
+/// trivial work at 7 ms for two workers and 10–12 ms for four (`spmd
+/// dispatch`), and a model decoder that issues one dispatch per parallel
+/// kernel node paid it about 5,000 times per token pass: every parallel
+/// node cost 11 ms whatever its size.  The resident gang parks on the
+/// job word between jobs and is kicked over the star's parent sends on
+/// each submit; the same box's barrier bench shows that path at a few
+/// hundred microseconds a phase.
+///
+/// One job at a time (`busy`): a nested or concurrent dispatch is refused
+/// (`None`) exactly as the one-shot gate refuses it, and the caller runs
+/// its tiles serially.  A founding the machine refuses (a one-lane box,
+/// or thread budget spent) is remembered, and every later dispatch takes
+/// the one-shot path instead.
+#[cfg(target_os = "none")]
+static RESIDENT_DISPATCH_CTX: SpmdCtx = SpmdCtx::new(DISPATCH_CAP as u32);
+
+#[cfg(target_os = "none")]
+struct ResidentDispatch {
+    /// Exclusive access to `region` for the duration of one dispatch.
+    busy: core::sync::atomic::AtomicBool,
+    /// [`RESIDENT_UNTRIED`], [`RESIDENT_FOUNDED`] or [`RESIDENT_REFUSED`].
+    state: core::sync::atomic::AtomicU8,
+    /// The founded gang width, stamped once at founding so the books can
+    /// be read without the dispatcher's claim.
+    width: core::sync::atomic::AtomicU32,
+    region: core::cell::UnsafeCell<Option<ResidentRegion<DISPATCH_CAP>>>,
+}
+
+// SAFETY: `region` is touched only between a successful `busy` claim and
+// its release, by the one dispatcher that made the claim.
+#[cfg(target_os = "none")]
+unsafe impl Sync for ResidentDispatch {}
+
+#[cfg(target_os = "none")]
+const RESIDENT_UNTRIED: u8 = 0;
+#[cfg(target_os = "none")]
+const RESIDENT_FOUNDED: u8 = 1;
+#[cfg(target_os = "none")]
+const RESIDENT_REFUSED: u8 = 2;
+
+#[cfg(target_os = "none")]
+static RESIDENT_DISPATCH: ResidentDispatch = ResidentDispatch {
+    busy: core::sync::atomic::AtomicBool::new(false),
+    state: core::sync::atomic::AtomicU8::new(RESIDENT_UNTRIED),
+    width: core::sync::atomic::AtomicU32::new(0),
+    region: core::cell::UnsafeCell::new(None),
+};
+
+/// **The resident dispatch gang's books**, read from any thread without
+/// the dispatcher's claim — the words a diagnostic reads to name a
+/// dispatch that never completed.  `job` is the generation last
+/// published, `complete` the one last retired by the gang, and `done`
+/// how many of the `width` founded workers have yet to account for the
+/// current job: a `done` that stays above zero while `job` leads
+/// `complete` names a worker that never returned.  All zero before the
+/// gang is founded, and off metal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentDispatchBooks {
+    /// A gang was founded and kept.
+    pub founded: bool,
+    /// Workers founded.
+    pub width: u32,
+    /// A dispatch currently holds the gang.
+    pub busy: bool,
+    /// The generation last published by a submit.
+    pub job: u32,
+    /// The generation last completed by the whole gang.
+    pub complete: u32,
+    /// Workers yet to account for the current job.
+    pub done: u32,
+}
+
+/// Read the resident dispatch gang's [`ResidentDispatchBooks`].
+#[cfg(target_os = "none")]
+pub fn resident_dispatch_books() -> ResidentDispatchBooks {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    let gang = &RESIDENT_DISPATCH;
+    if gang.state.load(Relaxed) != RESIDENT_FOUNDED {
+        return ResidentDispatchBooks::default();
+    }
+    let ctx = &RESIDENT_DISPATCH_CTX;
+    ResidentDispatchBooks {
+        founded: true,
+        width: gang.width.load(Relaxed),
+        busy: gang.busy.load(Acquire),
+        job: ctx.job_word().load(Acquire),
+        complete: ctx.complete_word().load(Acquire),
+        done: ctx.done_word().load(Acquire),
+    }
+}
+
+/// Off metal there is no gang: the empty books.
+#[cfg(not(target_os = "none"))]
+pub fn resident_dispatch_books() -> ResidentDispatchBooks {
+    ResidentDispatchBooks::default()
+}
+
+/// The resident gang's worker entry: the resident loop around the same
+/// type-erased body [`dispatch_worker`] runs for a one-shot launch.
+#[cfg(target_os = "none")]
+fn resident_dispatch_entry(ctx: &'static SpmdCtx, worker: u32) {
+    resident_run(ctx, worker, dispatch_worker);
+}
+
+/// How the resident gang answered a dispatch.
+#[cfg(target_os = "none")]
+enum ResidentOutcome {
+    /// Ran and completed.
+    Done(Dispatched),
+    /// Another dispatch holds the gang (nested or concurrent): refuse.
+    Busy,
+    /// No resident gang on this machine, or it could not take the job:
+    /// the one-shot launch path decides.
+    Unavailable,
+}
+
+/// Run one dispatch on the resident gang, founding it on first use.
+#[cfg(target_os = "none")]
+fn dispatch_resident(
+    tiles: u32,
+    width: u32,
+    body: &(dyn Fn(&'static SpmdCtx, u32) + Sync),
+) -> ResidentOutcome {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+    let gang = &RESIDENT_DISPATCH;
+    if gang
+        .busy
+        .compare_exchange(false, true, AcqRel, Acquire)
+        .is_err()
+    {
+        return ResidentOutcome::Busy;
+    }
+    let outcome = (|| {
+        // SAFETY: `busy` is held; see the `Sync` impl.
+        let slot = unsafe { &mut *gang.region.get() };
+        if slot.is_none() {
+            if gang.state.load(Relaxed) == RESIDENT_REFUSED {
+                return ResidentOutcome::Unavailable;
+            }
+            let fit = machine()
+                .map(|m| m.fitting_width())
+                .unwrap_or(1)
+                .clamp(1, DISPATCH_CAP as u32);
+            let founded = (fit >= 2)
+                .then(|| {
+                    found_resident::<DISPATCH_CAP>(
+                        &RESIDENT_DISPATCH_CTX,
+                        resident_dispatch_entry,
+                        fit as usize,
+                    )
+                })
+                .flatten();
+            match founded {
+                // A gang without its doorbell star has nothing to park on
+                // (`res/SPMD.md` §3): its workers would spin between jobs
+                // on the machine's best cores and starve the founding task.
+                // Retire it and keep the one-shot path, as the region's
+                // contract says; an executable takes `PROFILE_CHANNELS`
+                // to found the star.
+                Some(region) if !region.star_active() => {
+                    let _ = region.retire();
+                    gang.state.store(RESIDENT_REFUSED, Relaxed);
+                    return ResidentOutcome::Unavailable;
+                }
+                Some(region) => {
+                    gang.width.store(region.width() as u32, Relaxed);
+                    *slot = Some(region);
+                    gang.state.store(RESIDENT_FOUNDED, Relaxed);
+                }
+                None => {
+                    gang.state.store(RESIDENT_REFUSED, Relaxed);
+                    return ResidentOutcome::Unavailable;
+                }
+            }
+        }
+        let Some(region) = slot.as_mut() else {
+            return ResidentOutcome::Unavailable;
+        };
+        let active = width.clamp(1, region.width() as u32);
+        let env = &body as *const &(dyn Fn(&'static SpmdCtx, u32) + Sync) as *mut ();
+        // SAFETY: `body` outlives this call, and the job's completion is
+        // waited for below before `env` goes out of scope.
+        let Some(ticket) = (unsafe { region.submit(active, tiles, env) }) else {
+            return ResidentOutcome::Unavailable;
+        };
+        // A fresh ticket from this region cannot be refused; were the
+        // region's own books ever inconsistent, the job is published all
+        // the same, so the wait stands regardless.
+        let _ = region.wait(ticket);
+        ResidentOutcome::Done(Dispatched {
+            width: active,
+            tiles,
+        })
+    })();
+    gang.busy.store(false, Release);
+    outcome
+}
 
 /// What a [`dispatch`] launch chose — the width it fit to and the tile
 /// span it covered, so a terminal tool can show the auto-decision the caller
@@ -1360,10 +1572,10 @@ fn dispatch_worker(ctx: &'static SpmdCtx, worker: u32) {
 /// **The width model** — every fact a dispatch width is chosen from, and
 /// [`choose`](Self::choose) is the only place the choice is made.
 ///
-/// The fit policy (ruling 2026-08-20) reads one fact: the best lane.  That
-/// is the right default precisely when nothing else is known, and it is
-/// what this model returns when nothing else is supplied.  What it cannot
-/// see is that a gang costs more to *start* the wider it is, so a small
+/// The fit input is now the highest-service reachable homogeneous cohort
+/// when founding-time calibration is complete, else the best lane. This
+/// model returns that input until per-call-site work cost is known. What
+/// either static fit cannot see is that a gang costs more to *start*, so a small
 /// grid can finish sooner on fewer workers — measured on a Lunar Lake box
 /// 2026-09-03 with `spmd lane <width>` (median of the per-round minimum,
 /// 64 rounds, identical body at every width):
@@ -1391,13 +1603,14 @@ fn dispatch_worker(ctx: &'static SpmdCtx, worker: u32) {
 /// (workload-independent, calibrated once), `per_tile_ns` is a workload
 /// property (per call site).  Absent either, `choose` returns the fit
 /// width — today's answer, exactly — so this model is inert until both are
-/// supplied.  `res/SPMD.md` §12 carries the open question of where
-/// `per_tile_ns` comes from; nothing in the tree feeds it yet.
+/// supplied. Crossing classes also changes tile cost; a future calibration
+/// must measure that separately rather than treating this one scalar as
+/// class-invariant. `res/SPMD.md` §12 carries the open question of where
+/// per-call-site cost comes from; nothing in the tree feeds it yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WidthModel<'a> {
-    /// The fit width: one worker per exclusive best-class core
-    /// ([`Machine::fitting_width`]), already clamped to the runtime
-    /// ceiling by the caller.
+    /// The caller's default cohort width ([`Machine::fitting_width`]),
+    /// already clamped to the runtime ceiling.
     pub fit: u32,
     /// Measured per-batch dispatch overhead in nanoseconds, indexed by
     /// `width - 1` — the wake-and-drain cost `spmd lane <width>` prints.
@@ -1447,31 +1660,34 @@ impl WidthModel<'_> {
     }
 }
 
-/// Pick the launch width for `tiles` under the **fit policy** (ruling
-/// 2026-08-20): one worker per exclusive best-class core (`best_lane`),
-/// so the region runs co-resident in the monitored tier — never more
-/// workers than tiles, never past the runtime ceiling, at least one. A
-/// machine with no facts stamped falls back to a single worker (correct,
-/// if unparallel — the honest floor rather than a guessed width).
+/// Pick a launch width from the calibrated reachable cohort when available,
+/// else the factual best-class population. Never more workers than tiles or
+/// the runtime ceiling. A machine with no facts falls back to one worker.
 ///
 /// (The adaptive fill-past-a-threshold policy the design weighed is a
 /// future knob on exactly this one function — `res/SPMD.md` §12.)
 #[cfg(target_os = "none")]
 fn dispatch_width(tiles: u32) -> u32 {
     let lane = machine()
-        .map(|m| m.best_lane)
+        .map(|m| m.dispatch_fit(tiles))
         .filter(|&l| l > 0)
         .unwrap_or(1);
-    // No calibration and no per-tile cost: the model returns the fit
-    // width, which is what this function has always returned. The
-    // equivalence is host-proven (`the_width_model_reproduces_the_fit_policy`),
-    // so routing through the model changes no behavior — it only puts the
-    // policy somewhere a ruling can reach.
+    // No per-call-site cost or dispatch-overhead table: WidthModel preserves
+    // this founding-time cohort fit. Its host test proves that fallback.
     WidthModel {
         fit: lane.clamp(1, DISPATCH_CAP as u32),
         overhead_ns: &[],
     }
     .choose(tiles, None)
+}
+
+/// The founding sessions of a gang of `width` workers when one session
+/// carries at most `ceiling`: as few as fit, each its even share of the
+/// gang ([`block_split`]), as `[start, end)` worker ranges in order.
+#[cfg_attr(all(not(target_os = "none"), not(test)), allow(dead_code))]
+fn founding_sessions(width: u32, ceiling: u32) -> impl Iterator<Item = (u32, u32)> {
+    let sessions = width.div_ceil(ceiling.max(1));
+    (0..sessions).map(move |session| block_split(width, sessions, session))
 }
 
 /// Even block split of `span` items across `workers`: worker `w` gets
@@ -1574,6 +1790,11 @@ fn dispatch_erased(
     width: u32,
     body: &(dyn Fn(&'static SpmdCtx, u32) + Sync),
 ) -> Option<Dispatched> {
+    match dispatch_resident(tiles, width, body) {
+        ResidentOutcome::Done(dispatched) => return Some(dispatched),
+        ResidentOutcome::Busy => return None,
+        ResidentOutcome::Unavailable => {}
+    }
     let env = &body as *const &(dyn Fn(&'static SpmdCtx, u32) + Sync) as *mut ();
     let region = launch::<DISPATCH_CAP>(
         &DISPATCH_CTX,
@@ -1888,6 +2109,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn machine_fit_uses_calibrated_cohort_with_best_lane_fallback() {
+        let mut machine = Machine {
+            logical_cpus: 16,
+            best_lane: 4,
+            calibrated_fit: None,
+            performance_cores: 4,
+            efficient_cores: 8,
+            low_power_cores: 4,
+            standard_cores: 0,
+            hardware_feedback: true,
+        };
+        assert_eq!(machine.fitting_width(), 4);
+        machine.calibrated_fit = Some(8);
+        assert_eq!(machine.fitting_width(), 8);
+        assert_eq!(machine.dispatch_fit(3), 3);
+        assert_eq!(machine.dispatch_fit(5), 4);
+        assert_eq!(machine.dispatch_fit(8), 8);
+        machine.calibrated_fit = Some(u32::MAX);
+        assert_eq!(machine.fitting_width(), crate::thread::MAX_THREADS - 1);
+    }
+
     /// A partially calibrated table is not a licence to interpolate: if any
     /// width in range has no measured overhead, the model declines to
     /// compare and hands back the fit width.
@@ -1976,6 +2219,39 @@ mod tests {
                 assert!(max - min <= 1, "unbalanced split: {min}..={max}");
             }
         }
+    }
+
+    /// Every gang the runtime can found takes the fewest sessions its
+    /// width needs, none past the ceiling, sharing the gang evenly: a
+    /// meshed gang one worker over the ceiling founds as two near-halves,
+    /// never a full session plus a lone worker.
+    #[test]
+    fn a_gang_founds_in_the_fewest_even_sessions() {
+        let meshed = crate::star::MESH_CEILING as u32;
+        for ceiling in [meshed, crate::session::MAX_SESSION_FOUNDS as u32] {
+            for width in 1..crate::thread::MAX_THREADS {
+                let sessions: std::vec::Vec<(u32, u32)> = founding_sessions(width, ceiling).collect();
+                assert_eq!(sessions.len() as u32, width.div_ceil(ceiling), "width {width}");
+                let mut next = 0;
+                for &(start, end) in &sessions {
+                    assert_eq!(start, next, "width {width}: sessions are contiguous");
+                    assert!((1..=ceiling).contains(&(end - start)), "width {width}");
+                    next = end;
+                }
+                assert_eq!(next, width, "width {width}: every worker founds");
+                let sizes = sessions.iter().map(|(start, end)| end - start);
+                let (min, max) = (sizes.clone().min().unwrap(), sizes.max().unwrap());
+                assert!(max - min <= 1, "width {width}: {min}..={max}");
+            }
+        }
+        let split = |width| -> std::vec::Vec<u32> {
+            founding_sessions(width, meshed)
+                .map(|(start, end)| end - start)
+                .collect()
+        };
+        assert_eq!(split(4), [4], "a Lunar Lake gang founds whole");
+        assert_eq!(split(meshed + 1), [(meshed + 1) / 2, (meshed + 2) / 2]);
+        assert_eq!(split(12), [6, 6]);
     }
 
     /// A scripted worker: joins yield the scripted outcomes in order.

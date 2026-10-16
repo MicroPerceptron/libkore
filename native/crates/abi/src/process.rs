@@ -15,6 +15,13 @@
 //! the whole-stream terminal: it is legal only with no unanswered
 //! [`ProcessOutputKind::InputReady`], after which neither direction is used and
 //! the launcher may block on task lifecycle.
+//!
+//! The input-side [`ProcessInputKind::Interrupt`] record is the one launcher
+//! record that is not input: it is legal at any time, answers no
+//! `InputReady`, and asks the child to stop at its next safe point and exit
+//! in order (the terminal's Ctrl-C). A launcher sends it once, then allows a
+//! bounded grace before it revokes the task; a child that never reads its
+//! input simply meets the revoke (`res/LIFECYCLE_HARDENING.md` §3).
 
 use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -48,6 +55,27 @@ pub const PROCESS_STDIN_WAKE_INDEX: u16 = 2;
 pub const PROCESS_OUTPUT_WAKE_ROLE: u16 = crate::task::role::USER_BASE;
 /// Child boot-role instance for the output-wake `ChanSend`.
 pub const PROCESS_OUTPUT_WAKE_INDEX: u16 = 3;
+
+/// Boot-role used by a **stream host**: a task that holds the *parent* end of
+/// another process's stream on its launcher's behalf (an emulator window,
+/// `res/SHELL_TERMINAL.md`). The launcher formats the page and keeps the
+/// lifecycle pivots (the child's task handle and the channel roots). The host
+/// has no output receive: the child's output wake is a send into the host's
+/// own executor doorbell, so every host park is one executor park.
+pub const PROCESS_STDIO_HOST_ROLE: u16 = crate::task::role::USER_BASE;
+/// Host boot-role instance for the stream view. Distinct from every child
+/// index above, so one block can never carry both ends' meanings at once.
+pub const PROCESS_STDIO_HOST_INDEX: u16 = 4;
+/// Host boot-role instance for the **host channel** `ChanRecv`: everything
+/// else the launcher hands the host arrives here as capabilities — first the
+/// stdin-wake send that completes the parent end, then a delegated
+/// `ACCESS | REVOKE` handle for each foreground task the host may end
+/// (`res/SHELL_TERMINAL.md` §9).
+pub const PROCESS_STDIO_HOST_CHANNEL_INDEX: u16 = 5;
+/// Exact rights of a foreground slot: a delegated task handle that may
+/// observe and end its task, and nothing else.
+pub const FOREGROUND_SLOT_RIGHTS: crate::cap::Rights =
+    crate::cap::Rights::ACCESS.union(crate::cap::Rights::REVOKE);
 
 /// Exact authority delivered on either child-held stream-wake endpoint.
 ///
@@ -125,6 +153,7 @@ pub enum ProcessStreamError {
 
 const PROCESS_INPUT_DATA: u16 = 1;
 const PROCESS_INPUT_CLOSED: u16 = 2;
+const PROCESS_INPUT_INTERRUPT: u16 = 3;
 
 /// Decoded launcher-to-child input record kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,11 +162,20 @@ pub enum ProcessInputKind {
     Data,
     /// The launcher has closed the child's input stream.
     Closed,
+    /// The launcher asks the child to stop at its next safe point: release
+    /// what it holds and exit, or (a REPL) abandon the current line. Not
+    /// input: legal at any time, including with no unanswered `InputReady`,
+    /// and it answers none. A child reading a line when it arrives keeps that
+    /// request outstanding, so it prompts again without a second
+    /// `InputReady`, and if it exits instead it exits without `Closed`. The
+    /// launcher revokes the task if the child leaves the record unread past
+    /// its grace.
+    Interrupt,
 }
 
 /// One launcher-to-child foreground-input record.
 ///
-/// Every bit pattern is safe to copy out of a shared ring, but only the two
+/// Every bit pattern is safe to copy out of a shared ring, but only the three
 /// canonical encodings pass [`Self::validate`]. In particular, unused bytes
 /// must remain zero so malformed peers cannot smuggle ambiguous state through
 /// padding or an inactive payload suffix.
@@ -181,6 +219,16 @@ impl ProcessInputChunk {
         }
     }
 
+    /// Encode the single canonical interrupt record.
+    pub const fn interrupt() -> Self {
+        Self {
+            tag: U16::new(PROCESS_INPUT_INTERRUPT),
+            len: U16::new(0),
+            reserved: U32::new(0),
+            payload: [0; PROCESS_STDIN_CHUNK_BYTES],
+        }
+    }
+
     /// Validate and decode this record's kind.
     pub fn kind(&self) -> Result<ProcessInputKind, ProcessStreamError> {
         if self.reserved.get() != 0 {
@@ -197,18 +245,21 @@ impl ProcessInputChunk {
             PROCESS_INPUT_CLOSED if len == 0 && self.payload.iter().all(|byte| *byte == 0) => {
                 Ok(ProcessInputKind::Closed)
             }
+            PROCESS_INPUT_INTERRUPT if len == 0 && self.payload.iter().all(|byte| *byte == 0) => {
+                Ok(ProcessInputKind::Interrupt)
+            }
             _ => Err(ProcessStreamError::Invalid),
         }
     }
 
-    /// Whether this is one of the two canonical input encodings.
+    /// Whether this is one of the three canonical input encodings.
     pub fn validate(&self) -> bool {
         self.kind().is_ok()
     }
 
-    /// Validate the record and return its live byte prefix. Closed records
-    /// return an empty slice; callers that distinguish EOF should inspect
-    /// [`Self::kind`] first.
+    /// Validate the record and return its live byte prefix. Closed and
+    /// interrupt records return an empty slice; callers that distinguish them
+    /// should inspect [`Self::kind`] first.
     pub fn bytes(&self) -> Result<&[u8], ProcessStreamError> {
         self.kind()?;
         Ok(&self.payload[..usize::from(self.len.get())])
@@ -411,12 +462,11 @@ pub const PROCESS_ARG_BYTES: usize = 272;
 /// largest context anyone builds, which is the bootstrap command catalogue
 /// `help` reads — [`MAX_COMMAND_SNAPSHOT_ENTRIES`](crate::command::MAX_COMMAND_SNAPSHOT_ENTRIES)
 /// rows of name, usage and summary plus four framing bytes each. The
-/// catalogue's 35 rows need 2078 bytes at their present verbosity, which
-/// 2048 refused — `wasm` could not join without deleting another command's
-/// documentation. 2560 carries them with room for several more rows, and
-/// still leaves the payload it borrows (3208) most of its width for the
-/// output a command writes back.
-pub const PROCESS_CONTEXT_BYTES: usize = 2560;
+/// catalogue has 40 rows, including the delegated Lua worker. Its complete
+/// snapshot no longer fits 2560 bytes. 3072 carries the current catalogue
+/// and remains within the existing 3208-byte alternating payload; no page
+/// layout or command-output capacity changes.
+pub const PROCESS_CONTEXT_BYTES: usize = 3072;
 const _: () = assert!(
     PROCESS_CONTEXT_BYTES <= PROCESS_OUTPUT_BYTES,
     "context borrows the output payload and cannot outgrow it"
@@ -430,14 +480,15 @@ const _: () = assert!(
 /// the link's facts, the device's counters, and the bound radio's) + 16
 /// reserved.
 ///
-/// The header's ceiling is the widest bounded reply any status view must
-/// fit: the maximal `status sys <first-core>` report needs 3099 output bytes
+/// The header's historical ceiling came from the widest bounded status reply:
+/// the former per-core `status sys <first-core>` report needed 3099 output bytes
 /// (and `status input i2c` 3072), so with the 540-byte header of ABI 11 the
 /// output had 33 bytes to give.  ABI 12 takes 20 of them for the filesystem's
 /// latency moments; 13 remain, and the next byte past them costs that report
 /// a row.  ABI 13's timer census therefore came out of the argument buffer,
 /// not the output — and so did the 96 bytes its `status` row needs, which
-/// takes the output to 3208 with 19 bytes under the widest report.  ABI 13's
+/// takes the output to 3208 with 19 bytes under that report. The current
+/// compact `status sys` leaves this output allocation ABI-stable. ABI 13's
 /// frame-class census (16 bytes in the system snapshot) likewise comes out
 /// of the argument buffer: 312 → 296, still clearing the shell's 256-byte
 /// line and the files app's 255-byte path word, and the output stays 3208.
@@ -843,6 +894,10 @@ mod tests {
         let input_closed = ProcessInputChunk::closed();
         assert_eq!(input_closed.kind(), Ok(ProcessInputKind::Closed));
         assert_eq!(input_closed.bytes(), Ok([].as_slice()));
+        let interrupt = ProcessInputChunk::interrupt();
+        assert_eq!(interrupt.kind(), Ok(ProcessInputKind::Interrupt));
+        assert_eq!(interrupt.bytes(), Ok([].as_slice()));
+        assert_ne!(interrupt, input_closed);
 
         let stdout = ProcessOutputEvent::stdout(b"42\n").unwrap();
         assert!(stdout.validate());
@@ -913,6 +968,15 @@ mod tests {
 
         let mut input = ProcessInputChunk::closed();
         input.tag.set(u16::MAX);
+        assert_eq!(input.kind(), Err(ProcessStreamError::Invalid));
+
+        // An interrupt carries nothing: a length or payload byte is a record
+        // this launcher did not write.
+        let mut input = ProcessInputChunk::interrupt();
+        input.len.set(1);
+        assert_eq!(input.kind(), Err(ProcessStreamError::Invalid));
+        let mut input = ProcessInputChunk::interrupt();
+        input.payload[0] = 3;
         assert_eq!(input.kind(), Err(ProcessStreamError::Invalid));
 
         let mut event = ProcessOutputEvent::stdout(b"x").unwrap();

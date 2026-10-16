@@ -813,6 +813,7 @@ dependencies = [
  "heapless",
  "kore-abi",
  "kore-collections",
+ "kore-ring",
  "kore-rt",
  "kore-svc-extract",
  "zerocopy",
@@ -900,6 +901,7 @@ dependencies = [
 name = "kore-rt"
 version = "0.0.1"
 dependencies = [
+ "heapless",
  "kore-abi",
  "kore-collections",
  "kore-hint",

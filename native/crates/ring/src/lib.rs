@@ -55,6 +55,7 @@ extern crate std;
 
 pub mod event;
 pub mod spsc;
+pub mod stor;
 pub mod transfer;
 pub mod uring;
 

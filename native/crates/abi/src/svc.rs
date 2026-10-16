@@ -195,6 +195,7 @@ pub struct MonitorReqWire {
 impl MonitorReqWire {
     pub const OP_SNAPSHOT: u8 = 1;
     pub const OP_PROCESSOR: u8 = 3;
+    pub const OP_IOMMU: u8 = 4;
     /// One page of the PCI function census (`crate::device::census`):
     /// `reserved[0]` is the page ordinal, `memory` / `exec` are the zero
     /// records.  The monitor assembles the census from its own
@@ -214,6 +215,8 @@ pub struct MonitorRepWire {
     pub grants: u8,
     pub reserved: [u8; 5],
     pub snapshot: crate::monitor::TelemetrySnapshot,
+    /// Tagged observation payload: ProcessorPage for processor replies, or
+    /// iommu_status::Snapshot encoded by its wire-page methods for IOMMU replies.
     pub processor: crate::processor_status::ProcessorPage,
     /// [`TAG_DEVICE_CENSUS`](Self::TAG_DEVICE_CENSUS) only; the zero page
     /// on every other tag (the codec refuses a stray one).
@@ -221,6 +224,7 @@ pub struct MonitorRepWire {
 }
 
 impl MonitorRepWire {
+    pub const TAG_IOMMU: u8 = 5;
     pub const TAG_PROCESSOR: u8 = 4;
     pub const TAG_SNAPSHOT: u8 = 1;
     pub const TAG_REFUSED: u8 = 2;
@@ -234,7 +238,8 @@ impl MonitorRepWire {
 /// bytes never ride this record (#148) — they ride the **staging
 /// window**, one shared mapping the client attaches once
 /// ([`OP_ATTACH`](Self::OP_ATTACH)) and both sides then address by page
-/// index.  16 bytes.
+/// index.  The final word is zero for the original page verbs and carries the
+/// checked extent length for the additive extent verbs.  16 bytes.
 ///
 /// **Why staging rather than a delivered view per page.**  The original
 /// shape delivered a fresh `LeasedRegion` view with every `Out`/`In`,
@@ -251,20 +256,18 @@ impl MonitorRepWire {
     Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
 pub struct SwapReqWire {
-    /// Verb discriminant: [`OP_OUT`](Self::OP_OUT) /
-    /// [`OP_IN`](Self::OP_IN) / [`OP_DISCARD`](Self::OP_DISCARD) /
-    /// [`OP_ATTACH`](Self::OP_ATTACH).
+    /// Verb discriminant; zero is invalid.
     pub op: u8,
     /// Reserved; must be zero.
     pub reserved: [u8; 3],
-    /// `Out`/`In`: the **staging page index** the bytes occupy.
+    /// `Out`/`In` and extent store/load: the **first staging page index**.
     /// `Attach`: the founder-published return-landing correlation value
     /// naming the transfer this request adopts.  `Discard`: zero.
     pub arg: U32,
-    /// `In`/`Discard`: the store token a `Stored` reply returned.
+    /// Restore/load/release: the store token a `Stored` reply returned.
     pub token: U32,
-    /// Reserved; must be zero.
-    pub reserved2: [u8; 4],
+    /// Extent store/load/release: exact page count.  Zero for every other op.
+    pub pages: U32,
 }
 
 impl SwapReqWire {
@@ -275,11 +278,19 @@ impl SwapReqWire {
     /// `SwapRequest::Discard` — drop a stored page unrestored.
     pub const OP_DISCARD: u8 = 3;
     /// `SwapRequest::Attach` — adopt the staging window transferred over
-    /// the return channel; every later `Out`/`In` addresses it by page.
+    /// the return channel; later byte-moving verbs address spans within it.
     pub const OP_ATTACH: u8 = 4;
     /// `SwapRequest::Status` — read the tier's books (no arguments; the
     /// answer is [`SwapRepWire::TAG_STATUS`]'s counter block).
     pub const OP_STATUS: u8 = 5;
+    /// Store a bounded immutable staging extent; the reply's opaque token
+    /// names the whole extent.
+    pub const OP_STORE_EXTENT: u8 = 6;
+    /// Load an extent without consuming it.  Explicit release is a separate
+    /// operation so prefetch retries and cancellation cannot lose the copy.
+    pub const OP_LOAD_EXTENT: u8 = 7;
+    /// Release one extent after all users have stopped reading it.
+    pub const OP_RELEASE_EXTENT: u8 = 8;
 }
 
 /// The power request wire form (`PowerRequest`'s crossing shape) — #392.
@@ -323,6 +334,10 @@ impl PowerReqWire {
     pub const OP_DISPLAY_EVIDENCE_REPORT: u8 = 15;
     /// Read one evidence word: index, then zeros. Missing words refuse Unavailable.
     pub const OP_DISPLAY_EVIDENCE: u8 = 16;
+    /// Set a 0–100 manual preference or 254 (Manifold auto) in reserved[0].
+    pub const OP_PERFORMANCE_SET: u8 = 17;
+    /// Read the committed CPU preference; all payload bytes are zero.
+    pub const OP_PERFORMANCE_STATUS: u8 = 18;
 }
 
 /// The power reply wire form.  A power service mints no authority, so
@@ -355,6 +370,8 @@ impl PowerRepWire {
     pub const TAG_LID_STATUS: u8 = 8;
     /// Echoed evidence index and its u32 LE value.
     pub const TAG_DISPLAY_EVIDENCE: u8 = 9;
+    /// Requested preference (0–100 manual, 254 auto, 255 unset) in reserved[0].
+    pub const TAG_PERFORMANCE_STATUS: u8 = 10;
 
     /// The session refused the transition.  Authority (`MODIFY` absent) and
     /// feasibility (no firmware backend realizes it) are **not separable
@@ -718,7 +735,8 @@ impl DeviceRepWire {
 /// token is **data** — the server's private map key, never a capability
 /// (the SwapBackend contract) — and a swap service grants nothing, ever
 /// (`grants` is always zero; pinned so the reply layout matches its
-/// siblings).  8 bytes.
+/// siblings).  104 bytes: an 8-byte outcome header followed by the status
+/// counter tail, which is zero on every non-status reply.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -747,13 +765,13 @@ pub struct SwapRepWire {
     pub stored_pages: U32,
     /// Attached staging-window pages (`0` = unattached).
     pub staging_pages: U32,
-    /// Reserved; must be zero.
-    pub reserved2: [u8; 4],
-    /// `Out` ops answered `Stored`.
+    /// Live stored extents (`TAG_STATUS` only); zero on every other tag.
+    pub stored_extents: U32,
+    /// Successful stores (`StoreExtent` and compatibility `Out`).
     pub outs: U64,
-    /// `In` ops answered `Restored`.
+    /// Successful loads (`LoadExtent` and compatibility `In`).
     pub ins: U64,
-    /// `Discard` ops answered `Discarded`.
+    /// Successful releases (`ReleaseExtent` and compatibility `Discard`).
     pub discards: U64,
     /// Device commands submitted (disk tier; zram: zero).
     pub io_submitted: U64,
@@ -795,6 +813,10 @@ impl SwapRepWire {
     pub const TAG_ATTACHED: u8 = 5;
     /// `SwapResponse::Status` — the books ride the counter block.
     pub const TAG_STATUS: u8 = 6;
+    /// `SwapResponse::Loaded` — staging holds a non-destructive extent load.
+    pub const TAG_LOADED: u8 = 7;
+    /// `SwapResponse::Released` — the extent identity is retired.
+    pub const TAG_RELEASED: u8 = 8;
 
     /// [`posture`](Self::posture) bit: a backing device is bound (the
     /// disk tier's controller; always set by the zram tier, whose store
@@ -1246,7 +1268,9 @@ impl SpawnWire {
 /// or retirement metadata only. Ordinary `Invoke` requires it empty; immutable
 /// generation selection comes exclusively from the admitting capability.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct TaskReqWire {
     /// Verb discriminant: [`OP_WAIT`](Self::OP_WAIT) /
     /// [`OP_KILL`](Self::OP_KILL) / [`OP_EXIT`](Self::OP_EXIT) /
@@ -1390,6 +1414,7 @@ impl LibraryFailure {
 
 impl TaskReqWire {
     pub const OP_PROCESSOR: u8 = 23;
+    pub const OP_IOMMU: u8 = 24;
     // Discriminant 1 is RETIRED: it carried the legacy block-carrying
     // spawn (`Spawn { entry, stack, flags, block }`), deleted whole by
     // the 2026-07-28 v2 ruling.  It stays refused and must not be
@@ -1526,9 +1551,9 @@ impl TaskReqWire {
 /// [`index`](Self::index) for the selected generation's validated segment
 /// count. The append-only snapshot tail is populated only on `Spawned`; all
 /// other tags require
-/// [`crate::monitor::TelemetrySnapshot::EMPTY`]. The processor tail is populated
-/// only by `ProcessorStatus`; other tags require its canonical all-zero value.
-/// 616 bytes; both peers must be rebuilt together.
+/// [`crate::monitor::TelemetrySnapshot::EMPTY`]. The observation tail carries
+/// `ProcessorStatus` or the tagged IOMMU snapshot; other tags require zero.
+/// Both peers must be rebuilt together when adding observation tags.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -1544,7 +1569,8 @@ pub struct TaskRepWire {
     pub grants: u8,
     /// `Spawned`: the selected generation's validated segment count (`<=
     /// crate::image::MAX_SEGMENTS`; zero for an unlinked spawn).
-    /// Zero on every other tag.
+    /// On a `LedgerFull` refusal, the bounded diagnostic origin; zero for
+    /// other refusals and all tags without an index vocabulary.
     pub index: u8,
     /// Frozen tag 3: historical service-wait exit status.
     pub status: I32,
@@ -1563,13 +1589,61 @@ pub struct TaskRepWire {
     /// producer; empty on every other tag and on launches without the
     /// network profile.
     pub net: crate::monitor::NetSnapshot,
+    /// Tagged observation payload: ProcessorPage for processor replies, or
+    /// iommu_status::Snapshot encoded by its wire-page methods for IOMMU replies.
     pub processor: crate::processor_status::ProcessorPage,
     /// [`TAG_DEVICE_CENSUS`](Self::TAG_DEVICE_CENSUS)'s page; the zero
     /// page on every other tag.
     pub census: crate::device::DeviceCensusPage,
+    /// Only `REFUSE_LEDGER_FULL` with `index == 1` may carry this bounded
+    /// failure snapshot. Every other reply requires the all-zero form.
+    pub cleanup: CleanupRowDiagnosticWire,
+}
+
+/// One failure-only exec cleanup-row snapshot. No capability names, addresses,
+/// or authority cross this wire. Counts are saturated to `u32` at capture.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct CleanupRowDiagnosticWire {
+    pub rows: U32,
+    pub capacity: U32,
+    pub occupied: U32,
+    pub rollback: U32,
+    pub child_live: U32,
+    pub child_dead: U32,
+    pub child_retryable: U32,
+    pub spawned: U32,
+    pub compensated: U32,
+    pub reclaimed: U32,
+    pub refill: u8,
+    pub mm_idle: u8,
+    pub truncated: u8,
+    pub reserved: u8,
+}
+
+impl CleanupRowDiagnosticWire {
+    pub const EMPTY: Self = Self {
+        rows: U32::new(0),
+        capacity: U32::new(0),
+        occupied: U32::new(0),
+        rollback: U32::new(0),
+        child_live: U32::new(0),
+        child_dead: U32::new(0),
+        child_retryable: U32::new(0),
+        spawned: U32::new(0),
+        compensated: U32::new(0),
+        reclaimed: U32::new(0),
+        refill: 0,
+        mm_idle: 0,
+        truncated: 0,
+        reserved: 0,
+    };
 }
 
 impl TaskRepWire {
+    pub const TAG_IOMMU: u8 = 24;
     pub const TAG_PROCESSOR: u8 = 23;
     /// `TaskResponse::Spawned` — paired with one parent-handle grant for an
     /// ordinary owned spawn; the one-shot kernel bootstrap form is data-only.
@@ -1738,6 +1812,8 @@ impl TaskRepWire {
     /// the other is what makes a launch look intermittently slow when it is
     /// in fact permanently refused.
     pub const REFUSE_PEER_ADMISSION_WEDGED: u8 = 22;
+    pub const REFUSE_MODEL_UNAVAILABLE: u8 = 23;
+    pub const REFUSE_MODEL_MEMORY_UNAVAILABLE: u8 = 24;
 }
 
 // Live task discriminants stay disjoint from the frozen retired band on
@@ -2365,6 +2441,14 @@ impl HypervisorReqWire {
     /// `HypervisorRequest::Status` — one coherent, data-only snapshot of the
     /// service's single-guest and text-console books.
     pub const OP_STATUS: u8 = 11;
+    /// `HypervisorRequest::SpawnMmio` — found the MMIO console witness
+    /// (`blob::echo_mmio_package`): the echo guest again, but driving its
+    /// 16550 through a memory-mapped window instead of port I/O, so every
+    /// console byte is a stage-2 fault the hypervisor must decode and
+    /// complete (#765).  Same gating as [`OP_SPAWN_ECHO`](Self::OP_SPAWN_ECHO).
+    pub const OP_SPAWN_MMIO: u8 = 12;
+    /// Two-vCPU SPMD guest witness.
+    pub const OP_SPAWN_SMP: u8 = 13;
 }
 
 /// Capacity of the hypervisor pair window's **guest-output** console
@@ -2521,6 +2605,9 @@ impl HypervisorStatusWire {
     pub const PAYLOAD_MULTISEG: u8 = 4;
     /// The MicroPython acceptance payload.
     pub const PAYLOAD_MICROPYTHON: u8 = 5;
+    /// The echo guest on the memory-mapped console (#765).
+    pub const PAYLOAD_MMIO: u8 = 6;
+    pub const PAYLOAD_SMP: u8 = 7;
 
     /// A live guest task currently exists.
     pub const STATUS_GUEST_EXISTS: u16 = 1 << 0;
@@ -2562,6 +2649,103 @@ pub struct AccelBindingWire {
     /// Reserved; must be zero.
     pub reserved: [u8; 3],
 }
+
+/// One member of a staged ordered accelerator submission.  The service
+/// executes entries in table order and returns one event retaining every
+/// named program and buffer.  Each member carries the same launch vocabulary
+/// as a single `SubmitLaunch` and one ordering edge to the members before
+/// it.  232 bytes: the 40-byte head keeps every binding's `U64` words on the
+/// record's 8-byte grid, as in [`AccelReqWire`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct AccelSequenceEntryWire {
+    /// Resident program object id.
+    pub program: U64,
+    /// Number of live entries in `bindings` (`1..=MAX_ACCEL_BINDINGS`).
+    pub binding_count: U32,
+    /// Member flags: [`FLAG_BARRIER`](Self::FLAG_BARRIER); every other bit
+    /// is reserved zero and refuses at decode.
+    pub flags: U32,
+    /// Explicit workgroup count `[x, y, z]`.  With `local` all zero, the
+    /// six words name the artifact-defined launch; otherwise every axis of
+    /// both is nonzero, exactly as `SubmitLaunch`'s `target[0..24]`.
+    pub groups: [U32; 3],
+    /// Explicit logical workgroup size `[x, y, z]` (see `groups`).
+    pub local: [U32; 3],
+    /// Program bindings; entries after `binding_count` must be zero.
+    pub bindings: [AccelBindingWire; MAX_ACCEL_BINDINGS],
+}
+
+impl AccelSequenceEntryWire {
+    /// This member starts only after every earlier member's memory writes
+    /// are complete and visible.  Clear, the client declares it independent
+    /// of the members since the most recent barrier and the provider may
+    /// overlap them.  Ignored on the first member.
+    pub const FLAG_BARRIER: u32 = 1 << 0;
+    /// A gate: this member starts only once the word its sync record names
+    /// holds at least the record's value, and after every earlier member's
+    /// writes and everything the host and storage wrote while it waited are
+    /// visible to it (`res/QWEN_EXPERT_STREAMING.md` §3).  Takes one record
+    /// of the table after the entries ([`AccelSequenceSyncWire`]).
+    pub const FLAG_GATE: u32 = 1 << 1;
+    /// A signal: once this member retires and its writes are visible to the
+    /// host, the provider writes the record's value to the word it names.
+    /// Takes one record, after the member's gate record when it has both.
+    pub const FLAG_SIGNAL: u32 = 1 << 2;
+    /// Every flag a member may carry.
+    pub const FLAGS: u32 = Self::FLAG_BARRIER | Self::FLAG_GATE | Self::FLAG_SIGNAL;
+
+    /// The sync records this member takes from the table.
+    pub const fn sync_records(&self) -> usize {
+        let flags = self.flags.get();
+        (flags & Self::FLAG_GATE != 0) as usize + (flags & Self::FLAG_SIGNAL != 0) as usize
+    }
+}
+
+/// One gate's or signal's word: the staged table of these follows the entry
+/// table, one record for each [`FLAG_GATE`](AccelSequenceEntryWire::FLAG_GATE)
+/// and [`FLAG_SIGNAL`](AccelSequenceEntryWire::FLAG_SIGNAL) in member order
+/// (a member's gate before its signal).  The word is the 8-byte-aligned
+/// quadword at `offset` in a buffer of the queue's context; a gate compares
+/// its low dword with `value` (unsigned, at least; `value` fits 32 bits), a
+/// signal writes `value`.  32 bytes.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct AccelSequenceSyncWire {
+    /// The buffer object id holding the word.
+    pub buffer: U64,
+    /// The word's byte offset in the buffer; a multiple of 8.
+    pub offset: U64,
+    /// What a gate waits for, or what a signal writes.
+    pub value: U64,
+    /// Reserved; must be zero.
+    pub reserved: [u8; 8],
+}
+
+/// Sync records one staged submission may carry after its entries: what
+/// the 16 KiB sequence stage holds past a full entry table (1,536 bytes),
+/// more than a frozen window's routed layers need.
+pub const MAX_ACCEL_SEQUENCE_SYNCS: usize = 48;
+
+/// Ordered members one staged submission may contain.
+///
+/// Every submission costs the client its round trips to the service
+/// (submit, poll, retire), so the ceiling sets how many of them a frozen
+/// decode pays per token: Qwen3-32B's 1219 kernels a token were 39 windows
+/// at 32 and are 20 at 64. Two bounds hold it at 64: the Xe provider's
+/// per-job timing page has one 64-byte timestamp slot per member (4096 /
+/// 64), and a 64-entry table (14,848 bytes) still fits the 16 KiB sequence
+/// stage the inference client reserves.
+pub const MAX_ACCEL_SEQUENCE_ENTRIES: usize = 64;
+/// Ping-pong submission capacity: one job can execute while its successor is
+/// prepared and queued. Each slot retains distinct commands, completion and
+/// operand leases until retirement; increasing this requires matching storage
+/// in the provider and client, not merely accepting more event handles.
+pub const MAX_ACCEL_PIPELINE_DEPTH: usize = 2;
 
 /// The accel request wire form (`AccelRequest`'s crossing shape) — the
 /// accelerator-class control plane (`res/DEVICE_SERVICE.md` §7): one
@@ -2717,8 +2901,19 @@ impl AccelReqWire {
     /// Close the authenticated recyclable arrival.
     pub const OP_CLOSE_PEER: u8 = 24;
     /// Owned DRAM import: subject=context, a=bytes, b=alignment, c=usage,
-    /// d=authenticated return-landing correlation. Domain is Shared.
+    /// d=authenticated return-landing correlation. Domain is Shared. `c`
+    /// holds virtio-accel's `BufferUsage` bits and, beside them,
+    /// [`IMPORT_USAGE_POLLED`](Self::IMPORT_USAGE_POLLED).
     pub const OP_IMPORT_BUFFER: u8 = 25;
+    /// `OP_IMPORT_BUFFER`'s usage bit beyond virtio-accel's `BufferUsage`:
+    /// the importer reads or writes this buffer while the device runs — a
+    /// sequence's gate and signal words, and what it reads or writes around
+    /// them (`res/QWEN_EXPERT_STREAMING.md` §4). The provider maps it coherent
+    /// in both directions mid-job, at a bandwidth cost no streamed payload
+    /// should pay, or refuses it where it cannot prove that on its platform.
+    /// Only such an import may hold a gate's or a signal's word. A provider
+    /// that predates the bit refuses it as an unknown usage.
+    pub const IMPORT_USAGE_POLLED: u32 = 1 << 31;
     /// Return an imported allocation after quiescent buffer detachment; subject=buffer.
     pub const OP_EXPORT_BUFFER: u8 = 26;
     /// Administration pair: request retirement of the exact recyclable peer
@@ -2730,6 +2925,28 @@ impl AccelReqWire {
     /// `AccelRequest::ReadLog` — copy the tail of the provider's firmware
     /// log into the staging window: `b` = stage offset, `c` = capacity.
     pub const OP_READ_LOG: u8 = 29;
+    /// Submit a dependency-ordered table as one provider event: `subject` is
+    /// the queue, `a`/`b` name the staged byte extent, `c` is the entry count,
+    /// and `d` is the relative timeout in ns (zero = infinite).  The staged
+    /// extent is exactly `c * size_of::<AccelSequenceEntryWire>()` bytes,
+    /// then one [`AccelSequenceSyncWire`] for each gate and signal the
+    /// entries' flags name (none when they name none).
+    pub const OP_SUBMIT_SEQUENCE: u8 = 30;
+    /// Reserve per-pair buffer/program budgets only when the device owner
+    /// already holds enough DMA pool capacity. `b` = buffer bytes, `c` =
+    /// program bytes; no capability is transferred. Other words are zero.
+    pub const OP_RESERVE_MEMORY: u8 = 31;
+    /// Read retained failure text without a staging mapping: `a` = byte offset.
+    pub const OP_READ_FAILURE: u8 = 32;
+    /// Read the provider's current telemetry text without a staging mapping:
+    /// `a` = byte offset. Offset zero takes a fresh snapshot; later offsets
+    /// page through that snapshot. Answered with [`AccelRepWire::TAG_FAILURE`]'s
+    /// bounded text page.
+    pub const OP_READ_TELEMETRY: u8 = 33;
+    /// Configure optional timing for an owned, quiescent context: subject=context,
+    /// a=enabled (0/1). Enabling starts a fresh interval; disabling preserves it.
+    /// Unknown providers refuse rather than claim measurements they cannot make.
+    pub const OP_CONFIGURE_PROFILING: u8 = 34;
 }
 
 /// The accel reply wire form (`AccelResponse`'s crossing shape).  Data
@@ -2754,7 +2971,8 @@ pub struct AccelRepWire {
     /// `state` is failed; zero otherwise.
     pub refusal: u8,
     /// `TAG_EVENT`: the event's state — 1 pending, 2 complete, 3 failed
-    /// (see `refusal`), 4 cancelled.  Zero for every other tag.
+    /// (see `refusal`), 4 cancelled. `TAG_FAILURE`: byte count in `info`.
+    /// Zero for every other tag.
     pub state: u8,
     /// Reserved; must be zero.
     pub reserved: [u8; 4],
@@ -2769,7 +2987,9 @@ pub struct AccelRepWire {
     /// eight limit words (6×4 + 2×8). For an external refusal (including
     /// failed events and indeterminate submissions), bytes 0..4 hold the
     /// provider domain (u32 LE), 4..12 the code (i64 LE), and 12..80 are
-    /// zero. Zero for every other tag/refusal. Old decoders reject the new
+    /// zero. `TAG_FAILURE` holds up to `state` text bytes, zero-padded.
+    /// `TAG_PROFILING_CONFIGURED` holds enabled (0/1) in byte 0; its tail is zero.
+    /// Zero for every other tag/refusal. Old decoders reject the new
     /// refusal discriminant rather than silently discarding its detail.
     pub info: [u8; 80],
 }
@@ -2833,6 +3053,15 @@ impl AccelRepWire {
     /// `AccelResponse::Log` — `id` is how many log bytes now sit at the
     /// requested stage offset (zero when the provider keeps no log).
     pub const TAG_LOG: u8 = 24;
+    /// Retained failure text: `id` echoes offset, `state` is bytes in `info`.
+    /// The unused info tail is zero; no grants or live device access.
+    pub const TAG_FAILURE: u8 = 25;
+    /// Profiling configured: id echoes context and info[0] echoes enabled (0/1).
+    /// All other payload bytes, state, refusal and grants remain zero.
+    pub const TAG_PROFILING_CONFIGURED: u8 = 26;
+    /// One inline diagnostic page occupies the existing info payload.
+    pub const FAILURE_CHUNK_BYTES: usize =
+        core::mem::size_of::<Self>() - core::mem::offset_of!(Self, info);
 
     /// The backend cannot perform the operation (unsupported verb,
     /// domain, flag set, or cancellation without the capability).
@@ -3276,6 +3505,7 @@ const _: () = {
                 + size_of::<crate::monitor::NetSnapshot>()
                 + size_of::<crate::processor_status::ProcessorPage>()
                 + size_of::<crate::device::DeviceCensusPage>()
+                + size_of::<CleanupRowDiagnosticWire>()
     );
     assert!(size_of::<ImageReqWire>() == 8 + size_of::<ImageName>() + 16 + 64); // 152
     assert!(size_of::<ImageRepWire>() == 16 + size_of::<ModuleDescriptor>()); // 496
@@ -3328,6 +3558,16 @@ const _: () = {
     assert!(1152 + 576 <= 0x2000, "fs pair must fit [layout] ring_bytes");
     // 48-byte head ‖ 48 target words ‖ 6×32 bindings.
     assert!(size_of::<AccelBindingWire>() == 32);
+    // 8 program ‖ 4 count ‖ 4 flags ‖ 2×12 geometry ‖ 6×32 bindings.
+    assert!(size_of::<AccelSequenceEntryWire>() == 40 + MAX_ACCEL_BINDINGS * 32); // 232
+    assert!(size_of::<AccelSequenceSyncWire>() == 32);
+    // A full entry table and its sync records fit the client's 16 KiB stage.
+    assert!(
+        MAX_ACCEL_SEQUENCE_ENTRIES * size_of::<AccelSequenceEntryWire>()
+            + MAX_ACCEL_SEQUENCE_SYNCS * size_of::<AccelSequenceSyncWire>()
+            <= 16 * 1024
+    );
+    assert!(core::mem::offset_of!(AccelSequenceEntryWire, bindings) % 8 == 0);
     assert!(size_of::<AccelReqWire>() == 48 + 48 + MAX_ACCEL_BINDINGS * 32); // 288
     assert!(size_of::<AccelReqWire>() == 288);
     assert!(size_of::<AccelRepWire>() == 96);
@@ -3655,7 +3895,7 @@ mod tests {
             capacity_pages: U32::new(262144),
             stored_pages: U32::new(3),
             staging_pages: U32::new(8),
-            reserved2: [0; 4],
+            stored_extents: U32::new(2),
             outs: U64::new(11),
             ins: U64::new(9),
             discards: U64::new(2),
@@ -4117,9 +4357,10 @@ pub struct FsReqWire {
     pub name_len: u8,
     /// Live bytes of [`name2`](Self::name2) (`0..=FS_NAME_BYTES`).
     pub name2_len: u8,
-    /// `Create`: the object subtype to stamp (data, never authority; the
-    /// values are `kore-dagfs`'s `ObjectSubtype`). `Search`: the freshness
-    /// policy. Zero elsewhere.
+    /// `Create`: the object subtype to stamp (data, never authority over the
+    /// object; the values are `kore-dagfs`'s `ObjectSubtype`, and an
+    /// attesting one needs its `stamp_rights` on the parent route).
+    /// `Search`: the freshness policy. Zero elsewhere.
     pub reserved0: u8,
     /// `Grant`: the destination session. Zero elsewhere.
     pub session: U16,
@@ -4274,7 +4515,55 @@ impl FsReqWire {
     pub const OP_WRITE_REPLACEMENT: u8 = 44;
     pub const OP_COMMIT_REPLACE: u8 = 45;
     pub const OP_ABORT_REPLACE: u8 = 46;
-    pub const OP_MAX: u8 = Self::OP_ABORT_REPLACE;
+    /// **Retired, reserved:** the pack lane's verbs (`PackInfo`,
+    /// `PackAttach`, `PackRead`, `PackDetach`, `PackPoll`, `PackSubmit`,
+    /// `PackKick`). The pack region is read through a storage ring now
+    /// (`OP_STOR_*`, `res/STORAGE_TRANSPORT.md` §4); these codes decode to
+    /// nothing and are never reassigned.
+    pub const OP_PACK_INFO: u8 = 47;
+    pub const OP_PACK_ATTACH: u8 = 48;
+    pub const OP_PACK_READ: u8 = 49;
+    pub const OP_PACK_DETACH: u8 = 50;
+    pub const OP_PACK_POLL: u8 = 51;
+    pub const OP_PACK_SUBMIT: u8 = 52;
+    pub const OP_PACK_KICK: u8 = 53;
+    /// Attach the session's storage ring (`res/STORAGE_TRANSPORT.md` §4): the
+    /// caller-funded, formatted window rides the retained return leg as a
+    /// view; `window_offset` carries only the return-post correlation. The
+    /// reply carries the block size in `count` and the transfer ceiling in
+    /// `cursor`.
+    pub const OP_STOR_ATTACH: u8 = 54;
+    /// Install a read grant over the designated pack region into the
+    /// session's ring. The reply carries the grant id in `handle` and the
+    /// region's length in `len`.
+    pub const OP_STOR_GRANT_PACK: u8 = 55;
+    /// Adopt one device-mapping fabric route over caller-funded memory as a
+    /// target of the session's ring; the route rides the retained return leg
+    /// and `window_offset` carries only the return-post correlation. The
+    /// reply carries the target slot in `handle` and its length in `len`.
+    pub const OP_STOR_TARGET: u8 = 56;
+    /// Release ring target `handle`; refused `BUSY` while a command uses it.
+    pub const OP_STOR_RELEASE: u8 = 57;
+    /// The notice a parked row is owed after the caller published into its
+    /// ring. No operand.
+    pub const OP_STOR_KICK: u8 = 58;
+    /// Detach and retire the session's ring; refused `BUSY` until nothing is
+    /// in flight. No operand.
+    pub const OP_STOR_DETACH: u8 = 59;
+    /// Install a read grant over lent version `handle` (a version lease this
+    /// session holds) into the session's ring: the version's whole blocks,
+    /// pinned by the lease. The reply carries the grant id in `handle` and
+    /// the bytes it covers in `len`; the partial last block, if any, is read
+    /// through the lease as before. Releasing the lease is refused `BUSY`
+    /// while a read under the grant is in flight.
+    pub const OP_STOR_GRANT_VERSION: u8 = 60;
+    /// Read the transport engine's counters — testimony, no authority: the
+    /// reply carries submissions in `handle`, completions in `len`, device
+    /// commands in flight in `count`, expired deadlines in `cursor`, and
+    /// stale completions (low half) and refused timeline completions (high
+    /// half) in `revision`. No operand.
+    pub const OP_STOR_INSPECT: u8 = 61;
+    pub const OP_MAX: u8 = Self::OP_STOR_INSPECT;
 
     /// [`kind`](Self::kind): a file.
     pub const KIND_FILE: u8 = 1;
@@ -4309,7 +4598,10 @@ impl FsReqWire {
 pub struct FsRepWire {
     /// `STATUS_OK` or a refusal class; zero (unseeded) is invalid.
     pub status: u8,
-    /// Object kind on a successful open/create/stat, else zero.
+    /// Object kind on a successful open/create/stat; on a
+    /// [`STATUS_PROVIDER_FAILURE`](Self::STATUS_PROVIDER_FAILURE) refusal,
+    /// the provider's cause (`kore-dagfs`'s frozen `ProviderError` code, zero
+    /// for none); else zero.
     pub kind: u8,
     /// Reply flags — [`FLAG_MORE`](Self::FLAG_MORE) for a paged listing.
     pub flags: u8,

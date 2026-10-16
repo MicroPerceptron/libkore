@@ -11,6 +11,11 @@
 //! The wrapper is deliberately dumb about where designations come from: a
 //! GPT partition, a fixed platform carve, or a test's arbitrary window all
 //! narrow the same way.
+//!
+//! A view can also be sealed [`read_only`](RegionDevice::read_only): a
+//! designation that grants read authority only (a pack image) then cannot
+//! reach a write or discard through any caller above it — the refusal lives
+//! in the clamp's own rebase, not in a channel flag a caller could skip.
 
 use super::{
     BlockError, BlockGeometry, BlockHealth, DeviceCommand, DeviceCompletion, DirectBlockDevice,
@@ -21,6 +26,8 @@ pub struct RegionDevice<D: DirectBlockDevice> {
     device: D,
     first_lba: u64,
     blocks: u64,
+    /// Sealed read-only: writes and discards are refused at rebase.
+    read_only: bool,
 }
 
 impl<D: DirectBlockDevice> RegionDevice<D> {
@@ -31,6 +38,7 @@ impl<D: DirectBlockDevice> RegionDevice<D> {
             device,
             first_lba: 0,
             blocks: geometry.block_count,
+            read_only: false,
         })
     }
 
@@ -54,7 +62,16 @@ impl<D: DirectBlockDevice> RegionDevice<D> {
             device: self.device,
             first_lba,
             blocks,
+            read_only: self.read_only,
         })
+    }
+
+    /// Seal the view read-only.  One-way: nothing unseals a view, and
+    /// [`narrow`](Self::narrow) keeps the seal, so read authority can never
+    /// widen into write authority by re-deriving the clamp.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     /// The view's extent as `(first_lba, blocks)` in backend coordinates.
@@ -96,6 +113,14 @@ impl<D: DirectBlockDevice> RegionDevice<D> {
     }
 
     fn rebase_command(&self, command: DeviceCommand) -> Result<DeviceCommand, BlockError> {
+        if self.read_only
+            && matches!(
+                command,
+                DeviceCommand::Write { .. } | DeviceCommand::Discard { .. }
+            )
+        {
+            return Err(BlockError::ReadOnly);
+        }
         Ok(match command {
             DeviceCommand::Read {
                 lba,
@@ -130,10 +155,20 @@ impl<D: DirectBlockDevice> DirectBlockDevice for RegionDevice<D> {
     /// A clamp changes addresses, not how the queue advances.
     const INDEPENDENT_PROGRESS: bool = D::INDEPENDENT_PROGRESS;
 
+    fn namespace_lba(&self) -> u64 {
+        self.device.namespace_lba().saturating_add(self.first_lba)
+    }
+
+    fn abort(&mut self, cookie: u64) -> bool {
+        self.device.abort(cookie)
+    }
+
     fn geometry(&self) -> BlockGeometry {
+        let inner = self.device.geometry();
         BlockGeometry {
             block_count: self.blocks,
-            ..self.device.geometry()
+            read_only: inner.read_only || self.read_only,
+            ..inner
         }
     }
 
@@ -262,6 +297,25 @@ mod tests {
             (1, 2_000, 2_000)
         );
         assert!(books.snapshot(channel.stats().max_outstanding).measured());
+    }
+
+    /// A clamp names where its block zero sits in the namespace, and a
+    /// clamp of a clamp adds both offsets — the coordinates a transport
+    /// grant is written in.
+    #[test]
+    fn nested_regions_report_their_namespace_origin() {
+        let whole = RegionDevice::whole(device()).unwrap();
+        assert_eq!(whole.namespace_lba(), 0);
+        let outer = whole.narrow(2, 6).map_err(|(_, error)| error).unwrap();
+        assert_eq!(outer.namespace_lba(), 2);
+        let inner = RegionDevice::whole(outer)
+            .unwrap()
+            .narrow(1, 3)
+            .map_err(|(_, error)| error)
+            .unwrap();
+        assert_eq!(inner.namespace_lba(), 3);
+        let channel: BlockChannel<_, 2, 4> = BlockChannel::new(inner, CompletionMode::Poll).unwrap();
+        assert_eq!(channel.namespace_lba(), 3);
     }
 
     #[test]
@@ -435,5 +489,48 @@ mod tests {
         let id = channel.submit_write(3, 1, buffer, 0).unwrap();
         assert_eq!(channel.wait().unwrap().request, id);
         assert!(channel.submit_write(4, 1, buffer, 0).is_err());
+    }
+
+    /// A sealed view refuses writes and discards in the clamp itself — a
+    /// device call below a channel that forgot its own read-only state still
+    /// cannot reach the blocks — while reads rebase exactly as before, and a
+    /// later narrow keeps the seal.
+    #[test]
+    fn a_read_only_view_refuses_writes_below_the_channel() {
+        let mut region = RegionDevice::whole(device())
+            .unwrap()
+            .read_only()
+            .narrow(2, 4)
+            .map_err(|(_, error)| error)
+            .unwrap();
+        assert!(region.geometry().read_only);
+        let mut buffer = region.allocate_buffer(512).unwrap();
+        let write = DeviceCommand::Write {
+            lba: 0,
+            blocks: 1,
+            buffer_offset: 0,
+        };
+        assert_eq!(
+            region.submit(write, Some(&mut buffer), 1),
+            Err(BlockError::ReadOnly)
+        );
+        assert_eq!(
+            region.submit(DeviceCommand::Discard { lba: 0, blocks: 1 }, None, 2),
+            Err(BlockError::ReadOnly)
+        );
+        let read = DeviceCommand::Read {
+            lba: 1,
+            blocks: 1,
+            buffer_offset: 0,
+        };
+        region.submit(read, Some(&mut buffer), 3).unwrap();
+
+        let mut channel: BlockChannel<_, 2, 4> =
+            BlockChannel::new(region, CompletionMode::Poll).unwrap();
+        let registered = channel.register_buffer(512).unwrap();
+        assert_eq!(
+            channel.submit_write(0, 1, registered, 0),
+            Err(BlockError::ReadOnly)
+        );
     }
 }

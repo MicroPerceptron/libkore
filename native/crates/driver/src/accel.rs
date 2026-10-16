@@ -5,6 +5,71 @@
 
 pub use virtio_accel_core::*;
 
+/// Opaque, provider-defined evidence for a sealed device epoch.
+/// The host forwards both fields through the existing External refusal without
+/// interpreting or masking the code. An i64 carries all 64 diagnostic bits;
+/// signedness is part of the provider's layout. This is data, not authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LossEvidence {
+    pub domain: u32,
+    pub code: i64,
+}
+
+/// One member of a provider-ordered execution plan.
+///
+/// Programs remain independent lifecycle objects. The event returned for the
+/// complete plan retains every program and bound buffer until retirement.
+/// Backends that can encode an ordered hardware command list execute the slice
+/// without a host completion round trip between members.
+///
+/// Each member carries its own [`LaunchShape`], admitted exactly as a single
+/// [`NativeAccelerator::submit_with_launch`] of that program would admit it,
+/// and one ordering edge to the members before it:
+///
+/// * `barrier == true` — the member starts only after every earlier member's
+///   memory writes are complete and visible to it (a data dependency);
+/// * `barrier == false` — the client declares the member independent of the
+///   members since the most recent barrier, so a backend may overlap it with
+///   them. It still never starts ahead of a barrier that precedes it.
+///
+/// The first member's flag is ignored: nothing in the plan precedes it. A
+/// backend that executes every member strictly in order honors both values;
+/// the flag grants permission to overlap, never an obligation to.
+pub struct OrderedExecution<'a, P, B> {
+    pub program: &'a P,
+    pub bindings: &'a [BindingRef<'a, B>],
+    pub launch: LaunchShape,
+    pub barrier: bool,
+    /// Before the member, wait until a host-published word reaches a
+    /// value (a gate, [`SyncRef`]). A backend with no command-stream wait
+    /// refuses a list that names one.
+    pub gate: Option<SyncRef<'a, B>>,
+    /// Once the member retires and its writes are visible to the host,
+    /// write a value to a word (a signal, [`SyncRef`]). A backend with no
+    /// such completion write refuses a list that names one.
+    pub signal: Option<SyncRef<'a, B>>,
+}
+
+/// A gate's or signal's word: the 8-byte-aligned quadword at `offset` in a
+/// buffer the queue's context holds (`res/QWEN_EXPERT_STREAMING.md` §3-4).
+/// A gate holds its member until the word's low dword is at least `value`
+/// (unsigned); a signal writes `value`, zero-extended, after its member's
+/// writes are visible to the host. The host and the device meet on the
+/// word alone: nothing else of the buffer is bound.
+pub struct SyncRef<'a, B> {
+    pub buffer: &'a B,
+    pub offset: u64,
+    pub value: u64,
+}
+
+impl<B> Clone for SyncRef<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<B> Copy for SyncRef<'_, B> {}
+
 /// One accelerator's DMA demand, stated per frame class
 /// (`res/ACCEL_MEMORY_SCALE.md` §2.2).
 ///
@@ -220,13 +285,33 @@ pub trait NativeAccelerator: Accelerator {
         Ok(())
     }
 
-    /// The packed device-plane witness of a reported `DeviceLost` (the
-    /// provider's own layout; `0` when none was retained). A sealed epoch's
-    /// refusals may carry it so a serial-less client can name the fault
-    /// instead of only the loss. Providers with no device witness keep the
-    /// default.
-    fn loss_evidence(&self) -> u64 {
-        0
+    /// The first retained device-plane witness of a reported DeviceLost.
+    /// None means no witness; Some with a zero code is valid evidence.
+    /// Providers own the domain and bit layout; hosts must preserve both.
+    fn loss_evidence(&self) -> Option<LossEvidence> {
+        None
+    }
+
+    /// Format retained failure metadata before the host hands off the lost
+    /// epoch. Must not allocate, touch registers, wait, or submit device work.
+    /// Device-domain addresses are permitted; host physical addresses and
+    /// buffer contents are not. Truncation is controlled by the host's writer.
+    fn failure_report(&self, _out: &mut dyn core::fmt::Write) {}
+
+    /// Bounded operational telemetry for a diagnostic reader — clock, device
+    /// time, completion wakes — formatted from retained counters: no MMIO,
+    /// waits or DMA access. The default reports nothing.
+    fn telemetry_report(&self, _out: &mut dyn core::fmt::Write) {}
+
+    /// Configure optional execution timing for one owned, quiescent context.
+    /// Enabling resets its measurement interval; disabling retains the result.
+    /// This must not change submission, completion or visibility semantics.
+    fn configure_profiling(
+        &self,
+        _context: &Self::Context,
+        _enabled: bool,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
     }
 
     /// Copy the newest bytes of the device firmware's own log into `out`,
@@ -269,6 +354,25 @@ pub trait NativeAccelerator: Accelerator {
             LaunchShape::ArtifactDefined => self.submit(queue, program, bindings, timeout),
             LaunchShape::Workgroups(_) => Err(SubmitFailure::Rejected(BackendError::Unsupported)),
         }
+    }
+
+    /// Submit a non-empty, dependency-ordered program list as one event.
+    ///
+    /// The default rejects the native extension. A backend accepting it must
+    /// preserve slice order, honor every member's
+    /// [`barrier`](OrderedExecution::barrier), and signal completion only
+    /// after every member is complete. A member whose launch shape the
+    /// backend cannot honor rejects the whole list. Failure is atomic with
+    /// respect to acceptance: a rejected call publishes no member, while an
+    /// indeterminate call returns the one event retaining the entire list.
+    fn submit_ordered(
+        &self,
+        queue: &Self::Queue,
+        executions: &[OrderedExecution<'_, Self::Program, Self::Buffer>],
+        timeout: Timeout,
+    ) -> Result<Self::Event, SubmitFailure<Self::Event>> {
+        let _ = (queue, executions, timeout);
+        Err(SubmitFailure::Rejected(BackendError::Unsupported))
     }
 }
 

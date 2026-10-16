@@ -20,8 +20,8 @@ use kore_rt::cap::{ExecutableCode, ExecutableMapping, MappedLeaseView, StashedLe
 use kore_rt::entry::Rt;
 
 use crate::{
-    HostModule, LoadError, MAX_LOADED_MODULES, MAX_MODULE_BYTES, MAX_SEARCH_PATH, ModuleKind,
-    Search, compose_path, object_name, read_views,
+    HostModule, LIBS_VIEW, LoadError, MAX_LOADED_MODULES, MAX_MODULE_BYTES, MAX_SEARCH_PATH,
+    ModuleKind, Search, compose_path, library_grant, object_name, read_views,
 };
 
 /// Bytes the TLS layout's tables may carve for a scope of at most
@@ -169,11 +169,15 @@ impl Loader {
         result
     }
 
-    /// Link `<stem>.so` from the search list into the task.
+    /// Link `<stem>.so` from the task's library view into the task.
+    ///
+    /// No search list: native code resolves only through the READ-only
+    /// [`LIBS_VIEW`](crate::LIBS_VIEW) edge ([`open_library`]), never the
+    /// task's own tree — the crate doc's provenance rule, held here rather
+    /// than by each caller's choice of prefixes.
     pub async fn load_native(
         &mut self,
         fs: &mut Fs<'_, '_>,
-        search: Search<'_>,
         stem: &[u8],
     ) -> Result<ModuleId, LoadError> {
         if let Some(id) = self.find(stem) {
@@ -183,7 +187,7 @@ impl Loader {
             return Err(LoadError::TooMany);
         }
         let name = object_name(ModuleKind::Native, stem).ok_or(LoadError::Name)?;
-        let view = open_in(fs, search, &name).await?;
+        let view = open_library(fs, &name).await?;
         let bytes = match Self::stage(fs, &view).await {
             Ok(bytes) => {
                 fs.close(view).await;
@@ -476,6 +480,22 @@ impl Loader {
     pub fn host_name(rt: &Rt) -> Option<ImageName> {
         rt.ld().map(|ld| ld.exe_name)
     }
+}
+
+/// Open `name` in the task's library view.
+///
+/// The edge is entered as the grant it is ([`Fs::named_grant_entry`] then
+/// [`Fs::open_grant`]), not by walking `libs/<name>`: a path walk asks the
+/// task's own root first, so a `libs` directory the task made there (where
+/// the view's install collided) would answer instead.  [`library_grant`]
+/// refuses an edge the task could write beneath.
+async fn open_library(fs: &mut Fs<'_, '_>, name: &Name) -> Result<View, LoadError> {
+    let view = Name::from_bytes(LIBS_VIEW.as_bytes()).map_err(|_| LoadError::Name)?;
+    let grant = library_grant(fs.named_grant_entry(&view).await?)?;
+    let libs = fs.open_grant(grant, WALK_READ).await?;
+    let member = fs.open_at(&libs, *name, WALK_READ).await;
+    fs.close(libs).await;
+    member.map_err(LoadError::from)
 }
 
 /// Open `name` under the first prefix that holds it.

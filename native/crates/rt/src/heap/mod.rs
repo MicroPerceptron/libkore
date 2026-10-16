@@ -56,8 +56,8 @@ mod source;
 pub use crate::mem_source::MemSource;
 #[cfg(target_os = "none")]
 pub use source::carve_and_map;
-pub use source::{adopt_supply, reserve_from_top};
 pub use source::{HeapSupplySource, StaticMemSource};
+pub use source::{adopt_supply, reserve_from_top};
 
 use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
 use core::ptr::NonNull;

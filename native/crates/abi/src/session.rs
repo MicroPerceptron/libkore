@@ -968,6 +968,19 @@ pub enum Status {
     /// on the frozen vocabulary; older decoders read the raw value as
     /// [`Malformed`](Self::Malformed), which is equally terminal.
     Unfounded = 11,
+    /// A memory-fabric route overlaps an independently admitted exclusive
+    /// mapping. The caller must retire the alias before opening this route.
+    FabricRouteConflict = 12,
+    /// The registration or requested range has no executable route edge.
+    FabricRouteNoEdge = 13,
+    /// The requested route access exceeds its registered lending window.
+    FabricRouteWrongAccess = 14,
+    /// The live fabric facts reject the requested route or generation.
+    FabricRouteInfeasible = 15,
+    /// Route identity or per-supply claim storage is exhausted.
+    FabricRouteCapacity = 16,
+    /// The registration capability could not authorize a route child.
+    FabricRouteCapability = 17,
 }
 
 /// Hard cap on a session's invocation count — heapless, fixed-capacity
@@ -1244,7 +1257,7 @@ const _: () = {
     // Resource-kind derives occupy the low, append-only band.  START owns one
     // value in the global high-flavor band, and must remain distinct from
     // every defined flavor even where subject kinds currently disambiguate.
-    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_TASK_START as u16);
+    assert!((crate::cap::ResourceKind::MemoryController as u16) < DERIVE_KIND_TASK_START as u16);
     assert!(DERIVE_KIND_TASK_START != DERIVE_KIND_IOVA_ANON);
     assert!(DERIVE_KIND_TASK_START != DERIVE_KIND_SET_TP);
     assert!(DERIVE_KIND_TASK_START != DERIVE_KIND_PROTECT);
@@ -1264,7 +1277,7 @@ const _: () = {
     assert!(DERIVE_KIND_ARENA_EXTEND != DERIVE_KIND_DEVICE_RECORD);
     assert!(DERIVE_KIND_ARENA_EXTEND != DERIVE_KIND_IOVA_ANON);
     assert!(DERIVE_KIND_ARENA_EXTEND != DERIVE_KIND_EXEC_SEAL);
-    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_ARENA_EXTEND as u16);
+    assert!((crate::cap::ResourceKind::MemoryController as u16) < DERIVE_KIND_ARENA_EXTEND as u16);
     // DEVICE_ACTIVATE shares the PciDevice subject with resource derives but
     // owns the next high-band byte; keep it distinct from every effect flavor.
     assert!(DERIVE_KIND_DEVICE_ACTIVATE != DERIVE_KIND_ARENA_EXTEND);
@@ -1273,13 +1286,13 @@ const _: () = {
     assert!(DERIVE_KIND_DEVICE_ACTIVATE != DERIVE_KIND_TASK_JOIN);
     assert!(DERIVE_KIND_DEVICE_ACTIVATE != DERIVE_KIND_DEVICE_RECORD);
     assert!(DERIVE_KIND_DEVICE_ACTIVATE != DERIVE_KIND_IOVA_ANON);
-    // DeviceMmu is the current highest resource kind; the whole band must
+    // MemoryController is the current highest resource kind; the whole band must
     // stay below the derive-kind flavors.
-    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_DEVICE_ACTIVATE as u16);
+    assert!((crate::cap::ResourceKind::MemoryController as u16) < DERIVE_KIND_DEVICE_ACTIVATE as u16);
     // The strict MSI-X route shares the PciDevice subject with ordinary route,
     // BAR, self-grant, and DEVICE_ACTIVATE derives. Its high flavor must remain
     // outside the resource band and distinct from the other PciDevice effect.
-    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_IRQ_ROUTE_MSIX as u16);
+    assert!((crate::cap::ResourceKind::MemoryController as u16) < DERIVE_KIND_IRQ_ROUTE_MSIX as u16);
     assert!(DERIVE_KIND_IRQ_ROUTE_MSIX != DERIVE_KIND_DEVICE_ACTIVATE);
     assert!(DERIVE_KIND_IRQ_ROUTE_MSIX != DERIVE_KIND_SYSTEM_OBSERVE);
     // The I2C-HID observation shares the PciDevice subject with BAR, route,
@@ -1293,7 +1306,7 @@ const _: () = {
     );
     assert!(DERIVE_KIND_I2C_HID_READY_ROUTE != DERIVE_KIND_IRQ_ROUTE_LINE);
     assert!(DERIVE_KIND_I2C_HID_READY_ROUTE != DERIVE_KIND_I2C_HID_RECORD);
-    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_PEER_IOVA as u16);
+    assert!((crate::cap::ResourceKind::MemoryController as u16) < DERIVE_KIND_PEER_IOVA as u16);
     assert!(DERIVE_KIND_PEER_IOVA != DERIVE_KIND_IRQ_ROUTE_MSIX);
     assert!(DERIVE_KIND_PEER_IOVA != DERIVE_KIND_DEVICE_ACTIVATE);
     // Task-subject flavors must be pairwise distinct for the same reason
@@ -1368,7 +1381,7 @@ const DERIVE_FLAVORS: [u8; 35] = [
 /// refuses it rather than running it as an unflavored derive (the
 /// `Revoke` arm's rule, finally applied to `Derive`).
 pub const fn derive_kind_known(kind: u8) -> bool {
-    if kind <= crate::cap::ResourceKind::DeviceMmu as u8 {
+    if kind <= crate::cap::ResourceKind::MemoryController as u8 {
         return true;
     }
     let mut i = 0;
@@ -1387,7 +1400,7 @@ const _: () = {
     // admit would swallow a flavor.
     let mut i = 0;
     while i < DERIVE_FLAVORS.len() {
-        assert!(DERIVE_FLAVORS[i] > crate::cap::ResourceKind::DeviceMmu as u8);
+        assert!(DERIVE_FLAVORS[i] > crate::cap::ResourceKind::MemoryController as u8);
         i += 1;
     }
 };
@@ -1531,6 +1544,12 @@ impl Committed {
             9 => Status::Exited,
             10 => Status::AltDelivery,
             11 => Status::Unfounded,
+            12 => Status::FabricRouteConflict,
+            13 => Status::FabricRouteNoEdge,
+            14 => Status::FabricRouteWrongAccess,
+            15 => Status::FabricRouteInfeasible,
+            16 => Status::FabricRouteCapacity,
+            17 => Status::FabricRouteCapability,
             _ => Status::Malformed,
         }
     }
@@ -1947,14 +1966,28 @@ pub struct ViewMapReq {
     /// `0` for ordinary cursor placement. For `SURFACES`, selects one of
     /// [`SurfaceMapLane`]'s two fixed halves.
     pub lane: u8,
-    pub reserved: [u8; 5],
+    /// [`VIEW_MAP_SINK`], or zero. (Formerly the first reserved byte, so a
+    /// zeroed request keeps its meaning.)
+    pub flags: u8,
+    pub reserved: [u8; 4],
 }
+
+/// [`ViewMapReq::flags`]: when the lessor's lease dies under this mapping,
+/// repoint its pages at the receiver space's sink page instead of unmapping
+/// them (`res/STORAGE_TRANSPORT.md` §12, option B). For a row that reads a
+/// client-funded ring asynchronously: a dead client leaves it bytes that mean
+/// nothing, never a fault. The mapping takes base-page grain. `MAP` window
+/// only.
+pub const VIEW_MAP_SINK: u8 = 1;
 
 impl ViewMapReq {
     pub const WIRE: usize = 8;
 
     pub fn placement(&self) -> Option<ViewMapWindow> {
-        if self.reserved != [0; 5] {
+        if self.reserved != [0; 4] || self.flags & !VIEW_MAP_SINK != 0 {
+            return None;
+        }
+        if self.sink() && self.window.get() != crate::task::geom::MAP {
             return None;
         }
         match self.window.get() {
@@ -1965,6 +1998,12 @@ impl ViewMapReq {
             }
             _ => None,
         }
+    }
+
+    /// Whether the mapping sinks rather than unmaps when its lessor dies
+    /// ([`VIEW_MAP_SINK`]).
+    pub fn sink(&self) -> bool {
+        self.flags & VIEW_MAP_SINK != 0
     }
 
     pub fn surface_lane(&self) -> Option<SurfaceMapLane> {
@@ -2245,6 +2284,28 @@ pub const REVOKE_KIND_UNSHARE_IOVA: u8 = 6;
 /// executable at the same instant, through any alias. What it removes is
 /// only the need to *abandon* an arena to rewrite it.
 pub const REVOKE_KIND_EXEC_RETURN: u8 = 7;
+
+/// The [`Invocation::kind`] selector for **live** exact IOVA unshare through
+/// [`OpCode::Revoke`] — [`REVOKE_KIND_UNSHARE_IOVA`] for a requester that
+/// keeps running (`res/STORAGE_TRANSPORT.md` §11).
+///
+/// Authentication, argument ([`UnshareReq`]) and share-list effect are those
+/// of [`REVOKE_KIND_UNSHARE_IOVA`]. The physical half differs only in the
+/// latch: the plain kind closes the requester's DMA latch (Bus Master
+/// Enable) before the unmap and leaves it closed, which a driver must then
+/// reopen for every surviving window. This kind leaves an active latch
+/// open. It removes the window's leaves, completes the page-selective
+/// IOTLB and device-TLB invalidation with drain, and only then releases the
+/// window's identity, so any access the device still makes through the
+/// window is refused by the IOMMU and recorded as a translation fault
+/// instead of reaching the backing. Proving that no command still names the
+/// window is the caller's own correctness, not the kernel's safety.
+///
+/// A requester that is not active retires as under the plain kind. So does
+/// an active requester whose latch rests on this window when no other window
+/// shares its domain: the latch closes with its last window. When another
+/// window survives, the latch re-anchors on it.
+pub const REVOKE_KIND_UNSHARE_IOVA_LIVE: u8 = 8;
 
 /// Argument payload for a **page delegation** derive (`Derive`,
 /// [`kind`](Invocation::kind)` = Region` on a held/staged `Region`
@@ -2608,6 +2669,29 @@ impl PowerReq {
     pub const WIRE: usize = 8;
 }
 
+/// `Derive` discriminator on a held `SystemPower` grant for a CPU performance
+/// preference effect. Kind zero remains the frozen machine-transition verb;
+/// this distinct kind cannot turn a malformed preference into a shutdown.
+pub const POWER_PERFORMANCE_KIND: u8 = 0xfe;
+/// Kernel-selected per-CPU preference. The 0–100 wire range remains manual.
+pub const POWER_PERFORMANCE_AUTO: u8 = 254;
+
+/// A machine-wide CPU performance preference, from energy saving (0) to
+/// maximum performance (100). This is a policy hint, not a frequency in MHz.
+/// The kernel applies it on each CPU through that CPU's performance facet.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, TryFromBytes, KnownLayout, Immutable, Unaligned)]
+pub struct PowerPerformanceReq {
+    /// Inclusive 0–100 manual preference, or [`POWER_PERFORMANCE_AUTO`].
+    pub level: u8,
+    /// Reserved; must be zero.
+    pub reserved: [u8; 7],
+}
+
+impl PowerPerformanceReq {
+    pub const WIRE: usize = 8;
+}
+
 /// One read-only machine metric exposed through `SystemObserve`.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, TryFromBytes, KnownLayout, Immutable, Unaligned)]
@@ -2622,12 +2706,16 @@ pub enum SystemMetric {
     KernelHeap = 4,
     /// Conservative largest single kernel-heap free run.
     KernelHeapLargest = 5,
-    /// Cumulative IOMMU translation-fault records drained since boot;
-    /// auxiliary = the LAST record, packed (`[15:0]` source-id,
-    /// `[23:16]` raw reason, `[24]` write, `[63:25]` faulting-IOVA
-    /// page).  Sampling DRAINS any records still latched in hardware —
-    /// the IOMMU's own testimony that a device DMA'd and translation
-    /// refused it, and a serial-less machine's only view of it.
+    /// The IOMMU fault census word: `[31:0]` cumulative translation-fault
+    /// records drained since boot, `[47:32]` hardware fault-log overflows
+    /// (records the unit discarded before any drain saw them), `[63:48]`
+    /// fault-event interrupts landed (zero on a machine whose fault lane
+    /// never fired, so every record here came from a polled drain); each
+    /// field saturates.  Auxiliary = the LAST record, packed (`[15:0]`
+    /// source-id, `[23:16]` raw reason, `[24]` write, `[63:25]`
+    /// faulting-IOVA page).  Sampling DRAINS any records still latched in
+    /// hardware — the IOMMU's own testimony that a device DMA'd and
+    /// translation refused it, and a serial-less machine's only view of it.
     IommuFaults = 6,
     /// Live memory-fabric domain registrations (res/MEMORY_FABRIC.md, #697);
     /// value packs domain count in the low word and registry capacity in the
@@ -2713,6 +2801,100 @@ pub enum SystemMetric {
     /// scrub fill in 100 MB/s units in `[63:40]`; all zero when that CPU
     /// was not measured (no run to lend, or it never answered).
     ProcessorStream = 22,
+    /// Committed CPU preference: value 0–100, or 255 when no preference has
+    /// been set and the firmware's initial HWP request remains in force.
+    /// Auxiliary is zero. This reports policy, not delivered clock speed.
+    CpuPerformance = 23,
+    /// Latest owner interval duration and busy-time delta.
+    ProcessorWindow = 24,
+    /// Publication sequence and owner-local monotonic sample time.
+    ProcessorCountersStamp = 25,
+    /// Retired instructions and unhalted core cycles.
+    ProcessorCountersExecution = 26,
+    /// Profile-specific FP event and L2 request misses.
+    ProcessorCountersMemory = 27,
+    /// Profile-specific extra event and configuration.
+    ProcessorCountersExtra = 28,
+    /// Profile-specific cache fill or coherence-stall counter.
+    ProcessorCountersTraffic = 29,
+    /// Boot-frozen CPU count; no aggregate runtime scan.
+    ProcessorCount = 30,
+    /// Request a kernel-bounded telemetry cache refresh; returns start/deadline.
+    /// Operand 0 measures scheduler busy time alone; 1 also reads the boot-owned
+    /// PMU counters. No caller-selected events or register authority move.
+    ProcessorCapture = 31,
+    /// Live memory-controller bytes per second; auxiliary is Kore's
+    /// concurrently measured sustained stream rate. Both zero means no
+    /// supported counter or no fresh interval, not idle DRAM.
+    MemoryTraffic = 32,
+    /// One retained IOMMU fault record: the operand counts back from the
+    /// newest (0 = the last drained), and the pair is
+    /// [`IommuFaultRecord::to_observation`] — the packed record as
+    /// [`IommuFaults`](Self::IommuFaults) carries it, with its drain
+    /// sequence and the moment it was drained.  Reading does not drain.
+    /// An operand past what the kernel retains
+    /// ([`IOMMU_FAULT_RING`]) or past the tally refuses, so a reader walks
+    /// from 0 until refused.
+    IommuFaultRecord = 33,
+    /// Catalog controller count; auxiliary = units recorded unresponsive.
+    IommuCount = 34,
+    /// Indexed immutable descriptor, Unit::identity() observation.
+    IommuUnit = 35,
+    /// Indexed capabilities and scope counts, Unit::features() observation.
+    IommuUnitFeatures = 36,
+}
+
+/// Records the kernel retains for [`SystemMetric::IommuFaultRecord`].
+pub const IOMMU_FAULT_RING: u16 = 16;
+
+/// One retained IOMMU fault record, as [`SystemMetric::IommuFaultRecord`]
+/// carries it.  Testimony only; it grants nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IommuFaultRecord {
+    /// The record, packed as the [`IommuFaults`](SystemMetric::IommuFaults)
+    /// auxiliary: `[15:0]` source-id, `[23:16]` raw reason, `[24]` write,
+    /// `[63:25]` faulting-IOVA page.
+    pub packed: u64,
+    /// Its 1-based place in the drain order (saturating at 24 bits).
+    pub sequence: u32,
+    /// Monotonic microseconds since boot at the drain (saturating at 40
+    /// bits — thirty-five years).
+    pub at_us: u64,
+}
+
+impl IommuFaultRecord {
+    /// `value` = the packed record; `aux` = microseconds in `[39:0]` and
+    /// the sequence in `[63:40]`.
+    pub const fn to_observation(self) -> (u64, u64) {
+        (
+            self.packed,
+            Self::aux_of(self.sequence as u64, self.at_us * 1000),
+        )
+    }
+
+    /// The auxiliary word for a record drained `at_ns` as the `sequence`-th.
+    pub const fn aux_of(sequence: u64, at_ns: u64) -> u64 {
+        let us = at_ns / 1000;
+        let us = if us > (1 << 40) - 1 {
+            (1 << 40) - 1
+        } else {
+            us
+        };
+        let sequence = if sequence > (1 << 24) - 1 {
+            (1 << 24) - 1
+        } else {
+            sequence
+        };
+        us | sequence << 40
+    }
+
+    pub const fn from_observation(value: u64, aux: u64) -> Self {
+        Self {
+            packed: value,
+            sequence: (aux >> 40) as u32,
+            at_us: aux & ((1 << 40) - 1),
+        }
+    }
 }
 
 /// The three physical frame-size classes, as the census operand names them.
@@ -3031,6 +3213,7 @@ impl SystemObserveReq {
         matches!(
             metric,
             SystemMetric::DeviceRow
+                | SystemMetric::ProcessorCapture
                 | SystemMetric::ProcessorIdentity
                 | SystemMetric::ProcessorTopology
                 | SystemMetric::ProcessorCache
@@ -3038,6 +3221,15 @@ impl SystemObserveReq {
                 | SystemMetric::MemoryClass
                 | SystemMetric::MemoryStream
                 | SystemMetric::ProcessorStream
+                | SystemMetric::IommuFaultRecord
+                | SystemMetric::IommuUnit
+                | SystemMetric::IommuUnitFeatures
+                | SystemMetric::ProcessorWindow
+                | SystemMetric::ProcessorCountersStamp
+                | SystemMetric::ProcessorCountersExecution
+                | SystemMetric::ProcessorCountersMemory
+                | SystemMetric::ProcessorCountersExtra
+                | SystemMetric::ProcessorCountersTraffic
         )
     }
 
@@ -3581,6 +3773,8 @@ pub struct FabricRouteInfo {
     pub access: u8,
     /// CPU map=0, IOMMU map=1. Other operations have no mapping admission.
     pub operation: u8,
+    /// Largest page alignment preserved by the route's exact backing.
+    pub align_log2: u8,
 }
 pub const FABRIC_ROUTE_INFO_KIND: u16 = 0xFF10;
 pub const FABRIC_ROUTE_INFO_MAGIC: u64 = 0x6B6F_7265_4652_494E;
@@ -3588,15 +3782,23 @@ impl FabricRouteInfo {
     pub fn encode(self) -> crate::cap::CapRecord {
         let mut rec = inert_frame(FABRIC_ROUTE_INFO_KIND, FABRIC_ROUTE_INFO_MAGIC);
         rec.scope_rid = self.bytes;
-        rec.holder = crate::cap::Cid(u64::from(self.access) | (u64::from(self.operation) << 8));
+        rec.holder = crate::cap::Cid(
+            u64::from(self.access)
+                | (u64::from(self.operation) << 8)
+                | (u64::from(self.align_log2) << 16),
+        );
         rec
     }
     pub fn decode(rec: &crate::cap::CapRecord) -> Option<Self> {
         if !is_inert_report(rec, FABRIC_ROUTE_INFO_KIND, FABRIC_ROUTE_INFO_MAGIC)
             || rec.scope_rid == 0
             || rec.scope_rid % 4096 != 0
-            || rec.holder.0 & !0x107 != 0
+            || rec.holder.0 & !0x00ff_0107 != 0
             || rec.holder.0 & 3 == 0
+            || !matches!(
+                (rec.holder.0 >> 16) as u8,
+                LEASE_ALIGN_4K | LEASE_ALIGN_2M | LEASE_ALIGN_1G
+            )
             || !rec.rights.is_empty()
             || rec.epoch != 0
             || rec.chain_len != 0
@@ -3609,6 +3811,7 @@ impl FabricRouteInfo {
             bytes: rec.scope_rid,
             access: rec.holder.0 as u8,
             operation: (rec.holder.0 >> 8) as u8,
+            align_log2: (rec.holder.0 >> 16) as u8,
         })
     }
 }
@@ -4826,6 +5029,13 @@ mod tests {
             Status::Irq,
             Status::Exited,
             Status::AltDelivery,
+            Status::Unfounded,
+            Status::FabricRouteConflict,
+            Status::FabricRouteNoEdge,
+            Status::FabricRouteWrongAccess,
+            Status::FabricRouteInfeasible,
+            Status::FabricRouteCapacity,
+            Status::FabricRouteCapability,
         ];
         for s in all {
             for index in [0u16, 1, 7, 63, u16::MAX] {
@@ -5109,7 +5319,20 @@ mod tests {
                 req.surface_lane(),
                 (window == ViewMapWindow::Surfaces).then_some(SurfaceMapLane::First)
             );
-            for at in 3..bytes.len() {
+            // Byte 3 is the flags byte: the sink bit is admitted on MAP only,
+            // an unknown bit never. Bytes 4.. stay reserved.
+            let mut sink = bytes;
+            sink[3] = VIEW_MAP_SINK;
+            let (req, _) = ViewMapReq::try_ref_from_prefix(&sink).unwrap();
+            assert_eq!(
+                req.placement(),
+                (window == ViewMapWindow::Map).then_some(ViewMapWindow::Map)
+            );
+            let mut unknown = bytes;
+            unknown[3] = 2;
+            let (req, _) = ViewMapReq::try_ref_from_prefix(&unknown).unwrap();
+            assert_eq!(req.placement(), None);
+            for at in 4..bytes.len() {
                 let mut dirty = bytes;
                 dirty[at] = 1;
                 let (req, _) = ViewMapReq::try_ref_from_prefix(&dirty).unwrap();
@@ -5128,7 +5351,8 @@ mod tests {
         let invalid_map_lane = ViewMapReq {
             window: ViewMapWindow::Map.role().into(),
             lane: SurfaceMapLane::Second as u8,
-            reserved: [0; 5],
+            flags: 0,
+            reserved: [0; 4],
         };
         assert_eq!(invalid_map_lane.placement(), None);
         for role in [
@@ -5140,10 +5364,27 @@ mod tests {
             let req = ViewMapReq {
                 window: role.into(),
                 lane: 0,
-                reserved: [0; 5],
+                flags: 0,
+                reserved: [0; 4],
             };
             assert_eq!(req.placement(), None);
         }
+        // The sink flag is admitted on MAP alone; an unknown flag refuses.
+        let sink = ViewMapReq {
+            window: ViewMapWindow::Map.role().into(),
+            lane: 0,
+            flags: VIEW_MAP_SINK,
+            reserved: [0; 4],
+        };
+        assert_eq!(sink.placement(), Some(ViewMapWindow::Map));
+        assert!(sink.sink());
+        let sink_heap = ViewMapReq {
+            window: ViewMapWindow::Heap.role().into(),
+            ..sink
+        };
+        assert_eq!(sink_heap.placement(), None);
+        let unknown = ViewMapReq { flags: 2, ..sink };
+        assert_eq!(unknown.placement(), None);
     }
 
     #[test]
@@ -5387,10 +5628,11 @@ mod tests {
             bytes: 8192,
             access: 7,
             operation: 1,
+            align_log2: LEASE_ALIGN_2M,
         };
         let record = info.encode();
         assert_eq!(FabricRouteInfo::decode(&record), Some(info));
-        for flags in [0, 4, 8, 0x203, 0x108] {
+        for flags in [0, 4, 8, 0x203, 0x108, 13 << 16, 31 << 16] {
             let mut bad = record;
             bad.holder = crate::cap::Cid(flags);
             assert!(FabricRouteInfo::decode(&bad).is_none());
@@ -5569,7 +5811,7 @@ mod tests {
             }
             if kind == FABRIC_ROUTE_INFO_KIND {
                 rec.scope_rid = 4096;
-                rec.holder = crate::cap::Cid(0x103);
+                rec.holder = crate::cap::Cid(0x103 | (u64::from(LEASE_ALIGN_4K) << 16));
             }
             if kind == SYSTEM_OBSERVE_REPORT_KIND {
                 rec.chain_len = SystemMetric::Clock as u8;

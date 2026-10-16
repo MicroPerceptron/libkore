@@ -598,6 +598,11 @@ pub mod op {
     /// read-write destination necessarily passed the stronger read proof. The
     /// SQE carries indices only and cannot supply a missing topology proof.
     pub const PEER_COPY: u8 = KORE_BASE + 2;
+    /// Storage-transport **discard** (`res/STORAGE_TRANSPORT.md` §4): the
+    /// grant's range `[off, off + len)` no longer holds data the client
+    /// needs. Carries no target (`buf_index` ignored). Needs the grant's
+    /// discard right; a device without deallocate completes it as a no-op.
+    pub const DISCARD: u8 = KORE_BASE + 3;
 }
 
 #[cfg(test)]

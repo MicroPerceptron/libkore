@@ -1218,11 +1218,11 @@ pub(crate) fn spawn_gang_workers(
     // whose per-worker kick-mesh endows name PEER BANDS and therefore
     // cannot exist yet: they are built below, after the claims loop
     // fixes every member's band.  A meshed chunk is invocation-bounded
-    // at [`MESH_CHUNK`](crate::star::MESH_CHUNK) (n·(n+5) ≤ 107).
+    // at [`MESH_CEILING`](crate::star::MESH_CEILING) (n·(n+6) invocations).
     if !endows.is_empty() && (endows.len() != n || star.is_some()) {
         return false;
     }
-    if star.is_some() && n > crate::star::MESH_CHUNK {
+    if star.is_some() && n > crate::star::MESH_CEILING {
         return false;
     }
     let Some(self_space) = crate::entry::geometry::self_space_slot() else {
@@ -1386,7 +1386,7 @@ pub(crate) fn spawn_gang_workers(
         kind: 0,
         rights: kore_abi::cap::Rights::empty(),
     };
-    let mut mesh_store = [[vacant_cap; { crate::star::MESH_CHUNK + 1 }]; MAX_SESSION_FOUNDS];
+    let mut mesh_store = [[vacant_cap; { crate::star::MESH_CEILING + 2 }]; MAX_SESSION_FOUNDS];
     let mut mesh_lens = [0usize; MAX_SESSION_FOUNDS];
     if let Some(plan) = star {
         let mut bands = [(0usize, 0u32); MAX_SESSION_FOUNDS];
@@ -2283,7 +2283,8 @@ mod tests {
     fn worker_bootstrap_does_not_inherit_process_attachments() {
         use kore_abi::process::{
             PROCESS_IO_INDEX, PROCESS_IO_ROLE, PROCESS_OUTPUT_WAKE_INDEX, PROCESS_OUTPUT_WAKE_ROLE,
-            PROCESS_STDIN_WAKE_INDEX, PROCESS_STDIN_WAKE_ROLE, PROCESS_STDIO_INDEX,
+            PROCESS_STDIO_HOST_CHANNEL_INDEX, PROCESS_STDIN_WAKE_INDEX, PROCESS_STDIN_WAKE_ROLE,
+            PROCESS_STDIO_HOST_INDEX, PROCESS_STDIO_HOST_ROLE, PROCESS_STDIO_INDEX,
             PROCESS_STDIO_ROLE, PROCESS_STDIO_WAKE_RIGHTS,
         };
 
@@ -2301,6 +2302,8 @@ mod tests {
             (PROCESS_STDIO_ROLE, PROCESS_STDIO_INDEX),
             (PROCESS_STDIN_WAKE_ROLE, PROCESS_STDIN_WAKE_INDEX),
             (PROCESS_OUTPUT_WAKE_ROLE, PROCESS_OUTPUT_WAKE_INDEX),
+            (PROCESS_STDIO_HOST_ROLE, PROCESS_STDIO_HOST_INDEX),
+            (PROCESS_STDIO_HOST_ROLE, PROCESS_STDIO_HOST_CHANNEL_INDEX),
         ] {
             assert_eq!(
                 bootstrap.handle(role, index),

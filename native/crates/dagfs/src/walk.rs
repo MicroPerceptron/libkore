@@ -9,8 +9,9 @@
 //! needs a live pair.
 
 use crate::{
-    Fs, FsError, FsRequest, FsResponse, GrantId, Handle, Name, ObjectKind, ObjectSubtype, Refusal,
-    Revision, Rights, StableObjectId, Stat, bounds::MAX_PATH_DEPTH, path, read_grant_entry,
+    Fs, FsError, FsRequest, FsResponse, GrantEntry, GrantId, Handle, Name, ObjectKind,
+    ObjectSubtype, Refusal, Revision, Rights, StableObjectId, Stat, bounds::MAX_PATH_DEPTH, path,
+    read_grant_entry,
 };
 
 /// The three masks a verb walks with.
@@ -282,6 +283,14 @@ impl<'w, 't> Fs<'w, 't> {
 
     /// Find a named authority edge in this task's view.
     pub async fn named_grant(&mut self, name: &Name) -> Result<Option<GrantId>, Refusal> {
+        Ok(self.named_grant_entry(name).await?.map(|entry| entry.grant))
+    }
+
+    /// [`named_grant`](Self::named_grant) with the edge's listed rights, for
+    /// a caller whose decision depends on what the edge permits — not only
+    /// on its name. Never a containment child of the root: only an edge
+    /// granted to this session answers.
+    pub async fn named_grant_entry(&mut self, name: &Name) -> Result<Option<GrantEntry>, Refusal> {
         let FsResponse::GrantsListed { entries } = self
             .checked(&FsRequest::ListGrants { window_offset: 0 })
             .await?
@@ -291,7 +300,7 @@ impl<'w, 't> Fs<'w, 't> {
         for index in 0..entries as usize {
             let entry = read_grant_entry(&self.window[..], 0, index).map_err(Refusal::Fs)?;
             if !entry.is_private_root && entry.display_name.as_ref() == Some(name) {
-                return Ok(Some(entry.grant));
+                return Ok(Some(entry));
             }
         }
         Ok(None)

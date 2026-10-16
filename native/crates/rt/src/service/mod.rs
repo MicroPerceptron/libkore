@@ -499,6 +499,20 @@ pub trait SystemService: crate::svc::SvcProtocol + Sized {
         true
     }
 
+    /// Advance service-owned device work on **every** executor wake of the
+    /// generic host, request-bearing or not.
+    ///
+    /// A driver row whose parks include its device route
+    /// ([`enable_irq_parks`](crate::executor::enable_irq_parks)) is re-polled
+    /// on each interrupt, but the ordinary loop finds no ring work on such a
+    /// wake and parks again: a completion the row itself must reap and
+    /// refill (a queue kept at depth for a client that is not calling)
+    /// would otherwise wait for the next request. This hook is that reap.
+    ///
+    /// It must be bounded and must never wait: it runs inside the host's
+    /// poll, before the request rings are drained. The default is inert.
+    fn poll_background(&mut self) {}
+
     /// Earliest absolute monotonic deadline owned by this service. Ordinary
     /// request-only services keep the inert default.
     fn next_deadline(&self) -> Option<u64> {
