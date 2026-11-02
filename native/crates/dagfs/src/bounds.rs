@@ -14,19 +14,20 @@
 //! | Constant | Value | Dominant cost |
 //! |---|---|---|
 //! | [`MAX_OBJECTS`] | 512 | 512 × ~48 B ≈ 24 KiB |
-//! | [`MAX_DIRECTORIES`] × [`MAX_DIR_ENTRIES`] | 64 × 128 | ≈ 328 KiB |
+//! | live directories × [`MAX_DIR_ENTRIES`] | ≤ 512 × 128 | ≈ 7 KiB per live directory, allocated when it is created |
 //! | [`MAX_NAME_LEN`] | 32 | (per entry, inline) |
 //! | [`RAM_CHUNKS`] × [`RAM_CHUNK_BYTES`] | 64 × 256 | 16 KiB pool |
-//! | `MAX_SESSIONS` (service-side) × [`MAX_HANDLES_PER_SESSION`] | 12 × 32 | ≈ 212 KiB |
+//! | [`MAX_HANDLES_PER_SESSION`] + [`MAX_EDGES_PER_SESSION`] | 32 + 32 | ≈ 5.7 KiB per attached session slot, allocated when the slot first attaches |
 //! | [`MAX_PLACEMENTS`] | 72 | ≈ 5 KiB RAM placement table |
 //! | [`MAX_BLOCK_PLACEMENTS`] | 1024 | file (≤512) + durable-derived (≤512); block provider only |
 //! | [`MAX_BLOCK_EXTENT_NODES`] | 6147 | ≈ 192 KiB heap-backed 32-byte nodes + free heap; block provider only |
-//! | [`MAX_AUTHORITY_EDGES`] | 64 | ≈ 4 KiB |
 //!
 //! Directory child lists live in their own arena rather than inside
 //! [`MAX_OBJECTS`] precisely so a *file* object does not reserve directory
 //! space: an inline `Body::Directory` would have made every object as large
-//! as the largest directory.
+//! as the largest directory.  The arena reserves only a slot per possible
+//! directory; a directory's child list is allocated when the directory is
+//! created and freed when it is reclaimed, so the cost follows the tree.
 //!
 //! The volume-scaled tables are **heap reservations, not inline fields**:
 //! since `res/FILESYSTEM_SCALE.md` stage B the object, directory, placement,
@@ -43,16 +44,15 @@
 //! ## Deliberately compact presentation bounds
 //!
 //! [`MAX_NAME_LEN`] is **32**, not POSIX's common 255-byte ceiling. Names are
-//! stored inline in a directory's entry slots, so the
-//! component maximum multiplies by [`MAX_DIR_ENTRIES`] × [`MAX_DIRECTORIES`]:
-//! at 255 bytes the directory arena alone would be ~140 KiB, more than
-//! everything else combined. Thirty-two bytes covers every current native
+//! stored inline in a directory's entry slots, so the component maximum
+//! multiplies by [`MAX_DIR_ENTRIES`] in every live directory's table: at 255
+//! bytes one directory would be ~33 KiB. Thirty-two bytes covers every current native
 //! service, shell, and gate name.
 //!
-//! [`MAX_PATH_DEPTH`] is **32**, raised from 8 on measurement. It is the
-//! length of the edge proof stored in *every* open handle, so it multiplies
-//! by the handle arena — session-scaled and heap-backed now — and it fixes
-//! the wire spelling of a search hit: `kore_abi::svc::FS_SEARCH_PATH_BYTES`
+//! [`MAX_PATH_DEPTH`] is **32**, raised from 8 on measurement. It bounds the
+//! edge proof an open handle carries, which the service stores at the depth
+//! actually walked, so it costs a handle only as deep as its path; and it
+//! fixes the wire spelling of a search hit: `kore_abi::svc::FS_SEARCH_PATH_BYTES`
 //! is pinned to `MAX_PATH_DEPTH × MAX_NAME_LEN` plus separators, and the
 //! assertion beside the bound refuses to compile a depth the wire cannot
 //! spell.
@@ -76,19 +76,15 @@
 /// constant.
 pub const MAX_OBJECTS: usize = 512;
 
-/// Raised 16 → 64. It no longer enters the durable reservation at all, since
-/// `MAX_DURABLE_EDGES` is decoupled from the directory × entry product, so
-/// this is now purely a service-heap cost. It must also stay comfortably
-/// above [`MAX_PATH_DEPTH`]: a chain as deep as the proof allows needs one
-/// directory per level, and when the two are equal the arena refuses before
-/// the depth bound can.
-///
-/// Maximum live directory *child lists*.  Every directory object owns one,
-/// so this is the ceiling on live directories — necessarily
-/// `<= MAX_OBJECTS`.  Exhaustion refuses with
-/// [`FsError::OutOfObjects`](crate::FsError::OutOfObjects), since from
-/// a client's view the thing that could not be created is the directory.
-pub const MAX_DIRECTORIES: usize = 64;
+/// Maximum live directory *child lists* — derived, not chosen.  Every
+/// directory is an object, so the object arena already bounds how many can
+/// exist; a separate knob could only refuse a directory the object arena had
+/// room for (it was raised 16 → 64 by hand before it was derived).  Each
+/// child list is allocated when its directory is created, so a high ceiling
+/// costs a slot, not a table.  Exhaustion refuses with
+/// [`FsError::OutOfObjects`](crate::FsError::OutOfObjects), since from a
+/// client's view the thing that could not be created is the directory.
+pub const MAX_DIRECTORIES: usize = MAX_OBJECTS;
 
 /// Maximum containment edges beneath one directory.  Exhaustion refuses with
 /// [`FsError::OutOfEdges`](crate::FsError::OutOfEdges).
@@ -108,8 +104,9 @@ pub const MAX_NAME_LEN: usize = 32;
 /// so more than half of ordinary content was literally unaddressable, while
 /// the deepest observed path was 28 (`res/FILESYSTEM_SCALE.md`). Costs
 /// nothing on disk — depth is client-side traversal, never a stored fact —
-/// and multiplies only the handle arena, which is session-scaled and now
-/// heap-backed. It does reach the wire: a search hit spells its path into
+/// and costs a handle only as deep as its own path: the service stores each
+/// proof at the depth walked, so the bound is a ceiling, not a reservation.
+/// It does reach the wire: a search hit spells its path into
 /// `kore_abi::svc::FS_SEARCH_PATH_BYTES`, pinned below.
 pub const MAX_PATH_DEPTH: usize = 32;
 
@@ -139,10 +136,31 @@ pub const MAX_TASK_VIEWS: usize = 4;
 /// halfway down. The two bounds are related and must move together.
 pub const MAX_HANDLES_PER_SESSION: usize = 32;
 
-/// Maximum live authority edges — private roots plus direct grants — across
-/// all sessions.  Exhaustion refuses with
+/// Maximum authority edges one session holds — its root, the store views a
+/// task view carries, the working directories pinned beneath it, and the
+/// grants others issue to it. Exhaustion refuses with
 /// [`FsError::OutOfEdges`](crate::FsError::OutOfEdges).
-pub const MAX_AUTHORITY_EDGES: usize = 64;
+///
+/// Per session, like [`MAX_HANDLES_PER_SESSION`], and for the same reason: a
+/// session's edges live beside its handles in storage of its own, so no
+/// session can spend another's, and the service's footprint follows the
+/// sessions actually attached rather than a machine-wide table. The edge a
+/// grant creates is stored with its *holder*. The service pins the bound
+/// against the most its own views can make one session hold (a task view's
+/// root, three store views and a pinned directory per invocation view).
+pub const MAX_EDGES_PER_SESSION: usize = 32;
+
+/// Maximum depth of a delegation lineage: an authority edge and the parents
+/// it was attenuated from, up to the root they all descend from. A grant
+/// that would sit deeper refuses with [`FsError::Range`](crate::FsError::Range).
+///
+/// Every operation revalidates its edge's whole lineage, so this bounds that
+/// walk, and the read guards it holds, independently of how many edges
+/// exist. The deepest chain the system builds itself — session zero's root,
+/// the system view, the administration root, the workspace, a home anchor, a
+/// task view, a pinned directory and a command's root — is eight edges; the
+/// rest is room for clients' own delegation.
+pub const MAX_LINEAGE_DEPTH: usize = 32;
 
 /// Maximum directory entries returned in one `list`
 /// page.  A larger directory is read across several calls via the returned
@@ -260,10 +278,13 @@ mod tests {
     use super::*;
 
     /// A directory object needs a child list, so the child-list arena must
-    /// not claim to hold more directories than there are objects.
+    /// not claim to hold more directories than there are objects — nor
+    /// fewer, which would refuse a directory the object arena has room for.
     #[test]
-    fn directory_arena_fits_inside_object_arena() {
-        assert!(MAX_DIRECTORIES <= MAX_OBJECTS);
+    fn directory_arena_is_the_object_arena() {
+        assert_eq!(MAX_DIRECTORIES, MAX_OBJECTS);
+        // A chain as deep as the proof allows needs one directory per level.
+        assert!(MAX_DIRECTORIES > MAX_PATH_DEPTH);
     }
 
     /// The edge proof is a `heapless::Vec<_, MAX_PATH_DEPTH>`; a traversal

@@ -56,9 +56,20 @@ pub const EVENT_ABI: u32 = 1;
 const ALIGN: usize = 64;
 
 /// Byte offset of the wake word (the producer's cache line).
-const SEQ_AT: usize = 64;
+pub const SEQ_AT: usize = 64;
 /// Byte offset of the park intent (the consumer's cache line).
-const PARKED_AT: usize = 128;
+pub const PARKED_AT: usize = 128;
+
+/// The park intent's **doorbell** value: the consumer committed to waiting
+/// on its executor's standing post, and a batch owes it a notice.
+pub const PARK_DOORBELL: u32 = 1;
+/// The park intent's **word** value: the consumer committed to waiting on
+/// the wake word itself through the kernel address-wait (`res/EVENT.md`
+/// §6), and a batch owes it a `wake_word` on that memory.  A producer that
+/// cannot name the word (no mapping of its own noted) sends the notice
+/// instead — the consumer's word park carries its doorbell post too, so
+/// either wake reaches it.
+pub const PARK_WORD: u32 = 2;
 /// Byte offset of the state block.
 const STATE_AT: usize = 192;
 
@@ -355,11 +366,28 @@ impl<S: EventState, R: RingRecord> EventSource<'_, S, R> {
     /// instead of waiting.
     #[must_use = "true means the consumer parked: a notice is owed"]
     pub fn commit(&mut self) -> bool {
+        self.commit_intent() != 0
+    }
+
+    /// [`commit`](Self::commit), answering the collected intent itself:
+    /// `0` = nobody parked, [`PARK_DOORBELL`] = a notice is owed,
+    /// [`PARK_WORD`] = the consumer is parked on the wake word (a
+    /// `wake_word` reaches it; so does a notice).  The runtime's
+    /// `commit_and_kick` chooses its kick by this word.
+    #[must_use = "a non-zero intent means the consumer parked: a wake is owed"]
+    pub fn commit_intent(&mut self) -> u32 {
         let seq = self.raw.seq();
         // `state` may already have advanced `seq`; a records-only batch
         // advances it here.  Always move it so one word means "new".
         seq.fetch_add(2, Ordering::SeqCst);
-        self.raw.parked().swap(0, Ordering::SeqCst) != 0
+        self.raw.parked().swap(0, Ordering::SeqCst)
+    }
+
+    /// The wake word itself — what the producer names to the kernel
+    /// address-wait's `wake_word` (by the mapping it holds, through
+    /// `kore_rt::cap::mapped::locate`).
+    pub fn seq_word(&self) -> &AtomicU32 {
+        self.raw.seq()
     }
 }
 
@@ -442,12 +470,24 @@ impl<S: EventState, R: RingRecord> EventSink<'_, S, R> {
     /// The intent may go stale (a later wake for an earlier park); a
     /// spurious notice is the harmless direction, exactly as in `futex`.
     pub fn park(&self, seen: u32) -> bool {
-        self.raw.parked().store(1, Ordering::SeqCst);
+        self.raw.parked().store(PARK_DOORBELL, Ordering::SeqCst);
         if self.raw.seq().load(Ordering::SeqCst) != seen {
             self.raw.parked().store(0, Ordering::SeqCst);
             return false;
         }
         true
+    }
+
+    /// Restate a committed intent as a **word** park ([`PARK_WORD`]): the
+    /// consumer is about to sleep on the wake word itself (the kernel
+    /// address-wait), so the producer may answer with a `wake_word`
+    /// instead of a notice.  Called after [`park`](Self::park) said the
+    /// wait stands, and again before every re-park; the value is a hint
+    /// about *how* to wake, and the Dekker proof is unchanged — the kernel
+    /// makes the final `seq` check against the physical word at park time,
+    /// so a batch landing after this store resolves the park at once.
+    pub fn park_on_word(&self) {
+        self.raw.parked().store(PARK_WORD, Ordering::SeqCst);
     }
 
     /// Withdraw a published park intent (a wait that ends for another

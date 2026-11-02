@@ -1,0 +1,44 @@
+# `kore-vol` — a kore volume, from the host: what a terminal's home holds, and
+# what the host built copied into it (`res/DAGFS.md`, "From the host"). It
+# finds, mounts and commits the volume through the filesystem row's own code
+# — `kore-svc-dagfs`'s locate, recovery and dual-root commit over
+# `kore-driver`'s block channel — so an image it writes is one the next boot
+# mounts as it would its own.
+[package]
+name = "kore-vol"
+version = "0.0.0"
+edition = "2024"
+description = "kore volume tool and library: list, read, install into and remove from a terminal's home on an offline disk image."
+publish = false
+
+# The procedure itself, for a host program that keeps machines (a VM
+# supervisor staging a project, a packager) — the binary below prints over
+# it, so both drive one copy of it.
+[lib]
+name = "kore_vol"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kore-vol"
+path = "src/main.rs"
+
+[dependencies]
+kore-svc-dagfs = { path = "../../services/dagfs" }
+# The image file as a block device (`image`), beside the channel the row
+# drives its own medium through.
+kore-driver = { path = "../../crates/driver", features = ["service", "image"] }
+# Each file's read-back is compared by digest with what was written. Default
+# features (std, and the SIMD backends): a host tool, the same lockfile
+# entry the filesystem service takes `pure`.
+blake3 = "1.8.7"
+
+# A machine's disk (`src/device.rs`): its BSD lock (`flock`) and the record
+# locks a machine running on it holds (`fcntl_getlk`), on Linux alone.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
+
+[dev-dependencies]
+# The tests hold an image the way another process would, to see the tool
+# refuse it, and build a GPT-partitioned image with the driver's own
+# synthetic table.
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs"] }

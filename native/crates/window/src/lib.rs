@@ -3,11 +3,17 @@
 #![no_std]
 
 pub mod appearance;
+pub mod capture;
 #[cfg(feature = "runtime")]
 pub mod channel;
 #[cfg(feature = "runtime")]
 pub mod client;
 pub mod command;
+pub mod cursor;
+pub mod document;
+pub mod menu;
+pub mod notify;
+pub mod pick;
 #[cfg(feature = "runtime")]
 pub mod configure;
 #[cfg(feature = "runtime")]

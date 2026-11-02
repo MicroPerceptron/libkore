@@ -77,7 +77,8 @@ pub use client::{
     Opened, RING_TARGET_RIGHTS, PendingVersion, ReleasePendingVersionFailure,
     ReleaseVersionFailure, RingFs, RingFsError, RingReleasePendingVersionFailure,
     RingReleaseVersionFailure, SearchResultPage, Stat, Transport, VERSION_IDENTITY_BYTES,
-    process_face, read_dir_entry, read_grant_entry, read_search_hit, read_system_status,
+    process_face, read_dir_entry, read_grant_entry, read_located, read_parent, read_search_hit,
+    read_system_status,
     read_version_identity,
 };
 pub use entry::DirEntry;
@@ -91,7 +92,7 @@ pub use io::SaveOutcome;
 pub use name::Name;
 pub use object::{ANY_REVISION, ObjectId, ObjectKind, ObjectSubtype, Revision, StableObjectId};
 #[cfg(feature = "runtime")]
-pub use protocol::{DagfsProtocol, FsRequest, FsResponse};
+pub use protocol::{DagfsProtocol, FsRequest, FsResponse, MaintainAction};
 pub use refusal::{Refusal, Stop, describe};
 #[cfg(feature = "runtime")]
 pub use search::{

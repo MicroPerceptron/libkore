@@ -80,6 +80,21 @@
 //! each child with the ends, which needs a `role::CHANNEL_SPACE` grant in the
 //! task that spawns. Nothing in the API changes when it lands.
 //!
+//! **For a word in a shared window the gap is closed** by the kernel
+//! address-wait (`res/EVENT.md` §6).  A word that
+//! [`cap::mapped::locate`](crate::cap::mapped::locate) can name by the held
+//! slot that mapped it — a ring, an event channel, a barrier word placed in
+//! a shared lease — parks through [`verbs::wait_word`] (no doorbell needed:
+//! the mapping is the wait authority) and is woken through
+//! [`verbs::wake_word`] (no send end needed: "you may wake what you can
+//! write").  The registry records *which* wake reaches each waiter, so a
+//! [`wake`] spends a `wake_word` on word-parked waiters and a doorbell kick
+//! on the rest; a word the registry cannot name keeps today's doorbell path
+//! unchanged.
+//!
+//! [`verbs::wait_word`]: crate::cap::verbs::wait_word
+//! [`verbs::wake_word`]: crate::cap::verbs::wake_word
+//!
 //! # Two forms of the wait, one registry
 //!
 //! [`wait`] blocks the thread in the kernel; [`wait_async`] yields to the
@@ -127,6 +142,15 @@ use crate::thread::MAX_THREADS;
 /// a lost wakeup with no diagnostic anywhere.
 const WAITS_PER_THREAD: usize = crate::executor::MAX_TASKS + 1;
 
+/// Bound of one **word** park when the caller asked for no timeout: the
+/// kernel address-wait is never unbounded, so an open-ended wait is a loop
+/// of bounded parks, each returning a spurious [`Woken`](WaitOutcome::Woken)
+/// the caller's re-check absorbs.  Long enough that a blocked lock waiter
+/// is not paced by it; short enough that the one wake a stale window hint
+/// could lose costs a slice, not forever.
+#[cfg_attr(not(target_os = "none"), expect(dead_code, reason = "the word park is a metal-only trap"))]
+const WORD_SLICE_NS: u64 = 250_000_000;
+
 /// The registry: **which addresses each thread has waiters on**, or
 /// [`NOT_WAITING`].
 ///
@@ -154,15 +178,61 @@ static WAITING_ON: [[AtomicUsize; WAITS_PER_THREAD]; MAX_THREADS as usize] =
 /// asserted, because the cost of being wrong about that is a fail-closed
 /// refusal here and a lost wakeup if it were ignored.
 fn claim_wait(thread: usize, addr: usize) -> Option<usize> {
+    claim_wait_entry(thread, addr)
+}
+
+/// [`claim_wait`] for a waiter that will park **on the word** through the
+/// kernel address-wait rather than on its doorbell: the entry carries
+/// [`WORD_MODE`], so a waker knows a `wake_word` — not a kick — reaches it.
+fn claim_wait_on_word(thread: usize, addr: usize) -> Option<usize> {
+    claim_wait_entry(thread, addr | WORD_MODE)
+}
+
+/// Flip a word-mode registry entry back to doorbell mode in place — the
+/// futex-side half of a word park the kernel refused.  `true` iff the entry
+/// still stood in word mode.
+fn demote_to_bell(thread: usize, slot: usize, addr: usize) -> bool {
+    WAITING_ON[thread][slot]
+        .compare_exchange(addr | WORD_MODE, addr, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+fn claim_wait_entry(thread: usize, entry: usize) -> Option<usize> {
     for (slot, cell) in WAITING_ON[thread].iter().enumerate() {
         if cell
-            .compare_exchange(NOT_WAITING, addr, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(NOT_WAITING, entry, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
             return Some(slot);
         }
     }
     None
+}
+
+/// The registry entry's **mode bit**: set when the waiter parks on the word
+/// itself (the kernel address-wait) and a `wake_word` is what reaches it;
+/// clear when it parks on its doorbell and a kick does.  Bit 0 is free
+/// because a `u32` word is 4-aligned — the address and the mode ride one
+/// atomic store, so a waker never sees one without the other.
+const WORD_MODE: usize = 1;
+
+/// How the waiters `thread` has on `addr` can be reached: `(by kick, by
+/// wake_word)` — both may hold at once (a thread's suspended futures keep
+/// doorbell entries while the thread itself blocks on a word).
+fn thread_wait_modes(thread: usize, addr: usize) -> (bool, bool) {
+    let mut bell = false;
+    let mut word = false;
+    for cell in &WAITING_ON[thread] {
+        let entry = cell.load(Ordering::SeqCst);
+        if entry & !WORD_MODE == addr {
+            if entry & WORD_MODE != 0 {
+                word = true;
+            } else {
+                bell = true;
+            }
+        }
+    }
+    (bell, word)
 }
 
 /// A claimed wait slot, released when the waiter stops waiting **however it
@@ -198,14 +268,13 @@ fn release_wait(thread: usize, slot: usize) {
     WAITING_ON[thread][slot].store(NOT_WAITING, Ordering::SeqCst);
 }
 
-/// Whether `thread` has any waiter registered on `addr`.
-///
-/// One kick per thread is enough however many of its futures are waiting: the
-/// executor's drain is total, so a single notice re-polls all of them.
+/// Whether `thread` has any waiter registered on `addr`, in either mode —
+/// the registry's own fact, which [`thread_wait_modes`] refines for wakers.
+#[cfg(test)]
 fn thread_waits_on(thread: usize, addr: usize) -> bool {
     WAITING_ON[thread]
         .iter()
-        .any(|cell| cell.load(Ordering::SeqCst) == addr)
+        .any(|cell| cell.load(Ordering::SeqCst) & !WORD_MODE == addr)
 }
 
 /// The vacant registry entry.
@@ -336,6 +405,16 @@ pub(crate) fn wait_barrier(
     wait_inner(word, expected, timeout, true, BARRIER_SPIN)
 }
 
+/// [`wait_barrier`] with **no** jitter-window spin: straight to the park.
+///
+/// For a waiter the jitter window has already failed — an idle resident
+/// worker whose last slice rode out with no job (`barrier::wait_while_idle`).
+/// Nothing co-resident is about to store the word, so the spin would only
+/// occupy the core; counted like the barrier wait it stands in for.
+pub(crate) fn wait_idle(word: &AtomicU32, expected: u32, timeout: Option<Duration>) -> WaitOutcome {
+    wait_inner(word, expected, timeout, true, NO_SPIN)
+}
+
 /// [`wait`] without the [`stats`] accounting — for the star's hub,
 /// whose housekeeping slices would otherwise pollute the very numbers
 /// a terminal bench reads to judge the WORKERS' wait behavior.
@@ -359,12 +438,22 @@ fn wait_inner(
     };
     let addr = address_of(word);
 
+    // ── 0 · Route ───────────────────────────────────────────────────────
+    // A word inside a window this task mapped through a noting verb is
+    // named to the kernel by that authority and parks on the word itself
+    // (the kernel address-wait); every other word keeps the doorbell park.
+    // Decided once, before the registry entry, because the entry records
+    // the decision for wakers.
+    let route = crate::cap::mapped::locate(word as *const AtomicU32 as *const u8);
+
     // ── 1 · Arm ─────────────────────────────────────────────────────────
     // The standing post must exist before this thread is discoverable as a
     // waiter, or a notice sent in the window between registering and parking
     // would find no post and be dropped (`WouldBlock`, on the floor). Arming
-    // first makes "too early" indistinguishable from "on time".
-    if !imp::arm() {
+    // first makes "too early" indistinguishable from "on time".  A word park
+    // needs no post: the mapping is its wait authority, which is what lets a
+    // doorbell-less worker wait here at all.
+    if route.is_none() && !imp::arm() {
         return WaitOutcome::Unsupported;
     }
 
@@ -372,7 +461,11 @@ fn wait_inner(
     // This store must be visible before the load below, and `SeqCst` on both
     // is what forbids the store-load reordering that would let this thread
     // and a waker miss each other (module docs, mechanism 2).
-    let Some(slot) = claim_wait(me, addr) else {
+    let slot = match route {
+        Some(_) => claim_wait_on_word(me, addr),
+        None => claim_wait(me, addr),
+    };
+    let Some(slot) = slot else {
         return WaitOutcome::Unsupported;
     };
     let _slot = WaitSlot { thread: me, slot };
@@ -392,7 +485,23 @@ fn wait_inner(
     if counted {
         STAT_PARKS.fetch_add(1, Ordering::Relaxed);
     }
-    let outcome = imp::park(timeout);
+    let outcome = match route {
+        Some((subject, offset)) => {
+            imp::park_word(subject, offset, expected, timeout, || {
+                // Fall back to the doorbell for this call: demote the
+                // registry entry FIRST (a waker that reads it from here on
+                // kicks instead of `wake_word`), then re-check the word (a
+                // waker that read word mode before the demotion has already
+                // stored — SeqCst on both sides, one of us sees the other),
+                // then arm the doorbell.  Without the demotion a word-mode
+                // waiter parked on its doorbell is unreachable by any waker.
+                demote_to_bell(me, slot, addr)
+                    && word.load(Ordering::SeqCst) == expected
+                    && imp::arm()
+            })
+        }
+        None => imp::park(timeout),
+    };
     if counted {
         match outcome {
             WaitOutcome::Woken => STAT_WOKEN.fetch_add(1, Ordering::Relaxed),
@@ -589,6 +698,12 @@ const BARRIER_SPIN: SpinBudget = SpinBudget {
     cap: Duration::from_micros(8),
 };
 
+/// No spin at all — [`wait_idle`]'s budget.
+const NO_SPIN: SpinBudget = SpinBudget {
+    turns: 0,
+    cap: Duration::ZERO,
+};
+
 /// Sleep on the line for a few turns, hoping to skip the park entirely.
 ///
 /// `Some` when the word moved — the caller is done and never blocks. `None`
@@ -711,9 +826,24 @@ pub(crate) fn notify_resident_completion() -> bool {
 /// resolves the park it is about to enter.
 pub fn wake(word: &AtomicU32) -> bool {
     let addr = address_of(word);
+    let route = crate::cap::mapped::locate(word as *const AtomicU32 as *const u8);
     let mut unreachable_waiter = false;
     for thread in 0..MAX_THREADS as usize {
-        if thread_waits_on(thread, addr) {
+        let (bell, on_word) = thread_wait_modes(thread, addr);
+        // A word-parked waiter is reached on the memory, by this side's own
+        // mapping of it: one waiter released, no send end spent.  The
+        // thread's block is what a kick could not end, so the word comes
+        // first when both modes stand.
+        if on_word {
+            if let Some((subject, offset)) = route
+                && imp::wake_word(subject, offset, 1)
+            {
+                STAT_KICKS.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            unreachable_waiter = true;
+        }
+        if bell {
             if imp::kick(thread) {
                 STAT_KICKS.fetch_add(1, Ordering::Relaxed);
                 return true;
@@ -743,10 +873,16 @@ pub fn wake(word: &AtomicU32) -> bool {
 /// synchronization fact.
 pub fn wake_all(word: &AtomicU32) -> usize {
     let addr = address_of(word);
+    let route = crate::cap::mapped::locate(word as *const AtomicU32 as *const u8);
     let mut woken = 0;
     let mut missed = false;
+    let mut word_waiters = 0;
     for thread in 0..MAX_THREADS as usize {
-        if thread_waits_on(thread, addr) {
+        let (bell, on_word) = thread_wait_modes(thread, addr);
+        if on_word {
+            word_waiters += 1;
+        }
+        if bell {
             if imp::kick(thread) {
                 STAT_KICKS.fetch_add(1, Ordering::Relaxed);
                 woken += 1;
@@ -754,6 +890,18 @@ pub fn wake_all(word: &AtomicU32) -> usize {
                 STAT_MISSED.fetch_add(1, Ordering::Relaxed);
                 missed = true;
             }
+        }
+    }
+    // Every word-parked waiter is released by ONE `wake_word` on the memory
+    // (the kernel keys them by the word's physical identity), counted per
+    // thread it reached — the same unit the kicks above are counted in.
+    if word_waiters > 0 {
+        if route.is_some_and(|(subject, offset)| imp::wake_word(subject, offset, u32::MAX)) {
+            STAT_KICKS.fetch_add(word_waiters, Ordering::Relaxed);
+            woken += word_waiters as usize;
+        } else {
+            STAT_MISSED.fetch_add(word_waiters, Ordering::Relaxed);
+            missed = true;
         }
     }
     // The relay hop (the star, `res/SPMD.md` §3): every waiter this
@@ -924,6 +1072,67 @@ mod imp {
         }
     }
 
+    /// Park on the word itself through the kernel address-wait, `timeout`
+    /// folded in as the mandatory deadline.
+    ///
+    /// An open-ended wait is a bounded park the caller's re-check loop
+    /// renews: the slice expiring reports [`Woken`](WaitOutcome::Woken) (a
+    /// spurious wake, which the contract already requires callers to
+    /// tolerate), never a fabricated timeout.  A kernel refusal of the
+    /// *shape* — a stale window hint the kernel no longer honours — falls
+    /// back to the doorbell park for this call rather than refusing the
+    /// wait; the registry entry's mode is then optimistic for one park,
+    /// which costs at most a slice, never a lost wake on a live window.
+    pub(super) fn park_word(
+        subject: kore_abi::session::SlotRef,
+        offset: u32,
+        expected: u32,
+        timeout: Option<Duration>,
+        mut fall_back: impl FnMut() -> bool,
+    ) -> WaitOutcome {
+        use crate::cap::verbs::{WordWait, WordWaitError};
+
+        let Ok(now) = crate::clock::uptime() else {
+            return WaitOutcome::Unsupported;
+        };
+        let deadline = match timeout {
+            Some(d) => (now + d).as_nanos(),
+            None => now.as_nanos().saturating_add(super::WORD_SLICE_NS),
+        };
+        match verbs::wait_word(subject, offset, expected, deadline) {
+            Ok(WordWait::Changed) => WaitOutcome::Woken,
+            Ok(WordWait::Deadline) => {
+                if timeout.is_some() {
+                    WaitOutcome::TimedOut
+                } else {
+                    WaitOutcome::Woken
+                }
+            }
+            // The window died under the waiter: no later wait on this word
+            // can succeed either.
+            Ok(WordWait::Revoked) | Err(WordWaitError::TransportUnavailable) => {
+                WaitOutcome::Unsupported
+            }
+            // The kernel did not park us (a full waiter board, or a refused
+            // subject): this call rides the doorbell instead.  `fall_back`
+            // demotes the registry entry, re-checks the word and arms the
+            // bell; `false` means the word already moved (Woken) or the bell
+            // cannot be armed — either way, do not sleep.
+            Ok(WordWait::WouldBlock) | Err(WordWaitError::Refused(_)) => {
+                if !fall_back() {
+                    return WaitOutcome::Woken;
+                }
+                park(timeout)
+            }
+        }
+    }
+
+    /// Release up to `count` waiters parked on the word at `offset` of the
+    /// held `subject` — the wake a shared window needs no send end for.
+    pub(super) fn wake_word(subject: kore_abi::session::SlotRef, offset: u32, count: u32) -> bool {
+        verbs::wake_word(subject, offset, count)
+    }
+
     /// Shared parking transport for the fixed thread doorbell and an affine
     /// alternate receiver. Only the caller owning the landing may consume it.
     fn park_status(post: crate::transport::ParkPost, timeout: Option<Duration>) -> Option<Status> {
@@ -1027,11 +1236,25 @@ mod imp {
         super::WaitOutcome::Unsupported
     }
 
+    pub(super) fn park_word(
+        _subject: kore_abi::session::SlotRef,
+        _offset: u32,
+        _expected: u32,
+        _timeout: Option<core::time::Duration>,
+        _fall_back: impl FnMut() -> bool,
+    ) -> super::WaitOutcome {
+        super::WaitOutcome::Unsupported
+    }
+
     pub(super) fn park_post(
         _post: crate::transport::ParkPost,
         _timeout: Option<core::time::Duration>,
     ) -> super::WaitOutcome {
         super::WaitOutcome::Unsupported
+    }
+
+    pub(super) fn wake_word(_subject: kore_abi::session::SlotRef, _offset: u32, _count: u32) -> bool {
+        false
     }
 
     pub(super) fn kick(_index: usize) -> bool {
@@ -1054,6 +1277,34 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_budget_never_spins_with_or_without_a_clock() {
+        let word = AtomicU32::new(1);
+        for clock in [None, Some(0)] {
+            assert_eq!(
+                spin_briefly_with(
+                    &word,
+                    1,
+                    NO_SPIN,
+                    || clock,
+                    |_| panic!("idle wait must park without a monitored spin"),
+                ),
+                None,
+            );
+        }
+        word.store(2, Ordering::SeqCst);
+        assert_eq!(
+            spin_briefly_with(
+                &word,
+                1,
+                NO_SPIN,
+                || None,
+                |_| panic!("changed word must not spin"),
+            ),
+            Some(WaitOutcome::Retry),
+        );
+    }
+
     #[test]
     fn jitter_window_is_time_bounded_without_a_monitor() {
         use core::cell::Cell;

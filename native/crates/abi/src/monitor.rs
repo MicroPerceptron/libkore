@@ -421,7 +421,9 @@ pub struct MemorySnapshot {
     flags: U32,
     extents: U32,
     supplies: U32,
-    reserved: U32,
+    /// Former reserved word: whole 2 MiB supplies still allowed on the
+    /// requesting face, only when SUPPLY_BUDGET is present.
+    huge_supply_units: U32,
     granted: U64,
     released: U64,
     reused: U64,
@@ -431,11 +433,13 @@ pub struct MemorySnapshot {
 }
 
 impl MemorySnapshot {
+    /// The provider sampled the requesting face's huge-supply meter.
+    const SUPPLY_BUDGET: u32 = 1 << 1;
     pub const EMPTY: Self = Self {
         flags: U32::new(0),
         extents: U32::new(0),
         supplies: U32::new(0),
-        reserved: U32::new(0),
+        huge_supply_units: U32::new(0),
         granted: U64::new(0),
         released: U64::new(0),
         reused: U64::new(0),
@@ -459,7 +463,7 @@ impl MemorySnapshot {
             flags: U32::new(AVAILABLE),
             extents: U32::new(extents),
             supplies: U32::new(supplies),
-            reserved: U32::new(0),
+            huge_supply_units: U32::new(0),
             granted: U64::new(granted),
             released: U64::new(released),
             reused: U64::new(reused),
@@ -470,10 +474,29 @@ impl MemorySnapshot {
     }
 
     pub fn available(self) -> bool {
-        self.flags.get() == AVAILABLE
+        self.flags.get() & AVAILABLE != 0
     }
     pub fn validate(self) -> bool {
-        self.reserved.get() == 0 && (self.available() || self == Self::EMPTY)
+        self.flags.get() & !(AVAILABLE | Self::SUPPLY_BUDGET) == 0
+            && (self.available() || self == Self::EMPTY)
+            && (self.flags.get() & Self::SUPPLY_BUDGET != 0 || self.huge_supply_units.get() == 0)
+    }
+    /// Attach this arrival's allowance in whole minimum huge-supply units.
+    /// Rounding down never promises a request that the byte quota refuses.
+    /// The former reserved word keeps the wire and launch-page sizes intact.
+    /// None denotes inconsistent accounting or an unrepresentable allowance.
+    pub fn with_supply_budget(mut self, limit: u64, used: u64) -> Option<Self> {
+        if !self.validate() || !self.available() { return None; }
+        let units = limit.checked_sub(used)? >> crate::session::LEASE_ALIGN_2M;
+        self.huge_supply_units = U32::new(u32::try_from(units).ok()?);
+        self.flags = U32::new(self.flags.get() | Self::SUPPLY_BUDGET);
+        Some(self)
+    }
+    /// Remaining 2 MiB / 1 GiB aligned supply allowance on this face.
+    /// None means unavailable or malformed, never an unlimited allowance.
+    pub fn huge_supply_remaining(self) -> Option<u64> {
+        (self.validate() && self.flags.get() & Self::SUPPLY_BUDGET != 0)
+            .then(|| u64::from(self.huge_supply_units.get()) << crate::session::LEASE_ALIGN_2M)
     }
     pub fn extents(self) -> u32 {
         self.extents.get()
@@ -1910,6 +1933,23 @@ mod tests {
     }
 
     #[test]
+    fn supply_budget_distinguishes_absent_exhausted_and_invalid() {
+        let sample = MemorySnapshot::new(0, 0, 0, 0, 0, 0, 0, 0);
+        assert_eq!(sample.huge_supply_remaining(), None);
+        let budget = sample.with_supply_budget(26 << 30, 24 << 30).unwrap();
+        assert!(budget.validate());
+        assert_eq!(budget.huge_supply_remaining(), Some(2 << 30));
+        assert_eq!(sample.with_supply_budget(0, 0).unwrap().huge_supply_remaining(), Some(0));
+        assert!(sample.with_supply_budget(1, 2).is_none());
+        assert!(sample.with_supply_budget(u64::MAX, 0).is_none());
+        assert!(MemorySnapshot::EMPTY.with_supply_budget(1, 0).is_none());
+        assert_eq!(sample.with_supply_budget((2 << 20) - 1, 0).unwrap().huge_supply_remaining(), Some(0));
+        let mut untagged = budget;
+        untagged.flags = U32::new(AVAILABLE);
+        assert!(!untagged.validate());
+    }
+
+    #[test]
     fn provider_snapshots_validate_only_defined_postures() {
         let system = SystemSnapshot::new(
             4, 1_000, 500, 16_384, 8_192, 4_096, 2_048, 1_024, 0, 0, 3, 0, 0,
@@ -1948,7 +1988,7 @@ mod tests {
         );
 
         let mut corrupt_memory = memory;
-        corrupt_memory.reserved = U32::new(1);
+        corrupt_memory.huge_supply_units = U32::new(1);
         assert!(
             !TelemetrySnapshot::new(system, corrupt_memory, exec, ManifoldSnapshot::EMPTY)
                 .validate()

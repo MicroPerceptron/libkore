@@ -19,8 +19,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll};
 
+use super::NoticeSink;
 use super::task::{TaskHeader, header_of};
-use crate::transport::ParkPost;
+use crate::transport::{ParkPost, WordArm};
 
 /// Concurrent pending deadlines per executor — a design bound (§8's
 /// posture: refusal on overflow, sized for the declared task set).
@@ -60,6 +61,11 @@ pub enum WakeReason {
     Irq,
     /// The folded sleep deadline won (`Status::Deadline`).
     Deadline,
+    /// The armed memory word was seen to move, or a `wake_word` on its
+    /// memory fired (`Status::Word` — the kernel address-wait,
+    /// `res/EVENT.md` §6).  Like every other reason, a hint: the waiter
+    /// re-reads the word.
+    Word,
 }
 
 /// One-way lifecycle of the executor's optional hardware-wake posture.
@@ -93,12 +99,20 @@ pub(crate) struct ExecCtx {
             ParkPost,
             NonNull<TaskHeader>,
             u64,
-            NonNull<Option<AlternateOwner>>,
+            NonNull<Option<ArmedOwner>>,
         )>,
     >,
-    /// Monotone identity for the one alternate registration. Matching the
-    /// generation as well as the task prevents one cancelled future from
-    /// clearing a successor owned by the same executor task.
+    /// At most one task may add a **word arm** (the kernel address-wait,
+    /// `res/EVENT.md` §6) to the executor's next idle park — the park
+    /// carries ONE `WordWaitReq`.  A second registrant is *refused*, never
+    /// silently dropped (its future resolves `None` and the caller falls
+    /// back to the doorbell rung); a delivery arm registering while a word
+    /// arm stands **evicts** the word (the two do not compose on the wire),
+    /// waking its owner to fall back the same way.
+    word: Cell<Option<WordRegistration>>,
+    /// Monotone identity shared by the alternate and word registrations.
+    /// Matching the generation as well as the task prevents one cancelled
+    /// future from clearing a successor owned by the same executor task.
     next_delivery: Cell<u64>,
     /// A protocol call consumed and re-posted the executor doorbell inside a
     /// blocking send-and-wait trap. The outer executor spends this edge as a
@@ -114,6 +128,21 @@ pub(crate) struct ExecCtx {
     /// row's remaining budget in nanoseconds.  Latched by the outcome arm,
     /// taken exactly once by whichever loop owns the service.
     quiesce_ask: Cell<Option<u64>>,
+    /// The doorbell owner's [`NoticeSink`], if it named one, its lifetime
+    /// erased ([`set_notice_sink`](Self::set_notice_sink)).
+    notice_sink: Cell<Option<NonNull<dyn NoticeSink>>>,
+}
+
+/// The one word arm registered on an executor (see [`ExecCtx::word`]).
+#[derive(Clone, Copy)]
+struct WordRegistration {
+    arm: WordArm,
+    /// The arm's mandatory bound — also registered on the timer table, so
+    /// the idle park's folded deadline never lacks it.
+    deadline_ns: u64,
+    task: NonNull<TaskHeader>,
+    generation: u64,
+    owner: NonNull<Option<ArmedOwner>>,
 }
 
 impl ExecCtx {
@@ -123,10 +152,46 @@ impl ExecCtx {
             last_wake: Cell::new(WakeReason::Doorbell),
             timers: [const { Cell::new(None) }; MAX_TIMERS],
             delivery: Cell::new(None),
+            word: Cell::new(None),
             next_delivery: Cell::new(0),
             inline_doorbell: Cell::new(false),
             irq: Cell::new(IrqParkPolicy::Unarmed),
             quiesce_ask: Cell::new(None),
+            notice_sink: Cell::new(None),
+        }
+    }
+
+    /// Offer every notice this executor consumes to `sink`.
+    ///
+    /// Only [`Executor::with_notice_sink`](super::Executor::with_notice_sink)
+    /// calls this, on the context the `Executor<'t, _>` owns, with a sink
+    /// borrowed for that same `'t`: the context cannot outlive the borrow,
+    /// and [`note_notice`](Self::note_notice) is its only reader.
+    pub(crate) fn set_notice_sink<'t>(&self, sink: &'t dyn NoticeSink) {
+        let sink: NonNull<dyn NoticeSink + 't> = NonNull::from(sink);
+        // SAFETY: only the trait object's lifetime bound changes; the pointer
+        // and its vtable are untouched. The erased pointer is dereferenced
+        // only by `note_notice`, on this context, which the owning executor
+        // holds no longer than `'t` (see above).
+        let sink = unsafe {
+            core::mem::transmute::<NonNull<dyn NoticeSink + 't>, NonNull<dyn NoticeSink>>(sink)
+        };
+        self.notice_sink.set(Some(sink));
+    }
+
+    /// One doorbell notice this executor consumed, in its idle park or inline
+    /// in a blocking call: the kernel's quiesce ask is latched here, and
+    /// every other notice goes to the owner's sink, if one was named.
+    pub(crate) fn note_notice(&self, cookie: u64, payload: u64) {
+        if cookie == kore_abi::session::NOTICE_COOKIE_POWER_QUIESCE {
+            self.note_quiesce_ask(payload);
+            return;
+        }
+        if let Some(sink) = self.notice_sink.get() {
+            // SAFETY: `set_notice_sink` stored a sink borrowed for the life of
+            // the executor that owns this context; this call runs on that
+            // executor's thread while it is alive.
+            unsafe { sink.as_ref() }.notice(cookie, payload);
         }
     }
 
@@ -261,24 +326,109 @@ impl ExecCtx {
             .min()
     }
 
-    fn register_delivery(
-        &self,
-        post: ParkPost,
-        task: NonNull<TaskHeader>,
-        future_owner: NonNull<Option<AlternateOwner>>,
-    ) -> u64 {
-        assert!(
-            self.delivery.get().is_none(),
-            "executor alternate delivery wait already owned"
-        );
+    fn next_generation(&self) -> u64 {
         let mut generation = self.next_delivery.get().wrapping_add(1);
         if generation == 0 {
             generation = 1;
         }
         self.next_delivery.set(generation);
+        generation
+    }
+
+    fn register_delivery(
+        &self,
+        post: ParkPost,
+        task: NonNull<TaskHeader>,
+        future_owner: NonNull<Option<ArmedOwner>>,
+    ) -> u64 {
+        assert!(
+            self.delivery.get().is_none(),
+            "executor alternate delivery wait already owned"
+        );
+        // A word arm and an alternate post do not compose in one park
+        // (`WAIT_WORD | WAIT_DELIVERY_ALT` is malformed).  The affine
+        // delivery wins: the word waiter is evicted and woken to re-check
+        // and fall back to the doorbell rung — a spurious wake, the
+        // harmless direction.
+        if let Some(mut word) = self.word.replace(None) {
+            // SAFETY: a registered word owner pointer names the pinned
+            // `owner` field of a live, still-pending `ArmedWake` (its Drop
+            // clears the registry first).
+            if let Some(owner) = unsafe { word.owner.as_mut() } {
+                owner.evicted = true;
+            }
+            // SAFETY: registered headers are live for the run.
+            unsafe { word.task.as_ref() }.mark_ready();
+        }
+        let generation = self.next_generation();
         self.delivery
             .set(Some((post, task, generation, future_owner)));
         generation
+    }
+
+    /// Claim the park's one word arm for `task`, or `None` when it (or an
+    /// alternate post, which the arm cannot ride beside) is already owned.
+    fn register_word(
+        &self,
+        arm: WordArm,
+        deadline_ns: u64,
+        task: NonNull<TaskHeader>,
+        future_owner: NonNull<Option<ArmedOwner>>,
+    ) -> Option<u64> {
+        if self.word.get().is_some() || self.delivery.get().is_some() {
+            return None;
+        }
+        let generation = self.next_generation();
+        self.word.set(Some(WordRegistration {
+            arm,
+            deadline_ns,
+            task,
+            generation,
+            owner: future_owner,
+        }));
+        Some(generation)
+    }
+
+    fn clear_word(&self, task: NonNull<TaskHeader>, generation: u64) {
+        if self
+            .word
+            .get()
+            .is_some_and(|w| w.task == task && w.generation == generation)
+        {
+            self.word.set(None);
+        }
+    }
+
+    /// The word arm the next idle park carries, with its mandatory deadline.
+    pub(crate) fn word_arm(&self) -> Option<(WordArm, u64)> {
+        self.word.get().map(|w| (w.arm, w.deadline_ns))
+    }
+
+    /// The park resolved `Status::Word`: wake exactly the arm's owner (the
+    /// future's ready leg clears the registration).
+    pub(crate) fn wake_word_owner(&self) {
+        if let Some(word) = self.word.get() {
+            // SAFETY: registered headers are live for the run.
+            unsafe { word.task.as_ref() }.mark_ready();
+        }
+    }
+
+    /// The kernel refused the word arm (`WouldBlock` — its bounded waiter
+    /// board was full): the arm is withdrawn for this wait exactly as an
+    /// alternate-delivery eviction withdraws it, so the owner's
+    /// `next_wake_on_word` answers `None` and the wait re-publishes its
+    /// doorbell intent and takes rung 3.  Re-parking with the arm standing
+    /// would ask the same full board again at once — a livelock across every
+    /// waiting thread on a machine whose gangs out-number the board.
+    pub(crate) fn refuse_word(&self) {
+        if let Some(mut word) = self.word.replace(None) {
+            // SAFETY: the owner slot and header are live for the run, as in
+            // `register_delivery`'s eviction of the same arm.
+            if let Some(owner) = unsafe { word.owner.as_mut() } {
+                owner.evicted = true;
+            }
+            unsafe { word.task.as_ref() }.mark_ready();
+        }
     }
 
     fn clear_delivery(&self, task: NonNull<TaskHeader>, generation: u64) {
@@ -341,11 +491,15 @@ impl ExecCtx {
         }
         if let Some((_, _, _, mut future_owner)) = self.delivery.replace(None) {
             // SAFETY: alternate registration accepts this pointer only from a
-            // pinned `AlternateWake`. Its Drop clears the registry before the
+            // pinned `ArmedWake`. Its Drop clears the registry before the
             // field dies; therefore a still-registered pointer names a live,
             // immovable owner field. Executor teardown invalidates the future's
             // raw context backlink before this context can itself die.
             unsafe { *future_owner.as_mut() = None };
+        }
+        if let Some(mut word) = self.word.replace(None) {
+            // SAFETY: as for the alternate registration above.
+            unsafe { *word.owner.as_mut() = None };
         }
         self.inline_doorbell.set(false);
     }
@@ -657,42 +811,104 @@ pub fn quiesce_deadline(budget_ns: u64) -> u64 {
 /// standing delivery arm beside the ordinary doorbell. The empty descriptor
 /// stays inside x86-64's caller-saved-register carrier.
 pub async fn next_wake_on(post: ParkPost) -> WakeReason {
-    AlternateWake::new(post, None).await
+    ArmedWake::alternate(post, None)
+        .await
+        .expect("an alternate delivery arm is never refused or evicted")
 }
 
 /// Deadline-bounded sibling of [`next_wake_on`]. Either standing post or the
 /// relative deadline wakes the root, with both registrations settled on the
 /// ready leg or cancellation drop.
 pub async fn next_wake_on_for(post: ParkPost, delta_ns: u64) -> WakeReason {
-    AlternateWake::new(post, Some(delta_ns)).await
+    ArmedWake::alternate(post, Some(delta_ns))
+        .await
+        .expect("an alternate delivery arm is never refused or evicted")
 }
 
-/// One alternate executor registration, owned by the future that installed
-/// it.  The ready leg and `Drop` share the same idempotent teardown, so a
-/// `select`-style caller cannot leave a stale post (or folded deadline) behind
-/// when another branch cancels this wait while it is pending.
-struct AlternateWake {
-    post: ParkPost,
+/// Complete on the next executor wake while arming the idle park's **word
+/// arm** on the `u32` at byte `offset` of the held memory `subject` (a
+/// lease or mapped view, by arena slot — `cap::mapped::locate` names one
+/// from a pointer), last read as `expected`, bounded by the **absolute**
+/// deadline `deadline_ns` (mandatory: the kernel address-wait is never
+/// unbounded).  The first of {doorbell, word, deadline, IRQ} wakes the
+/// root; a [`WakeReason::Word`] means the word moved or a `wake_word` on
+/// its memory fired, and — like every reason — is a hint to re-read.
+///
+/// `None` when the arm was **refused**: the executor's park carries one
+/// word arm, and another future owns it (or an alternate delivery arm
+/// stands, which the word cannot ride beside).  Nothing was registered;
+/// the caller re-checks its word and falls back to the doorbell park
+/// ([`next_wake_for`]) for this wait.  A pending wait that a later
+/// alternate arm evicts resolves `None` the same way.
+pub async fn next_wake_on_word(
+    subject: kore_abi::session::SlotRef,
+    offset: u32,
+    expected: u32,
+    deadline_ns: u64,
+) -> Option<WakeReason> {
+    ArmedWake::word(
+        WordArm {
+            subject,
+            offset,
+            expected,
+        },
+        deadline_ns,
+    )
+    .await
+}
+
+/// Which executor arm an [`ArmedWake`] installs.
+#[derive(Clone, Copy)]
+enum Arm {
+    /// The bounded alternate standing post.
+    Post(ParkPost),
+    /// The kernel address-wait's word (its deadline rides `deadline_ns`).
+    Word(WordArm),
+}
+
+/// One executor arm registration, owned by the future that installed it.
+/// The ready leg and `Drop` share the same idempotent teardown, so a
+/// `select`-style caller cannot leave a stale arm (or folded deadline)
+/// behind when another branch cancels this wait while it is pending.
+struct ArmedWake {
+    arm: Arm,
+    /// A relative bound, resolved to `deadline_ns` on first poll.
     delta_ns: Option<u64>,
+    /// The absolute bound (a word arm names it directly).
     deadline_ns: Option<u64>,
-    owner: Option<AlternateOwner>,
+    owner: Option<ArmedOwner>,
     timer: TimerRegistration,
     _pin: PhantomPinned,
 }
 
 #[derive(Clone, Copy)]
-struct AlternateOwner {
+struct ArmedOwner {
     task: NonNull<TaskHeader>,
     ctx: NonNull<ExecCtx>,
-    delivery_generation: Option<u64>,
+    /// The registry generation this future owns (delivery or word).
+    generation: Option<u64>,
+    /// Set by the executor through the registry's backlink when a later
+    /// alternate arm displaced this word arm: the ready leg answers `None`.
+    evicted: bool,
 }
 
-impl AlternateWake {
-    const fn new(post: ParkPost, delta_ns: Option<u64>) -> Self {
+impl ArmedWake {
+    const fn alternate(post: ParkPost, delta_ns: Option<u64>) -> Self {
         Self {
-            post,
+            arm: Arm::Post(post),
             delta_ns,
             deadline_ns: None,
+            owner: None,
+            timer: TimerRegistration::new(),
+            _pin: PhantomPinned,
+        }
+    }
+
+    const fn word(arm: WordArm, deadline_ns: u64) -> Self {
+        Self {
+            arm: Arm::Word(arm),
+            delta_ns: None,
+            deadline_ns: Some(deadline_ns),
             owner: None,
             timer: TimerRegistration::new(),
             _pin: PhantomPinned,
@@ -710,61 +926,83 @@ impl AlternateWake {
         // leave `run_pinned`; target panics abort rather than unwind. Normal
         // executor exit also clears the complete registry as a backstop.
         let ctx = unsafe { owner.ctx.as_ref() };
-        if let Some(generation) = owner.delivery_generation {
-            ctx.clear_delivery(owner.task, generation);
+        if let Some(generation) = owner.generation {
+            match self.arm {
+                Arm::Post(_) => ctx.clear_delivery(owner.task, generation),
+                Arm::Word(_) => ctx.clear_word(owner.task, generation),
+            }
         }
     }
 }
 
-impl Future for AlternateWake {
-    type Output = WakeReason;
+impl Future for ArmedWake {
+    type Output = Option<WakeReason>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: no field is moved. Pinning makes `owner`'s address stable
         // while the executor registry holds its teardown backlink.
         let this = unsafe { self.get_unchecked_mut() };
         let hdr = header_of(cx.waker())
-            .expect("alternate wake requires the kore executor (foreign waker)");
+            .expect("armed wake requires the kore executor (foreign waker)");
         // SAFETY: the kore waker vouches for a live executor-owned header.
         let ctx = unsafe { hdr.as_ref() }.exec.load(Ordering::Relaxed);
         assert!(
             !ctx.is_null(),
-            "alternate wake polled outside an executor pass"
+            "armed wake polled outside an executor pass"
         );
         // SAFETY: the executor installs this pointer for the duration of poll.
         let ctx = unsafe { &*ctx };
 
         if let Some(owner) = this.owner {
-            assert_eq!(owner.task, hdr, "alternate wake changed owning task");
+            assert_eq!(owner.task, hdr, "armed wake changed owning task");
             assert_eq!(owner.ctx.as_ptr(), ctx as *const ExecCtx as *mut ExecCtx);
             let reason = ctx.last_wake();
+            let evicted = owner.evicted;
             this.clear_registration();
-            return Poll::Ready(reason);
+            return Poll::Ready((!evicted).then_some(reason));
         }
 
         if let Some(delta_ns) = this.delta_ns {
-            let deadline = *this
-                .deadline_ns
+            this.deadline_ns
                 .get_or_insert_with(|| ctx.now().saturating_add(delta_ns));
-            if ctx.now() >= deadline {
-                return Poll::Ready(WakeReason::Deadline);
-            }
+        }
+        if let Some(deadline) = this.deadline_ns
+            && ctx.now() >= deadline
+        {
+            return Poll::Ready(Some(WakeReason::Deadline));
         }
 
         // Publish the owner first so either registration panicking still
         // unwinds through the same idempotent cleanup.
-        this.owner = Some(AlternateOwner {
+        this.owner = Some(ArmedOwner {
             task: hdr,
             ctx: NonNull::from(ctx),
-            delivery_generation: None,
+            generation: None,
+            evicted: false,
         });
         let future_owner = NonNull::from(&mut this.owner);
-        let generation = ctx.register_delivery(this.post, hdr, future_owner);
+        let generation = match this.arm {
+            Arm::Post(post) => ctx.register_delivery(post, hdr, future_owner),
+            Arm::Word(arm) => {
+                let deadline = this
+                    .deadline_ns
+                    .expect("a word arm always carries its deadline");
+                match ctx.register_word(arm, deadline, hdr, future_owner) {
+                    Some(generation) => generation,
+                    // Refused: the park's one word arm is owned.  Nothing
+                    // was registered, so the owner is withdrawn whole.
+                    None => {
+                        this.owner = None;
+                        return Poll::Ready(None);
+                    }
+                }
+            }
+        };
         let owner = this
             .owner
             .as_mut()
-            .expect("alternate owner disappeared during registration");
-        owner.delivery_generation = Some(generation);
+            .expect("armed owner disappeared during registration");
+        owner.generation = Some(generation);
         if let Some(deadline) = this.deadline_ns {
             // SAFETY: this field stays pinned with AlternateWake and is
             // cleared before that parent's Drop can release its storage.
@@ -774,7 +1012,7 @@ impl Future for AlternateWake {
     }
 }
 
-impl Drop for AlternateWake {
+impl Drop for ArmedWake {
     fn drop(&mut self) {
         self.clear_registration();
     }
@@ -988,7 +1226,7 @@ mod tests {
             };
             let mut ordinary = core::pin::pin!(next_wake_until(41));
             {
-                let mut alternate = core::pin::pin!(AlternateWake::new(post, Some(29)));
+                let mut alternate = core::pin::pin!(ArmedWake::alternate(post, Some(29)));
                 if reverse {
                     assert_eq!(ordinary.as_mut().poll(&mut cx), Poll::Pending);
                     assert_eq!(alternate.as_mut().poll(&mut cx), Poll::Pending);
@@ -1003,7 +1241,7 @@ mod tests {
                 ctx.note_wake(WakeReason::Delivery);
                 assert_eq!(
                     alternate.as_mut().poll(&mut cx),
-                    Poll::Ready(WakeReason::Delivery)
+                    Poll::Ready(Some(WakeReason::Delivery))
                 );
             }
             assert_eq!(ctx.delivery_post(), None);
@@ -1017,7 +1255,7 @@ mod tests {
 
             // Conversely, a cancelled ordinary wait cannot remove the
             // alternate post's later deadline.
-            let mut alternate = core::pin::pin!(AlternateWake::new(post, Some(59)));
+            let mut alternate = core::pin::pin!(ArmedWake::alternate(post, Some(59)));
             assert_eq!(alternate.as_mut().poll(&mut cx), Poll::Pending);
             {
                 let mut cancelled = core::pin::pin!(next_wake_for(17));
@@ -1063,7 +1301,7 @@ mod tests {
         };
 
         {
-            let wait = AlternateWake::new(post, Some(29));
+            let wait = ArmedWake::alternate(post, Some(29));
             let mut wait = core::pin::pin!(wait);
             assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
             assert_eq!(ctx.delivery_post(), Some(post));
@@ -1077,7 +1315,7 @@ mod tests {
         // The released bounded slot can be claimed immediately by another
         // wait instead of poisoning the executor's next idle park.
         {
-            let replacement = AlternateWake::new(post, None);
+            let replacement = ArmedWake::alternate(post, None);
             let mut replacement = core::pin::pin!(replacement);
             assert_eq!(replacement.as_mut().poll(&mut cx), Poll::Pending);
         }
@@ -1122,7 +1360,7 @@ mod tests {
             land: SlotRef::from_wire(47),
             recv_tag: 53,
         };
-        let wait = AlternateWake::new(post, Some(59));
+        let wait = ArmedWake::alternate(post, Some(59));
         let mut wait = core::pin::pin!(wait);
 
         assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
@@ -1153,6 +1391,64 @@ mod tests {
         ctx.advance(17);
         assert!(!task.take_ready());
         assert_eq!(ctx.timers_min(), None);
+    }
+
+    /// A console waiting for guest output must return to its input drain on a
+    /// keyboard doorbell even when the output word has not changed. Exercise
+    /// both wait rungs with the real executor registrations, then check that
+    /// the predicate-only wait still ignores an unrelated wake.
+    #[test]
+    fn composed_event_wait_returns_on_other_input_with_either_park_rung() {
+        use crate::event::{EventWait, wait_once, wait_past};
+        use kore_ring::event::{SEQ_AT, region_bytes, split};
+
+        #[repr(align(64))]
+        struct Window([u8; region_bytes::<u32, kore_abi::svc::OutChunk>(1)]);
+
+        for noted in [false, true] {
+            let ctx = ExecCtx::new();
+            let task = TaskHeader::new();
+            let waker = task_waker(&ctx, &task);
+            let mut cx = Context::from_waker(&waker);
+            let mut window = Window([0; region_bytes::<u32, kore_abi::svc::OutChunk>(1)]);
+            let base = window.0.as_ptr();
+            let slot = SlotRef::from_wire(21);
+            if noted {
+                crate::cap::mapped::note(base, window.0.len(), slot);
+            }
+            let (mut source, sink) =
+                split::<u32, kore_abi::svc::OutChunk>(&mut window.0, 1).unwrap();
+            let seen = sink.seq();
+            {
+                let mut wait = core::pin::pin!(wait_once(&sink, seen, None));
+                assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+                assert_eq!(
+                    ctx.word_arm().map(|(arm, _)| (arm.subject, arm.offset)),
+                    noted.then_some((slot, SEQ_AT as u32))
+                );
+                ctx.note_wake(WakeReason::Doorbell);
+                assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(EventWait::Woken));
+            }
+            assert_eq!(ctx.word_arm(), None);
+            assert_eq!(ctx.timers_min(), None);
+            assert_eq!(sink.parked_word().load(Ordering::SeqCst), 0);
+            {
+                let mut wait = core::pin::pin!(wait_past(&sink, seen, None));
+                assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+                ctx.note_wake(WakeReason::Doorbell);
+                assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+                source.commit();
+                ctx.note_wake(WakeReason::Word);
+                assert_eq!(
+                    wait.as_mut().poll(&mut cx),
+                    Poll::Ready(EventWait::Changed)
+                );
+            }
+            assert_eq!(ctx.word_arm(), None);
+            assert_eq!(ctx.timers_min(), None);
+            assert_eq!(sink.parked_word().load(Ordering::SeqCst), 0);
+            crate::cap::mapped::forget(base);
+        }
     }
 
     #[test]

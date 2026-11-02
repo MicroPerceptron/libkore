@@ -832,6 +832,7 @@ dependencies = [
  "kore-ring",
  "kore-rt",
  "kore-scrub",
+ "rustix",
  "zerocopy",
 ]
 
@@ -856,6 +857,13 @@ name = "kore-hint"
 version = "0.0.0"
 dependencies = [
  "raw-cpuid",
+]
+
+[[package]]
+name = "kore-host"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "kore-vol",
 ]
 
 [[package]]
@@ -887,6 +895,14 @@ dependencies = [
  "kore-late",
  "kore-std",
  "libm",
+]
+
+[[package]]
+name = "kore-nvme"
+version = "0.0.0"
+dependencies = [
+ "kore-abi",
+ "kore-driver",
 ]
 
 [[package]]
@@ -947,12 +963,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-svc-block"
+version = "0.0.1"
+dependencies = [
+ "kore-abi",
+ "kore-driver",
+ "kore-nvme",
+ "kore-rt",
+ "kore-svc-device",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-svc-dagfs"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "crc",
+ "heapless",
+ "kore-abi",
+ "kore-collections",
+ "kore-dagfs",
+ "kore-driver",
+ "kore-nvme",
+ "kore-ring",
+ "kore-rt",
+ "kore-svc-block",
+ "kore-svc-extract",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-svc-device"
+version = "0.0.0"
+dependencies = [
+ "heapless",
+ "kore-abi",
+ "kore-rt",
+]
+
+[[package]]
 name = "kore-svc-extract"
 version = "0.0.1"
 dependencies = [
  "blake3",
  "heapless",
  "kore-rt",
+]
+
+[[package]]
+name = "kore-vol"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "kore-driver",
+ "kore-svc-dagfs",
+ "rustix",
 ]
 
 [[package]]

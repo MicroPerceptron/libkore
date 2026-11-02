@@ -55,6 +55,14 @@ unsafe impl<T: Send, A: Allocator + Sync + ?Sized + 'static> Send for AtomicSlot
 unsafe impl<T: Send + Sync, A: Allocator + Sync + ?Sized + 'static> Sync for AtomicSlotVec<T, A> {}
 
 impl<T, A: Allocator + ?Sized + 'static> AtomicSlotVec<T, A> {
+    /// Heap bytes one slot costs: its value cell, its state word and its
+    /// reader count. A caller budgeting an arena of `n` slots — a service
+    /// holding its heap to what its arenas can reach — multiplies by this
+    /// rather than respelling the layout.
+    pub const SLOT_BYTES: usize = core::mem::size_of::<UnsafeCell<MaybeUninit<T>>>()
+        + core::mem::size_of::<AtomicU64>()
+        + core::mem::size_of::<AtomicU32>();
+
     /// Build an empty arena of exactly `capacity` slots, backed by `alloc`.
     ///
     /// Fallible by construction: a founded service never aborts on allocator

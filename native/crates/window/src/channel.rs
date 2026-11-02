@@ -85,6 +85,15 @@ impl WindowState {
     /// Legacy two-pixels-per-unit flag, used when no quarter-step code is present.
     pub const DOUBLE_DENSITY: u32 = 1 << 3;
 
+    /// A screenshot waits on this window (`res/SCREENSHOTS.md`, window
+    /// capture): present one frame even while not [`VISIBLE`](Self::VISIBLE).
+    /// The compositor copies the first frame committed after it set this, at
+    /// commit, while the client is still blocked in `present`; it clears the
+    /// flag once it has a copy. The client library folds it into
+    /// visibility, and presents its current backing itself when the app has
+    /// nothing to repaint, so no app needs code of its own.
+    pub const CAPTURE: u32 = 1 << 8;
+
     // Four unused flag bits carry exact quarter steps without changing the
     // mapped state layout. Old peers retain the native/double fallback.
     const DENSITY_SHIFT: u32 = 4;
@@ -221,8 +230,31 @@ mod tests {
         assert_eq!(state.density(), Density::Native);
     }
 
+    /// The capture request is its own bit: density updates never touch it,
+    /// and it never reads as a density.
+    #[test]
+    fn the_capture_flag_is_disjoint_from_every_other_bit() {
+        use crate::appearance::Density;
+        let named = WindowState::FOCUSED
+            | WindowState::VISIBLE
+            | WindowState::LIGHT
+            | WindowState::DOUBLE_DENSITY
+            | WindowState::DENSITY_MASK;
+        assert_eq!(WindowState::CAPTURE & named, 0);
+        let mut state = WindowState {
+            flags: WindowState::CAPTURE,
+            ..WindowState::default()
+        };
+        for density in Density::ALL {
+            state.set_density(density);
+            assert_ne!(state.flags & WindowState::CAPTURE, 0);
+            assert_eq!(state.density(), density);
+        }
+    }
+
     /// The whole pair — request/reply rings, commit plane, terminal
-    /// output, and this channel — fits the frozen pair lease.
+    /// output, this channel and the menu plane — fits the frozen pair
+    /// lease.
     #[test]
     fn the_pair_window_still_fits_its_lease() {
         let pair = kore_rt::svc::window_bytes::<crate::control::WindowWire>(
@@ -233,7 +265,7 @@ mod tests {
         let output = kore_ring::spsc::region_bytes::<kore_abi::svc::OutChunk>(
             crate::wire::TERMINAL_OUTPUT_CAP,
         );
-        let total = pair + commits + output + region_bytes();
+        let total = pair + commits + output + region_bytes() + crate::menu::MENU_PLANE_BYTES;
         assert!(
             total <= crate::wire::SURFACE_PAIR_BYTES,
             "pair layout overflows the lease: {total:#x} > {:#x}",

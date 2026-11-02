@@ -829,6 +829,82 @@ mod tests {
         ))
     }
 
+    /// Pack maintenance's composition (`res/PACK_STREAMING.md` §7): a
+    /// region refresh drives a Stream lane through its region clamp, times
+    /// its probes off the lane's clock, and rewrites the clamped extent
+    /// without changing a byte anywhere on the disk.
+    #[test]
+    fn a_region_refresh_rides_a_stream_lane_inside_its_clamp() {
+        use crate::block::refresh::{Bucket, Outcome, Progress, RegionRefresh};
+        use crate::block::{BlockBuffer, DeviceCommand};
+        // Eight buffers for the job's four chunk slots.
+        type Backend8 = EngineBackend<'static, Single<Dev, 32>, OneQueue, 2, 3, 2, 8, 32, 32>;
+        type Engine8 = StorEngine<'static, Single<Dev, 32>, OneQueue, 3, 2, 8, 32, 32>;
+        let mut dev = Dev::new(512, 8).unwrap();
+        let mut buffer = dev.allocate_buffer(512).unwrap();
+        for lba in 0..64u64 {
+            buffer.bytes_mut().fill(lba as u8 | 0x80);
+            dev.submit(DeviceCommand::Write { lba, blocks: 1, buffer_offset: 0 }, Some(&mut buffer), 0).unwrap();
+            dev.poll().unwrap().result.unwrap();
+        }
+        dev.set_clock(1_000, 50_000);
+        let image = |dev: &mut Dev| {
+            let mut out = [0u8; 32 * 1024];
+            let mut buffer = dev.allocate_buffer(4096).unwrap();
+            for (index, chunk) in out.chunks_exact_mut(4096).enumerate() {
+                let read = DeviceCommand::Read { lba: index as u64 * 8, blocks: 8, buffer_offset: 0 };
+                dev.submit(read, Some(&mut buffer), 0).unwrap();
+                dev.poll().unwrap().result.unwrap();
+                chunk.copy_from_slice(buffer.bytes());
+            }
+            out
+        };
+        let before = image(&mut dev);
+        let place = Box::leak(Box::new(core::mem::MaybeUninit::<Engine8>::uninit()));
+        let engine = Engine8::init_in(place, Single::new(dev)).ok().expect("policy fits");
+        let backend: &'static Backend8 = Box::leak(Box::new(
+            Backend8::new(engine, [window(), window()], [LaneClasses::FILESYSTEM, LaneClasses::STREAM])
+                .unwrap(),
+        ));
+        let lane = backend.claim(1).unwrap();
+        let region = RegionDevice::whole(lane).unwrap().narrow(16, 32).ok().expect("clamp");
+        let mut books = [Bucket::default(); 4];
+        let mut job = RegionRefresh::new(region, &mut books).ok().expect("the job builds");
+        let run = |job: &mut RegionRefresh<'_, _>| {
+            for _ in 0..10_000 {
+                if job.advance(true) == Progress::Idle {
+                    return;
+                }
+            }
+            panic!("the job never went idle");
+        };
+        job.scan().unwrap();
+        run(&mut job);
+        assert_eq!(job.outcome(), Outcome::Scanned);
+        assert_eq!((job.scan_summary().scanned, job.scan_summary().mapped), (1, 1));
+        assert!(job.buckets()[0].median_ns > 0, "probes were timed off the lane's clock");
+        job.refresh_range(0, 1).unwrap();
+        run(&mut job);
+        assert_eq!(job.outcome(), Outcome::Refreshed);
+        assert_eq!(job.refresh_summary().bytes, 32 * 512);
+        assert_eq!(job.stale_completions(), 0);
+        assert!(job.into_device().is_ok());
+        assert_eq!(backend.outstanding(1), Some(0));
+        let (stats, expired) = backend.stats().unwrap();
+        assert_eq!((stats.stale_completions, expired), (0, 0));
+        // Read the whole disk back through the other lane.
+        let whole = RegionDevice::whole(backend.claim(0).unwrap()).unwrap();
+        let mut channel: BlockChannel<_, 2, 4> = BlockChannel::new(whole, CompletionMode::Poll).unwrap();
+        let buffer = channel.register_buffer(4096).unwrap();
+        let mut after = [0u8; 32 * 1024];
+        for (index, chunk) in after.chunks_exact_mut(4096).enumerate() {
+            let read = channel.submit_read(index as u64 * 8, 8, buffer, 0).unwrap();
+            assert_eq!(channel.wait().unwrap().request, read);
+            channel.read_buffer(buffer, 0, chunk).unwrap();
+        }
+        assert!(after == before, "a refresh changed a byte");
+    }
+
     /// The ordinary composition runs unchanged on an engine lane: a block
     /// channel over a region clamp writes and reads back, and the two lanes'
     /// regions never see each other's bytes.

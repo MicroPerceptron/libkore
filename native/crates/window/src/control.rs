@@ -5,7 +5,9 @@
 //! arrival identity, not an opcode or a terminal number supplied by a client,
 //! decides which vocabulary the service permits.
 
+use crate::capture::{CaptureMode, CaptureRefusal};
 use crate::configure::{Configure, Content, Preference};
+use crate::document::{DocumentKind, KindMask};
 use crate::wire::{self as surface, SurfaceRequest, SurfaceResponse};
 use kore_abi::{
     session::SlotRef,
@@ -30,6 +32,9 @@ const SET_TABS: u8 = 0x4b;
 const PUBLISH_DOCK_ITEM: u8 = 0x4c;
 const TAKE_SHELL_ACTION: u8 = 0x4d;
 const SET_LAYOUT_HINTS: u8 = 0x4e;
+const PREPARE_CAPTURE: u8 = 0x4f;
+const REQUEST_CAPTURE: u8 = 0x50;
+const RELEASE_CAPTURE: u8 = 0x51;
 const ACCEPTED: u8 = 0x40;
 const ADMITTED: u8 = 0x41;
 const REFUSED: u8 = 0x42;
@@ -150,6 +155,10 @@ pub struct DockItem {
     icon: u64,
     kind: u8,
     flags: u8,
+    /// The document classes this row's app opens — its handler contract,
+    /// so "Open With" lists it for those kinds. Data, never authority: the
+    /// controller still decides what an activation launches.
+    opens: KindMask,
     label: [u8; DOCK_LABEL_BYTES],
 }
 
@@ -173,6 +182,7 @@ impl DockItem {
             kind,
             flags: 0,
             icon: 0,
+            opens: KindMask::NONE,
             label,
         })
     }
@@ -207,6 +217,15 @@ impl DockItem {
 
     pub const fn icon(&self) -> u64 {
         self.icon
+    }
+
+    /// The same row declaring the document classes its app opens.
+    pub const fn with_opens(self, opens: KindMask) -> Self {
+        Self { opens, ..self }
+    }
+
+    pub const fn opens(&self) -> KindMask {
+        self.opens
     }
 
     pub const fn kind(&self) -> u8 {
@@ -253,33 +272,124 @@ impl DockItem {
 pub enum ShellAction {
     /// Dock row `index` of catalog `version` was activated.
     Launch { version: u16, index: u8 },
+    /// A window this controller launched asked to open the filesystem
+    /// object with stable identity `object` (never zero) in the default
+    /// handler for its `kind`. Data only: the opened window locates it from
+    /// its own root.
+    Open { object: u64, kind: DocumentKind },
+    /// A window's "Open With" menu chose dock row `index` of catalog
+    /// `version` to open the object with stable identity `object`.
+    OpenWith { version: u16, index: u8, object: u64 },
+    /// The seat's screen is frozen (`res/SCREENSHOTS.md`): launch the
+    /// capture writer on a pair prepared with [`DisplayRequest::
+    /// PrepareCapture`] for `ticket`. The geometry is data for the
+    /// controller's own books; the writer reads the frame's own.
+    /// `window` is the window a [`CaptureMode::Window`] frame was copied
+    /// from, so the controller can name its app; `None` for every other
+    /// mode. Inert identity: the controller matches it against the peers it
+    /// launched.
+    Captured {
+        ticket: u32,
+        mode: CaptureMode,
+        width: u16,
+        height: u16,
+        window: Option<PeerId>,
+    },
+    /// A capture of `mode` did not happen, and why. The controller says so.
+    CaptureRefused {
+        mode: CaptureMode,
+        refusal: CaptureRefusal,
+    },
+    /// A window this controller launched asked the user to choose a file of
+    /// the types `types` accepts (`res/FILE_PICKER.md`): launch the picker
+    /// with `token` (never zero), by which it claims the pick. Data only;
+    /// the compositor brokers the answer.
+    Pick { token: u64, types: u64 },
 }
 
 impl ShellAction {
-    const fn from_wire(id: u64, a: u64) -> Option<Option<Self>> {
+    /// The dock row word `Launch` and `OpenWith` share: `version | index << 16`.
+    fn row(word: u64) -> Option<(u16, u8)> {
+        let (version, index) = (word as u16, (word >> 16) as u8);
+        (word >> 24 == 0 && version != 0 && (index as usize) < MAX_DOCK_ITEMS).then_some((version, index))
+    }
+
+    fn from_wire(id: u64, a: u64, b: u64) -> Option<Option<Self>> {
         match id {
-            0 => {
-                if a != 0 {
-                    return None;
-                }
-                Some(None)
-            }
-            1 => {
-                let version = a as u16;
-                let index = (a >> 16) as u8;
-                if a >> 24 != 0 || version == 0 || index as usize >= MAX_DOCK_ITEMS {
-                    return None;
-                }
+            0 if a == 0 && b == 0 => Some(None),
+            1 if b == 0 => {
+                let (version, index) = Self::row(a)?;
                 Some(Some(Self::Launch { version, index }))
             }
+            2 if a != 0 => Some(Some(Self::Open {
+                object: a,
+                kind: DocumentKind::from_code(b)?,
+            })),
+            3 if a != 0 => {
+                let (version, index) = Self::row(b)?;
+                Some(Some(Self::OpenWith {
+                    version,
+                    index,
+                    object: a,
+                }))
+            }
+            4 if a as u32 != 0 && a >> 40 == 0 && b >> 48 == 0 => {
+                let (width, height) = (b as u16, (b >> 16) as u16);
+                (width != 0 && height != 0).then_some(())?;
+                let mode = CaptureMode::from_code((a >> 32) as u8)?;
+                let window = match (b >> 32) as u16 {
+                    0 => None,
+                    arrival => Some(PeerId::from_arrival(arrival)?),
+                };
+                // Only a window capture names a window, and it always does.
+                (window.is_some() == (mode == CaptureMode::Window)).then_some(())?;
+                Some(Some(Self::Captured {
+                    ticket: a as u32,
+                    mode,
+                    width,
+                    height,
+                    window,
+                }))
+            }
+            5 if a >> 8 == 0 && b >> 8 == 0 => Some(Some(Self::CaptureRefused {
+                mode: CaptureMode::from_code(a as u8)?,
+                refusal: CaptureRefusal::from_code(b as u8)?,
+            })),
+            6 if a != 0 && b != 0 => Some(Some(Self::Pick { token: a, types: b })),
             _ => None,
         }
     }
 
-    const fn words(action: Option<Self>) -> (u64, u64) {
+    const fn words(action: Option<Self>) -> (u64, u64, u64) {
         match action {
-            None => (0, 0),
-            Some(Self::Launch { version, index }) => (1, version as u64 | ((index as u64) << 16)),
+            None => (0, 0, 0),
+            Some(Self::Launch { version, index }) => (1, version as u64 | ((index as u64) << 16), 0),
+            Some(Self::Open { object, kind }) => (2, object, kind.code() as u64),
+            Some(Self::OpenWith {
+                version,
+                index,
+                object,
+            }) => (3, object, version as u64 | ((index as u64) << 16)),
+            Some(Self::Captured {
+                ticket,
+                mode,
+                width,
+                height,
+                window,
+            }) => (
+                4,
+                ticket as u64 | (mode.code() as u64) << 32,
+                width as u64
+                    | (height as u64) << 16
+                    | match window {
+                        Some(peer) => (peer.arrival() as u64) << 32,
+                        None => 0,
+                    },
+            ),
+            Some(Self::CaptureRefused { mode, refusal }) => {
+                (5, mode.code() as u64, refusal.code() as u64)
+            }
+            Some(Self::Pick { token, types }) => (6, token, types),
         }
     }
 }
@@ -340,9 +450,7 @@ impl kore_rt::svc::SvcProtocol for WindowWire {
     fn request_grants(request: &SurReqWire) -> usize {
         usize::from(matches!(
             decode_req(request),
-            Some(DisplayRequest::Surface(
-                SurfaceRequest::CreateSurface { .. }
-            ))
+            Some(DisplayRequest::Surface(request)) if surface::request_carries_grant(&request)
         ))
     }
     fn init_pair_window(
@@ -492,6 +600,10 @@ pub enum DisplayRequest {
     PrepareWindow {
         content: Content,
         preference: Preference,
+        /// The app icon the window presents under (a `kore_app_icons` id, the
+        /// one its dock row publishes; `0` = none). Inert identity, never
+        /// authority: it is how a running dock row finds its own windows.
+        icon: u64,
     },
     Configure,
     Acknowledge {
@@ -515,6 +627,25 @@ pub enum DisplayRequest {
     },
     /// Controller verb: dequeue the oldest pending dock action, if any.
     TakeShellAction,
+    /// Controller verb: the next peer this controller admits is the
+    /// capture writer for `ticket` (from [`ShellAction::Captured`]). It
+    /// gets no window; its one verb is
+    /// [`SurfaceRequest::TakeCapture`], and its teardown retires the
+    /// frozen frame.
+    PrepareCapture { ticket: u32 },
+    /// Controller verb: capture this controller's seat, as its
+    /// PrintScreen chord would (the `screenshot` command). A
+    /// [`CaptureMode::Window`] capture takes `window`, a peer this
+    /// controller launched, or the seat's focused window when `None`; every
+    /// other mode names none.
+    RequestCapture {
+        mode: CaptureMode,
+        window: Option<PeerId>,
+    },
+    /// Controller verb: give back the frozen frame for `ticket` without
+    /// writing it (the writer could not be launched). A frame a writer
+    /// was admitted for is retired by that writer's teardown instead.
+    ReleaseCapture { ticket: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -578,12 +709,14 @@ pub fn encode_req(request: &DisplayRequest) -> SurReqWire {
         DisplayRequest::PrepareWindow {
             content,
             preference,
+            icon,
         } => {
             w.op = PREPARE;
             w.subject = u64::from(content == Content::Application).into();
             let (kind, value) = preference.words();
             w.a = kind.into();
             w.b = value.into();
+            w.c = icon.into();
         }
         DisplayRequest::Configure => w.op = CONFIGURE,
         DisplayRequest::Acknowledge { serial, surface } => {
@@ -642,7 +775,8 @@ pub fn encode_req(request: &DisplayRequest) -> SurReqWire {
                 | (u64::from(index) << 16)
                 | (u64::from(count) << 24)
                 | (u64::from(item.kind) << 32)
-                | (u64::from(item.flags) << 40))
+                | (u64::from(item.flags) << 40)
+                | (u64::from(item.opens.bits()) << 48))
                 .into();
             let [b, c, d] = label_words(&item.label);
             w.b = b.into();
@@ -650,6 +784,19 @@ pub fn encode_req(request: &DisplayRequest) -> SurReqWire {
             w.d = d.into();
         }
         DisplayRequest::TakeShellAction => w.op = TAKE_SHELL_ACTION,
+        DisplayRequest::PrepareCapture { ticket } => {
+            w.op = PREPARE_CAPTURE;
+            w.subject = u64::from(ticket).into();
+        }
+        DisplayRequest::RequestCapture { mode, window } => {
+            w.op = REQUEST_CAPTURE;
+            w.subject = window.map_or(0, |peer| u64::from(peer.arrival())).into();
+            w.a = u64::from(mode.code()).into();
+        }
+        DisplayRequest::ReleaseCapture { ticket } => {
+            w.op = RELEASE_CAPTURE;
+            w.subject = u64::from(ticket).into();
+        }
     }
     w
 }
@@ -677,6 +824,7 @@ pub fn decode_req(w: &SurReqWire) -> Option<DisplayRequest> {
                 _ => return None,
             },
             preference: Preference::from_words(w.a.get(), w.b.get())?,
+            icon: w.c.get(),
         },
         CONFIGURE => DisplayRequest::Configure,
         ACK_CONFIGURE if w.a.get() != 0 && w.subject.get() != 0 => DisplayRequest::Acknowledge {
@@ -722,8 +870,7 @@ pub fn decode_req(w: &SurReqWire) -> Option<DisplayRequest> {
         PUBLISH_DOCK_ITEM => {
             let a = w.a.get();
             let (version, index, count) = (a as u16, (a >> 16) as u8, (a >> 24) as u8);
-            if a >> 48 != 0
-                || version == 0
+            if version == 0
                 || count == 0
                 || count as usize > MAX_DOCK_ITEMS
                 || index >= count
@@ -739,10 +886,32 @@ pub fn decode_req(w: &SurReqWire) -> Option<DisplayRequest> {
                     (a >> 40) as u8,
                     label_bytes([w.b.get(), w.c.get(), w.d.get()]),
                 )?
-                .with_icon(w.subject.get()),
+                .with_icon(w.subject.get())
+                .with_opens(KindMask::from_bits((a >> 48) as u16)?),
             }
         }
         TAKE_SHELL_ACTION => DisplayRequest::TakeShellAction,
+        PREPARE_CAPTURE => DisplayRequest::PrepareCapture {
+            ticket: u32::try_from(w.subject.get())
+                .ok()
+                .filter(|ticket| *ticket != 0)?,
+        },
+        REQUEST_CAPTURE => {
+            let mode = CaptureMode::from_code(u8::try_from(w.a.get()).ok()?)?;
+            let window = match u16::try_from(w.subject.get()).ok()? {
+                0 => None,
+                arrival => Some(PeerId::from_arrival(arrival)?),
+            };
+            if window.is_some() && mode != CaptureMode::Window {
+                return None;
+            }
+            DisplayRequest::RequestCapture { mode, window }
+        }
+        RELEASE_CAPTURE => DisplayRequest::ReleaseCapture {
+            ticket: u32::try_from(w.subject.get())
+                .ok()
+                .filter(|ticket| *ticket != 0)?,
+        },
         op if op & OUTPUT != 0 => {
             DisplayRequest::Output(kore_svc_output::wire::decode_req(&OutReqWire {
                 op: op & !OUTPUT,
@@ -804,9 +973,10 @@ pub fn encode_rep(response: &DisplayResponse, grants: u8) -> SurRepWire {
         }
         DisplayResponse::ShellAction(action) => {
             w.tag = SHELL_ACTION;
-            let (id, a) = ShellAction::words(action);
+            let (id, a, b) = ShellAction::words(action);
             w.id = id.into();
             w.a = a.into();
+            w.b = b.into();
         }
     }
     w
@@ -862,7 +1032,7 @@ pub fn decode_rep(w: &SurRepWire) -> Option<(DisplayResponse, u8)> {
             })
         }
         SHELL_ACTION => {
-            DisplayResponse::ShellAction(ShellAction::from_wire(w.id.get(), w.a.get())?)
+            DisplayResponse::ShellAction(ShellAction::from_wire(w.id.get(), w.a.get(), w.b.get())?)
         }
         tag if tag & OUTPUT != 0 => {
             DisplayResponse::Output(kore_svc_output::wire::decode_rep(&OutRepWire {
@@ -911,7 +1081,10 @@ pub fn reply_matches(w: &SurReqWire, response: &DisplayResponse, grants: u8) -> 
             | DisplayRequest::Focus { .. }
             | DisplayRequest::SetTabs(_)
             | DisplayRequest::SetLayoutHints(_)
-            | DisplayRequest::PublishDockItem { .. },
+            | DisplayRequest::PublishDockItem { .. }
+            | DisplayRequest::PrepareCapture { .. }
+            | DisplayRequest::RequestCapture { .. }
+            | DisplayRequest::ReleaseCapture { .. },
             DisplayResponse::Accepted,
         ) => true,
         (DisplayRequest::TakeShellAction, DisplayResponse::ShellAction(_)) => true,
@@ -939,7 +1112,10 @@ pub fn reply_matches(w: &SurReqWire, response: &DisplayResponse, grants: u8) -> 
             | DisplayRequest::SetTabs(_)
             | DisplayRequest::SetLayoutHints(_)
             | DisplayRequest::PublishDockItem { .. }
-            | DisplayRequest::TakeShellAction,
+            | DisplayRequest::TakeShellAction
+            | DisplayRequest::PrepareCapture { .. }
+            | DisplayRequest::RequestCapture { .. }
+            | DisplayRequest::ReleaseCapture { .. },
             DisplayResponse::ControlRefused(_),
         ) => true,
         (DisplayRequest::CancelAdmission, DisplayResponse::ControlRefused(_)) => true,
@@ -972,6 +1148,12 @@ mod tests {
                     width: 2,
                     height: 3,
                 },
+                icon: 0x9e37_79b9_7f4a_7c15,
+            },
+            DisplayRequest::PrepareWindow {
+                content: Content::Terminal,
+                preference: Preference::Tile,
+                icon: 0,
             },
             DisplayRequest::Configure,
             DisplayRequest::Acknowledge {
@@ -1040,6 +1222,111 @@ mod tests {
             wire.grants = 1;
             assert_eq!(decode_rep(&wire), None);
         }
+    }
+
+    /// The capture vocabulary rides the controller face byte-exactly: a
+    /// zero ticket, an unknown mode or refusal, and stray bits refuse.
+    #[test]
+    fn capture_verbs_and_actions_round_trip_and_fail_closed() {
+        for request in [
+            DisplayRequest::PrepareCapture { ticket: 1 },
+            DisplayRequest::PrepareCapture { ticket: u32::MAX },
+            DisplayRequest::RequestCapture {
+                mode: CaptureMode::Screen,
+                window: None,
+            },
+            DisplayRequest::RequestCapture {
+                mode: CaptureMode::Region,
+                window: None,
+            },
+            DisplayRequest::RequestCapture {
+                mode: CaptureMode::Window,
+                window: None,
+            },
+            DisplayRequest::RequestCapture {
+                mode: CaptureMode::Window,
+                window: PeerId::from_arrival(0x1_05),
+            },
+            DisplayRequest::ReleaseCapture { ticket: 3 },
+        ] {
+            let wire = encode_req(&request);
+            assert_eq!(decode_req(&wire), Some(request));
+            assert!(reply_matches(&wire, &DisplayResponse::Accepted, 0));
+            assert!(reply_matches(
+                &wire,
+                &DisplayResponse::ControlRefused(ControlRefusal::Busy),
+                0
+            ));
+            assert!(!reply_matches(&wire, &DisplayResponse::Accepted, 1));
+            let mut stray = wire;
+            stray.d = 1.into();
+            assert_eq!(decode_req(&stray), None);
+        }
+        let mut zero = encode_req(&DisplayRequest::PrepareCapture { ticket: 1 });
+        zero.subject = 0.into();
+        assert_eq!(decode_req(&zero), None, "a zero ticket names nothing");
+        let mut wide = zero;
+        wide.subject = (u64::from(u32::MAX) + 1).into();
+        assert_eq!(decode_req(&wide), None);
+        let mut unknown = encode_req(&DisplayRequest::RequestCapture {
+            mode: CaptureMode::Screen,
+            window: None,
+        });
+        unknown.a = 9.into();
+        assert_eq!(decode_req(&unknown), None);
+        let mut named = encode_req(&DisplayRequest::RequestCapture {
+            mode: CaptureMode::Screen,
+            window: None,
+        });
+        named.subject = 0x1_05.into();
+        assert_eq!(decode_req(&named), None, "only a window capture names a window");
+        named.a = u64::from(CaptureMode::Window.code()).into();
+        named.subject = 0x05.into();
+        assert_eq!(decode_req(&named), None, "a static pair is no window");
+        named.subject = 0x1_0000.into();
+        assert_eq!(decode_req(&named), None, "an arrival is 16 bits");
+
+        for action in [
+            ShellAction::Captured {
+                ticket: 7,
+                mode: CaptureMode::Screen,
+                width: 2560,
+                height: 1600,
+                window: None,
+            },
+            ShellAction::Captured {
+                ticket: u32::MAX,
+                mode: CaptureMode::Window,
+                width: 640,
+                height: 400,
+                window: PeerId::from_arrival(0xffff),
+            },
+            ShellAction::CaptureRefused {
+                mode: CaptureMode::Window,
+                refusal: CaptureRefusal::NoWindow,
+            },
+        ] {
+            let response = DisplayResponse::ShellAction(Some(action));
+            let wire = encode_rep(&response, 0);
+            assert_eq!(decode_rep(&wire), Some((response, 0)));
+            let mut stray = wire;
+            stray.c = 1.into();
+            assert_eq!(decode_rep(&stray), None);
+        }
+        for (a, b) in [
+            (7 | 1 << 32, 0),               // zero geometry
+            (1 << 32, 2560 | 1600 << 16),   // zero ticket
+            (7 | 9 << 32, 2560 | 1600 << 16), // unknown mode
+            (7 | 1 << 40, 2560 | 1600 << 16), // a bit past the mode
+            (7 | 1 << 32, 2560 | 1600 << 16 | 0x1_05 << 32), // a screen names no window
+            (7 | 2 << 32, 2560 | 1600 << 16), // a window capture names its window
+            (7 | 2 << 32, 2560 | 1600 << 16 | 0x05 << 32), // a static pair is no window
+            (7 | 2 << 32, 2560 | 1600 << 16 | 1 << 48), // a bit past the window
+        ] {
+            assert_eq!(ShellAction::from_wire(4, a, b), None, "{a:#x} {b:#x}");
+        }
+        assert_eq!(ShellAction::from_wire(5, 1, 0), None, "no refusal code");
+        assert_eq!(ShellAction::from_wire(5, 1, 9), None, "unknown refusal");
     }
 
     #[test]
@@ -1275,12 +1562,24 @@ mod tests {
         assert_eq!(decode_req(&wire), None);
         wire.a = (1 | (9 << 24) | (2 << 32)).into();
         assert_eq!(decode_req(&wire), None);
-        // Undefined flag bits and bits above the flag byte fail closed;
-        // the defined running bit decodes to the flagged row.
+        // Undefined flag bits and handler bits no document class has fail
+        // closed; the defined running bit decodes to the flagged row, and
+        // the handler mask to the row that opens those classes.
         wire.a = (1 | (1 << 24) | (2 << 32) | (2 << 40)).into();
         assert_eq!(decode_req(&wire), None);
-        wire.a = (1 | (1 << 24) | (2 << 32) | (1 << 48)).into();
+        wire.a = (1 | (1 << 24) | (2 << 32) | (1 << (48 + DocumentKind::ALL.len()))).into();
         assert_eq!(decode_req(&wire), None);
+        let editor = KindMask::of(&[DocumentKind::Text, DocumentKind::Code]);
+        wire.a = (1 | (1 << 24) | (2 << 32) | (u64::from(editor.bits()) << 48)).into();
+        assert_eq!(
+            decode_req(&wire),
+            Some(DisplayRequest::PublishDockItem {
+                version: 1,
+                index: 0,
+                count: 1,
+                item: item.with_opens(editor),
+            })
+        );
         wire.a = (1 | (1 << 24) | (2 << 32) | (1 << 40)).into();
         assert_eq!(
             decode_req(&wire),
@@ -1308,6 +1607,62 @@ mod tests {
             wire.b = 1.into();
             assert_eq!(decode_rep(&wire), None);
         }
+        // Opens carry their object's class in `b`; an "Open With" its dock
+        // row there, under the same row law as a launch.
+        for response in [
+            DisplayResponse::ShellAction(Some(ShellAction::Open {
+                object: 0x5eed,
+                kind: DocumentKind::Unknown,
+            })),
+            DisplayResponse::ShellAction(Some(ShellAction::Open {
+                object: u64::MAX,
+                kind: DocumentKind::Binary,
+            })),
+            DisplayResponse::ShellAction(Some(ShellAction::OpenWith {
+                version: 4,
+                index: 7,
+                object: 9,
+            })),
+            DisplayResponse::ShellAction(Some(ShellAction::Pick {
+                token: u64::MAX,
+                types: 0b100,
+            })),
+        ] {
+            let wire = encode_rep(&response, 0);
+            assert_eq!(decode_rep(&wire), Some((response, 0)));
+        }
+        // A pick names its token and at least one type.
+        let pick = encode_rep(&DisplayResponse::ShellAction(Some(ShellAction::Pick { token: 5, types: 1 })), 0);
+        for (a, b) in [(0, 1), (5, 0)] {
+            let mut bad = pick;
+            bad.a = a.into();
+            bad.b = b.into();
+            assert_eq!(decode_rep(&bad), None, "token {a} types {b}");
+        }
+        let mut open = encode_rep(
+            &DisplayResponse::ShellAction(Some(ShellAction::Open {
+                object: 1,
+                kind: DocumentKind::Text,
+            })),
+            0,
+        );
+        open.b = (DocumentKind::ALL.len() as u64).into();
+        assert_eq!(decode_rep(&open), None);
+        let mut with = encode_rep(
+            &DisplayResponse::ShellAction(Some(ShellAction::OpenWith {
+                version: 4,
+                index: 0,
+                object: 9,
+            })),
+            0,
+        );
+        with.b = (4 | (8 << 16)).into();
+        assert_eq!(decode_rep(&with), None, "a row past the dock");
+        with.b = 0.into();
+        assert_eq!(decode_rep(&with), None, "no catalog version");
+        with.b = 4.into();
+        with.a = 0.into();
+        assert_eq!(decode_rep(&with), None, "no object");
         let mut wire = encode_rep(&DisplayResponse::ShellAction(None), 0);
         wire.a = 1.into();
         assert_eq!(decode_rep(&wire), None);

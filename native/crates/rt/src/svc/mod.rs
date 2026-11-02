@@ -49,7 +49,8 @@ mod serve;
 
 pub use client::{
     AffineBundleCallError, CallError, CallReply, ClientEndpoints, GrantPin, InvocationAuxiliary,
-    InvocationAuxiliaryCapability, MAX_INVOCATION_AUXILIARIES, ReplyWaitStats, RetainedReturnCallError,
+    InvocationAuxiliaryCapability, MAX_INVOCATION_AUXILIARIES, Observation, ReplyWaitStats,
+    RetainedReturnCallError,
     ReturnCallError, ReturnCapability, ReturnDeriveError, ReturnDeriver, ReturnLeaseSource,
     StagedReturn, StagedReturnError, SvcClient,
 };
@@ -58,6 +59,7 @@ pub use serve::{
     MAX_MINTED_PAIRS, MAX_SERVE_PAIRS, MintedPair, PeerAdmissionError, PeerAdmissionRefusal,
     PeerAssemblyError, PeerAssemblyRefusal, PeerBundleAssembler, PeerBundlePart, PeerId,
     PeerMapPlan, RecyclablePeerBundle, ServeEndpoints, ServeHost, ServePair, ServeStats,
+    peer_slot_bytes,
 };
 pub(crate) use serve::{ServiceOwner, own_service};
 
@@ -407,8 +409,9 @@ pub const COOKIE_SHELL_CONFIG_POSTED: u64 = 0x4b4f_5245_5343_4601; // "KORESCF\x
 pub const INIT_SHELL_CONFIG_PRIMARY_RESOURCES: u64 = INIT_SHELL_CONFIG_RESOURCES + 2;
 
 /// Number of affine configuration members in a sibling seat's package.
-/// Sibling seats omit the primary seat's hypervisor console.
-pub const INIT_SHELL_CONFIG_RESOURCES: u64 = 14;
+/// Sibling seats omit the primary seat's hypervisor console. The final member
+/// is an ACCESS-only sender to the founder's isolated diagnostic receiver.
+pub const INIT_SHELL_CONFIG_RESOURCES: u64 = 15;
 
 /// A shell observed its separately founded Axiom presenter through compositor
 /// status. Low 32 bits: presented epoch; bits 32..47: terminal; bit 63: the
@@ -491,6 +494,8 @@ const _: () = {
     assert!(!kernel_reserved(COOKIE_REFUSED));
     assert!(!kernel_reserved(COOKIE_SHELL));
     assert!(!kernel_reserved(COOKIE_STORE));
+    assert!(!kernel_reserved(COOKIE_HOMES));
+    assert!(COOKIE_HOMES != COOKIE_STORE);
     assert!(!kernel_reserved(COOKIE_SPMD));
     assert!(!kernel_reserved(COOKIE_LUA));
     assert!(!kernel_reserved(COOKIE_LUA_REPL));
@@ -500,6 +505,7 @@ const _: () = {
     assert!(COOKIE_TERMINAL_APP != COOKIE_SHELL);
     assert!(COOKIE_MPY != COOKIE_LUA);
     assert!(COOKIE_MPY != COOKIE_LUA_REPL);
+    assert!(!kernel_reserved(COOKIE_BOOT_SETTLED));
 };
 
 /// Shell witness payload: wired, attached, and serving the prompt.
@@ -931,6 +937,17 @@ mod shell_failure_tests {
 /// testimony), and a seed verdict is not shell testimony.
 pub const COOKIE_STORE: u64 = 0x6B72_5F73_746F_7265; // "kr_store"
 
+/// Completion cookie for the home skeleton (`"kr_homes"`), posted by INIT
+/// last of its post-ready work, once it has asked exec to provision each
+/// terminal's durable home (`res/PHOTOS.md` § Sample pictures). Bits 0..7:
+/// the homes asked; 8..15: how many are recorded at the current skeleton
+/// version; 16..23: files copied in this boot (saturating — the skeleton's
+/// whole size on a first boot, zero after); 24..29: the first unprovisioned
+/// home's stage (`kore_abi::svc::LibraryFailure`), 0 when every home is.
+/// Non-fatal like [`COOKIE_STORE`], and for the same reason the ONLY place a
+/// dead skeleton and a working one differ — the gates key on it.
+pub const COOKIE_HOMES: u64 = 0x6B72_5F68_6F6D_6573; // "kr_homes"
+
 /// One init phase boundary (`"kr_initP"`): `[7:0]` the phase ordinal,
 /// `[63:8]` init's committed session clock in milliseconds. Posted at
 /// every step of the bring-up ladder so a boot log attributes the
@@ -951,6 +968,13 @@ pub const COOKIE_INIT_PHASE: u64 = 0x6B72_5F69_6E69_7450; // "kr_initP"
 /// kernel keeps the latest per kind and the terminal verdict names the row
 /// or the step, so a stall is one call rather than forty.
 pub const COOKIE_INIT_STEP: u64 = 0x6B72_5F69_6E69_7453; // "kr_initS"
+
+/// Doorbell notices init could not hold (`"kr_iRlst"`): the payload is how
+/// many. Init holds what an executor handoff consumes from its doorbell and
+/// then acts on it, or relays it, in arrival order; a notice that met the hold
+/// full is counted and named here instead of leaving a silent gap in the
+/// testimony it relays.
+pub const COOKIE_INIT_RELAY_LOST: u64 = 0x6B72_5F69_526C_7374; // "kr_iRlst"
 
 /// Three ordered, failure-only words of an exec cleanup-row snapshot. Init
 /// sends A, B, C on its retained founder channel; C completes one bounded
@@ -1004,6 +1028,39 @@ pub const COOKIE_LUA_REPL: u64 = 0x6B72_5F6C_7561_5250; // "kr_luaRP"
 /// the hypervisor is the final manifest row, so the request must not hold INIT's
 /// readiness (and therefore prevent that row from being founded).
 pub const COOKIE_MPY: u64 = 0x6B72_5F6D_7079_4F4B; // "kr_mpyOK"
+
+/// Diagnostic fields packed above [`COOKIE_MPY`]'s verdict byte. The shell
+/// produces these state-nibble values and the kernel's founding logger decodes
+/// them; one vocabulary prevents the two images from assigning different
+/// meanings to a failure. Values 0..=4 remain the observed guest states.
+pub mod mpy_verdict {
+    /// The bounded Status request got no reply within its observation slice.
+    pub const STATUS_TIMEOUT: u64 = 0x5;
+    /// The service replied but could not publish the status-plane record.
+    pub const STATUS_UNAVAILABLE: u64 = 0x6;
+    /// StatusReady arrived without the promised status-plane record.
+    pub const STATUS_MISSING_RECORD: u64 = 0x7;
+    /// The published status-plane record failed wire decoding.
+    pub const STATUS_MALFORMED_RECORD: u64 = 0x8;
+    /// The reply was not one of the Status verb's two legal responses.
+    pub const STATUS_UNEXPECTED_REPLY: u64 = 0x9;
+    /// A non-timeout request/reply infrastructure error occurred.
+    pub const STATUS_CALL_ERROR: u64 = 0xa;
+    /// Older shell images used this undifferentiated no-snapshot code.
+    pub const STATUS_UNSPECIFIED: u64 = 0xe;
+    /// The verdict's upper byte counts 80 ms units.
+    pub const ELAPSED_UNIT_MS: u64 = 80;
+    /// The one-byte elapsed field saturates at this many units.
+    pub const ELAPSED_MAX_UNITS: u64 = u8::MAX as u64;
+}
+
+/// Init's boot is done (`"kr_bootS"`), sent once on the boot-settle lane
+/// ([`role::BOOT_SETTLE`](kore_abi::task::role::BOOT_SETTLE)) after init's
+/// last boot step, the SPMD witness. The compositor holds the welcome's
+/// animation until it arrives (#1332). Payload 0. Init sends it only after a
+/// boot that ran to its end: on a failure, init stops and the welcome stays
+/// still.
+pub const COOKIE_BOOT_SETTLED: u64 = 0x6B72_5F62_6F6F_7453; // "kr_bootS"
 
 /// Request-ring capacity of a founded pair's shared window — the
 /// **cross-boundary geometry contract** (Phase-A checkpoint G2a-3a): the

@@ -191,6 +191,9 @@ pub enum ResourceKind {
     SystemObserve,
     /// Inert, one-shot proof that one executable endpoint authorized one
     /// exact invocation supply. It exposes no endpoint or memory authority.
+    /// Its resource id is that supply's revocation [`Tag`] index, so a
+    /// receiver holding both can read which landed supply it vouches for
+    /// ([`CapRecord::scope_id`] against the supply's [`Cid::tag`]).
     InvocationWitness,
     /// A task's **SPMD batch-reservation claim** on a CPU (G6c —
     /// `res/SPMD.md` §7): the `CpuShare`/`Fpu` sibling marking a core
@@ -303,6 +306,58 @@ impl CapRecord {
             mac: [0; 16],
         }
     }
+
+    /// The per-kind id of the resource this record authorizes: the id half
+    /// of [`scope_rid`](Self::scope_rid). Meaningful together with
+    /// [`kind`](Self::kind); ids are unique only within a kind.
+    #[inline]
+    pub const fn scope_id(&self) -> u32 {
+        rid_id(self.scope_rid)
+    }
+}
+
+/// A resource's global identity: its kind interleaved bit by bit with its
+/// per-kind id, the kind on the even bits and the id on the odd bits. Ids are
+/// unique within a kind (the catalog discipline), so a rid is unique across
+/// kinds, and the kernel binds it into every stamped record as
+/// [`CapRecord::scope_rid`]. This is the one encoding the kernel's
+/// `Resource::rid` and every userland reader of a record share.
+#[inline]
+pub const fn rid(kind: u32, id: u32) -> u64 {
+    spread_even(kind) | (spread_even(id) << 1)
+}
+
+/// The kind half of a [`rid`].
+#[inline]
+pub const fn rid_kind(rid: u64) -> u32 {
+    gather_even(rid)
+}
+
+/// The per-kind id half of a [`rid`].
+#[inline]
+pub const fn rid_id(rid: u64) -> u32 {
+    gather_even(rid >> 1)
+}
+
+/// Move bit `i` of `x` to bit `2i` (the classic Morton spread).
+const fn spread_even(x: u32) -> u64 {
+    let mut x = x as u64;
+    x = (x | (x << 16)) & 0x0000_FFFF_0000_FFFF;
+    x = (x | (x << 8)) & 0x00FF_00FF_00FF_00FF;
+    x = (x | (x << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
+    x = (x | (x << 2)) & 0x3333_3333_3333_3333;
+    (x | (x << 1)) & 0x5555_5555_5555_5555
+}
+
+/// The inverse of [`spread_even`]: bit `2i` of `x` back to bit `i`, ignoring
+/// the odd bits.
+const fn gather_even(x: u64) -> u32 {
+    let mut x = x & 0x5555_5555_5555_5555;
+    x = (x | (x >> 1)) & 0x3333_3333_3333_3333;
+    x = (x | (x >> 2)) & 0x0F0F_0F0F_0F0F_0F0F;
+    x = (x | (x >> 4)) & 0x00FF_00FF_00FF_00FF;
+    x = (x | (x >> 8)) & 0x0000_FFFF_0000_FFFF;
+    ((x | (x >> 16)) & 0x0000_0000_FFFF_FFFF) as u32
 }
 
 // Frozen wire pins (#81; the crate-header wire-freeze discipline) — the stamped arena-slot record
@@ -314,4 +369,55 @@ const _: () = {
     assert!(size_of::<Cid>() == 8);
     assert!(size_of::<Tag>() == 4);
     assert!(size_of::<Rights>() == 1);
+    // The rid layout is wire: every stamped record carries one. Pin the bit
+    // assignment (kind even, id odd) so a change cannot pass as a refactor.
+    assert!(rid(1, 0) == 0b01);
+    assert!(rid(0, 1) == 0b10);
+    assert!(rid(u32::MAX, 0) == 0x5555_5555_5555_5555);
+    assert!(rid(0, u32::MAX) == 0xAAAA_AAAA_AAAA_AAAA);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rid_splits_back_into_its_kind_and_id() {
+        let samples = [
+            0,
+            1,
+            2,
+            0x5555_5555,
+            0xAAAA_AAAA,
+            0x8000_0001,
+            0x1234_5678,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+        for kind in samples {
+            for id in samples {
+                let rid = rid(kind, id);
+                assert_eq!(
+                    (rid_kind(rid), rid_id(rid)),
+                    (kind, id),
+                    "{kind:#x}/{id:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_invocation_witness_record_names_its_supply_tag() {
+        let supply = Cid::new(7, Tag(0x0123_4567));
+        let witness = CapRecord {
+            scope_rid: rid(ResourceKind::InvocationWitness as u32, supply.tag().0),
+            kind: ResourceKind::InvocationWitness as u16,
+            ..CapRecord::vacant()
+        };
+        assert_eq!(witness.scope_id(), supply.tag().0);
+        assert_eq!(
+            rid_kind(witness.scope_rid),
+            ResourceKind::InvocationWitness as u32
+        );
+    }
+}

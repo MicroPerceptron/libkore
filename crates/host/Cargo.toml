@@ -1,0 +1,15 @@
+[package]
+name = "kore-host"
+version = "0.1.0-alpha.1"
+edition = "2024"
+publish = false
+description = "Host-side Kore tooling: a Kore machine's volume, offline, through the native filesystem owner"
+repository = "https://github.com/MicroPerceptron/libkore"
+
+# The exported host root (native/provenance.json): the offline volume
+# procedure over the filesystem row's own engine. A host program depends on
+# this facade, never on a second copy of that procedure. Unix hosts only:
+# the image device takes POSIX record locks, as QEMU does on the images it
+# runs.
+[dependencies]
+kore-vol = { path = "../../native/tools/kore-vol" }

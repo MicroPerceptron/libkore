@@ -20,7 +20,8 @@
 //! coalescing: the state that matters is in the rings, the notice only
 //! says "look".  The idle cycle runs the **pinned order**:
 //!
-//! 1. **consume** the delivered notice (the cookie is a hint);
+//! 1. **consume** the delivered notice (the cookie is a hint; a doorbell
+//!    owner that named a [`NoticeSink`] is offered it);
 //! 2. **re-post** the doorbell recv *as its own commit* — the post now
 //!    stands, so any kick during the drain is accepted, not refused
 //!    (which is what makes a `WouldBlock`ed kick droppable: the
@@ -68,12 +69,108 @@ use crate::wake;
 pub use task::{SpawnRefused, SpawnToken, TaskStorage};
 pub use time::{
     WakeReason, clock_ns, enable_irq_parks, next_wake, next_wake_for, next_wake_on,
-    next_wake_on_for, next_wake_until, quiesce_asked, quiesce_deadline, retire_irq_parks,
-    sleep_for, sleep_until, take_quiesce_ask,
+    next_wake_on_for, next_wake_on_word, next_wake_until, quiesce_asked, quiesce_deadline,
+    retire_irq_parks, sleep_for, sleep_until, take_quiesce_ask,
 };
 
 use task::{TaskHeader, poll_task, waker_for};
 pub(crate) use time::ExecCtx;
+
+/// Where an executor hands the doorbell notices it consumes.
+///
+/// For the runtime's own kicks, a service's reply or report, a doorbell
+/// notice is only a wake: the executor consumes it, re-stands the post and
+/// re-polls every source, and the cookie is a hint. A doorbell can also carry
+/// notices whose payload is data, such as a child's testimony on its parent's
+/// doorbell, which the parent relays or acts on. An executor lent such a
+/// doorbell ([`Executor::from_standing`]) would discard them, so the doorbell's
+/// owner names a sink ([`Executor::with_notice_sink`]): every notice the
+/// executor consumes, in its idle park or inline in a blocking call, is offered
+/// to it in arrival order. The kernel's quiesce ask is the executor's own
+/// ([`take_quiesce_ask`]) and is never offered.
+pub trait NoticeSink {
+    /// One consumed notice. Called on the executor's thread, possibly from
+    /// within a poll; it must not re-enter the executor.
+    fn notice(&self, cookie: u64, payload: u64);
+}
+
+/// Whether `cookie` names one of the runtime's bare wake kicks: a service's
+/// request or reply, a data-plane report, an event. Each says only "look":
+/// its payload is empty and the consumer re-checks its own sources on every
+/// wake, so a doorbell owner holding notices for their data has nothing to
+/// keep from one ([`NoticeHold`]).
+pub const fn is_wake_hint(cookie: u64) -> bool {
+    matches!(
+        cookie,
+        crate::svc::COOKIE_REQUEST
+            | crate::svc::COOKIE_REPLY
+            | crate::svc::COOKIE_REPORT
+            | crate::event::COOKIE_EVENT
+    )
+}
+
+/// A [`NoticeSink`] that holds, in arrival order, the notices an executor
+/// consumed on a lent doorbell that carry data, every one but the runtime's
+/// wake hints ([`is_wake_hint`]), for the doorbell's owner to take and act on
+/// as its own park would have. It holds at most `N`; a notice that meets it
+/// full is counted ([`take_lost`](Self::take_lost)), never dropped silently.
+pub struct NoticeHold<const N: usize> {
+    ring: [Cell<(u64, u64)>; N],
+    head: Cell<usize>,
+    len: Cell<usize>,
+    lost: Cell<u32>,
+}
+
+impl<const N: usize> NoticeHold<N> {
+    /// An empty hold.
+    pub const fn new() -> Self {
+        const { assert!(N > 0, "a notice hold holds at least one notice") };
+        Self {
+            ring: [const { Cell::new((0, 0)) }; N],
+            head: Cell::new(0),
+            len: Cell::new(0),
+            lost: Cell::new(0),
+        }
+    }
+
+    /// The oldest held notice, as `(cookie, payload)`.
+    pub fn take(&self) -> Option<(u64, u64)> {
+        let len = self.len.get();
+        if len == 0 {
+            return None;
+        }
+        let head = self.head.get();
+        self.head.set((head + 1) % N);
+        self.len.set(len - 1);
+        Some(self.ring[head].get())
+    }
+
+    /// How many notices met the hold full since the last call.
+    pub fn take_lost(&self) -> u32 {
+        self.lost.replace(0)
+    }
+}
+
+impl<const N: usize> Default for NoticeHold<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> NoticeSink for NoticeHold<N> {
+    fn notice(&self, cookie: u64, payload: u64) {
+        if is_wake_hint(cookie) {
+            return;
+        }
+        let len = self.len.get();
+        if len == N {
+            self.lost.set(self.lost.get().saturating_add(1));
+            return;
+        }
+        self.ring[(self.head.get() + len) % N].set((cookie, payload));
+        self.len.set(len + 1);
+    }
+}
 
 /// Concurrently admitted tasks per executor (excluding the root) — the
 /// §3.3/§8 design bound: spawn capacity is the declared task set,
@@ -152,6 +249,11 @@ pub(crate) enum ExecFault {
     /// compose, and this is executor-internal state rather than anything the
     /// kernel reported: two futures installed contradictory wake sources.
     AltDeliveryWithIrqPark,
+    /// A word arm and an alternate-delivery post stood at once — the wire
+    /// refuses `WAIT_WORD | WAIT_DELIVERY_ALT`, and the registry evicts the
+    /// word when the post arrives, so this is executor-internal state
+    /// contradicting itself.
+    WordArmWithAltPost,
     /// The kernel reported alternate delivery into a landing slot this
     /// thread's read-only slot alias cannot read at all — distinct from a
     /// readable slot holding no record, which is tolerated (retired rung
@@ -177,6 +279,7 @@ impl ExecFault {
             Self::ParkTransport => (0x67, 0),
             Self::AltDeliveryWithIrqPark => (0x68, 0),
             Self::AltDeliveryUnreadable(slot) => (0x69, u64::from(slot)),
+            Self::WordArmWithAltPost => (0x6a, 0),
         };
         rung | (detail << 8)
     }
@@ -336,6 +439,13 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
     /// doorbell while the executor owns the handoff.
     pub fn from_standing(transport: &'t T, doorbell: Doorbell) -> Self {
         Self::with_post_state(transport, doorbell, true)
+    }
+
+    /// Offer every doorbell notice this executor consumes to `sink`
+    /// ([`NoticeSink`]).
+    pub fn with_notice_sink(self, sink: &'t dyn NoticeSink) -> Self {
+        self.ctx.set_notice_sink(sink);
+        self
     }
 
     fn with_post_state(transport: &'t T, doorbell: Doorbell, posted: bool) -> Self {
@@ -525,11 +635,22 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
         if !self.posted.get() {
             self.repost();
         }
-        let deadline = self.ctx.timers_min();
         let alternate = self.ctx.delivery_post();
         if alternate.is_some() && self.ctx.irq() {
             executor_fault(ExecFault::AltDeliveryWithIrqPark);
         }
+        // The one word arm (`res/EVENT.md` §6).  Its registrant also holds
+        // a timer entry for its deadline, so the folded minimum already
+        // carries the bound; the fold below is the belt to that brace — a
+        // word park is never unbounded.
+        let word = self.ctx.word_arm();
+        if alternate.is_some() && word.is_some() {
+            executor_fault(ExecFault::WordArmWithAltPost);
+        }
+        let deadline = match word {
+            Some((_, bound)) => Some(self.ctx.timers_min().map_or(bound, |d| d.min(bound))),
+            None => self.ctx.timers_min(),
+        };
         // ── the bell tier: monitor, then arm, then park ──────────────
         //
         // Two steps, and only the first is optional.  The monitored window
@@ -573,6 +694,9 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
         if self.ctx.irq() {
             park.wait_irq();
         }
+        if let Some((arm, _)) = word {
+            park.wait_word(arm.subject, arm.offset, arm.expected);
+        }
         let spec = ParkSpec {
             chan: self.doorbell.chan,
             land: self.doorbell.land,
@@ -580,7 +704,15 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
             deadline_ns: deadline,
             irq: self.ctx.irq(),
         };
-        let Ok(committed) = self.transport.commit_and_park(&park, &spec) else {
+        // A word arm names a held capability the wire already carries in
+        // full, so it commits through the held-authority entry (the join
+        // park's precedent); the doorbell post and deadline ride alongside.
+        let committed = if word.is_some() {
+            self.transport.commit_word_park(&park)
+        } else {
+            self.transport.commit_and_park(&park, &spec)
+        };
+        let Ok(committed) = committed else {
             executor_fault(ExecFault::ParkTransport)
         };
         // Running again, whatever the outcome was: republish `AWAKE` before
@@ -600,18 +732,14 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
             // re-post as its own commit, then the TOTAL drain — the §3.1
             // pinned order; the caller's poll loop is the drain.
             Status::Ok => {
-                match verbs::take_notice(self.doorbell.land) {
-                    None => executor_fault(ExecFault::NoDoorbellNotice),
-                    // The kernel's terminal quiesce ask rides the ordinary
-                    // doorbell (#809 §L); its reserved cookie is refused to
-                    // userland senders, so seeing it here is the kernel.
-                    Some((cookie, budget_ns))
-                        if cookie == kore_abi::session::NOTICE_COOKIE_POWER_QUIESCE =>
-                    {
-                        self.ctx.note_quiesce_ask(budget_ns);
-                    }
-                    Some(_) => {}
-                }
+                let Some((cookie, payload)) = verbs::take_notice(self.doorbell.land) else {
+                    executor_fault(ExecFault::NoDoorbellNotice)
+                };
+                // The kernel's terminal quiesce ask rides the ordinary
+                // doorbell (#809 §L); its reserved cookie is refused to
+                // userland senders, so seeing it here is the kernel. Every
+                // other notice goes to the owner's sink, if any.
+                self.ctx.note_notice(cookie, payload);
                 self.cycles.set(self.cycles.get() + 1);
                 self.ctx.note_wake(time::WakeReason::Doorbell);
                 self.posted.set(false);
@@ -647,10 +775,8 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
                 // Both posts may have completed before resolution.  Consume
                 // and re-stand the level-triggered doorbell when present, but
                 // preserve Delivery as the edge-visible reason.
-                if let Some((cookie, budget_ns)) = verbs::take_notice(self.doorbell.land) {
-                    if cookie == kore_abi::session::NOTICE_COOKIE_POWER_QUIESCE {
-                        self.ctx.note_quiesce_ask(budget_ns);
-                    }
+                if let Some((cookie, payload)) = verbs::take_notice(self.doorbell.land) {
+                    self.ctx.note_notice(cookie, payload);
                     self.cycles.set(self.cycles.get() + 1);
                     self.posted.set(false);
                     self.repost();
@@ -675,12 +801,39 @@ impl<'t, T: ParkTransport<Error: core::fmt::Debug>> Executor<'t, T> {
                 self.ctx.note_wake(time::WakeReason::Irq);
                 self.wake_all(root_hdr);
             }
+            // The word moved (or a `wake_word` on its memory fired): the
+            // post stands (the deadline win's rule again), and exactly the
+            // arm's owner wakes — its ready leg clears the registration and
+            // re-reads the word.
+            Status::Word => {
+                self.ctx.note_wake(time::WakeReason::Word);
+                self.ctx.wake_word_owner();
+            }
             // A scheduler notification resumed this task while the exact
             // doorbell post still stood.  There is no notice to consume and
             // no post to replace; loop back to the same standing park.  This
             // outcome is deliberately quiet and does not wake every future:
             // no executor-visible source became ready.
-            Status::WouldBlock => {}
+            Status::WouldBlock => {
+                // A word park the kernel could not arm (its bounded waiter
+                // board was full) returns without having parked at all;
+                // withdraw the arm so its owner falls back to the doorbell
+                // rung instead of this cycle repeating forever.
+                if word.is_some() {
+                    self.ctx.refuse_word();
+                }
+            }
+            // The word's memory was torn down under the standing arm (the
+            // lease behind the window revoked — a window re-founded or
+            // retired while its client still waited).  The wait is not
+            // wrong, its word is gone: withdraw the arm and let the owner
+            // re-check and take the doorbell, where the window's own
+            // replacement or refusal reaches it.  Without a word arm a
+            // `Revoked` park is the unknown it always was.
+            Status::Revoked if word.is_some() => {
+                self.ctx.note_wake(time::WakeReason::Word);
+                self.ctx.refuse_word();
+            }
             // The doorbell's recv end was reaped — the runtime's wake edge is
             // gone; nothing correct remains for THIS executor.
             //
@@ -906,9 +1059,9 @@ pub(crate) async fn settle_inline_doorbell<T: Transport>(
     doorbell: Doorbell,
     stamp_ms: u32,
 ) -> bool {
-    if verbs::take_notice(doorbell.land).is_none() {
+    let Some((cookie, payload)) = verbs::take_notice(doorbell.land) else {
         return false;
-    }
+    };
     let Some(reposted_ms) = stand_doorbell(transport, doorbell).await else {
         return false;
     };
@@ -925,7 +1078,11 @@ pub(crate) async fn settle_inline_doorbell<T: Transport>(
         );
         // SAFETY: the assertion above and executor poll discipline prove this
         // pointer remains live through this immediate Ready result.
-        unsafe { &*ctx }.note_inline_doorbell(settled_ms);
+        let ctx = unsafe { &*ctx };
+        // The call consumed the notice, not the executor's idle park; it is
+        // offered, and a quiesce ask latched, exactly as there.
+        ctx.note_notice(cookie, payload);
+        ctx.note_inline_doorbell(settled_ms);
         Poll::Ready(())
     })
     .await;
@@ -1102,5 +1259,70 @@ mod tests {
             !ceiling.is_zero(),
             "a zero budget would make the prelude a no-op that still reads as live"
         );
+    }
+
+    /// A hold keeps the notices that carry data in arrival order, keeps none
+    /// of the runtime's wake hints, counts what meets it full, and keeps
+    /// accepting once a taker makes room, across the ring's wrap.
+    #[test]
+    fn a_notice_hold_keeps_data_in_order_and_counts_what_it_cannot_hold() {
+        use super::{NoticeHold, NoticeSink, is_wake_hint};
+        use crate::svc::{COOKIE_REPLY, COOKIE_REPORT, COOKIE_REQUEST, COOKIE_SHELL};
+
+        for hint in [
+            COOKIE_REQUEST,
+            COOKIE_REPLY,
+            COOKIE_REPORT,
+            crate::event::COOKIE_EVENT,
+        ] {
+            assert!(is_wake_hint(hint));
+        }
+        assert!(!is_wake_hint(COOKIE_SHELL));
+
+        let hold = NoticeHold::<3>::new();
+        hold.notice(COOKIE_SHELL, 1);
+        hold.notice(COOKIE_REPLY, 0);
+        hold.notice(COOKIE_SHELL, 2);
+        hold.notice(COOKIE_REPORT, 0);
+        hold.notice(COOKIE_SHELL, 3);
+        hold.notice(COOKIE_SHELL, 4);
+        hold.notice(COOKIE_SHELL, 5);
+        assert_eq!(hold.take_lost(), 2);
+        assert_eq!(hold.take_lost(), 0);
+        assert_eq!(hold.take(), Some((COOKIE_SHELL, 1)));
+        hold.notice(COOKIE_SHELL, 6);
+        hold.notice(COOKIE_SHELL, 7);
+        assert_eq!(hold.take_lost(), 1);
+        for payload in [2, 3, 6] {
+            assert_eq!(hold.take(), Some((COOKIE_SHELL, payload)));
+        }
+        assert_eq!(hold.take(), None);
+    }
+
+    /// Every notice the executor consumes reaches one funnel: the kernel's
+    /// quiesce ask is latched for the service loop and never offered, every
+    /// other notice goes to the owner's sink, and without one nothing does.
+    #[test]
+    fn consumed_notices_reach_the_owners_sink_and_the_quiesce_ask_stays_the_executors() {
+        use super::{ExecCtx, NoticeHold};
+        use crate::svc::{COOKIE_REPLY, COOKIE_SHELL};
+        use kore_abi::session::NOTICE_COOKIE_POWER_QUIESCE;
+
+        let unowned = ExecCtx::new();
+        unowned.note_notice(COOKIE_SHELL, 9);
+        unowned.note_notice(NOTICE_COOKIE_POWER_QUIESCE, 40);
+        assert_eq!(unowned.take_quiesce_ask(), Some(40));
+
+        let hold = NoticeHold::<4>::new();
+        let ctx = ExecCtx::new();
+        ctx.set_notice_sink(&hold);
+        ctx.note_notice(COOKIE_SHELL, 1);
+        ctx.note_notice(NOTICE_COOKIE_POWER_QUIESCE, 50);
+        ctx.note_notice(COOKIE_REPLY, 0);
+        ctx.note_notice(COOKIE_SHELL, 2);
+        assert_eq!(ctx.take_quiesce_ask(), Some(50));
+        assert_eq!(hold.take(), Some((COOKIE_SHELL, 1)));
+        assert_eq!(hold.take(), Some((COOKIE_SHELL, 2)));
+        assert_eq!(hold.take(), None);
     }
 }

@@ -250,6 +250,27 @@ impl<'w, 't> Fs<'w, 't> {
         Ok((parent, name))
     }
 
+    /// How many folders hold each step of a route from the root, written
+    /// into each step's count: a step held by several is a fork a path bar
+    /// marks. A step that does not open ends the walk, the rest keeping
+    /// what they had.
+    pub async fn links_along(&mut self, steps: &mut [(Name, u32)]) {
+        let Ok(mut current) = self.open_root(Rights::READ).await else {
+            return;
+        };
+        for step in steps.iter_mut() {
+            let Ok(next) = self.open_at(&current, step.0, Rights::READ).await else {
+                break;
+            };
+            self.close(current).await;
+            current = next;
+            if let Ok(stat) = self.stat(&current).await {
+                step.1 = stat.links;
+            }
+        }
+        self.close(current).await;
+    }
+
     /// Metadata for an open view, revalidated by the service on this call.
     pub async fn stat(&mut self, view: &View) -> Result<Stat, Refusal> {
         match self

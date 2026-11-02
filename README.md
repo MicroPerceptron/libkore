@@ -6,6 +6,9 @@ It is an application facade, not a kernel package or a hosted operating-system
 runtime. Filesystem, clocks, process operations and devices use capabilities
 actually endowed to the process; selecting a Cargo feature grants none of them.
 The libraries do not install a global allocator or start a second executor.
+`kore-host` is the facade's counterpart on the other side of the machine
+boundary: host programs (vKore, volume browsers, packagers) reach a Kore
+machine's volume through the same exported owners a booted Kore runs.
 
 | Package | Use |
 | --- | --- |
@@ -14,8 +17,9 @@ The libraries do not install a global allocator or start a second executor.
 | `kore-ffi` | C headers and Zig module over a Rust-founded host, including filesystem, time, random, allocation and worker APIs; no standalone C/Zig CRT |
 | `kore-lua` | Embeddable Lua 5.5 engine and bridge; interactive and opt-in restricted worker policies |
 | `kore-wasi` | WASI 0.2 component host composed by an embedder with its Wasmtime engine and native owners |
+| `kore-host` | Host-side (Linux/macOS) tooling: a Kore machine's DagFS volume, offline, through the filesystem row's own engine |
 
-All five package manifests set `publish = false`; consume a reviewed Git
+All six package manifests set `publish = false`; consume a reviewed Git
 revision or a deliberately composed local checkout, not a registry version.
 The WASI host supports the `wasi:cli/command` world and native-backed I/O,
 filesystem, clocks and random imports; unsupported imports such as sockets
@@ -124,10 +128,31 @@ The host tests exercise Rust logic and the linked foreign/Lua harnesses; they
 do not prove founded service behavior or physical-device operation. Ordinary
 Rust dependency builds do not need the C/Zig generation tools.
 
-The roughly 5 MiB `native/` export contains 14 required packages, including optional
-and test dependencies, with unchanged source paths and manifests. It contains no
-kernel or boot images. `make native-check` detects source drift. For work beside
-a local Kore tree, follow [local integration](docs/integration.md).
+The roughly 11 MiB `native/` export contains 26 required packages, including optional
+and test dependencies, with unchanged source paths and manifests: the application
+owners above, and the host root `tools/kore-vol` with the filesystem service closure
+it drives (DagFS engine, block, device, memory and swap services, the NVMe driver).
+It contains no kernel or boot images. `make native-check` detects source drift. For
+work beside a local Kore tree, follow [local integration](docs/integration.md).
+
+## Host programs
+
+A program on a Linux or macOS host that keeps Kore machines depends on `kore-host`:
+
+```toml
+[target.'cfg(unix)'.dependencies]
+kore-host = { git = "https://github.com/MicroPerceptron/libkore", rev = "<reviewed commit>" }
+```
+
+`kore_host::volume` formats a blank disk image as a first boot would, installs a
+host tree under a terminal's home, removes one, and mounts a volume read-only to
+list, walk and read what a machine left — screenshots, logs, a project's files —
+through the exported `kore-vol` procedure over the DagFS engine, so what it reads
+is what Kore reads and what it writes is what the next boot mounts. Volumes are
+offline only: the image device refuses an image a running QEMU holds. A commit
+writes `volume::FORMAT_VERSION`; a volume a newer Kore wrote is refused, so pick the
+libkore revision whose export matches the machines' Kore build. See the crate
+documentation for bounds and the Linux whole-disk mode.
 
 ## Alpha boundary
 

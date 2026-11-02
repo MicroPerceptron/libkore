@@ -42,6 +42,21 @@ pub struct ParkPost {
     pub recv_tag: u32,
 }
 
+/// One watched memory word that may be folded into a parking trap — the
+/// executor's transport-level description of a `WAIT_WORD` arm
+/// (`res/EVENT.md` §6).  Named by *authority*: the held lease / mapped
+/// view's arena slot and a byte offset within it, never an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WordArm {
+    /// The held `MemLease` / mapped-view slot the word lives in.
+    pub subject: SlotRef,
+    /// Byte offset of the `u32` word from the subject's base.
+    pub offset: u32,
+    /// The value the waiter last read; the kernel refuses to sleep on a
+    /// word that already differs.
+    pub expected: u32,
+}
+
 use crate::service::{Grant, GrantArg};
 use crate::session::{BuildError, SessionBuilder, Staged};
 
@@ -86,9 +101,9 @@ pub trait Transport {
     /// it but must preserve the non-parking contract.
     fn commit_affine(&self, session: &SessionBuilder) -> Result<Committed, Self::Error> {
         debug_assert!(
-            !session
-                .flags()
-                .intersects(SessionFlags::WAIT_DELIVERY | SessionFlags::WAIT_IRQ),
+            !session.flags().intersects(
+                SessionFlags::WAIT_DELIVERY | SessionFlags::WAIT_IRQ | SessionFlags::WAIT_WORD
+            ),
             "affine commit cannot carry WAIT bits"
         );
         self.commit_now(session)
@@ -184,6 +199,21 @@ pub trait ParkTransport: Transport + sealed::Sealed {
     /// doorbell, deadline, or route may ride alongside; the composite is
     /// resolved by the first-wins rule the flags document.
     fn commit_join_park(&self, session: &SessionBuilder) -> Result<Committed, Self::Error>;
+
+    /// Commit a [`SessionFlags::WAIT_WORD`] session and park on the memory
+    /// word it names — the **kernel address-wait** (`res/EVENT.md` §6).
+    ///
+    /// Its own entry for the reason [`commit_join_park`](Self::commit_join_park)
+    /// has one: the wait authority is a *held capability* (the lease or
+    /// mapped view the `WordWaitReq` names by slot), which the wire already
+    /// carries in full — a spec would restate it.  The deadline is
+    /// mandatory (the builder refuses an unbounded word wait); a standing
+    /// doorbell post or a route may ride alongside, resolved by the
+    /// first-wins rule the flags document.  `Word` = the word moved (or a
+    /// `wake_word` fired), `Deadline` = the bound won, `Revoked` = the
+    /// subject's lease died, `WouldBlock` = the kernel's bounded waiter
+    /// board was full (re-park).
+    fn commit_word_park(&self, session: &SessionBuilder) -> Result<Committed, Self::Error>;
 }
 
 impl ParkTransport for TrapTransport {
@@ -254,6 +284,21 @@ impl ParkTransport for TrapTransport {
         self.trap(session)
     }
 
+    #[cfg(target_os = "none")]
+    fn commit_word_park(&self, session: &SessionBuilder) -> Result<Committed, TrapUnavailable> {
+        debug_assert!(
+            session
+                .flags()
+                .contains(SessionFlags::WAIT_WORD | SessionFlags::WAIT_SLEEP),
+            "a word park must carry WAIT_WORD with its WAIT_SLEEP bound"
+        );
+        // The bell guard rides exactly as on `commit_and_park`: a word park
+        // may carry the executor's standing doorbell post, so a peer's
+        // notice is owed the same `AWAKE` republish on return.
+        let _parked = crate::wake::Parked::enter();
+        self.trap(session)
+    }
+
     /// Off the metal userland targets (host tests): the honest typed refusal —
     /// same posture as the plain verbs, minus their WAIT-bits-clear assertion
     /// (this IS the flagged form).
@@ -273,6 +318,11 @@ impl ParkTransport for TrapTransport {
 
     #[cfg(not(target_os = "none"))]
     fn commit_join_park(&self, _session: &SessionBuilder) -> Result<Committed, TrapUnavailable> {
+        Err(TrapUnavailable)
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn commit_word_park(&self, _session: &SessionBuilder) -> Result<Committed, TrapUnavailable> {
         Err(TrapUnavailable)
     }
 }
@@ -309,9 +359,9 @@ impl TrapTransport {
     /// plain verb debug-asserts the bits clear (`res/USERLAND.md` §4).
     fn issue(&self, session: &SessionBuilder) -> Result<Committed, TrapUnavailable> {
         debug_assert!(
-            !session
-                .flags()
-                .intersects(SessionFlags::WAIT_DELIVERY | SessionFlags::WAIT_IRQ),
+            !session.flags().intersects(
+                SessionFlags::WAIT_DELIVERY | SessionFlags::WAIT_IRQ | SessionFlags::WAIT_WORD
+            ),
             "plain commit with WAIT bits set — parking commits are commit_and_park's (Phase A)"
         );
         self.trap(session)

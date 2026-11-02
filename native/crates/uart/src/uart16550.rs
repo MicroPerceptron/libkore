@@ -14,6 +14,7 @@ use super::{LineConfig, RegisterAccess, Uart};
 const REG_RBR: usize = 0; // receive buffer (read; DLL when DLAB)
 const REG_THR: usize = 0; // transmit holding (write; DLL when DLAB)
 const REG_IER: usize = 1; // interrupt enable (DLM when DLAB)
+const REG_IIR: usize = 2; // interrupt identification (read)
 const REG_FCR: usize = 2; // FIFO control (write)
 const REG_LCR: usize = 3; // line control
 const REG_LSR: usize = 5; // line status
@@ -22,6 +23,11 @@ const REG_SCR: usize = 7; // scratch (16550A and later; absent on a 16450)
 const LCR_8N1: u8 = 0x03; // 8 data bits, no parity, 1 stop; clears DLAB
 const LCR_DLAB: u8 = 0x80; // divisor-latch access
 const FCR_ENABLE_CLEAR: u8 = 0x07; // enable FIFOs + clear RX/TX
+const FCR_ENABLE: u8 = 0x01; // enable FIFOs, keep what is queued
+const IIR_FIFOS: u8 = 0xC0; // IIR[7:6]: `11` once FCR0 has enabled usable FIFOs
+/// The 16550A transmit FIFO. Deeper descendants (a 64-byte 16750, a
+/// DesignWare part) still hold at least this many, so it is a safe floor.
+const TX_FIFO_DEPTH: usize = 16;
 const LSR_DR: u8 = 0x01; // data ready (receive holding register non-empty)
 const LSR_THRE: u8 = 0x20; // transmit holding register empty
 
@@ -118,6 +124,24 @@ impl Uart for Uart16550 {
 
     fn tx_ready(&self, regs: &dyn RegisterAccess) -> bool {
         self.read_reg(regs, REG_LSR) & LSR_THRE != 0
+    }
+
+    /// PC16550D: FCR0 enables both FIFOs, and in FIFO mode LSR.THRE means
+    /// the whole transmit FIFO is empty, so one ready observation admits
+    /// [`TX_FIFO_DEPTH`] bytes. IIR[7:6] reads `11` only on a part whose
+    /// FIFOs then work; `00` (a 16450) or `10` (the original 16550, whose
+    /// FIFO is unusable) stays one byte per observation. Linux's
+    /// `serial8250` autoconfig makes the same IIR distinction.
+    ///
+    /// Call this before the first transmitted byte: entering FIFO mode
+    /// clears the FIFOs, and only an idle transmitter has nothing to lose.
+    fn enable_tx_fifo(&self, regs: &dyn RegisterAccess) -> usize {
+        self.write_reg(regs, REG_FCR, FCR_ENABLE);
+        if self.read_reg(regs, REG_IIR) & IIR_FIFOS == IIR_FIFOS {
+            TX_FIFO_DEPTH
+        } else {
+            1
+        }
     }
 
     fn tx_byte(&self, regs: &dyn RegisterAccess, byte: u8) {

@@ -63,6 +63,24 @@ pub enum FsRequest {
         cursor: u32,
         window_offset: u32,
     },
+    /// One page of an object's visible parents — the directories reachable
+    /// from the handle's authority root that hold an edge to it, each with
+    /// the shortest route from that root — landed in the data window as
+    /// search-hit records.  Answered as [`FsResponse::Listed`].
+    Parents {
+        handle: Handle,
+        cursor: u32,
+        window_offset: u32,
+    },
+    /// The route from the handle's authority root to the object with this
+    /// stable identity, landed in the data window as one search-hit record.
+    /// Answered as [`FsResponse::Listed`] with one entry; an object outside
+    /// the root's reach is `NotFound`, as one that does not exist.
+    Locate {
+        handle: Handle,
+        stable: crate::StableObjectId,
+        window_offset: u32,
+    },
     Create {
         parent: Handle,
         name: Name,
@@ -360,6 +378,32 @@ pub enum FsRequest {
     /// Refused `Busy` while commands are still in flight — the ring stops
     /// taking submissions at the first ask; ask again.
     StorDetach,
+    /// Ask the pack region's maintenance job for `action`
+    /// (`res/PACK_STREAMING.md` §7), and land its report — a
+    /// `PackMaintenanceWire` and the region's `PackBucketWire` records — in
+    /// the data window at `window_offset`. A scan or refresh starts and
+    /// replies at once; the row runs it between requests.
+    StorMaintain {
+        action: MaintainAction,
+        window_offset: u32,
+    },
+}
+
+/// What a [`FsRequest::StorMaintain`] asks of the pack region's
+/// maintenance job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaintainAction {
+    /// Report only.
+    Status,
+    /// Time every bucket's reads and judge which are stale.
+    Scan,
+    /// Rewrite, content unchanged, every bucket the last scan judged stale.
+    RefreshStale,
+    /// Rewrite buckets `first..first + count`, judged or not — still at
+    /// most once per bucket per boot.
+    RefreshRange { first: u32, count: u32 },
+    /// Stop the running job once the device returns what it holds.
+    Cancel,
 }
 
 impl FsRequest {
@@ -373,6 +417,8 @@ impl FsRequest {
                 | FsRequest::WriteReplacement { .. }
                 | FsRequest::Append { .. }
                 | FsRequest::List { .. }
+                | FsRequest::Parents { .. }
+                | FsRequest::Locate { .. }
                 | FsRequest::ListGrants { .. }
                 | FsRequest::LendVersion { .. }
                 | FsRequest::LendExecutable { .. }
@@ -380,6 +426,7 @@ impl FsRequest {
                 | FsRequest::CommitDerived { .. }
                 | FsRequest::Search { .. }
                 | FsRequest::SystemStatus { .. }
+                | FsRequest::StorMaintain { .. }
         )
     }
 }
@@ -414,8 +461,9 @@ pub enum FsResponse {
         links: u32,
         grants: u32,
     },
-    /// `entries` directory entries were written to the data window; `next` is
-    /// the cursor to resume at, or `None` when the listing is complete.
+    /// `entries` records were written to the data window — directory entries
+    /// for `List`, parent records for `Parents`; `next` is the cursor to
+    /// resume at, or `None` when the listing is complete.
     Listed {
         entries: u32,
         next: Option<u32>,
@@ -535,6 +583,11 @@ pub enum FsResponse {
         /// The last stage refusal, as `kore_driver::block::BlockError`'s
         /// discriminant plus one; zero for none.
         last_stage_error: u8,
+    },
+    /// The pack region's maintenance report landed in the data window:
+    /// `len` bytes, a `PackMaintenanceWire` and its bucket records.
+    StorMaintained {
+        len: u32,
     },
     /// The operation was refused. The engine's vocabulary crosses intact.
     Refused(FsError),

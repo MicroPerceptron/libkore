@@ -20,7 +20,10 @@ use core::{cell::Cell, marker::PhantomData};
 
 use kore_abi::monitor::FilesystemLatencySnapshot;
 
+#[cfg(feature = "image")]
+pub mod image;
 pub mod memory;
+pub mod refresh;
 pub mod region;
 
 pub use region::RegionDevice;

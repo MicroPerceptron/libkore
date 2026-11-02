@@ -66,6 +66,15 @@ impl Fs<'_, '_> {
     pub fn set_direct_polling(&mut self, direct: bool) {
         self.client.set_direct_polling(direct);
     }
+
+    /// Opt into the existing exact-pair deadline policy for data-only
+    /// control calls. On expiry this face must not be reused for unrelated
+    /// work; `status_pair_idle` remains false. Authority-return operations
+    /// keep their own custody policy. Change only while the pair is idle.
+    pub fn set_observation(&mut self, observation: kore_rt::svc::Observation) -> bool {
+        self.client.set_observation(observation)
+    }
+
 }
 
 pub struct Fs<'w, 't> {

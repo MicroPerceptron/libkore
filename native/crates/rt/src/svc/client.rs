@@ -328,6 +328,32 @@ pub enum CallError {
     Timeout,
 }
 
+/// How long a lifecycle owner watches one exact control request's reply
+/// ([`SvcClient::call_exact`]).
+///
+/// A pair carries one request at a time and its replies name no request, so
+/// a request whose observation expires stays published, owned by whoever
+/// published it, and every other request on the pair answers
+/// [`CallError::Outstanding`] until that owner carries it to its reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Observation {
+    /// Until the reply lands: the pair is idle again on return, unless the
+    /// transport itself failed.
+    Settle,
+    /// At most this many nanoseconds. Expiry is [`CallError::Timeout`] and
+    /// leaves the exact request published for its owner's next call.
+    Slice(u64),
+}
+
+impl Observation {
+    const fn budget_ns(self) -> Option<u64> {
+        match self {
+            Self::Settle => None,
+            Self::Slice(budget_ns) => Some(budget_ns),
+        }
+    }
+}
+
 /// Failure of an authority-bearing call, split by proven source custody.
 ///
 /// A non-`Ok` commit is not generally proof that the source survived: an OCC
@@ -938,7 +964,7 @@ fn classify_request_park_commit(committed: Committed, deadline_armed: bool) -> R
     let raw_status = committed.raw() as u16;
     let status = committed.status();
     let failing = committed.failing_index();
-    if raw_status > Status::FabricRouteCapability as u16 || failing != 0 {
+    if raw_status > Status::Word as u16 || failing != 0 {
         return RequestParkCommit::Terminal(CallError::Refused(Status::Malformed));
     }
     match status {
@@ -960,7 +986,8 @@ fn classify_request_park_commit(committed: Committed, deadline_armed: bool) -> R
         | Status::FabricRouteWrongAccess
         | Status::FabricRouteInfeasible
         | Status::FabricRouteCapacity
-        | Status::FabricRouteCapability) => RequestParkCommit::Terminal(CallError::Refused(status)),
+        | Status::FabricRouteCapability
+        | Status::Word) => RequestParkCommit::Terminal(CallError::Refused(status)),
     }
 }
 
@@ -992,7 +1019,7 @@ fn classify_return_commit(
     } else {
         failing >= invocations
     };
-    if invocations == 0 || raw_status > Status::FabricRouteCapability as u16 || impossible_index {
+    if invocations == 0 || raw_status > Status::Word as u16 || impossible_index {
         // Unknown status vocabulary, an empty transfer, or an impossible
         // invocation index cannot prove that the affine move did not run.
         return ReturnCommit::AfterTransfer(CallError::Refused(Status::Malformed));
@@ -1029,7 +1056,8 @@ fn classify_return_commit(
         | Status::FabricRouteWrongAccess
         | Status::FabricRouteInfeasible
         | Status::FabricRouteCapacity
-        | Status::FabricRouteCapability) => ReturnCommit::AfterTransfer(CallError::Refused(status)),
+        | Status::FabricRouteCapability
+        | Status::Word) => ReturnCommit::AfterTransfer(CallError::Refused(status)),
     }
 }
 
@@ -1069,7 +1097,8 @@ fn classify_parked_return_commit(committed: Committed, invocations: usize) -> Re
         | Status::FabricRouteWrongAccess
         | Status::FabricRouteInfeasible
         | Status::FabricRouteCapacity
-        | Status::FabricRouteCapability) => ReturnCommit::AfterTransfer(CallError::Refused(status)),
+        | Status::FabricRouteCapability
+        | Status::Word) => ReturnCommit::AfterTransfer(CallError::Refused(status)),
     }
 }
 
@@ -1546,6 +1575,35 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
             return Err(error);
         }
         self.resume_bounded(budget_ns).await
+    }
+
+    /// Carry one lifecycle request forward: continue `req` when it is the
+    /// exact request this pair already carries, otherwise publish it, then
+    /// watch its reply per `observation`.
+    ///
+    /// An owner whose earlier slice expired calls this again with the same
+    /// request; it never publishes a replacement. Any other request's
+    /// occupancy answers [`CallError::Outstanding`] before a kick or a reply
+    /// is consumed — that reply belongs to its own owner.
+    pub async fn call_exact(
+        &mut self,
+        req: &S::Request,
+        observation: Observation,
+    ) -> Result<CallReply<S::Response>, CallError>
+    where
+        S::ReqWire: PartialEq,
+    {
+        let budget_ns = observation.budget_ns();
+        match exact_outstanding_request(&self.state, &S::encode_req(req)) {
+            Ok(()) => self.resume_with_budget(budget_ns).await,
+            Err(CallError::NoOutstanding) => self.call_with_budget(req, budget_ns).await,
+            Err(error) => {
+                if error == CallError::Poisoned {
+                    self.retry_poison_cleanup();
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Continue the outstanding call and return the exact encoded request
@@ -3053,7 +3111,7 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
             };
             let committed =
                 commit(self.transport, &session, &spec).map_err(|_| CallError::Transport)?;
-            if committed.raw() as u16 > Status::FabricRouteCapability as u16
+            if committed.raw() as u16 > Status::Word as u16
                 || committed.failing_index() != 0
             {
                 return Err(CallError::Refused(Status::Malformed));
@@ -3100,7 +3158,8 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                 | Status::FabricRouteWrongAccess
                 | Status::FabricRouteInfeasible
                 | Status::FabricRouteCapacity
-                | Status::FabricRouteCapability) => return Err(CallError::Refused(status)),
+                | Status::FabricRouteCapability
+                | Status::Word) => return Err(CallError::Refused(status)),
             }
         }
         Err(CallError::Backpressure)
@@ -3512,6 +3571,94 @@ mod tests {
             Some(17),
             "the sole request stays published"
         );
+    }
+
+    /// Accepts every commit and counts them: a kick is a commit.
+    struct CountingTransport {
+        commits: core::cell::Cell<u32>,
+    }
+
+    impl Transport for CountingTransport {
+        type Error = core::convert::Infallible;
+
+        async fn commit(&self, session: &SessionBuilder) -> Result<Committed, Self::Error> {
+            self.commit_now(session)
+        }
+
+        fn commit_now(&self, _: &SessionBuilder) -> Result<Committed, Self::Error> {
+            self.commits.set(self.commits.get() + 1);
+            Ok(Committed::from_raw(Status::Ok.encode(0)))
+        }
+    }
+
+    fn ready<F: core::future::Future>(future: F) -> F::Output {
+        use core::task::{Context, Poll, Waker};
+        let mut future = core::pin::pin!(future);
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("the call waited although its outcome was decided"),
+        }
+    }
+
+    /// The state an expired slice leaves (see the bounded-park test above):
+    /// the request stays published and owns the pair. A different request is
+    /// refused before any kick; settling the same request carries it to its
+    /// reply without publishing it again.
+    #[test]
+    fn an_expired_slice_is_settled_only_by_its_own_request() {
+        let transport = CountingTransport {
+            commits: core::cell::Cell::new(0),
+        };
+        let mut window = RetainedTestWindow([0; RETAINED_TEST_WINDOW_BYTES]);
+        let (rings, mut serve) =
+            crate::svc::split_window::<RetainedTestProtocol>(&mut window.0, REQ_CAP, REP_CAP)
+                .unwrap();
+        let mut client = SvcClient::new(
+            &transport,
+            rings,
+            ClientEndpoints {
+                kick: SlotRef::from_wire(100),
+                grants: [None; MAX_GRANTS],
+            },
+        );
+        client.rings.req.push(17).unwrap();
+        client.state = ClientState::AwaitingReply { request: 17 };
+
+        let other = ready(client.call_exact(&18, Observation::Settle));
+        assert_eq!(other.err(), Some(CallError::Outstanding));
+        assert!(matches!(
+            &client.state,
+            ClientState::AwaitingReply { request } if *request == 17
+        ));
+        assert_eq!(transport.commits.get(), 0, "the refusal kicked nothing");
+
+        // The service serves the one published request and replies.
+        assert_eq!(serve.req.pop(), Some(17));
+        assert_eq!(serve.req.pop(), None, "18 was never published");
+        serve
+            .rep
+            .push(RetainedTestProtocol::encode_rep(&71, 0))
+            .unwrap();
+
+        let settled = ready(client.call_exact(&17, Observation::Settle))
+            .expect("settling the owner's request collects its reply");
+        assert_eq!(settled.response, 71);
+        assert!(client.is_idle());
+        assert_eq!(serve.req.pop(), None, "17 was not published twice");
+
+        // From idle, the same call publishes.
+        serve
+            .rep
+            .push(RetainedTestProtocol::encode_rep(&72, 0))
+            .unwrap();
+        let published = ready(client.call_exact(&19, Observation::Settle))
+            .expect("an idle pair publishes the request");
+        assert_eq!(published.response, 72);
+        assert_eq!(serve.req.pop(), Some(19));
+        assert!(client.is_idle());
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

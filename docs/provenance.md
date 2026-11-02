@@ -212,3 +212,45 @@ assertions on all three Kore architectures. The complete local-owner override
 passed its type-identity checks and duplicate-owner negative control. Both
 workspace dependency locks remain unchanged and pass locked resolution; the
 exporter verifies byte equality against the recorded Kore commit.
+
+## Host volume access: `kore-host` over the exported `kore-vol`
+
+The export now records Kore `1b6cb32271d35ce766cbf35d9746ce419429b233`: Kore main
+`e5e0b96a` (Cargo version 0.40.0, 2026-11-01) plus three commits that make
+`tools/kore-vol` a library with its binary printing over it (`beda0947`,
+`6f56689d`, `1b6cb322` on Kore's `ft/amazing-cray-qf1tpm`). The library
+returns `format`/`put`/`rm` results as data, mounts a volume read-only for
+`list`/`read_to`/`walk`, names the DagFS `FORMAT_VERSION`, reports
+`VolError::is_in_use`, and documents that its image lock is a per-process
+POSIX record lock. The binary's output, refusals and exit statuses are
+unchanged.
+
+`tools/kore-vol` is a new owner root. Following its path dependencies adds the
+filesystem service closure it drives — `kore-svc-dagfs`, `kore-svc-block`,
+`kore-svc-device`, `kore-svc-mm`, `kore-svc-swap`, `kore-nvme` and
+`kore-svc-extract-worker-c` — for 26 packages and 381 exact files. Publishing
+that closure was an explicit decision: host programs (vKore first) must read and
+write Kore volumes with the filesystem row's own engine rather than a second
+implementation of the DagFS format. `crates/host` (`kore-host`) is the facade
+they depend on; it adds no behavior of its own.
+
+Locally, with the pinned nightly: `cargo test` for the workspace (every feature
+except `test-foreign`), the native `kore-rt`/`kore-dagfs` suites and the
+exported `kore-vol` suites (9 CLI, 5 library, 1 unit) against this
+distribution's lock, the tool tests, the no-default-feature check, Clippy with
+warnings denied, documentation with warnings denied, all three Kore user-target
+checks for `kore-std`/`kore-ffi`/`kore-entry`, `check-entry`, Miri, the owner
+graph, the native drift check and the local-composition fixture all passed.
+`kore-host`'s own tests format, install, walk, read and remove through the
+exported closure. Not run locally: everything needing Zig 0.16.0 (`zig fmt`,
+`test-foreign`, `bindings-check`, `kore-lua`'s Kore-target build), because this
+environment could not execute a Zig toolchain; CI's host job runs them. The
+upstream device suite (loop-device GPT disks, as root) passed in Kore's tree.
+
+A production x86 ISO built from this Kore revision (`make iso-sealed-boot-x86
+BOOT_FEATURES=boot PAGING_PROFILE=4k48 MODE=release`, SHA-256
+`029ddd7e1e1cc1819c7e3ecf7ec22ffc3f0f6e01105972cd4d968313465aab23`) booted under
+QEMU 8.2 TCG on the gate's topology: 19/19 services and beacons, `first-shell:
+ready`, `app-store: seeded 44/44`, `home-skeleton: homes: 1/1`. After the machine
+was stopped, the host-side `kore-vol` read the volume that guest had formatted
+and populated. These are emulator results, not physical-hardware acceptance.

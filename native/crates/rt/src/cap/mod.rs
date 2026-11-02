@@ -3025,6 +3025,9 @@ impl MappedLeaseView {
         len: usize,
     ) -> Self {
         owned.activate();
+        // The view's own slot names this window to the kernel address-wait
+        // (`cap::mapped`): a word inside it is `(view slot, offset)`.
+        mapped::note(base.as_ptr(), len, owned.slot());
         Self {
             owned: core::mem::ManuallyDrop::new(owned),
             lease,
@@ -3128,8 +3131,15 @@ impl MappedLeaseView {
     /// precise share-list edge and PTE before reporting success.
     pub fn try_retire_outcome(&mut self) -> RetireOutcome {
         let lease = self.lease;
-        self.owned
-            .retire_via(|view| crate::cap::verbs::retire_owned_view(view, lease))
+        let outcome = self
+            .owned
+            .retire_via(|view| crate::cap::verbs::retire_owned_view(view, lease));
+        if outcome.is_closed() {
+            // The PTE is gone (or the lineage is dead): a word in this window
+            // can no longer be named through it.
+            mapped::forget(self.base.as_ptr());
+        }
+        outcome
     }
 
     /// Whether the exact mapping still owns a live local capability name.
@@ -4220,6 +4230,7 @@ pub enum RawDelivery {
     Cap,
 }
 
+pub mod mapped;
 mod record;
 
 pub mod verbs;

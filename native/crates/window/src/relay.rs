@@ -4,6 +4,12 @@
 //! one atomic route mailbox and a bounded raw-snapshot ring. The founder alone
 //! initializes them; input-stream owns echo/raw production and the compositor
 //! owns focus publication and consumption. IDs and epochs convey no authority.
+//!
+//! The mailbox also carries the seat's **capture intent** (#1414): the
+//! PrintScreen chord is a trusted key that input-stream takes out of every
+//! route and turns into a request here, so no application can see, swallow
+//! or forge it. Like the route, it is a level word, not a queued event: a
+//! dropped advisory kick cannot lose it.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use kore_abi::svc::{InputReport, OutChunk};
@@ -18,6 +24,8 @@ pub const RELAY_BYTES: usize = spsc::region_bytes::<SnapshotWire>(RELAY_CAP);
 pub const WINDOW_BYTES: usize = ECHO_BYTES + FOCUS_BYTES + RELAY_BYTES;
 const MAGIC: u64 = u64::from_le_bytes(*b"koreFCS1");
 const MAX_EPOCH: u64 = u64::MAX >> 1;
+/// The capture word is `seq << 8 | mode`: a 56-bit press sequence.
+const MAX_CAPTURE_SEQ: u64 = u64::MAX >> 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusTarget {
@@ -51,6 +59,16 @@ impl Focus {
     }
 }
 
+pub use crate::capture::CaptureMode;
+
+/// One capture intent. `seq` counts this seat's requests from 1 and is never
+/// reused, so a consumer can tell a new press from one it already took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureRequest {
+    pub seq: u64,
+    pub mode: CaptureMode,
+}
+
 #[repr(C, align(64))]
 struct FocusCell {
     magic: u64,
@@ -59,7 +77,14 @@ struct FocusCell {
     /// epoch's Reset and acknowledges it. Newer snapshots cannot overtake it.
     reset_epoch: AtomicU64,
     dropped: AtomicU64,
-    reserved: [u8; 32],
+    /// The newest capture request, `seq << 8 | mode` (`0` = none yet).
+    /// Only input-stream writes it.
+    capture: AtomicU64,
+    /// The newest request sequence the compositor took. Only the
+    /// compositor writes it. Claimed from the reserved tail, which a
+    /// founder zeroes, so an older founder's cell reads as no request.
+    capture_taken: AtomicU64,
+    reserved: [u8; 16],
 }
 
 pub struct FocusReader<'a> {
@@ -146,10 +171,26 @@ impl RelayProducer<'_> {
     }
 
     /// Level state, not a one-shot flag: a failed/dropped advisory kick cannot
-    /// clear queued data or an unacknowledged Reset.
+    /// clear queued data, an unacknowledged Reset or an untaken capture.
     pub fn needs_wake(&self) -> bool {
         self.cell.reset_epoch.load(Ordering::Acquire) != 0
             || self.ring.capacity_left() != self.ring.capacity()
+            || capture_untaken(self.cell)
+    }
+
+    /// Publish a capture request for this seat. The newest request replaces
+    /// one the compositor has not taken yet: presses closer together than a
+    /// compositor pass would capture the same frame. Exhaustion refuses; a
+    /// sequence is never reused.
+    pub fn request_capture(&mut self, mode: CaptureMode) -> Option<CaptureRequest> {
+        // This side is the only writer of the word.
+        let seq = (self.cell.capture.load(Ordering::Relaxed) >> 8)
+            .checked_add(1)
+            .filter(|&seq| seq <= MAX_CAPTURE_SEQ)?;
+        self.cell
+            .capture
+            .store((seq << 8) | mode as u64, Ordering::Release);
+        Some(CaptureRequest { seq, mode })
     }
     pub fn dropped(&self) -> u64 {
         self.cell.dropped.load(Ordering::Relaxed)
@@ -195,17 +236,41 @@ impl RelayConsumer<'_> {
         None
     }
     pub fn pending(&self) -> bool {
-        self.cell.reset_epoch.load(Ordering::Acquire) != 0 || self.ring.outstanding() != 0
+        self.cell.reset_epoch.load(Ordering::Acquire) != 0
+            || self.ring.outstanding() != 0
+            || capture_untaken(self.cell)
     }
     pub fn dropped(&self) -> u64 {
         self.cell.dropped.load(Ordering::Relaxed)
     }
+
+    /// Take the seat's newest capture request, once. Taking acknowledges it,
+    /// which settles the producer's wake. A malformed mode is acknowledged
+    /// too and captures nothing, so it cannot hold that wake high.
+    pub fn take_capture(&mut self) -> Option<CaptureRequest> {
+        let word = self.cell.capture.load(Ordering::Acquire);
+        let seq = word >> 8;
+        // This side is the only writer of `capture_taken`.
+        if seq == self.cell.capture_taken.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.cell.capture_taken.store(seq, Ordering::Release);
+        Some(CaptureRequest {
+            seq,
+            mode: CaptureMode::from_code(word as u8)?,
+        })
+    }
 }
 
+/// A request the compositor has not taken: level state for both peers.
+fn capture_untaken(cell: &FocusCell) -> bool {
+    cell.capture.load(Ordering::Acquire) >> 8 != cell.capture_taken.load(Ordering::Acquire)
+}
+
+/// A relayable keyboard snapshot: a keyboard record whose reserved bytes
+/// carry nothing but a valid lock state, and which is not a rollover report.
 pub fn keyboard(report: InputReport) -> bool {
-    report.kind == InputReport::KIND_KEYBOARD
-        && report.reserved == [0; 7]
-        && !report.data.contains(&1)
+    report.keyboard_locks().is_some() && !report.data.contains(&1)
 }
 
 /// The returned byte regions are disjoint and exact; neither ring's mutable
@@ -247,7 +312,9 @@ pub fn init(window: &mut [u8]) -> Result<(), RingError> {
                 route: AtomicU64::new(Focus::INITIAL.encode().unwrap()),
                 reset_epoch: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
-                reserved: [0; 32],
+                capture: AtomicU64::new(0),
+                capture_taken: AtomicU64::new(0),
+                reserved: [0; 16],
             });
     }
     Ok(())
@@ -258,7 +325,7 @@ fn focus_cell(window: &mut [u8]) -> Result<&FocusCell, RingError> {
     // immutable after founder init; all shared mutation uses atomic fields.
     let cell = unsafe { &*window.as_ptr().cast::<FocusCell>() };
     if cell.magic != MAGIC
-        || cell.reserved != [0; 32]
+        || cell.reserved != [0; 16]
         || Focus::decode(cell.route.load(Ordering::Acquire)).is_none()
     {
         return Err(RingError::BadHeader);
@@ -468,9 +535,13 @@ mod tests {
         let mut malformed = report;
         malformed.kind = 0;
         assert!(!input.reports.push(focus, malformed));
-        malformed = report;
-        malformed.reserved[0] = 1;
-        assert!(!input.reports.push(focus, malformed));
+        // The lock byte is the only meaningful reserved byte, and only its
+        // three lock bits: anything else is not a keyboard snapshot.
+        for (index, value) in [(0, 0x08), (1, 1), (6, 1)] {
+            malformed = report;
+            malformed.reserved[index] = value;
+            assert!(!input.reports.push(focus, malformed));
+        }
         malformed = report;
         malformed.data[0] = 1;
         assert!(!input.reports.push(focus, malformed));
@@ -480,6 +551,23 @@ mod tests {
         assert!(!compositor.reports.pending());
         assert_eq!(compositor.reports.poll(), None);
         assert_eq!(compositor.echo.pop(), None);
+    }
+
+    /// The seat's lock state rides the snapshot to the window unchanged — a
+    /// client resolves Caps Lock exactly as the terminal discipline does.
+    #[test]
+    fn a_locked_snapshot_reaches_the_window_with_its_locks() {
+        use kore_abi::keyboard::Locks;
+        let mut page = Page([0; 4096]);
+        let (mut input, mut compositor) = split(&mut page.0).unwrap();
+        let focus = compositor.focus.advance(FocusTarget::Window).unwrap();
+        let report = InputReport::keyboard(1, 0, [4, 0, 0, 0, 0, 0])
+            .with_locks(Locks::CAPS.toggled(Locks::SCROLL));
+        assert!(input.reports.push(focus, report));
+        let Some(RelayEvent::Snapshot { report: got, .. }) = compositor.reports.poll() else {
+            panic!("the locked snapshot must be relayed");
+        };
+        assert_eq!(got.keyboard_locks(), Some(Locks::CAPS.toggled(Locks::SCROLL)));
     }
 
     #[test]
@@ -507,7 +595,7 @@ mod tests {
             })
         );
         let mut malformed = report;
-        malformed.reserved[0] = 1;
+        malformed.reserved[1] = 1;
         input
             .reports
             .ring
@@ -578,6 +666,119 @@ mod tests {
         );
         assert_eq!(compositor.reports.poll(), None);
         assert_eq!(input.reports.dropped(), 2);
+    }
+
+    #[test]
+    fn a_capture_request_is_taken_once_and_settles_the_wake() {
+        let mut page = Page([0; 4096]);
+        let (mut input, mut compositor) = split(&mut page.0).unwrap();
+        // A founder's zeroed words read as no request.
+        assert_eq!(compositor.reports.take_capture(), None);
+        assert!(!input.reports.needs_wake());
+        assert!(!compositor.reports.pending());
+
+        let request = input.reports.request_capture(CaptureMode::Screen).unwrap();
+        assert_eq!(
+            request,
+            CaptureRequest {
+                seq: 1,
+                mode: CaptureMode::Screen
+            }
+        );
+        assert!(
+            input.reports.needs_wake(),
+            "an untaken capture holds the wake"
+        );
+        assert!(compositor.reports.pending());
+        // The request is not a snapshot: the ring stays empty.
+        assert_eq!(compositor.reports.poll(), None);
+        assert_eq!(compositor.reports.take_capture(), Some(request));
+        assert_eq!(compositor.reports.take_capture(), None, "taken once");
+        assert!(!input.reports.needs_wake());
+        assert!(!compositor.reports.pending());
+
+        let next = input.reports.request_capture(CaptureMode::Region).unwrap();
+        assert_eq!(next.seq, 2, "a sequence is never reused");
+        assert_eq!(compositor.reports.take_capture(), Some(next));
+    }
+
+    #[test]
+    fn a_newer_capture_replaces_an_untaken_one() {
+        let mut page = Page([0; 4096]);
+        let (mut input, mut compositor) = split(&mut page.0).unwrap();
+        input.reports.request_capture(CaptureMode::Screen).unwrap();
+        let newest = input.reports.request_capture(CaptureMode::Window).unwrap();
+        assert_eq!(compositor.reports.take_capture(), Some(newest));
+        assert_eq!(compositor.reports.take_capture(), None);
+        assert!(!input.reports.needs_wake());
+    }
+
+    /// A capture rides beside the snapshot ring, not in it: a pending Reset
+    /// neither blocks nor drops it, and draining the Reset does not take it.
+    #[test]
+    fn a_capture_is_independent_of_snapshot_loss() {
+        let mut page = Page([0; 4096]);
+        let (mut input, mut compositor) = split(&mut page.0).unwrap();
+        let focus = compositor.focus.advance(FocusTarget::Window).unwrap();
+        let held = InputReport::keyboard(1, 0, [4, 0, 0, 0, 0, 0]);
+        for _ in 0..=RELAY_CAP {
+            let _ = input.reports.push(focus, held);
+        }
+        let request = input.reports.request_capture(CaptureMode::Window).unwrap();
+        assert_eq!(
+            compositor.reports.poll(),
+            Some(RelayEvent::Reset { epoch: focus.epoch })
+        );
+        assert_eq!(compositor.reports.poll(), None);
+        assert!(input.reports.needs_wake(), "the capture is still owed");
+        assert_eq!(compositor.reports.take_capture(), Some(request));
+        assert!(!input.reports.needs_wake());
+    }
+
+    #[test]
+    fn capture_exhaustion_refuses_and_a_malformed_mode_settles() {
+        let mut page = Page([0; 4096]);
+        let (mut input, mut compositor) = split(&mut page.0).unwrap();
+        let last = (MAX_CAPTURE_SEQ << 8) | CaptureMode::Screen as u64;
+        input.reports.cell.capture.store(last, Ordering::Release);
+        assert_eq!(input.reports.request_capture(CaptureMode::Window), None);
+        assert_eq!(input.reports.cell.capture.load(Ordering::Acquire), last);
+        assert_eq!(
+            compositor.reports.take_capture(),
+            Some(CaptureRequest {
+                seq: MAX_CAPTURE_SEQ,
+                mode: CaptureMode::Screen
+            })
+        );
+
+        // A mode no chord produces captures nothing, and is still taken.
+        for mode in [0u8, 4, 0xff] {
+            let seq = 7 + u64::from(mode);
+            input
+                .reports
+                .cell
+                .capture
+                .store((seq << 8) | u64::from(mode), Ordering::Release);
+            assert!(input.reports.needs_wake());
+            assert_eq!(compositor.reports.take_capture(), None);
+            assert!(!input.reports.needs_wake(), "mode {mode:#x} settled");
+        }
+    }
+
+    /// The reserved tail still fails closed after the capture claim.
+    #[test]
+    fn a_dirty_reserved_tail_refuses_attachment() {
+        let mut page = Page([0; 4096]);
+        init(&mut page.0).unwrap();
+        let tail = ECHO_BYTES + FOCUS_BYTES - 1;
+        page.0[tail] = 1;
+        assert!(matches!(input_side(&mut page.0), Err(RingError::BadHeader)));
+        assert!(matches!(
+            compositor_side(&mut page.0),
+            Err(RingError::BadHeader)
+        ));
+        page.0[tail] = 0;
+        assert!(input_side(&mut page.0).is_ok());
     }
 
     #[test]

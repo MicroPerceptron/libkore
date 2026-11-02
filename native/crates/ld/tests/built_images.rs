@@ -2,7 +2,7 @@
 //! epic #291, P4 #295): the closed loop behind `make user-verify`.
 //!
 //! `KORE_USER_IMAGES` names the `user/` cargo target dir; for each
-//! `<spec>/release/{libdemo.so,libpci_names.so,hello,time,sleep,status,lspci,help,window,clear,lua,liblua_demo.so,kore-editor}` present this asserts,
+//! `<spec>/release/{libdemo.so,libpci_names.so,libkore_grammars.so,hello,time,sleep,status,lspci,help,window,clear,lua,liblua_demo.so,kore-terminal,kore-files,kore-editor}` present this asserts,
 //! by raw ELF
 //! inspection (the `elf` crate — the same substrate `kore_ld::parse` trusts):
 //!
@@ -16,7 +16,11 @@
 //! - `libdemo.so` carries `PT_TLS` and ≥1 TPREL-class reloc;
 //! - `hello` names `libdemo.so`, while `status` and `lspci` name
 //!   `libpci_names.so` through `DT_NEEDED`, proving both shared-library
-//!   boundaries survive the build.
+//!   boundaries survive the build;
+//! - `libkore_grammars.so` imports exactly the C runtime symbols its
+//!   consumers export ([`GRAMMAR_IMPORTS`]), and the editor and the terminal
+//!   name it through `DT_NEEDED` and export each of them — the launch-time
+//!   library that binds into its executable.
 //!
 //! `KORE_USER_IMAGE_ARCH`, when set, closes the walk to exactly one of
 //! `x86_64`, `aarch64`, or `riscv64`. Production packaging uses that
@@ -39,6 +43,11 @@ use elf::endian::AnyEndian;
 use kore_ld::reloc::{AArch64, RelocArch, RelocKind, Riscv64, X86_64};
 
 const PAGE: u64 = 4096;
+
+/// What `libkore_grammars.so` imports from the executable it links into:
+/// its scanners' allocator, and the `abort` its panic ends in. The Makefile's
+/// `GRAMMAR_IMPORTS` exports the same set from each consumer.
+const GRAMMAR_IMPORTS: &[&str] = &["abort", "calloc", "free", "malloc", "realloc"];
 
 /// Per-image census of eager relocation semantics — the printed
 /// evidence that the §7 set (and nothing else) is what the toolchain
@@ -205,7 +214,39 @@ fn verify_image<A: RelocArch>(path: &Path, kind: ImageKind) {
                 .unwrap_or_else(|e| panic!("{tag}: late protection layout: {e:?}"));
         }
     }
-    if let ImageKind::NeedsLibrary(required) = kind {
+    if let ImageKind::HostedLibrary { imports } | ImageKind::HostsLibrary { exports: imports, .. } = kind {
+        let (symbols, strings) = elf
+            .dynamic_symbol_table()
+            .unwrap_or_else(|e| panic!("{tag}: dynsym parse: {e}"))
+            .unwrap_or_else(|| panic!("{tag}: no .dynsym"));
+        let mut undefined: Vec<&str> = Vec::new();
+        let mut defined: Vec<&str> = Vec::new();
+        for sym in symbols.iter() {
+            let name = strings
+                .get(sym.st_name as usize)
+                .unwrap_or_else(|e| panic!("{tag}: dynsym strtab: {e}"));
+            if name.is_empty() {
+                continue;
+            }
+            if sym.st_shndx == abi::SHN_UNDEF {
+                undefined.push(name);
+            } else {
+                defined.push(name);
+            }
+        }
+        if matches!(kind, ImageKind::HostedLibrary { .. }) {
+            undefined.sort_unstable();
+            assert_eq!(
+                undefined, imports,
+                "{tag}: a hosted library imports exactly what its executables export"
+            );
+        } else {
+            for symbol in imports {
+                assert!(defined.contains(symbol), "{tag}: .dynsym does not export {symbol}");
+            }
+        }
+    }
+    if let ImageKind::NeedsLibrary(required) | ImageKind::HostsLibrary { library: required, .. } = kind {
         let dynstr_hdr = elf
             .section_header_by_name(".dynstr")
             .unwrap_or_else(|e| panic!("{tag}: shdr walk: {e}"))
@@ -260,6 +301,16 @@ enum ImageKind {
         opener: &'static str,
         host_prefix: &'static str,
     },
+    /// A launch-time library that binds into its executable: its undefined
+    /// dynamic symbols are exactly `imports`, which the stub resolves against
+    /// the executable first (`crates/ld/src/link.rs`).
+    HostedLibrary { imports: &'static [&'static str] },
+    /// An executable that names `library` through `DT_NEEDED` and defines
+    /// each of `exports` in `.dynsym`, for that library to bind.
+    HostsLibrary {
+        library: &'static str,
+        exports: &'static [&'static str],
+    },
 }
 
 /// Verify one exact profile directory. Aggregate callers may treat absence as
@@ -277,6 +328,12 @@ fn check_variant<A: RelocArch>(root: &Path, variant: &str, required: bool) -> us
     for (name, kind) in [
         ("libdemo.so", ImageKind::DemoLibrary),
         ("libpci_names.so", ImageKind::SharedLibrary),
+        (
+            "libkore_grammars.so",
+            ImageKind::HostedLibrary {
+                imports: GRAMMAR_IMPORTS,
+            },
+        ),
         ("hello", ImageKind::NeedsLibrary("libdemo.so")),
         ("time", ImageKind::Executable),
         ("sleep", ImageKind::Executable),
@@ -294,8 +351,21 @@ fn check_variant<A: RelocArch>(root: &Path, variant: &str, required: bool) -> us
                 host_prefix: "lua_",
             },
         ),
-        ("kore-terminal", ImageKind::Executable),
-        ("kore-editor", ImageKind::Executable),
+        (
+            "kore-terminal",
+            ImageKind::HostsLibrary {
+                library: "libkore_grammars.so",
+                exports: GRAMMAR_IMPORTS,
+            },
+        ),
+        ("kore-files", ImageKind::Executable),
+        (
+            "kore-editor",
+            ImageKind::HostsLibrary {
+                library: "libkore_grammars.so",
+                exports: GRAMMAR_IMPORTS,
+            },
+        ),
         ("kore-aftershock", ImageKind::Executable),
         ("kore-skylilt", ImageKind::Executable),
     ] {

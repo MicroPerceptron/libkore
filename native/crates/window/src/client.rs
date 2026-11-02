@@ -9,7 +9,7 @@ use core::{marker::PhantomData, ptr::NonNull};
 use kore_abi::{
     cap::Rights,
     session::{DISPLAY_FORMAT_XRGB8888, Notice, SlotRef, SurfaceMapLane},
-    svc::{CommitWire, OutChunk, SurReqWire},
+    svc::{CommitWire, MAX_COMMIT_RECTS, OutChunk, SurReqWire},
     task::role,
 };
 use kore_ring::spsc::{Consumer, Producer};
@@ -28,7 +28,7 @@ use crate::{
     configure::Configure,
     control::{ControlRefusal, TabModel},
     event::Event,
-    wire::{self, Commit, Damage, SurfaceRefusal, SurfaceRequest, SurfaceResponse},
+    wire::{self, Commit, Damage, SurRect, SurfaceRefusal, SurfaceRequest, SurfaceResponse},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +51,8 @@ pub enum ClientError {
     CommitRejected,
     EpochExhausted,
     EventMalformed,
+    /// A menu the encoder refused before anything reached the compositor.
+    Menu(crate::menu::MenuError),
 }
 
 impl ClientError {
@@ -156,6 +158,30 @@ impl PairMapping {
             },
         )?
         .with_reply_wait(self.bell))
+    }
+}
+
+/// A frozen frame, mapped read-only for its capture writer. The view's
+/// owner is held for as long as the pixels are borrowed.
+pub struct CaptureView {
+    frame: crate::capture::CaptureFrame,
+    pixels: NonNull<u32>,
+    _view: StashedView,
+}
+
+impl CaptureView {
+    pub const fn frame(&self) -> crate::capture::CaptureFrame {
+        self.frame
+    }
+
+    /// Row `y`: `width` XRGB pixels, packed.
+    pub fn row(&self, y: u32) -> &[u32] {
+        let (width, height) = (usize::from(self.frame.width), u32::from(self.frame.height));
+        assert!(y < height, "row {y} of a {height}-row frame");
+        // SAFETY: `take_capture` checked the mapping holds `width * height`
+        // aligned pixels; the lend outlives `self`, and nothing writes the
+        // frozen frame once it is lent.
+        unsafe { core::slice::from_raw_parts(self.pixels.as_ptr().add(y as usize * width), width) }
     }
 }
 
@@ -311,6 +337,9 @@ pub struct WindowClient<'w, 't, T: Transport> {
     commits: Producer<'w, CommitWire>,
     output: Consumer<'w, OutChunk>,
     channel: crate::channel::WindowChannelSink<'w>,
+    /// The menu plane ([`crate::menu`]): written here, snapshotted by the
+    /// compositor on `ShowMenu` before it answers.
+    menu: &'w mut [u8],
     current: Option<Backing>,
     previous: Option<Backing>,
     tombstone: Option<BackingTombstone>,
@@ -319,6 +348,12 @@ pub struct WindowClient<'w, 't, T: Transport> {
     needs_configuration: bool,
     focused: bool,
     visible: bool,
+    /// The compositor's capture ask ([`WindowState::CAPTURE`]) as last
+    /// synced, and whether a frame was presented since it was raised.
+    ///
+    /// [`WindowState::CAPTURE`]: crate::channel::WindowState::CAPTURE
+    capture_asked: bool,
+    capture_answered: bool,
     observed_scheme: Option<crate::appearance::ColorScheme>,
     observed_density: Option<crate::appearance::Density>,
     queried: bool,
@@ -344,12 +379,13 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
         let (pair, aux) = memory.split_at_mut(pair_bytes);
         let rings = kore_rt::svc::client_rings::<WindowWire>(pair, REQ_CAP, REP_CAP)
             .map_err(|_| ClientError::Ring)?;
-        let (commits, output, channel) = wire::split_window_aux(aux).ok_or(ClientError::Ring)?;
+        let aux = wire::split_window_aux(aux).ok_or(ClientError::Ring)?;
         Ok(Self {
             control: SvcClient::new(transport, rings, endpoints),
-            commits: kore_ring::spsc::producer(commits).map_err(|_| ClientError::Ring)?,
-            output: kore_ring::spsc::consumer(output).map_err(|_| ClientError::Ring)?,
-            channel: crate::channel::sink(channel).map_err(|_| ClientError::Ring)?,
+            commits: kore_ring::spsc::producer(aux.commits).map_err(|_| ClientError::Ring)?,
+            output: kore_ring::spsc::consumer(aux.output).map_err(|_| ClientError::Ring)?,
+            channel: crate::channel::sink(aux.events).map_err(|_| ClientError::Ring)?,
+            menu: aux.menu,
             current: None,
             previous: None,
             tombstone: None,
@@ -358,6 +394,8 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
             needs_configuration: true,
             focused: false,
             visible: true,
+            capture_asked: false,
+            capture_answered: false,
             observed_scheme: None,
             observed_density: None,
             queried: false,
@@ -377,6 +415,10 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
     /// window is minimized, closing, or fully occluded under a higher
     /// window's opaque core.  While `false`, a client may stop producing
     /// frames and park on [`wait_change`](Self::wait_change).
+    ///
+    /// A screenshot of this window (`res/SCREENSHOTS.md`, window capture)
+    /// reads as visible until a frame is presented for it, so an app that
+    /// pauses while hidden draws its current state for the shot.
     pub const fn visible(&self) -> bool {
         self.visible
     }
@@ -402,11 +444,30 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
 
     pub async fn wait_change(&mut self, bound: core::time::Duration) {
         let seen = self.channel.seq();
-        if self.change_pending() {
+        if self.change_pending() || self.answer_capture().await {
             return;
         }
         kore_rt::event::wait_past(&self.channel, seen, Some(bound)).await;
         let _ = self.sync_status();
+    }
+
+    /// A screenshot waits on this window and no frame has been presented
+    /// since it asked: present the current backing, unchanged, so the shot
+    /// is a whole frame of this window's own rather than the compositor's
+    /// late copy of a backing that may be mid-paint. Called only where the
+    /// app is about to park, so every writer has finished. Once per ask:
+    /// a refused or overtaken frame leaves the ask to the compositor's
+    /// bound. Whether a frame was offered.
+    async fn answer_capture(&mut self) -> bool {
+        // A capture must not publish an unpainted replacement backing.
+        if !self.capture_asked || self.capture_answered || self.needs_configuration || self.needs_initial_frame() {
+            return false;
+        }
+        self.capture_answered = true;
+        let mut rects = [SurRect::default(); MAX_COMMIT_RECTS];
+        rects[0] = SurRect { x: 0, y: 0, w: 1, h: 1 };
+        let _ = self.present(Damage::Rects { rects, count: 1 }).await;
+        true
     }
 
     /// [`wait_change`](Self::wait_change) for a window whose task also drains
@@ -419,7 +480,7 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
     /// its own deadlines.
     pub async fn wait_any(&mut self, bound: core::time::Duration) {
         let seen = self.channel.seq();
-        if self.change_pending() {
+        if self.change_pending() || self.answer_capture().await {
             return;
         }
         kore_rt::event::wait_once(&self.channel, seen, Some(bound)).await;
@@ -434,6 +495,13 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
     }
     pub const fn focused(&self) -> bool {
         self.focused
+    }
+
+    /// A new backing has no retained pixels, even if an overtaken resize
+    /// returned to the application's previous dimensions. Retained renderers
+    /// must paint it completely before publishing its first frame.
+    pub fn needs_initial_frame(&self) -> bool {
+        self.current.as_ref().is_some_and(|current| !current.destroyed && current.presented == 0)
     }
 
     pub fn surface(&self) -> Result<Surface<'_>, ClientError> {
@@ -479,9 +547,11 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
         self.observed_scheme.unwrap_or_default()
     }
 
-    /// Consume all event types. Old-coordinate input is discarded; newer input
-    /// first requests a configure and resets held keys/buttons. Close and reset
-    /// remain actionable regardless of a superseded geometry serial.
+    /// Consume all event types. Old-coordinate pointer input is discarded;
+    /// newer pointer input first requests a configure and resets held
+    /// buttons. Keyboard snapshots, focus, menu, close and reset carry no geometry
+    /// and remain actionable regardless of a superseded configure serial; a
+    /// newer serial on any of them still requests the configure.
     pub fn pop_event(&mut self) -> Result<EventPoll, ClientError> {
         let mut advanced = false;
         for _ in 0..crate::event::EVENT_CAP {
@@ -662,6 +732,9 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
             .push(wire)
             .map_err(|_| ClientError::CommitQueue)?;
         self.current.as_mut().unwrap().epoch = epoch;
+        // The first frame consumed after a capture ask is the one the
+        // compositor copies.
+        self.capture_answered |= self.capture_asked;
         // The record alone wakes nobody: without this kick the compositor
         // learns of the frame only when something else wakes it, and this
         // peer's status re-read below (bounded at `PRESENT_WAIT_BOUND_NS`)
@@ -766,6 +839,113 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
         }
     }
 
+    /// Show `cursor` while the pointer is over this window's content
+    /// ([`crate::cursor`]): the shape that says what a press there would
+    /// do. It holds until the window asks again, so ask on a change, not
+    /// per frame. A `Busy` refusal is retryable.
+    pub async fn set_cursor(&mut self, cursor: crate::cursor::Cursor) -> Result<(), ClientError> {
+        match self
+            .surface_request(SurfaceRequest::SetCursor { cursor })
+            .await?
+        {
+            SurfaceResponse::CursorSet { cursor: held } if held == cursor => Ok(()),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Ask this window's controller to open the filesystem object with
+    /// stable identity `object` in the default handler for its `kind`.
+    /// Inert: the controller decides. A `Busy` refusal (its queue is full)
+    /// is retryable.
+    pub async fn open_object(
+        &mut self,
+        object: u64,
+        kind: crate::document::DocumentKind,
+    ) -> Result<(), ClientError> {
+        match self
+            .surface_request(SurfaceRequest::OpenObject { object, kind })
+            .await?
+        {
+            SurfaceResponse::OpenQueued { object: queued } if queued == object => Ok(()),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Show a context menu at the content-relative anchor `(x, y)`: `build`
+    /// encodes it into the menu plane, and the compositor draws it once it
+    /// answers. The menu ends with an [`Event::Menu`] naming `serial`
+    /// (nonzero): the chosen entry's id, or zero if it was dismissed. A
+    /// refusal leaves no menu open; `Busy` is retryable.
+    pub async fn show_menu(
+        &mut self,
+        x: i32,
+        y: i32,
+        serial: u32,
+        build: impl FnOnce(&mut crate::menu::MenuBuilder<'_>),
+    ) -> Result<(), ClientError> {
+        if serial == 0 {
+            return Err(ClientError::Protocol);
+        }
+        let mut menu = crate::menu::MenuBuilder::new(self.menu);
+        build(&mut menu);
+        let len = menu.finish().map_err(ClientError::Menu)?;
+        let len = u16::try_from(len).map_err(|_| ClientError::Protocol)?;
+        match self
+            .surface_request(SurfaceRequest::ShowMenu { x, y, len, serial })
+            .await?
+        {
+            SurfaceResponse::MenuShown { serial: shown } if shown == serial => Ok(()),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Ask the user, through this window's controller, to choose a file of
+    /// the types `types` accepts (a nonzero mask over `kore_kit::kinds`
+    /// rows). The answer arrives as [`Event::Picked`] naming `serial`
+    /// (nonzero), a chosen file's name just before it in `PickedName`
+    /// records ([`crate::pick::NameParts`]). `Busy` (the controller's queue
+    /// is full) is retryable.
+    pub async fn pick_object(&mut self, types: u64, serial: u32) -> Result<(), ClientError> {
+        if types == 0 || serial == 0 {
+            return Err(ClientError::Protocol);
+        }
+        match self
+            .surface_request(SurfaceRequest::PickObject { types, serial })
+            .await?
+        {
+            SurfaceResponse::PickQueued { serial: queued } if queued == serial => Ok(()),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Bind this window to the pick it was launched for, by its `token`.
+    pub async fn claim_pick(&mut self, token: u64) -> Result<(), ClientError> {
+        match self.surface_request(SurfaceRequest::ClaimPick { token }).await? {
+            SurfaceResponse::PickClaimed { token: claimed } if claimed == token => Ok(()),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Answer the pick this window claimed: `object` and its `name` chosen,
+    /// or `object` zero and no name when the user cancelled. The name is
+    /// written at the head of the menu plane, which the compositor
+    /// snapshots before it answers.
+    pub async fn picked(&mut self, token: u64, object: u64, name: &[u8]) -> Result<(), ClientError> {
+        let chosen = object != 0;
+        if chosen != crate::pick::valid_name(name) || (!chosen && !name.is_empty()) {
+            return Err(ClientError::Protocol);
+        }
+        self.menu[..name.len()].copy_from_slice(name);
+        let len = name.len() as u8;
+        match self
+            .surface_request(SurfaceRequest::Picked { token, object, len })
+            .await?
+        {
+            SurfaceResponse::PickAnswered { token: answered } if answered == token => Ok(()),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
     async fn read_configuration(&mut self) -> Result<Configure, ClientError> {
         let reply = self
             .control
@@ -812,7 +992,11 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
         let Some(state) = self.channel.state() else {
             return Ok(());
         };
-        self.visible = state.flags & crate::channel::WindowState::VISIBLE != 0;
+        use crate::channel::WindowState;
+        self.capture_asked = state.flags & WindowState::CAPTURE != 0;
+        // A new ask re-arms only after one was seen settled.
+        self.capture_answered &= self.capture_asked;
+        self.visible = state.flags & (WindowState::VISIBLE | WindowState::CAPTURE) != 0;
         let Some(current) = self.current.as_mut() else {
             return Ok(());
         };
@@ -890,6 +1074,44 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
             }
         }
         Ok(())
+    }
+
+    /// The capture writer's one verb (`res/SCREENSHOTS.md`): borrow the
+    /// frozen frame this pair was admitted for. The lend carries ACCESS
+    /// without MODIFY, so the kernel maps it with no write permission; the
+    /// frame is checked against the mapping before any pixel is read.
+    pub async fn take_capture(&mut self) -> Result<CaptureView, ClientError> {
+        let mut reply = self
+            .control
+            .call(&Request::Surface(SurfaceRequest::TakeCapture))
+            .await
+            .map_err(|_| ClientError::Transport)?;
+        let frame = match reply.response {
+            Response::Surface(SurfaceResponse::Capture(frame)) => frame,
+            Response::Surface(SurfaceResponse::Refused { refusal, .. }) => {
+                return Err(ClientError::SurfaceRefused(refusal));
+            }
+            _ => return Err(ClientError::Protocol),
+        };
+        let returned = reply.retained[0].take().ok_or(ClientError::Protocol)?;
+        let view = returned
+            .try_into_stashed_view(Rights::ACCESS)
+            .map_err(|_| ClientError::Protocol)?;
+        let lane = self.surface_lanes.claim().ok_or(ClientError::Busy)?;
+        let mapped =
+            verbs::map_stashed_view_surface_lane(&view, lane).ok_or(ClientError::Mapping)?;
+        let pixels = usize::try_from(frame.pixel_bytes()).map_err(|_| ClientError::Geometry)?;
+        if !frame.is_valid()
+            || mapped.len() < pixels
+            || mapped.cast::<u8>().as_ptr().addr() % 4 != 0
+        {
+            return Err(ClientError::Geometry);
+        }
+        Ok(CaptureView {
+            frame,
+            pixels: mapped.cast::<u32>(),
+            _view: view,
+        })
     }
 
     async fn create_backing(&mut self, config: Configure) -> Result<(), ClientError> {
@@ -1080,7 +1302,31 @@ fn valid_configuration(previous: Option<Configure>, next: Configure) -> bool {
 }
 
 fn scoped_event(current: u64, serial: u64, event: Event) -> Option<Event> {
-    if matches!(event, Event::Reset | Event::CloseRequested) {
+    // A configure serial scopes geometry. A pointer report is geometry — its
+    // coordinates mean nothing under a superseded aperture — but a keyboard
+    // snapshot carries none, and the app derives presses by diffing it
+    // against its own previous snapshot, so a held key across a re-layout
+    // cannot become a phantom press. Dropping or resetting it instead loses
+    // the character outright: the compositor stamps keys with the layout
+    // still on screen while this client may already hold a newer serial it
+    // has not presented, and two quick re-layouts leave that window open
+    // exactly when a user types into the window that just grew (#1054).
+    //
+    // Focus carries no geometry either, and the compositor stamps it with
+    // the live configure serial, so during a re-layout it is always ahead
+    // of this client. Rewriting it to a Reset left the app unaware it was
+    // focused until the app layer's corrective Focus after the drain — too
+    // late for a key drained in the same pass, which the app's own focus
+    // guard then discarded. A menu choice names its own menu serial, not
+    // geometry, so a reconfigure while it was open cannot invalidate it.
+    if matches!(
+        event,
+        Event::Reset
+            | Event::CloseRequested
+            | Event::Keyboard { .. }
+            | Event::Focus(_)
+            | Event::Menu { .. }
+    ) {
         return Some(event);
     }
     if serial < current {
@@ -1185,6 +1431,72 @@ mod tests {
         );
     }
 
+    /// A capture ask reads as visibility and is answered once before a park:
+    /// the same ask never draws a second frame, however the first fared,
+    /// and a later ask re-arms only after the first was seen settled.
+    #[test]
+    fn a_capture_ask_is_visible_and_answered_once_per_ask() {
+        use crate::channel::WindowState;
+        use kore_rt::svc::SvcProtocol;
+        #[repr(align(64))]
+        struct Buffer<const N: usize>([u8; N]);
+        let mut pair = Buffer([0; wire::SURFACE_PAIR_BYTES]);
+        let mut event_memory = Buffer([0; 4096]);
+        WindowWire::init_pair_window(&mut pair.0, REQ_CAP, REP_CAP).unwrap();
+        let transport = CountingTransport::new();
+        let mut client = WindowClient::from_memory(
+            &transport,
+            &mut pair.0,
+            ClientEndpoints {
+                kick: SlotRef::from_wire(1),
+                grants: [const { None }; MAX_GRANTS],
+            },
+        )
+        .unwrap();
+        let (mut producer, channel) = kore_ring::event::split::<WindowState, EventWire>(
+            &mut event_memory.0,
+            crate::event::EVENT_CAP,
+        )
+        .unwrap();
+        client.channel = channel;
+
+        // Minimized, and the app has not configured yet: the ask reads as
+        // visibility, but there is no frame to offer.
+        let mut state = WindowState::default();
+        producer.replace_state(state);
+        client.sync_status().unwrap();
+        assert!(!client.visible());
+        state.flags = WindowState::CAPTURE;
+        producer.replace_state(state);
+        client.sync_status().unwrap();
+        assert!(client.visible(), "an ask reads as visible");
+        assert!(!drive(client.answer_capture()), "no configuration: nothing to present");
+        assert!(!client.capture_answered);
+
+        // Configured, the backing not yet live: the one offer is spent even
+        // though the frame failed, so a wait returns once and then parks.
+        client.needs_configuration = false;
+        assert!(drive(client.answer_capture()), "the ask is answered before parking");
+        assert!(client.capture_answered);
+        assert!(!drive(client.answer_capture()), "the same ask never draws twice");
+        client.sync_status().unwrap();
+        assert!(client.capture_answered, "a resync of the same ask keeps it spent");
+        assert_eq!(transport.commits.get(), 0, "a frame that failed kicks nobody");
+
+        // The compositor settles the ask: the window is hidden again, and a
+        // fresh ask is answered anew.
+        state.flags = 0;
+        producer.replace_state(state);
+        client.sync_status().unwrap();
+        assert!(!client.visible() && !client.capture_answered);
+        assert!(!drive(client.answer_capture()));
+        state.flags = WindowState::CAPTURE | WindowState::VISIBLE;
+        producer.replace_state(state);
+        client.sync_status().unwrap();
+        assert!(drive(client.answer_capture()), "a new ask is answered");
+        assert!(client.visible());
+    }
+
     #[test]
     fn actual_event_queue_filters_old_geometry_and_updates_focus() {
         use kore_rt::svc::SvcProtocol;
@@ -1223,9 +1535,9 @@ mod tests {
             focused: false,
         });
         client.needs_configuration = false;
-        producer
-            .push(EventWire::encode(1, Event::Focus(true)))
-            .unwrap();
+        // Focus is not geometry and is never filtered by serial (see
+        // `a_focus_change_reaches_the_app_before_the_key_typed_under_it`);
+        // the old-geometry filtering under test here is the pointer's.
         producer
             .push(EventWire::encode(2, Event::Focus(true)))
             .unwrap();
@@ -1246,7 +1558,7 @@ mod tests {
                     x: 10,
                     y: 20,
                     buttons: 1,
-                    wheel: 0,
+                    scroll: crate::event::Scroll::NONE,
                 },
             ))
             .unwrap();
@@ -1328,16 +1640,19 @@ mod tests {
         });
         client.needs_configuration = false;
 
-        // A resize can overtake records already in the bounded ring. They are
-        // intentionally hidden from the application, but consuming them still
-        // returns producer capacity and must wake a pending Reset retry.
+        // A resize can overtake coordinate records already in the bounded
+        // ring. They are intentionally hidden from the application, but
+        // consuming them still returns producer capacity and must wake a
+        // pending Reset retry. (Keyboard snapshots are not hidden this way;
+        // see `a_keystroke_crosses_a_configure_boundary_in_either_direction`.)
         producer
             .push(EventWire::encode(
                 1,
-                Event::Keyboard {
-                    source: 0,
-                    modifiers: 0,
-                    keys: [4, 0, 0, 0, 0, 0],
+                Event::Pointer {
+                    x: 23,
+                    y: 12,
+                    buttons: 1,
+                    scroll: crate::event::Scroll::NONE,
                 },
             ))
             .unwrap();
@@ -1525,24 +1840,77 @@ mod tests {
         assert_eq!(lanes.live(), 0);
     }
 
+    /// #1054: a keyboard snapshot has no geometry, so a configure serial must
+    /// never decide whether it reaches the app. Across two quick re-layouts
+    /// the compositor keeps stamping keys with the layout still on screen
+    /// while this client has already acknowledged a newer configure it has
+    /// not presented yet; a key typed then was silently dropped as stale, and
+    /// one typed under an even newer stamp was replaced by a Reset. Either
+    /// way the character was gone and the window looked focused and alive.
+    #[test]
+    fn a_keystroke_crosses_a_configure_boundary_in_either_direction() {
+        let keyboard = Event::Keyboard {
+            source: 1,
+            modifiers: 0x02,
+            keys: [0x1e, 0, 0, 0, 0, 0],
+            locks: kore_abi::keyboard::Locks::NONE,
+        };
+        assert_eq!(
+            scoped_event(2, 1, keyboard),
+            Some(keyboard),
+            "a key stamped with the still-presented layout is not stale input"
+        );
+        assert_eq!(
+            scoped_event(2, 3, keyboard),
+            Some(keyboard),
+            "a key stamped ahead of this client's configure is still the key"
+        );
+    }
+
+    /// #1054, the half that decides whether the delivered key is *used*: the
+    /// compositor stamps `Focus` with the live configure serial, so during a
+    /// re-layout it is always ahead of this client and was rewritten to a
+    /// Reset. The app never learned it was focused, and a key drained in the
+    /// same pass — before the app layer's corrective Focus — was discarded by
+    /// the app's own `if focused` guard. Focus carries no geometry either.
+    #[test]
+    fn a_focus_change_reaches_the_app_before_the_key_typed_under_it() {
+        let keyboard = Event::Keyboard {
+            source: 1,
+            modifiers: 0x02,
+            keys: [0x1e, 0, 0, 0, 0, 0],
+            locks: kore_abi::keyboard::Locks::NONE,
+        };
+        assert_eq!(
+            scoped_event(2, 3, Event::Focus(true)),
+            Some(Event::Focus(true))
+        );
+        assert_eq!(
+            scoped_event(2, 1, Event::Focus(false)),
+            Some(Event::Focus(false))
+        );
+        assert_eq!(scoped_event(2, 3, keyboard), Some(keyboard));
+    }
+
     #[test]
     fn input_never_uses_an_old_coordinate_configuration_and_reset_survives() {
         let pointer = Event::Pointer {
             x: 23,
             y: 12,
             buttons: 1,
-            wheel: 0,
+            scroll: crate::event::Scroll::NONE,
         };
         let keyboard = Event::Keyboard {
             source: 2,
             modifiers: 0,
             keys: [4, 0, 0, 0, 0, 0],
+            locks: kore_abi::keyboard::Locks::CAPS,
         };
         assert_eq!(scoped_event(2, 1, pointer), None);
-        assert_eq!(scoped_event(2, 1, keyboard), None);
         assert_eq!(scoped_event(2, 3, pointer), Some(Event::Reset));
-        assert_eq!(scoped_event(2, 3, keyboard), Some(Event::Reset));
         assert_eq!(scoped_event(2, 2, pointer), Some(pointer));
+        // Keyboard snapshots are not coordinate input: every serial delivers
+        // the key itself (see `a_keystroke_crosses_a_configure_boundary_in_either_direction`).
         assert_eq!(scoped_event(2, 2, keyboard), Some(keyboard));
         assert_eq!(scoped_event(2, 1, Event::Reset), Some(Event::Reset));
         assert_eq!(
@@ -1550,7 +1918,6 @@ mod tests {
             Some(Event::CloseRequested)
         );
         assert_eq!(scoped_event(2, 3, Event::Configure), Some(Event::Configure));
-        assert_eq!(scoped_event(2, 1, Event::Focus(false)), None);
     }
 
     #[test]

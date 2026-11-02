@@ -174,6 +174,10 @@ impl MmRepWire {
     /// (an admission in flight, or a retired face whose supplies have not
     /// all returned); ask again.
     pub const REFUSE_PENDING: u8 = 6;
+    /// `MmRefusal::Full` — no per-launch face fits: every serving slot is
+    /// attached or still crediting returns, or mm has no room to grow one.
+    /// A capacity refusal, the face admission's `TableFull`.
+    pub const REFUSE_FULL: u8 = 7;
 }
 
 // ─── monitor — federated telemetry assembly ───────────────────────
@@ -1353,6 +1357,11 @@ pub struct TaskReqWire {
 /// Why a library did not seed (`TaskRepWire::LIBRARY_FAILURE_*`): the
 /// stage `SeedLibrary` stopped at, so a `libs: L/M` verdict short of M names
 /// its cause on the kernel's store line instead of swallowing it.
+///
+/// The same vocabulary names where `ProvisionHome` stopped: the home
+/// skeleton is the same archive-export copy into a different directory, so
+/// its stages are these, plus [`HOME`](Self::HOME) and
+/// [`RECORD`](Self::RECORD), which only a home has.
 pub struct LibraryFailure;
 impl LibraryFailure {
     pub const NONE: u8 = 0;
@@ -1410,6 +1419,13 @@ impl LibraryFailure {
     pub const NO_IMAGE_CLIENT: u8 = 26;
     /// Write stage: the copy answered false without naming a stage (a new exit lacks its stamp).
     pub const UNCLASSIFIED: u8 = 27;
+    /// Home skeleton: the face is not live, or its durable home
+    /// (`work/<home>`) is absent or not a directory.
+    pub const HOME: u8 = 28;
+    /// Home skeleton: the home's provisioning record (`home-skeleton/<home>`,
+    /// beside `work/`) could not be read, does not parse, or could not be
+    /// written.
+    pub const RECORD: u8 = 29;
 }
 
 impl TaskReqWire {
@@ -1479,6 +1495,13 @@ impl TaskReqWire {
     /// gains no peer, no projection, and no launch authority; a task links
     /// it into itself at runtime.  Seal-exempt, via==0 only.
     pub const OP_SEED_LIBRARY: u8 = 22;
+    /// Provision one minted face's durable home with the home skeleton: copy
+    /// each archive DATA member the home's record says it has not had yet
+    /// into `<home>/<dir>/`, never replacing a file already there, then
+    /// record the skeleton version (`services/exec` `HOME_SKELETON`).
+    /// `slot` names the face; no plan, no target, no grants. Seal-exempt,
+    /// via==0 only: provisioning is the administrator's, not a task's.
+    pub const OP_PROVISION_HOME: u8 = 25;
 
     /// Every retired `TaskReqWire` discriminant, in one definition the
     /// decoder cites (the [`derive_kind_known`](crate::session::derive_kind_known)
@@ -1719,6 +1742,19 @@ impl TaskRepWire {
     /// Complete live bit vocabulary for `TAG_LIBRARY_SEEDED.index`.
     pub const LIBRARY_SEED_MASK: u8 =
         Self::LIBRARY_SEEDED | Self::LIBRARY_MANIFEST | Self::LIBRARY_FAILURE_MASK;
+    /// Reply to [`TaskReqWire::OP_PROVISION_HOME`]: `index` is
+    /// [`HOME_PROVISIONED`](Self::HOME_PROVISIONED) plus the
+    /// [`LibraryFailure`](crate::svc::LibraryFailure) stage in the
+    /// `LIBRARY_FAILURE_*` bits; `status` is how many files this call copied
+    /// in (zero for a home already at the current skeleton version). An
+    /// unprovisioned home is a posture (no store, or a stage that failed and
+    /// is retried next boot), never a refusal.
+    pub const TAG_HOME_PROVISIONED: u8 = 25;
+    /// `TAG_HOME_PROVISIONED.index`: the home is recorded at the current
+    /// skeleton version.
+    pub const HOME_PROVISIONED: u8 = 1 << 0;
+    /// Complete live bit vocabulary for `TAG_HOME_PROVISIONED.index`.
+    pub const HOME_PROVISION_MASK: u8 = Self::HOME_PROVISIONED | Self::LIBRARY_FAILURE_MASK;
     /// A task-owned exec client face was attached; `index` is its bounded id.
     pub const TAG_CLIENT_MINTED: u8 = 11;
     /// A minted face received its complete reply-grant receive bank.
@@ -1757,10 +1793,14 @@ impl TaskRepWire {
     /// `TaskRefusal::Retired` — the request named a frozen tombstone
     /// discriminant ([`TaskReqWire::op_retired`]); nothing was attempted.
     pub const REFUSE_RETIRED: u8 = 10;
-    /// `TaskRefusal::Contended` — concurrent invocations landed admissions
-    /// for more than one generation, so no landing could be attributed to
-    /// this request; every in-flight admission was retired and the caller
-    /// re-derives and retries.
+    /// `TaskRefusal::Contended` — a launch-time face was still settling
+    /// earlier work: its service refused while an earlier admission was
+    /// unclaimed (accelerator or memory), or its administration pair still
+    /// carried a request the launch could not resume and nothing was
+    /// allocated. Every moved input was retired and the caller re-derives
+    /// and retries. (Concurrent
+    /// launches of different generations are attributed by each
+    /// invocation's possession proof and never meet here.)
     pub const REFUSE_CONTENDED: u8 = 11;
     /// `TaskRefusal::PeerAdmissionPending` — the face's service accepted the
     /// child's peer bundle but had not yet published the admission verdict
@@ -2072,6 +2112,10 @@ pub struct InputReport {
     /// Zero for legacy records. Contacts may carry version-1 axis metadata:
     /// `[1, class, max_x_le[2], max_y_le[2], 0]`. Coordinates are normalized
     /// to a zero minimum by the descriptor decoder, not scaled to a display.
+    /// Keyboards carry `[locks, 0, 0, 0, 0, 0, 0]`: the seat's
+    /// [`Locks`](crate::keyboard::Locks) as of this snapshot, stamped by the
+    /// keymap owner (`kore-svc-input-stream`) — a device writes zero, since a
+    /// lock is a property of the seat, not of the key matrix.
     pub reserved: [u8; 7],
 }
 
@@ -2160,6 +2204,27 @@ impl InputReport {
             data: keys,
             reserved: [0; 7],
         }
+    }
+
+    /// This keyboard snapshot with the seat's lock state stamped in.
+    /// Any other kind is returned unchanged: locks mean nothing there.
+    pub const fn with_locks(mut self, locks: crate::keyboard::Locks) -> Self {
+        if self.kind == Self::KIND_KEYBOARD {
+            self.reserved[0] = locks.bits();
+        }
+        self
+    }
+
+    /// The lock state of a well-formed keyboard record: `None` for any other
+    /// kind, and for a keyboard record whose lock byte names a bit no lock
+    /// owns or whose remaining reserved bytes are not zero — a record a
+    /// consumer must refuse rather than interpret.
+    pub const fn keyboard_locks(&self) -> Option<crate::keyboard::Locks> {
+        let [locks, a, b, c, d, e, f] = self.reserved;
+        if self.kind != Self::KIND_KEYBOARD || (a | b | c | d | e | f) != 0 {
+            return None;
+        }
+        crate::keyboard::Locks::from_bits(locks)
     }
 
     /// A mouse report: button bitmap + signed relative deltas.
@@ -2273,6 +2338,10 @@ impl InputReqWire {
     /// `InputRequest::Status` — read the service's own books. Carries no
     /// operand: it steers nothing and names no subscription.
     pub const OP_STATUS: u8 = 4;
+    /// `InputRequest::SetIndicators` — `slot` carries the keyboard's wire
+    /// source identity (below 256), `subscription` the lock state's
+    /// [`Locks`](crate::keyboard::Locks) bits; `focus` and `reserved` zero.
+    pub const OP_SET_INDICATORS: u8 = 6;
 
     /// `SetFocus`: steer subsequent reports to nobody.
     pub const FOCUS_NONE: u8 = 0;
@@ -2352,6 +2421,8 @@ impl InputRepWire {
     pub const TAG_REFUSED: u8 = 4;
     /// `InputResponse::Status` — see `rung` and the four counters.
     pub const TAG_STATUS: u8 = 5;
+    /// `InputResponse::Indicated` — the indicator state was recorded.
+    pub const TAG_INDICATED: u8 = 7;
 
     /// `InputRefusal::BadQueue` — the delivered slot was absent,
     /// non-writable, or not a well-formed report ring.
@@ -2449,6 +2520,10 @@ impl HypervisorReqWire {
     pub const OP_SPAWN_MMIO: u8 = 12;
     /// Two-vCPU SPMD guest witness.
     pub const OP_SPAWN_SMP: u8 = 13;
+    /// Modern virtio-MMIO console guest.
+    pub const OP_SPAWN_VIRTIO: u8 = 14;
+    /// Explicit port-UART compatibility witness; normal guests use virtio.
+    pub const OP_SPAWN_UART: u8 = 15;
 }
 
 /// Capacity of the hypervisor pair window's **guest-output** console
@@ -2608,6 +2683,8 @@ impl HypervisorStatusWire {
     /// The echo guest on the memory-mapped console (#765).
     pub const PAYLOAD_MMIO: u8 = 6;
     pub const PAYLOAD_SMP: u8 = 7;
+    pub const PAYLOAD_VIRTIO: u8 = 8;
+    pub const PAYLOAD_UART: u8 = 9;
 
     /// A live guest task currently exists.
     pub const STATUS_GUEST_EXISTS: u16 = 1 << 0;
@@ -3548,6 +3625,11 @@ const _: () = {
     // histogram.
     assert!(size_of::<FsSystemStatusWire>() == 24 + 80 + 29 * 8 + 66); // 402
     assert!(size_of::<FsSystemStatusWire>() == FsSystemStatusWire::BYTES);
+    // 16-byte head ‖ 2×8 sizes ‖ 2×4 ‖ 8×2 books ‖ 4×4 latencies ‖ 8 bytes ‖
+    // 5×4 refresh counters.
+    assert!(size_of::<PackMaintenanceWire>() == 16 + 16 + 8 + 16 + 16 + 8 + 20); // 100
+    assert!(size_of::<PackMaintenanceWire>() == PackMaintenanceWire::BYTES);
+    assert!(size_of::<PackBucketWire>() == PackBucketWire::BYTES);
     // Both 8-deep rings must fit ONE founded pair window, and the filesystem
     // now asks the founding for `SvcProtocol::SERVE_PAIRS` of them — so this
     // is a per-pair budget the founder pays four times over, not once.
@@ -3716,7 +3798,8 @@ impl OutChunk {
 )]
 pub struct InReqWire {
     /// Verb discriminant: [`OP_ATTACH_RX`](Self::OP_ATTACH_RX) /
-    /// [`OP_DETACH_RX`](Self::OP_DETACH_RX) / [`OP_STATUS`](Self::OP_STATUS);
+    /// [`OP_DETACH_RX`](Self::OP_DETACH_RX) / [`OP_STATUS`](Self::OP_STATUS)
+    /// / [`OP_HOLD`](Self::OP_HOLD) / [`OP_REPRINT`](Self::OP_REPRINT);
     /// zero (unseeded) is invalid.
     pub op: u8,
     /// Reserved; must be zero.
@@ -3744,6 +3827,13 @@ impl InReqWire {
     pub const OP_DETACH_RX: u8 = 2;
     /// `InputStreamRequest::Status` — snapshot the counters.
     pub const OP_STATUS: u8 = 3;
+    /// `InputStreamRequest::Hold` — the line editor stops editing and
+    /// echoing until `Reprint`: keys queue, so the client can print an
+    /// asynchronous notice over an idle prompt.
+    pub const OP_HOLD: u8 = 5;
+    /// `InputStreamRequest::Reprint` — echo the line being edited, cursor
+    /// in place, then apply every key queued since `Hold`.
+    pub const OP_REPRINT: u8 = 6;
 }
 
 /// The stream-input-service reply wire form. The legacy stream counters are
@@ -3755,7 +3845,8 @@ impl InReqWire {
 pub struct InRepWire {
     /// Outcome discriminant: [`TAG_ATTACHED`](Self::TAG_ATTACHED) /
     /// [`TAG_DETACHED`](Self::TAG_DETACHED) / [`TAG_STATUS`](Self::TAG_STATUS)
-    /// / [`TAG_REFUSED`](Self::TAG_REFUSED).
+    /// / [`TAG_REFUSED`](Self::TAG_REFUSED) / [`TAG_HELD`](Self::TAG_HELD) /
+    /// [`TAG_REPRINTED`](Self::TAG_REPRINTED).
     pub tag: u8,
     /// `Refused`: the `InputStreamRefusal` discriminant
     /// ([`REFUSE_BUSY`](Self::REFUSE_BUSY)…); zero otherwise.
@@ -3830,6 +3921,11 @@ impl InRepWire {
     pub const TAG_STATUS: u8 = 3;
     /// `InputStreamResponse::Refused` — see `refusal`.
     pub const TAG_REFUSED: u8 = 4;
+    /// `InputStreamResponse::Held` — the line editor holds.
+    pub const TAG_HELD: u8 = 6;
+    /// `InputStreamResponse::Reprinted` — the line is echoed again and the
+    /// held keys applied.
+    pub const TAG_REPRINTED: u8 = 7;
 
     /// `InputStreamRefusal::Busy` — a queue is already attached (the v1
     /// single-peer bound, `res/USERLAND.md` §5.9).
@@ -3927,7 +4023,26 @@ mod tests {
         // shared report window's peer is untrusted) and round-trips.
         let kbd = InputReport::keyboard(3, 0x02, [0x04, 0x05, 0, 0, 0, 0]);
         assert_eq!(InputReport::read_from_bytes(kbd.as_bytes()).unwrap(), kbd);
+        // A device writes no locks; the keymap owner stamps them into the
+        // first reserved byte and nowhere else.
+        use crate::keyboard::Locks;
+        assert_eq!(kbd.keyboard_locks(), Some(Locks::NONE));
+        let caps = kbd.with_locks(Locks::CAPS.toggled(Locks::NUM));
+        assert_eq!(caps.reserved, [0x03, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            InputReport::read_from_bytes(caps.as_bytes())
+                .unwrap()
+                .keyboard_locks(),
+            Some(Locks::CAPS.toggled(Locks::NUM))
+        );
+        for (index, value) in [(0, 0x08), (1, 1), (6, 0x80)] {
+            let mut invalid = caps;
+            invalid.reserved[index] = value;
+            assert_eq!(invalid.keyboard_locks(), None, "byte {index} = {value:#x}");
+        }
         let mouse = InputReport::mouse(4, 0x01, 5, -3, 0);
+        assert_eq!(mouse.with_locks(Locks::CAPS), mouse, "only keyboards carry locks");
+        assert_eq!(mouse.keyboard_locks(), None);
         assert_eq!(mouse.data, [5, (-3i8) as u8, 0, 0, 0, 0]);
         let raw = [0xC3u8; 16];
         assert_eq!(InputReport::read_from_bytes(&raw).unwrap().kind, 0xC3);
@@ -4076,9 +4191,11 @@ mod tests {
             SurReqWire::OP_QUERY,
             SurReqWire::OP_CREATE_SURFACE,
             SurReqWire::OP_SIGNAL,
+            SurReqWire::OP_SHOW_MENU,
             SurRepWire::TAG_INFO,
             SurRepWire::TAG_SURFACE_MADE,
             SurRepWire::TAG_REFUSED,
+            SurRepWire::TAG_MENU_SHOWN,
         ] {
             assert_ne!(d, 0);
         }
@@ -4164,6 +4281,83 @@ impl SurReqWire {
     /// leaves only on the echo.  No words; `subject` is zero
     /// ([`SurRepWire::TAG_CLOSE_REQUESTED`]).
     pub const OP_REQUEST_CLOSE: u8 = 6;
+    /// `SurfaceRequest::SetCursor` — the cursor this window shows while the
+    /// pointer is over its content: `a` = one `CURSOR_*` code below, any
+    /// other value refused.  A request, not a grant: the compositor's own
+    /// pixels (chrome, the dock) choose for themselves, and the window's
+    /// choice holds until it asks again.  No subject
+    /// ([`SurRepWire::TAG_CURSOR_SET`]).
+    pub const OP_SET_CURSOR: u8 = 7;
+    /// `SurfaceRequest::OpenObject` — ask this window's controller to open
+    /// a filesystem object in its kind's default handler: `a` = the
+    /// object's stable identity (never zero), `b` = its document-kind code
+    /// (`kore_window::document::DocumentKind`; zero for unknown, which
+    /// opens in the catalogue's document app). Queued as an inert
+    /// `ShellAction::Open` for the controller that launched this window,
+    /// which decides; the identity is data the opened window locates from
+    /// its own root, never authority. No subject
+    /// ([`SurRepWire::TAG_OPEN_QUEUED`]).
+    pub const OP_OPEN_OBJECT: u8 = 8;
+    /// `SurfaceRequest::ShowMenu` — the compositor draws the context menu
+    /// this window encoded in its pair lease's menu plane
+    /// (`kore_window::menu`): `a` = the anchor's content-relative
+    /// `x as u32 | (y as u32) << 32`, `b` = the encoded length (1 to the
+    /// plane's size) `| serial << 32` (a nonzero `u32` the window picks).
+    /// The compositor snapshots and validates the plane before replying,
+    /// so the window may reuse it once answered; the choice returns as an
+    /// `Event::Menu` carrying the serial. No subject
+    /// ([`SurRepWire::TAG_MENU_SHOWN`]).
+    pub const OP_SHOW_MENU: u8 = 9;
+    /// `SurfaceRequest::TakeCapture` — a capture writer's one verb: lend
+    /// the frozen frame its pair was admitted for, read-only
+    /// ([`SurRepWire::TAG_CAPTURE`]). Only a capture peer may ask; no
+    /// words, no subject.
+    pub const OP_TAKE_CAPTURE: u8 = 10;
+    /// `SurfaceRequest::PickObject` — ask the user, through this window's
+    /// controller, to choose a file (`res/FILE_PICKER.md`): `a` = the file
+    /// types accepted, a nonzero mask over `kore_kit::kinds` rows; `b` = a
+    /// nonzero `u32` serial the window picks. Queued as an inert
+    /// `ShellAction::Pick` carrying a fresh token; the choice returns as
+    /// `Event::Picked` carrying the serial. No subject
+    /// ([`SurRepWire::TAG_PICK_QUEUED`]).
+    pub const OP_PICK_OBJECT: u8 = 11;
+    /// `SurfaceRequest::ClaimPick` — the picker the controller launched
+    /// for a pick binds itself to it: `a` = the pick's token (never zero),
+    /// handed to it at launch. Only a window of the asking window's own
+    /// controller, and only the first, may claim. No subject
+    /// ([`SurRepWire::TAG_PICK_CLAIMED`]).
+    pub const OP_CLAIM_PICK: u8 = 12;
+    /// `SurfaceRequest::Picked` — the claimed picker answers its pick: `a`
+    /// = the token, `b` = the chosen object's stable identity (zero: the
+    /// user cancelled), `c` = the length of the chosen entry's name, which
+    /// the picker wrote at the head of its menu plane (zero when
+    /// cancelled, else 1 to `kore_window::pick::PICK_NAME_BYTES`). The
+    /// compositor snapshots the name and ends the pick. No subject
+    /// ([`SurRepWire::TAG_PICK_ANSWERED`]).
+    pub const OP_PICKED: u8 = 13;
+
+    /// [`OP_SET_CURSOR`](Self::OP_SET_CURSOR) `a`: the standard arrow.
+    pub const CURSOR_DEFAULT: u64 = 0;
+    /// The I-beam: text a press would place a caret in.
+    pub const CURSOR_TEXT: u64 = 1;
+    /// The pointing hand: a control a press would activate.
+    pub const CURSOR_POINTER: u64 = 2;
+    /// The open hand: something a press would pick up.
+    pub const CURSOR_GRAB: u64 = 3;
+    /// The closed hand: something being carried.
+    pub const CURSOR_GRABBING: u64 = 4;
+    /// The vertical resize arrow: an edge that moves up and down.
+    pub const CURSOR_RESIZE_NS: u64 = 5;
+    /// The horizontal resize arrow: an edge that moves left and right.
+    pub const CURSOR_RESIZE_EW: u64 = 6;
+    /// The diagonal resize arrow from top-left to bottom-right.
+    pub const CURSOR_RESIZE_NWSE: u64 = 7;
+    /// The diagonal resize arrow from top-right to bottom-left.
+    pub const CURSOR_RESIZE_NESW: u64 = 8;
+    /// The hand under a no-entry badge: what a press here would not do.
+    pub const CURSOR_NOT_ALLOWED: u64 = 9;
+    /// The spinner: work under way while the window still answers.
+    pub const CURSOR_PROGRESS: u64 = 10;
 
     /// [`OP_CREATE_SURFACE`](Self::OP_CREATE_SURFACE) `b`: CPU-reachable
     /// backing — the one v1 reach.
@@ -4239,6 +4433,29 @@ impl SurRepWire {
     /// close was raised under (never zero: an unconfigured window cannot
     /// be closing).  The echo itself rides the event channel.
     pub const TAG_CLOSE_REQUESTED: u8 = 7;
+    /// `SurfaceResponse::CursorSet` — `a` echoes the
+    /// [`SurReqWire`] `CURSOR_*` code now held for the window.
+    pub const TAG_CURSOR_SET: u8 = 8;
+    /// `SurfaceResponse::OpenQueued` — `a` echoes the identity queued.
+    pub const TAG_OPEN_QUEUED: u8 = 9;
+    /// `SurfaceResponse::MenuShown` — `a` echoes the menu's serial; the
+    /// menu is open and the plane may be reused.
+    pub const TAG_MENU_SHOWN: u8 = 10;
+    /// `SurfaceResponse::Capture` — `id` = what the freeze's copy cost, in
+    /// nanoseconds, `a` = `width ‖ height << 16 ‖ mode << 32 ‖ screen
+    /// << 40 ‖ density << 48` (`kore_window::capture`), `b` = nanoseconds
+    /// since the UNIX epoch at the freeze (zero without a wall anchor),
+    /// `c` = nanoseconds since boot at the freeze. The reply's one grant
+    /// is the frozen frame's view, ACCESS without MODIFY, the pixels in
+    /// whole pages: the writer can read it and never write it.
+    pub const TAG_CAPTURE: u8 = 11;
+    /// `SurfaceResponse::PickQueued` — `a` echoes the pick's serial.
+    pub const TAG_PICK_QUEUED: u8 = 12;
+    /// `SurfaceResponse::PickClaimed` — `a` echoes the token claimed.
+    pub const TAG_PICK_CLAIMED: u8 = 13;
+    /// `SurfaceResponse::PickAnswered` — `a` echoes the token answered; the
+    /// pick has ended and the plane may be reused.
+    pub const TAG_PICK_ANSWERED: u8 = 14;
 
     /// A v1 vocabulary gate: an unknown op, a non-XRGB8888 format, a
     /// non-CPU reach, a non-LINEAR modifier, a non-empty flag set.
@@ -4563,7 +4780,45 @@ impl FsReqWire {
     /// stale completions (low half) and refused timeline completions (high
     /// half) in `revision`. No operand.
     pub const OP_STOR_INSPECT: u8 = 61;
-    pub const OP_MAX: u8 = Self::OP_STOR_INSPECT;
+    /// One page of an open object's visible parents into the data window:
+    /// the directories reachable from the handle's authority root that hold
+    /// an edge to it, each as an [`FsSearchHitWire`] whose `path` is the
+    /// shortest route from that root (empty for the root itself). The cursor
+    /// rides `length` and the page lands at `window_offset`, as `List`'s do;
+    /// the reply is `List`'s (`count`, `cursor`, [`FsRepWire::FLAG_MORE`]).
+    /// Observation data only: a caller opens a parent by its route.
+    pub const OP_PARENTS: u8 = 62;
+    /// Locate an object by its stable identity from the handle's authority
+    /// root: one [`FsSearchHitWire`] at `window_offset` whose `path` is the
+    /// shortest route from that root to the object, its own name last. The
+    /// identity rides `handle2`; the reply is `List`'s with a `count` of one.
+    /// An object the root does not reach is `NOT_FOUND`, exactly as one that
+    /// does not exist: the verb names nothing outside the caller's view.
+    /// Observation data only: a caller opens the object by its route.
+    pub const OP_LOCATE: u8 = 63;
+
+    /// Maintain the designated pack region (`res/PACK_STREAMING.md` §7):
+    /// `kind` names the action (`MAINTAIN_*`); a forced refresh carries its
+    /// first bucket in `handle` and its bucket count in `handle2`. Every
+    /// action answers with the region's [`PackMaintenanceWire`] report and
+    /// up to its `entries` [`PackBucketWire`] records, landed in the data
+    /// window at `window_offset`; the reply carries the bytes landed in
+    /// `count`. The row runs the job itself, between requests: a scan or a
+    /// refresh replies at once, and the client asks
+    /// [`MAINTAIN_STATUS`](Self::MAINTAIN_STATUS) until the phase is idle.
+    pub const OP_STOR_MAINTAIN: u8 = 64;
+    pub const OP_MAX: u8 = Self::OP_STOR_MAINTAIN;
+
+    /// [`OP_STOR_MAINTAIN`](Self::OP_STOR_MAINTAIN): report only.
+    pub const MAINTAIN_STATUS: u8 = 0;
+    /// Probe every bucket's read latency and judge which are stale.
+    pub const MAINTAIN_SCAN: u8 = 1;
+    /// Rewrite, content unchanged, every bucket the last scan judged stale.
+    pub const MAINTAIN_REFRESH_STALE: u8 = 2;
+    /// Rewrite buckets `handle..handle + handle2`, judged or not.
+    pub const MAINTAIN_REFRESH_RANGE: u8 = 3;
+    /// Stop the running job once the device returns what it holds.
+    pub const MAINTAIN_CANCEL: u8 = 4;
 
     /// [`kind`](Self::kind): a file.
     pub const KIND_FILE: u8 = 1;
@@ -5001,6 +5256,133 @@ impl FsSystemStatusWire {
     pub const LIFECYCLE_REBUILT: u16 = 6;
     /// The mounted region was recovered without a rebuild and is current.
     pub const LIFECYCLE_CURRENT: u16 = 7;
+}
+
+/// The pack region's maintenance report (`res/PACK_STREAMING.md` §7):
+/// what its scan measured, what its refresh rewrote, and where the job is.
+/// Lands in the data window ahead of `entries` [`PackBucketWire`] records,
+/// one per bucket in region order.
+///
+/// **Aggregates of one region.** The pack's buckets are block ranges; no
+/// name, file or session rides here, so any attached session may ask.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct PackMaintenanceWire {
+    /// `PHASE_*`.
+    pub phase: u8,
+    /// How the last job ended (`OUTCOME_*`).
+    pub outcome: u8,
+    /// With [`OUTCOME_FAULTED`](Self::OUTCOME_FAULTED): the device error,
+    /// as `kore_driver::block::BlockError`'s discriminant plus one.
+    pub fault: u8,
+    /// `FLAG_*`.
+    pub flags: u8,
+    /// Buckets the region is divided into.
+    pub buckets: U16,
+    /// [`PackBucketWire`] records following this one.
+    pub entries: U16,
+    /// Probes a scan times per bucket.
+    pub probes: U16,
+    /// A bucket is stale at this multiple of the 25th-percentile median.
+    pub stale_ratio: U16,
+    /// Commands of the job's on the device now.
+    pub in_flight: U16,
+    /// Passes a scan makes over the same probe pages; a bucket's estimate
+    /// is its fastest pass.
+    pub passes: U16,
+    /// Bytes in one bucket (the last may be short).
+    pub bucket_bytes: U64,
+    /// Bytes in the region.
+    pub region_bytes: U64,
+    /// Bytes one refresh command moves.
+    pub chunk_bytes: U32,
+    /// Scans completed since boot.
+    pub scans: U32,
+    /// Buckets probed in the running pass, or by the last scan once
+    /// complete.
+    pub scanned: U16,
+    /// Of those, buckets whose probes read mapped (non-zero) data.
+    pub mapped: U16,
+    /// Buckets judged stale.
+    pub stale: U16,
+    /// Buckets the last (or running) refresh set out to rewrite.
+    pub planned: U16,
+    /// Of those, rewritten and flushed.
+    pub done: U16,
+    /// Asked for but skipped: rewritten earlier this boot.
+    pub skipped: U16,
+    /// Buckets rewritten since boot.
+    pub lifetime: U16,
+    /// The running scan pass, from one; `passes` once the scan is complete.
+    pub pass: U16,
+    /// Probes the device failed.
+    pub failed_probes: U32,
+    /// Percentiles of the mapped buckets' median probe latency, ns.
+    pub p25_ns: U32,
+    pub p50_ns: U32,
+    pub p90_ns: U32,
+    /// Bytes rewritten and verified since boot.
+    pub bytes: U64,
+    /// Chunks left alone because they read as zeros.
+    pub zero_chunks: U32,
+    /// Reads the device failed; their chunks were left alone.
+    pub read_errors: U32,
+    /// Chunks whose two reads never agreed; left alone.
+    pub unstable_chunks: U32,
+    /// Writes repeated after a refusal or a disagreeing check.
+    pub write_retries: U32,
+    /// Checks that disagreed with the bytes just written.
+    pub mismatches: U32,
+}
+
+impl PackMaintenanceWire {
+    /// Bytes the record occupies in the data window.
+    pub const BYTES: usize = 100;
+    pub const PHASE_IDLE: u8 = 0;
+    pub const PHASE_SCANNING: u8 = 1;
+    pub const PHASE_REFRESHING: u8 = 2;
+    /// Cancelled or faulted, waiting for the device to return its commands.
+    pub const PHASE_DRAINING: u8 = 3;
+    pub const OUTCOME_NONE: u8 = 0;
+    pub const OUTCOME_SCANNED: u8 = 1;
+    pub const OUTCOME_REFRESHED: u8 = 2;
+    pub const OUTCOME_CANCELLED: u8 = 3;
+    /// A write could not be made to stick; see [`fault`](Self::fault).
+    pub const OUTCOME_FAULTED: u8 = 4;
+    /// The last scan ran to its end.
+    pub const FLAG_SCAN_COMPLETE: u8 = 1 << 0;
+}
+
+/// One bucket of the pack region, after a [`PackMaintenanceWire`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct PackBucketWire {
+    /// The last scan's estimate, ns: the fastest of its passes' medians of
+    /// mapped probes; zero unscanned.
+    pub median_ns: U32,
+    /// Probes of the last scan that read non-zero data.
+    pub mapped_probes: u8,
+    /// Probes of the last scan the device failed.
+    pub failed_probes: u8,
+    /// `FLAG_*`.
+    pub flags: u8,
+    pub reserved: u8,
+}
+
+impl PackBucketWire {
+    pub const BYTES: usize = 8;
+    /// The last scan judged the bucket stale, and it is not rewritten yet.
+    pub const FLAG_STALE: u8 = 1 << 0;
+    /// Rewritten this boot: no refresh touches it again before the next.
+    pub const FLAG_REFRESHED: u8 = 1 << 1;
+    /// A chunk could not be read cleanly and was left as it is.
+    pub const FLAG_INCOMPLETE: u8 = 1 << 2;
+    /// Most probes read non-zero data.
+    pub const FLAG_MAPPED: u8 = 1 << 3;
 }
 
 /// Startup-only display owner evidence. Data only; reporting never admits sleep.

@@ -629,6 +629,433 @@ pub fn spmd_resident() -> Result<ResidentWitness, SpmdFault> {
     })
 }
 
+// ── The fault-upcall exercise (`res/WASM_PLATFORM.md` §12) ──────────────
+
+/// What the fault-upcall exercise proved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpcallWitness {
+    /// Faults delivered to the handler and recovered from: a load from an
+    /// unmapped page, an invalid instruction, and on x86-64 a division by
+    /// zero (AArch64 and RISC-V do not trap on one).
+    pub delivered: u32,
+}
+
+/// Where the fault-upcall exercise failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpcallFault {
+    /// Installing the handler or arming the thread refused — always, off
+    /// the kore target.
+    Arm(crate::upcall::Refusal),
+    /// No unmapped page to fault on: the probe's guarded stack refused.
+    Target,
+    /// A probe ran to completion: its fault was never delivered.
+    NotDelivered { probe: u32 },
+    /// The handler was given the wrong `pc`, address or kind.
+    Evidence { probe: u32 },
+}
+
+/// **The fault-upcall exercise**: install a handler, arm this thread, and
+/// raise each fault a guarded guest raises — a load from an unmapped page,
+/// an invalid instruction, a division by zero — checking that each reaches
+/// the handler on the upcall stack with its exact evidence (the faulting
+/// instruction, the unmapped address, the kind), and that the handler's
+/// jump back resumes this thread on its own stack.  A wrong delivery is a
+/// wrong answer, never a missing line; a delivery the kernel refused ends
+/// the process, which the boot gate reads as the line never printed.
+///
+/// What a run cannot show in-process is a fault the upcall itself raises, or
+/// a declined one: either ends the process.  The kernel's policy holds both
+/// to account on the host (`runtime::sched::upcall`).
+#[cfg(target_os = "none")]
+pub fn upcall() -> Result<UpcallWitness, UpcallFault> {
+    use kore_abi::crash::FaultKind;
+
+    crate::upcall::install(upcall_probe::handler).map_err(UpcallFault::Arm)?;
+    let armed = crate::upcall::arm_thread().map_err(UpcallFault::Arm)?;
+    // A page no mapping backs: a guarded stack's guard page.
+    let target = crate::fiber_stack::GuardedStack::new(1).ok_or(UpcallFault::Target)?;
+    let unmapped = target.guard().start;
+    upcall_probe::TARGET.store(unmapped as usize, Ordering::Relaxed);
+
+    let probes = upcall_probe::probes();
+    let mut delivered = 0;
+    for (index, probe) in probes.iter().enumerate() {
+        let index = index as u32;
+        let seen =
+            upcall_probe::run(probe.code).ok_or(UpcallFault::NotDelivered { probe: index })?;
+        let start = probe.code as usize;
+        let expected_address = match probe.kind {
+            FaultKind::Memory => Some(unmapped as usize),
+            _ => None,
+        };
+        let right = (start..start + upcall_probe::PROBE_BYTES).contains(&seen.pc)
+            && seen.kind == probe.kind as usize
+            && seen.address == expected_address;
+        if !right {
+            return Err(UpcallFault::Evidence { probe: index });
+        }
+        delivered += 1;
+    }
+    drop(target);
+    drop(armed);
+    Ok(UpcallWitness { delivered })
+}
+
+/// Off the kore target there is no kernel to deliver a fault.
+#[cfg(not(target_os = "none"))]
+pub fn upcall() -> Result<UpcallWitness, UpcallFault> {
+    Err(UpcallFault::Arm(crate::upcall::Refusal::Unsupported))
+}
+
+/// The exercise's machinery: the probes that fault, a minimal catch and
+/// resume (the callee-saved registers, stack and return address, as a C
+/// `setjmp`/`longjmp` pair keeps them), and the handler that records what
+/// it was given and resumes the catch.
+#[cfg(target_os = "none")]
+mod upcall_probe {
+    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+    use kore_abi::crash::FaultKind;
+
+    /// Every probe faults within its first this-many bytes.
+    pub(super) const PROBE_BYTES: usize = 16;
+
+    /// The unmapped address the memory probe loads from.
+    pub(super) static TARGET: AtomicUsize = AtomicUsize::new(0);
+
+    /// The catch a fault resumes; null while no probe runs, so a fault
+    /// outside one is declined and ends the process as it would have.
+    static ACTIVE: AtomicPtr<Saved> = AtomicPtr::new(core::ptr::null_mut());
+
+    static SEEN_PC: AtomicUsize = AtomicUsize::new(0);
+    static SEEN_HAS_ADDRESS: AtomicUsize = AtomicUsize::new(0);
+    static SEEN_ADDRESS: AtomicUsize = AtomicUsize::new(0);
+    static SEEN_KIND: AtomicUsize = AtomicUsize::new(0);
+
+    /// A catch's saved state: room for the largest callee-saved set (RISC-V's
+    /// twelve integer and twelve FP registers, `ra` and `sp`).
+    type Saved = [u64; 32];
+
+    /// One probe: its code, and the fault it raises.
+    pub(super) struct Probe {
+        pub code: unsafe extern "C" fn(),
+        pub kind: FaultKind,
+    }
+
+    /// What the handler was given.
+    pub(super) struct Seen {
+        pub pc: usize,
+        pub address: Option<usize>,
+        pub kind: usize,
+    }
+
+    const LOAD: Probe = Probe {
+        code: probe_load,
+        kind: FaultKind::Memory,
+    };
+    const INVALID: Probe = Probe {
+        code: probe_invalid,
+        kind: FaultKind::InvalidInstruction,
+    };
+
+    /// The probes this ISA can raise: a division by zero traps on x86-64
+    /// only (AArch64 and RISC-V define its result).
+    #[cfg(target_arch = "x86_64")]
+    const PROBES: &[Probe] = &[
+        LOAD,
+        INVALID,
+        Probe {
+            code: probe_divide,
+            kind: FaultKind::Arithmetic,
+        },
+    ];
+    #[cfg(not(target_arch = "x86_64"))]
+    const PROBES: &[Probe] = &[LOAD, INVALID];
+
+    pub(super) fn probes() -> &'static [Probe] {
+        PROBES
+    }
+
+    /// Run `probe` under a catch: what the handler was given if it faulted
+    /// and was resumed, `None` if it ran to completion.
+    #[inline(never)]
+    pub(super) fn run(probe: unsafe extern "C" fn()) -> Option<Seen> {
+        let mut saved: Saved = [0; 32];
+        ACTIVE.store(&mut saved, Ordering::Release);
+        // SAFETY: `catch` saves this frame's callee-saved state into
+        // `saved`, which outlives every resume of it: the handler resumes
+        // it only while ACTIVE names it, and ACTIVE is cleared below before
+        // `saved` goes out of scope.  Nothing live across the call is held
+        // outside the state `catch` restores.
+        let caught = unsafe { catch(probe, &mut saved) };
+        ACTIVE.store(core::ptr::null_mut(), Ordering::Release);
+        (caught == 1).then(|| Seen {
+            pc: SEEN_PC.load(Ordering::Relaxed),
+            address: (SEEN_HAS_ADDRESS.load(Ordering::Relaxed) != 0)
+                .then(|| SEEN_ADDRESS.load(Ordering::Relaxed)),
+            kind: SEEN_KIND.load(Ordering::Relaxed),
+        })
+    }
+
+    /// The exercise's handler: record, then resume the catch.  With no
+    /// catch armed (a fault outside a probe, or a second one), it declines.
+    pub(super) unsafe extern "C" fn handler(
+        pc: usize,
+        _fp: usize,
+        has_address: usize,
+        address: usize,
+        kind: usize,
+    ) {
+        let saved = ACTIVE.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if saved.is_null() {
+            return;
+        }
+        SEEN_PC.store(pc, Ordering::Relaxed);
+        SEEN_HAS_ADDRESS.store(has_address, Ordering::Relaxed);
+        SEEN_ADDRESS.store(address, Ordering::Relaxed);
+        SEEN_KIND.store(kind, Ordering::Relaxed);
+        // SAFETY: `saved` is the live catch `run` armed, still on its frame.
+        unsafe { resume(saved) }
+    }
+
+    // ── x86-64 ──────────────────────────────────────────────────────────
+
+    /// `catch(probe, saved) -> 0` when the probe returns, `1` when resumed:
+    /// saves `rbx`, `rbp`, `r12`–`r15`, the caller's stack pointer and the
+    /// return address.
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn catch(_probe: unsafe extern "C" fn(), _saved: *mut Saved) -> u64 {
+        core::arch::naked_asm!(
+            "mov [rsi + 0], rbx",
+            "mov [rsi + 8], rbp",
+            "mov [rsi + 16], r12",
+            "mov [rsi + 24], r13",
+            "mov [rsi + 32], r14",
+            "mov [rsi + 40], r15",
+            "lea rax, [rsp + 8]",
+            "mov [rsi + 48], rax",
+            "mov rax, [rsp]",
+            "mov [rsi + 56], rax",
+            "sub rsp, 8",
+            "call rdi",
+            "add rsp, 8",
+            "xor eax, eax",
+            "ret",
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn resume(_saved: *const Saved) -> ! {
+        core::arch::naked_asm!(
+            "mov rbx, [rdi + 0]",
+            "mov rbp, [rdi + 8]",
+            "mov r12, [rdi + 16]",
+            "mov r13, [rdi + 24]",
+            "mov r14, [rdi + 32]",
+            "mov r15, [rdi + 40]",
+            "mov rsp, [rdi + 48]",
+            "mov eax, 1",
+            "jmp qword ptr [rdi + 56]",
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn probe_load() {
+        core::arch::naked_asm!(
+            "mov rax, qword ptr [rip + {target}]",
+            "mov rax, qword ptr [rax]",
+            "ret",
+            target = sym TARGET,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn probe_invalid() {
+        core::arch::naked_asm!("ud2", "ret")
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn probe_divide() {
+        core::arch::naked_asm!(
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "mov eax, 1",
+            "div ecx",
+            "ret"
+        )
+    }
+
+    // ── AArch64 ─────────────────────────────────────────────────────────
+
+    /// Saves `x19`–`x30`, `sp` and `d8`–`d15`; resumed, it returns `1`
+    /// through the saved link register.
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn catch(_probe: unsafe extern "C" fn(), _saved: *mut Saved) -> u64 {
+        core::arch::naked_asm!(
+            "stp x19, x20, [x1, #0]",
+            "stp x21, x22, [x1, #16]",
+            "stp x23, x24, [x1, #32]",
+            "stp x25, x26, [x1, #48]",
+            "stp x27, x28, [x1, #64]",
+            "stp x29, x30, [x1, #80]",
+            "mov x9, sp",
+            "str x9, [x1, #96]",
+            "stp d8, d9, [x1, #104]",
+            "stp d10, d11, [x1, #120]",
+            "stp d12, d13, [x1, #136]",
+            "stp d14, d15, [x1, #152]",
+            "stp x29, x30, [sp, #-16]!",
+            "mov x29, sp",
+            "blr x0",
+            "ldp x29, x30, [sp], #16",
+            "mov x0, #0",
+            "ret",
+        )
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn resume(_saved: *const Saved) -> ! {
+        core::arch::naked_asm!(
+            "ldp x19, x20, [x0, #0]",
+            "ldp x21, x22, [x0, #16]",
+            "ldp x23, x24, [x0, #32]",
+            "ldp x25, x26, [x0, #48]",
+            "ldp x27, x28, [x0, #64]",
+            "ldp x29, x30, [x0, #80]",
+            "ldr x9, [x0, #96]",
+            "mov sp, x9",
+            "ldp d8, d9, [x0, #104]",
+            "ldp d10, d11, [x0, #120]",
+            "ldp d12, d13, [x0, #136]",
+            "ldp d14, d15, [x0, #152]",
+            "mov x0, #1",
+            "ret",
+        )
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn probe_load() {
+        core::arch::naked_asm!(
+            "adrp x9, {target}",
+            "ldr x9, [x9, :lo12:{target}]",
+            "ldr x9, [x9]",
+            "ret",
+            target = sym TARGET,
+        )
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn probe_invalid() {
+        core::arch::naked_asm!("udf #0", "ret")
+    }
+
+    // ── RISC-V ──────────────────────────────────────────────────────────
+
+    /// Saves `s0`–`s11`, `ra`, `sp` and `fs0`–`fs11`; resumed, it returns
+    /// `1` through the saved return address.
+    #[cfg(target_arch = "riscv64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn catch(_probe: unsafe extern "C" fn(), _saved: *mut Saved) -> u64 {
+        core::arch::naked_asm!(
+            "sd s0, 0(a1)",
+            "sd s1, 8(a1)",
+            "sd s2, 16(a1)",
+            "sd s3, 24(a1)",
+            "sd s4, 32(a1)",
+            "sd s5, 40(a1)",
+            "sd s6, 48(a1)",
+            "sd s7, 56(a1)",
+            "sd s8, 64(a1)",
+            "sd s9, 72(a1)",
+            "sd s10, 80(a1)",
+            "sd s11, 88(a1)",
+            "sd ra, 96(a1)",
+            "sd sp, 104(a1)",
+            "fsd fs0, 112(a1)",
+            "fsd fs1, 120(a1)",
+            "fsd fs2, 128(a1)",
+            "fsd fs3, 136(a1)",
+            "fsd fs4, 144(a1)",
+            "fsd fs5, 152(a1)",
+            "fsd fs6, 160(a1)",
+            "fsd fs7, 168(a1)",
+            "fsd fs8, 176(a1)",
+            "fsd fs9, 184(a1)",
+            "fsd fs10, 192(a1)",
+            "fsd fs11, 200(a1)",
+            "addi sp, sp, -16",
+            "sd ra, 8(sp)",
+            "jalr a0",
+            "ld ra, 8(sp)",
+            "addi sp, sp, 16",
+            "li a0, 0",
+            "ret",
+        )
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn resume(_saved: *const Saved) -> ! {
+        core::arch::naked_asm!(
+            "ld s0, 0(a0)",
+            "ld s1, 8(a0)",
+            "ld s2, 16(a0)",
+            "ld s3, 24(a0)",
+            "ld s4, 32(a0)",
+            "ld s5, 40(a0)",
+            "ld s6, 48(a0)",
+            "ld s7, 56(a0)",
+            "ld s8, 64(a0)",
+            "ld s9, 72(a0)",
+            "ld s10, 80(a0)",
+            "ld s11, 88(a0)",
+            "ld ra, 96(a0)",
+            "ld sp, 104(a0)",
+            "fld fs0, 112(a0)",
+            "fld fs1, 120(a0)",
+            "fld fs2, 128(a0)",
+            "fld fs3, 136(a0)",
+            "fld fs4, 144(a0)",
+            "fld fs5, 152(a0)",
+            "fld fs6, 160(a0)",
+            "fld fs7, 168(a0)",
+            "fld fs8, 176(a0)",
+            "fld fs9, 184(a0)",
+            "fld fs10, 192(a0)",
+            "fld fs11, 200(a0)",
+            "li a0, 1",
+            "ret",
+        )
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn probe_load() {
+        core::arch::naked_asm!(
+            "lla t0, {target}",
+            "ld t0, 0(t0)",
+            "ld t0, 0(t0)",
+            "ret",
+            target = sym TARGET,
+        )
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn probe_invalid() {
+        core::arch::naked_asm!("unimp", "ret")
+    }
+}
+
 #[cfg(test)]
 mod lane_tests {
     use super::*;
@@ -658,5 +1085,15 @@ mod lane_tests {
     #[test]
     fn the_dispatch_exercise_refuses_off_metal() {
         assert_eq!(dispatch().unwrap_err(), DispatchFault::Launch);
+    }
+
+    /// Off metal there is no kernel to deliver a fault: the upcall exercise
+    /// refuses rather than reporting deliveries it never saw.
+    #[test]
+    fn the_upcall_exercise_refuses_off_metal() {
+        assert_eq!(
+            upcall().unwrap_err(),
+            UpcallFault::Arm(crate::upcall::Refusal::Unsupported)
+        );
     }
 }

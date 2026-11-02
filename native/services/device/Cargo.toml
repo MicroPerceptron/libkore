@@ -1,0 +1,17 @@
+[package]
+name = "kore-svc-device"
+version = "0.0.0"
+edition = "2024"
+description = "kore device broker: the DeviceRequest protocol over the RootComplex endowment."
+publish = false
+
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+kore-rt = { path = "../../crates/rt" }
+# The claim ledger is fixed-capacity: the broker sits in the control plane
+# of every driver's startup, so an allocation there would make hardware
+# bring-up depend on a heap the broker has no reason to hold.
+heapless = { version = "0.9.3", default-features = false }
+
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }

@@ -31,6 +31,11 @@ its committed dependency closure, tracked by `native/provenance.json`.
   Preserve callback-local pointer lifetimes, one outstanding request, scoped
   generations, acknowledged counts, provider errors and cancellation quarantine.
   Keep the native-executor turn budget so ready-only callbacks cannot starve it.
+- `crates/host` owns only the host-side facade over the exported `kore-vol`
+  procedure, never DagFS semantics: no second locate/recover/commit path, no
+  host-side format writer, no parsing of volume bytes outside the engine. Volumes
+  are offline; never open one a running machine holds. Behavior changes go to
+  Kore's `tools/kore-vol` and arrive through `tools/sync-native.py`.
 - C headers come from cbindgen 0.29.4; Zig aliases come from those declarations
   and target layouts from Zig 0.16.0 translation. Regenerate before checking.
   `test-foreign` is a host-test feature; never add a runtime C/Zig build dependency.

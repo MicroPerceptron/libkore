@@ -10,7 +10,7 @@
 
 use kore_svc_extract::{
     Confidence, Fact, FactKind, FactValue, InputIdentity, NormalizedResult, ParserProvenance,
-    SourceRange, encode_result,
+    ResultEncodeError, SourceRange, WORKER_REPORT_BYTES, encode_result,
     registry::{PLAIN_TEXT, Registry},
 };
 use kore_svc_extract_worker_rust::parse_plain_text;
@@ -111,13 +111,9 @@ pub async fn publish(
             } else {
                 None
             };
-            normalized_index_result(identity, bytes)
+            encode_batch(identity, bytes, &mut fs.window[..])
                 .map_err(Refusal::Fs)
-                .and_then(|result| {
-                    let length = encode_result(&result, &mut fs.window[..])
-                        .map_err(|_| Refusal::Fs(FsError::Unsupported))?;
-                    u32::try_from(length).map_err(|_| Refusal::Fs(FsError::Range))
-                })
+                .and_then(|length| u32::try_from(length).map_err(|_| Refusal::Fs(FsError::Range)))
         }
         Err(error) => Err(error),
     };
@@ -141,6 +137,52 @@ pub async fn publish(
     match (committed, released) {
         (Err(error), _) | (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// The batch [`publish`] commits for the version `identity` names, encoded
+/// into `window`: its length, or the typed reason the version stays
+/// unindexed. Free of the pair, so the producer half of a commit can be
+/// driven against the real store on a host.
+///
+/// The store keeps one #476 wire batch per version, at most
+/// [`WORKER_REPORT_BYTES`] — durable recovery refuses a larger extent — so
+/// that is the bound the batch is encoded against, not the data window.
+/// Encoded into the whole window, half a page of ordinary notes made a batch
+/// the store could not keep, and `CommitDerived` refused it `Range` after
+/// the write it describes had committed: the editor's save failed, and
+/// `find reindex` with it.
+///
+/// A batch that does not fit sheds this producer's own tokens, last first,
+/// and nothing else. The text spans are the file's text, which full-text and
+/// semantic search read whole, so a shed token costs those planes no hit; it
+/// leaves the fact-key plane exactly as partial as the `MAX_FACTS` cap in
+/// [`token_result`] already makes it. Text that does not fit on its own is
+/// never cut — a partial batch would answer `CurrentOnly` with false
+/// negatives — so that version stays unindexed.
+pub fn encode_batch(
+    identity: InputIdentity,
+    bytes: Option<&[u8]>,
+    window: &mut [u8],
+) -> Result<usize, FsError> {
+    let mut result = normalized_index_result(identity, bytes)?;
+    let bound = window.len().min(WORKER_REPORT_BYTES);
+    let batch = &mut window[..bound];
+    // Each refused pass sheds one token or ends, so the passes are bounded
+    // by the facts the result holds.
+    loop {
+        match encode_result(&result, batch) {
+            Ok(length) => return Ok(length),
+            Err(ResultEncodeError::Short)
+                if result
+                    .facts
+                    .last()
+                    .is_some_and(|fact| fact.kind == FactKind::Custom) =>
+            {
+                result.facts.pop();
+            }
+            Err(_) => return Err(FsError::Unsupported),
+        }
     }
 }
 
@@ -354,5 +396,99 @@ mod tests {
                 "{error:?} must remain a command failure"
             );
         }
+    }
+
+    /// Twenty short lines, each word new: more tokens than one batch keeps.
+    fn notes() -> std::string::String {
+        (0..20)
+            .map(|line| {
+                std::format!(
+                    "minute{line} reviewed storage{line} batches{line} answer{line} quickly{line}\n"
+                )
+            })
+            .collect()
+    }
+
+    fn custom_keys(result: &NormalizedResult) -> std::vec::Vec<&str> {
+        result
+            .facts
+            .iter()
+            .filter(|fact| fact.kind == FactKind::Custom)
+            .map(|fact| fact.key.as_str())
+            .collect()
+    }
+
+    /// The batch the store refused `Range` once it reached `CommitDerived`:
+    /// encoded whole it is larger than the one batch the store keeps, so it
+    /// sheds tokens, last first, until it fits. Every line of text and both
+    /// parser facts survive, so full-text search still reads the whole file.
+    #[test]
+    fn an_ordinary_page_sheds_trailing_tokens_to_fit_the_stores_batch() {
+        let text = notes();
+        let identity = InputIdentity::of(7, 1, text.as_bytes());
+        let whole = token_result(identity, text.as_bytes()).unwrap();
+        let mut unbounded = [0u8; 4 * WORKER_REPORT_BYTES];
+        assert!(
+            encode_result(&whole, &mut unbounded).unwrap() > WORKER_REPORT_BYTES,
+            "the fixture must not fit whole, or it proves nothing"
+        );
+
+        let mut window = [0u8; 4 * WORKER_REPORT_BYTES];
+        let length = encode_batch(identity, Some(text.as_bytes()), &mut window).unwrap();
+        assert!(length <= WORKER_REPORT_BYTES);
+        let batch = decode_result(&window[..length]).unwrap();
+        Registry::validate(&batch, identity, 0).unwrap();
+        assert_eq!(batch.text, whole.text, "no text is shed");
+        assert_eq!(
+            batch
+                .facts
+                .iter()
+                .filter(|fact| fact.kind != FactKind::Custom)
+                .count(),
+            whole
+                .facts
+                .iter()
+                .filter(|fact| fact.kind != FactKind::Custom)
+                .count(),
+            "the parser's facts are never shed"
+        );
+        let (kept, all) = (custom_keys(&batch), custom_keys(&whole));
+        assert!(!kept.is_empty() && kept.len() < all.len());
+        assert_eq!(kept, all[..kept.len()], "the earliest tokens are kept");
+    }
+
+    /// A batch that fits is the producer's whole result — nothing is shed.
+    #[test]
+    fn a_batch_that_fits_is_published_whole() {
+        let bytes = b"Test test another";
+        let identity = InputIdentity::of(7, 1, bytes);
+        let mut window = [0u8; WORKER_REPORT_BYTES];
+        let length = encode_batch(identity, Some(bytes), &mut window).unwrap();
+        assert_eq!(
+            decode_result(&window[..length]).unwrap(),
+            token_result(identity, bytes).unwrap()
+        );
+    }
+
+    /// Text alone past the batch is not cut down to fit: a partial batch
+    /// would answer `CurrentOnly` with false negatives, so the version stays
+    /// unindexed and search says so.
+    #[test]
+    fn text_too_long_for_one_batch_stays_unindexed() {
+        // Thirty-one 128-byte lines: under one transfer and the parser's span
+        // and line limits, so only the batch bound can refuse it.
+        let line = [b'a'; 127];
+        let mut text = std::vec::Vec::new();
+        for _ in 0..31 {
+            text.extend_from_slice(&line);
+            text.push(b'\n');
+        }
+        assert!(text.len() <= MAX_TRANSFER);
+        let identity = InputIdentity::of(7, 1, &text);
+        let mut window = [0u8; 4 * WORKER_REPORT_BYTES];
+        assert_eq!(
+            encode_batch(identity, Some(&text), &mut window),
+            Err(FsError::Unsupported)
+        );
     }
 }

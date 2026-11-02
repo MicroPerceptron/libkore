@@ -11,9 +11,10 @@ use crate::image::{ImageName, NAME_BYTES};
 pub const COMMAND_SNAPSHOT_ABI: u8 = 1;
 /// The largest task-local command set accepted by the decoder.  Raised
 /// from 32 when the desktop's `editor` and `power-ui` rows joined the two
-/// native filesystem verbs; the byte budget (`PROCESS_CONTEXT_BYTES`) is
-/// the other bound, proven by exec's host test over the real catalogue.
-pub const MAX_COMMAND_SNAPSHOT_ENTRIES: usize = 40;
+/// native filesystem verbs, and from 40 when Files and the documents editor
+/// became two rows; the byte budget (`PROCESS_CONTEXT_BYTES`) is the other
+/// bound, proven by exec's host test over the real catalogue.
+pub const MAX_COMMAND_SNAPSHOT_ENTRIES: usize = 48;
 /// The launcher holds a power-control face and therefore handles these two
 /// privileged controls in-process.
 pub const COMMAND_SNAPSHOT_SYSTEM_POWER: u8 = 1 << 0;

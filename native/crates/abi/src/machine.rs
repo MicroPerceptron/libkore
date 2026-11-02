@@ -212,9 +212,97 @@ pub const fn pack_spmd_fit_width(width: u32) -> u16 {
     (if width > max { max } else { width } as u16) << MACHINE_SPMD_FIT_SHIFT
 }
 
+/// [`MachineBlock::flags`] bits 2..5: the **SPMD gang placement** the
+/// kernel granted the founding this block was stamped for — the G6c batch
+/// decision (`res/SPMD.md` §G6c), reported to the worker it placed so a
+/// gang can learn which class it landed on instead of assuming the best
+/// one.  Bit 2 marks a stamped placement (a founding outside a gang leaves
+/// it clear, and every earlier founder wrote zero, which reads as "no
+/// gang"), bits 3..4 the core class in the kernel's rank order
+/// ([`GangClass`]), bit 5 whether the pin is time-shared with an incumbent
+/// reservation rather than exclusively reserved.  Additive on the frozen
+/// block like the fit width.
+const MACHINE_GANG_PRESENT: u16 = 1 << 2;
+const MACHINE_GANG_CLASS_SHIFT: u16 = 3;
+const MACHINE_GANG_CLASS_MASK: u16 = 0b11 << MACHINE_GANG_CLASS_SHIFT;
+const MACHINE_GANG_SHARED: u16 = 1 << 5;
+
+/// The core class a gang was placed on, in the kernel's class-rank order
+/// (`Performance` outranks `Standard` outranks `Efficient` outranks
+/// `LowPowerEfficient` — the homogeneity ruling, `res/SPMD.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GangClass {
+    Performance = 0,
+    Standard = 1,
+    Efficient = 2,
+    LowPowerEfficient = 3,
+}
+
+impl GangClass {
+    /// The witness letter the kernel's `spmd-reserve` / `spmd-pin` lines use.
+    pub const fn letter(self) -> &'static str {
+        match self {
+            Self::Performance => "P",
+            Self::Standard => "std",
+            Self::Efficient => "E",
+            Self::LowPowerEfficient => "LP-E",
+        }
+    }
+
+    const fn from_code(code: u16) -> Self {
+        match code & 0b11 {
+            0 => Self::Performance,
+            1 => Self::Standard,
+            2 => Self::Efficient,
+            _ => Self::LowPowerEfficient,
+        }
+    }
+}
+
+/// What the kernel's batch reservation granted this worker's gang.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GangPlacement {
+    /// The homogeneous class every member of the gang runs on.
+    pub class: GangClass,
+    /// `true` when the gang's cores are time-shared with an incumbent
+    /// reservation (the best fitting class was held); `false` when they
+    /// are exclusively reserved for this gang.
+    pub shared: bool,
+}
+
+/// Encode a granted gang placement for the machine flags.
+pub const fn pack_gang_placement(class: GangClass, shared: bool) -> u16 {
+    MACHINE_GANG_PRESENT
+        | ((class as u16) << MACHINE_GANG_CLASS_SHIFT)
+        | if shared { MACHINE_GANG_SHARED } else { 0 }
+}
+
+impl MachineBlock {
+    /// The gang placement the kernel granted this founding, or `None` for
+    /// a founding outside a gang (and for every block from a founder that
+    /// predates the field — the fail-closed direction: a reader then sizes
+    /// as it always did).
+    pub fn gang_placement(&self) -> Option<GangPlacement> {
+        let flags = self.flags.get();
+        (self.validate() && flags & MACHINE_GANG_PRESENT != 0).then(|| GangPlacement {
+            class: GangClass::from_code(
+                (flags & MACHINE_GANG_CLASS_MASK) >> MACHINE_GANG_CLASS_SHIFT,
+            ),
+            shared: flags & MACHINE_GANG_SHARED != 0,
+        })
+    }
+}
+
 const _: () = assert!(
     core::mem::size_of::<MachineBlock>() == 20,
     "the machine block is frozen ABI"
+);
+const _: () = assert!(
+    (MACHINE_GANG_PRESENT | MACHINE_GANG_CLASS_MASK | MACHINE_GANG_SHARED)
+        & (MACHINE_FLAG_CPU_ENTROPY | MACHINE_FLAG_HW_FEEDBACK | MACHINE_SPMD_FIT_MASK)
+        == 0,
+    "the gang placement bits must not overlap the other flag claims"
 );
 
 #[cfg(test)]
@@ -240,6 +328,51 @@ mod tests {
         assert_eq!(fit.spmd_fit_width(), Some(8));
         let absent = MachineBlock::new(16, 4, 0, pack_spmd_fit_width(0), 0);
         assert_eq!(absent.spmd_fit_width(), None);
+    }
+
+    #[test]
+    fn a_gang_placement_rides_the_flags_beside_the_fit_and_reads_absent_from_older_founders() {
+        let older = MachineBlock::new(
+            16,
+            4,
+            0,
+            MACHINE_FLAG_HW_FEEDBACK | pack_spmd_fit_width(8),
+            0,
+        );
+        assert_eq!(
+            older.gang_placement(),
+            None,
+            "a pre-placement founder: no gang"
+        );
+        assert_eq!(older.spmd_fit_width(), Some(8));
+        for (class, shared) in [
+            (GangClass::Performance, false),
+            (GangClass::Performance, true),
+            (GangClass::Standard, false),
+            (GangClass::Efficient, true),
+            (GangClass::LowPowerEfficient, false),
+        ] {
+            let flags = MACHINE_FLAG_HW_FEEDBACK
+                | pack_spmd_fit_width(8)
+                | pack_gang_placement(class, shared);
+            let b = MachineBlock::new(16, 4, 0, flags, 0);
+            assert_eq!(b.gang_placement(), Some(GangPlacement { class, shared }));
+            assert_eq!(
+                b.spmd_fit_width(),
+                Some(8),
+                "the fit survives beside the placement"
+            );
+            assert!(b.hardware_feedback());
+        }
+        let zeroed =
+            MachineBlock::read_from_bytes(&[0u8; core::mem::size_of::<MachineBlock>()]).unwrap();
+        assert_eq!(
+            zeroed.gang_placement(),
+            None,
+            "an unstamped block fails closed"
+        );
+        assert_eq!(GangClass::Efficient.letter(), "E");
+        assert_eq!(GangClass::LowPowerEfficient.letter(), "LP-E");
     }
 
     #[test]

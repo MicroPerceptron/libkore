@@ -292,6 +292,21 @@ pub trait SystemService: crate::svc::SvcProtocol + Sized {
         None
     }
 
+    /// Named metadata arena for a service whose **recyclable peers** — the
+    /// per-launch faces exec admits — must outnumber the bootstrap table.
+    ///
+    /// [`MAX_SERVE_PAIRS`](crate::svc::MAX_SERVE_PAIRS) bounds the manifest's
+    /// fixed roster, not a population: without an arena the host keeps its
+    /// allocation-free inline table, and every fixed pair it serves is a face
+    /// slot fewer. A service that hands one face to each program of a kind
+    /// that can run many at once returns its arena here, and the serving
+    /// ladder grows the host's peer table from it on demand, up to the
+    /// [`PeerId`](crate::svc::PeerId) slot space.
+    #[cfg(feature = "heap")]
+    fn peer_arena(&self) -> Option<&'static (dyn core::alloc::Allocator + Sync)> {
+        None
+    }
+
     /// **What this row's `role::DEVICE` endowments select at founding** —
     /// entry `n` is the selector for the row's `role::DEVICE` index `n`, so
     /// a driver that owns two controllers (the input service: an xHCI

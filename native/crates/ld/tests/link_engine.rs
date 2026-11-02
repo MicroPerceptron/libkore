@@ -1279,10 +1279,12 @@ fn stub_arena() -> &'static kore_ld::store::LinkArena<'static> {
 }
 
 /// The caps `user/runtime/ld-stub` passes: a program is itself plus at most
-/// one library, with a single init array.
+/// one library, with the engine's full init capacity (`main.rs`'s
+/// `max_inits: MAX_INIT_FNS` — `hello`'s `libdemo.so` initializers need more
+/// than one).
 const STUB_CAPS: LinkCaps = LinkCaps {
     max_modules: 2,
-    max_inits: 1,
+    max_inits: kore_ld::link::MAX_INIT_FNS,
 };
 
 /// **Every built executable must link under the stub's own caps.**

@@ -1,0 +1,19 @@
+[package]
+name = "kore-svc-mm"
+version = "0.0.0"
+edition = "2024"
+description = "kore memory-manager service: the lessor over one capability-endowed supply region and its trap-transport client."
+publish = false
+
+# The service framework, capability witnesses, fail-closed verbs, and heap
+# engine live in kore-rt; this crate owns the mm protocol, serve step, and
+# client.
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+kore-rt = { path = "../../crates/rt" }
+
+# Tests drive the sharded heap with real host threads (the kore-rt `std`
+# feature swaps in the per-thread TLS shard map), and the global-allocator
+# integration tests exercise host-side service models beside the allocator.
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }

@@ -8,7 +8,7 @@ repository = "https://github.com/MicroPerceptron/libkore"
 
 [workspace]
 resolver = "3"
-members = ["tests/consumer", "crates/ffi", "crates/entry", "crates/wasi", "crates/lua"]
+members = ["tests/consumer", "crates/ffi", "crates/entry", "crates/wasi", "crates/lua", "crates/host"]
 exclude = ["native"]
 
 [features]
@@ -30,5 +30,9 @@ kore-dagfs = { path = "native/crates/dagfs", optional = true }
 kore-driver = { path = "native/crates/driver", optional = true }
 
 [package.metadata.kore]
-# Used by tools/local-kore.py to construct one coherent local source override.
-owner-paths = { kore-start = "crates/start", kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver", kore-late = "crates/late" }
+# Used by tools/local-kore.py to construct one coherent local source override,
+# and by tools/sync-native.py as the export's roots. `kore-vol` is the host
+# root: the offline volume procedure (and the filesystem service closure it
+# drives) that host programs such as vKore consume; it never enters a Kore
+# executable's graph.
+owner-paths = { kore-start = "crates/start", kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver", kore-late = "crates/late", kore-vol = "tools/kore-vol" }

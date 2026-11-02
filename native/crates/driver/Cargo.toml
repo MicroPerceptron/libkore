@@ -35,6 +35,10 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 gpt_disk_types = { version = "0.16.1", default-features = false, features = ["bytemuck"] }
 crc = { version = "3.4.0", default-features = false }
 bytemuck = { version = "1.25.2", default-features = false }
+# The image-file device's whole-file record lock (`image` feature only): the
+# safe `fcntl` the vendored wasmtime already resolves, so the lock costs no
+# new crate. A host tool's dependency, never the kernel's or a service's.
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs"], optional = true }
 
 [features]
 # Native launch and health hooks over the allocation-free upstream lifecycle.
@@ -51,6 +55,10 @@ host-double = ["alloc"]
 # caps (`kore_driver::host`).  Pulls kore-rt; kept off the kernel's
 # default-feature build.
 service = ["dep:kore-rt", "dep:kore-collections"]
+# A regular image file as a block device (`kore_driver::block::image`), for
+# host tools that read or write a kore volume offline. Needs `std`: host
+# builds only.
+image = ["dep:rustix"]
 
 # The self-dev-dependency turns `service` on for this crate's own test
 # builds, so the service face stays test-compiled.

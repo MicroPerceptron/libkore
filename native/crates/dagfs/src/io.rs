@@ -348,6 +348,32 @@ impl<'w, 't> Fs<'w, 't> {
         path: &[u8],
         bytes: &[u8],
     ) -> Result<SaveOutcome, Refusal> {
+        let indexed = self.replace(path, bytes, true).await?;
+        Ok(match indexed {
+            Some(crate::index::Indexed::Published) | None => SaveOutcome::Indexed,
+            Some(crate::index::Indexed::Incomplete) => SaveOutcome::IndexIncomplete,
+        })
+    }
+
+    /// [`Self::replace_file`] for bytes no index parser reads — a photo, an
+    /// archive: the same one-transaction replacement and the same single
+    /// commit, without the plain-text index batch. That batch would only be
+    /// refused as `Unsupported` after reading the whole file, and report a
+    /// save that landed as an incomplete one.
+    #[cfg(feature = "index")]
+    pub async fn replace_binary(&mut self, path: &[u8], bytes: &[u8]) -> Result<(), Refusal> {
+        self.replace(path, bytes, false).await.map(|_| ())
+    }
+
+    /// The replacement both saves share; `index` publishes the plain-text
+    /// batch inside the transaction and answers its verdict.
+    #[cfg(feature = "index")]
+    async fn replace(
+        &mut self,
+        path: &[u8],
+        bytes: &[u8],
+        index: bool,
+    ) -> Result<Option<crate::index::Indexed>, Refusal> {
         let file = match self.open(path, WALK_WRITE).await {
             Ok(file) => file,
             Err(Refusal::Fs(FsError::NotFound)) => {
@@ -368,7 +394,8 @@ impl<'w, 't> Fs<'w, 't> {
         let held = self.hold_commits(true).await.is_ok();
         let written = self.write_bytes(&file, bytes).await;
         let outcome = match written {
-            Ok(()) => crate::index::classify(crate::index::publish(self, &file, Some(bytes)).await),
+            Ok(()) if index => crate::index::classify(crate::index::publish(self, &file, Some(bytes)).await).map(Some),
+            Ok(()) => Ok(None),
             Err(error) => Err(error),
         };
         let released = if held {
@@ -382,10 +409,7 @@ impl<'w, 't> Fs<'w, 't> {
         // commit was refused is not saved; say so rather than report the
         // index verdict of an unpublished tree.
         released?;
-        Ok(match indexed {
-            crate::index::Indexed::Published => SaveOutcome::Indexed,
-            crate::index::Indexed::Incomplete => SaveOutcome::IndexIncomplete,
-        })
+        Ok(indexed)
     }
 
     /// Ask the provider to make `file`'s committed state durable.

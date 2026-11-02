@@ -10,14 +10,23 @@
 //!   nobody's configuration: **check** (the word already moved — return),
 //!   **monitor** (sleep the core on the word's cache line for a few
 //!   microseconds; the producer's ordinary store is the wake, no syscall
-//!   on either side), **park** (the executor's standing doorbell post
-//!   with the deadline folded in; the producer's conditional notice
-//!   resolves it).  A kernel address-wait slots between the last two
-//!   when it lands (`res/EVENT.md` §6) without changing a caller.
+//!   on either side), **park on the word** (rung 3′ — the kernel
+//!   address-wait, `res/EVENT.md` §6: the executor's idle park carries
+//!   the wake word by the *authority* that mapped it, and the producer's
+//!   `wake_word` — or the word being seen moved at park time — resolves
+//!   it), else **park on the doorbell** (rung 3 — the executor's standing
+//!   post with the deadline folded in; the producer's conditional notice
+//!   resolves it).  Rung 3′ is taken exactly when the channel's window is
+//!   one this task mapped through a noting verb
+//!   ([`cap::mapped::locate`](crate::cap::mapped::locate)) and the
+//!   executor's one word arm is free; otherwise rung 3, unchanged.  No
+//!   caller changed for it to land.
 //! - [`commit_and_kick`] — the producer's one batch end.  Advances the
-//!   wake word, and sends the notice **only if the consumer had
-//!   committed to waiting** — a running consumer costs the producer
-//!   zero syscalls, which is the whole point at load.
+//!   wake word, and wakes the consumer **only if it had committed to
+//!   waiting** — by `wake_word` on the memory when the consumer parked on
+//!   the word and this side can name it, by the notice otherwise — so a
+//!   running consumer costs the producer zero syscalls, which is the
+//!   whole point at load.
 //!
 //! Every return is a hint; the memory is the truth.  Callers re-check in
 //! a loop, exactly as [`futex`](crate::futex) and the ring teach.  What
@@ -30,9 +39,11 @@ use core::sync::atomic::AtomicU32;
 use core::time::Duration;
 
 use kore_abi::session::Notice;
-use kore_ring::event::{EventSink, EventSource, EventState};
+use kore_ring::event::{EventSink, EventSource, EventState, PARK_WORD};
 use kore_ring::spsc::RingRecord;
 
+use crate::cap::mapped;
+use crate::cap::verbs;
 use crate::chan::ChanTx;
 use crate::transport::Transport;
 
@@ -64,6 +75,14 @@ pub enum EventWait {
 const MONITOR_TURNS: usize = 2;
 const MONITOR_CAP: Duration = Duration::from_micros(2);
 
+/// Bound of one word park when the caller asked for no deadline: the
+/// kernel address-wait is never unbounded, so an open-ended wait is a
+/// loop of bounded parks, each re-checking the word — a slice long enough
+/// that an idle consumer is not paced by it, short enough that a lost
+/// wake (a producer that could name neither word nor doorbell) costs one
+/// slice, not forever.
+const WORD_PARK_SLICE_NS: u64 = 250_000_000;
+
 /// Wait until the channel's wake word moves past `seen` (a value the
 /// caller read with [`EventSink::seq`] *before* its last check), or
 /// until `timeout` elapses; `None` waits until woken.
@@ -86,6 +105,11 @@ const MONITOR_CAP: Duration = Duration::from_micros(2);
 ///
 /// A cancelled wait (the future dropped mid-park) withdraws its park
 /// intent on drop, so a departed waiter is never charged a notice.
+///
+/// The word rung (3′) never lengthens a wait: it re-checks `seq` on every
+/// wake exactly as the doorbell rung does, keeps the same deadline, and
+/// keeps the doorbell post standing beneath it — a producer that cannot
+/// name the word still reaches this waiter with its notice.
 ///
 /// # Panics
 /// Polled outside the kore executor, as
@@ -158,9 +182,55 @@ async fn wait_with<S: EventState, R: RingRecord>(
         ),
         None => None,
     };
+    // Rung 3′ — park on the word itself, when this task can name it by
+    // the authority that mapped it.  The intent is restated as a word park
+    // before every re-park (the value tells the producer which wake
+    // reaches us; the Dekker pair above is untouched — the kernel makes
+    // the final `seq` check against the physical word at park time).  The
+    // arm can be refused (the executor's one word arm is owned) or evicted
+    // (an alternate delivery arm arrived); either way the wait falls back
+    // to rung 3 by re-publishing the doorbell intent through `park`, whose
+    // own re-check covers the gap.
+    let mut word = mapped::locate(sink.seq_word() as *const AtomicU32 as *const u8);
     loop {
         if sink.seq() != seen {
             return EventWait::Changed;
+        }
+        if let Some((subject, offset)) = word {
+            // An unbounded wait still bounds each word park (the kernel
+            // requires it); the loop's re-check makes the bound invisible.
+            let bound = match deadline {
+                Some(at) => {
+                    if crate::executor::clock_ns().await >= at {
+                        return EventWait::TimedOut;
+                    }
+                    at
+                }
+                None => crate::executor::clock_ns()
+                    .await
+                    .saturating_add(WORD_PARK_SLICE_NS),
+            };
+            sink.park_on_word();
+            match crate::executor::next_wake_on_word(subject, offset, seen, bound).await {
+                Some(_) if once => {
+                    // A word park also carries the executor's doorbell. A
+                    // composed waiter must drain its other inputs on that
+                    // wake, even when this channel's word stayed unchanged.
+                    return if sink.seq() != seen {
+                        EventWait::Changed
+                    } else {
+                        EventWait::Woken
+                    };
+                }
+                Some(_) => continue,
+                None => {
+                    word = None;
+                    if !sink.park(seen) {
+                        return EventWait::Changed;
+                    }
+                    continue;
+                }
+            }
         }
         match deadline {
             None => {
@@ -189,10 +259,12 @@ async fn wait_with<S: EventState, R: RingRecord>(
     }
 }
 
-/// End a producer batch: advance the wake word, and kick the consumer's
-/// doorbell **only if it had committed to waiting**.
+/// End a producer batch: advance the wake word, and wake the consumer
+/// **only if it had committed to waiting** — a `wake_word` on the memory
+/// when it parked on the word and this side can name it (`res/EVENT.md`
+/// §6), the doorbell notice otherwise.
 ///
-/// Returns whether a notice went out.  `Err(WouldBlock)` from the send
+/// Returns whether a wake went out.  `Err(WouldBlock)` from the send
 /// is treated as delivered-enough and dropped: a full doorbell means the
 /// consumer has an unconsumed wake standing, and the §3.1 order (the
 /// channel writes happen-before this kick) guarantees its next drain
@@ -203,8 +275,20 @@ pub async fn commit_and_kick<S: EventState, R: RingRecord, T: Transport>(
     source: &mut EventSource<'_, S, R>,
     kick: &ChanTx<'_, T>,
 ) -> bool {
-    if !source.commit() {
+    let intent = source.commit_intent();
+    if intent == 0 {
         return false;
+    }
+    // The consumer parked on the word (rung 3′): wake it on the memory,
+    // by this side's own mapping of it — no send end needed, one trap.
+    // A word this side cannot name, or a refused wake, falls back to the
+    // notice: the consumer's word park carries its doorbell post too.
+    if intent == PARK_WORD
+        && let Some((subject, offset)) =
+            mapped::locate(source.seq_word() as *const AtomicU32 as *const u8)
+        && verbs::wake_word(subject, offset, u32::MAX)
+    {
+        return true;
     }
     kick.send(Notice {
         cookie: COOKIE_EVENT,
@@ -217,6 +301,63 @@ pub async fn commit_and_kick<S: EventState, R: RingRecord, T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kore_abi::session::SlotRef;
+    use kore_ring::event::{PARK_DOORBELL, SEQ_AT, split};
+    use std::vec;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+    struct State {
+        serial: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+    struct Record {
+        value: u32,
+        _pad: u32,
+    }
+
+    /// Rung selection is a fact about the window, not the caller: a channel
+    /// in memory nobody noted keeps the doorbell rung, and once its window
+    /// is noted the wake word names itself as `(slot, SEQ_AT)` — the exact
+    /// pair the `WordWaitReq` / `WakeWordReq` carry — without the consumer
+    /// or producer changing a line.
+    #[test]
+    fn the_word_rung_is_taken_exactly_when_the_window_is_noted() {
+        let bytes = kore_ring::event::region_bytes::<State, Record>(4) + 64;
+        let mut backing = vec![0u8; bytes];
+        let off = backing.as_ptr().align_offset(64);
+        let window = &mut backing[off..];
+        let (base, len) = (window.as_ptr(), window.len());
+        let (mut source, sink) = split::<State, Record>(window, 4).unwrap();
+
+        let word = sink.seq_word() as *const AtomicU32 as *const u8;
+        assert_eq!(mapped::locate(word), None, "an unnoted window: rung 3");
+
+        let slot = SlotRef::from_wire(21);
+        mapped::note(base, len, slot);
+        assert_eq!(mapped::locate(word), Some((slot, SEQ_AT as u32)));
+        assert_eq!(
+            mapped::locate(source.seq_word() as *const AtomicU32 as *const u8),
+            Some((slot, SEQ_AT as u32)),
+            "both halves name the same word"
+        );
+
+        // The intent word tells the producer which wake reaches the
+        // consumer: a plain park is the doorbell, restated as the word park.
+        let seen = sink.seq();
+        assert!(sink.park(seen));
+        assert_eq!(sink.parked_word().load(core::sync::atomic::Ordering::SeqCst), PARK_DOORBELL);
+        sink.park_on_word();
+        assert_eq!(sink.parked_word().load(core::sync::atomic::Ordering::SeqCst), PARK_WORD);
+        assert_eq!(source.commit_intent(), PARK_WORD, "collected as a word park");
+        assert_eq!(source.commit_intent(), 0, "collected once");
+
+        mapped::forget(base);
+        assert_eq!(mapped::locate(word), None, "an unmapped window: rung 3 again");
+    }
+
     use core::future::Future;
     use core::sync::atomic::Ordering;
     use core::task::{Context, Poll, Waker};
