@@ -199,3 +199,63 @@ fn a_sink_that_fails_is_the_output_s_refusal_not_the_volume_s() {
     kore_vol::read(&image, None, |mount| mount.read_to(0, "blob", &mut bytes)).unwrap();
     assert_eq!(bytes, pattern(3, 70_000));
 }
+
+#[test]
+fn a_mount_releases_its_handles_whatever_a_read_or_a_listing_meets() {
+    /// Takes one byte, then has had enough: a preview's bound.
+    struct Enough(usize);
+    impl std::io::Write for Enough {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0 == 0 {
+                return Err(std::io::Error::other("enough"));
+            }
+            self.0 -= 1;
+            Ok(buf.len().min(1))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let dir = scratch("library-handles");
+    let image = blank_image(&dir, 32 * MIB);
+    let source = dir.join("blob");
+    fs::write(&source, pattern(5, 70_000)).unwrap();
+    kore_vol::format(&image, None).unwrap();
+    kore_vol::put(&image, None, 0, &source, "shots/blob", false).unwrap();
+    // A session holds at most `MAX_HANDLES_PER_SESSION` (32) handles; each
+    // refusal below, repeated well past that, must hand back what it opened.
+    kore_vol::read(&image, None, |mount| {
+        for _ in 0..100 {
+            assert!(matches!(
+                mount.read_to(0, "shots/blob", &mut Enough(1)),
+                Err(VolError::Output(_))
+            ));
+            assert!(matches!(
+                mount.read_to(0, "shots/missing", &mut Vec::new()),
+                Err(VolError::NotFound(_))
+            ));
+            assert!(matches!(
+                mount.read_to(0, "shots", &mut Vec::new()),
+                Err(VolError::Fs(_, _))
+            ));
+            assert!(matches!(
+                mount.list(0, Some("shots/missing")),
+                Err(VolError::NotFound(_))
+            ));
+            assert!(matches!(
+                mount.walk(0, "shots/blob", &mut |_| Ok(())),
+                Err(VolError::Fs(_, _))
+            ));
+        }
+        // And the session is still whole.
+        let Listing::Directory(entries) = mount.list(0, Some("shots"))? else {
+            panic!("shots is a directory");
+        };
+        assert_eq!(entries.len(), 1);
+        let mut bytes = Vec::new();
+        assert_eq!(mount.read_to(0, "shots/blob", &mut bytes)?, 70_000);
+        assert_eq!(bytes, pattern(5, 70_000));
+        Ok(())
+    })
+    .unwrap();
+}

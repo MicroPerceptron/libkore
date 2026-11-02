@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/MicroPerceptron/kore",
-  "revision": "1b6cb32271d35ce766cbf35d9746ce419429b233",
+  "revision": "ab6e7b157659cc4158ca30bb70a14bb64b0c6820",
   "packages": {
     "crates/abi": "kore-abi",
     "crates/app": "kore-app",
@@ -407,10 +407,10 @@
     "tools/kore-vol/src/lib.rs": "41f7fc123e770cc1f34e97de0c2fc6a0ee9211cc29172e23cb42f01e84d2b034",
     "tools/kore-vol/src/main.rs": "badf82b2ca2c83e5c29af760f4b50021d679ad75e65a94259b01efc082019a25",
     "tools/kore-vol/src/source.rs": "eaa9da2c97057be86b4dc8543213728ee22ecbf1be7484f3899affd03c09c68b",
-    "tools/kore-vol/src/volume.rs": "2629662b57585e41d32c931fb83ca687370ce94a6b2ec8d414e0c16cf0f1a9a9",
+    "tools/kore-vol/src/volume.rs": "67bb73f4a5ae5cc90b2511ecd1e74c91d573ca593f2fff986d6cbdad478f76e6",
     "tools/kore-vol/tests/cli.rs": "66983b612af2ec94f30a4dcecdd73a38e52e97523f2efecd678d450e7e984bd4",
     "tools/kore-vol/tests/common/mod.rs": "b561540f1cca00f440adf90123eafad96076ed5c8291af634528b4ce2edbb159",
     "tools/kore-vol/tests/device.rs": "4082b44d7c9dc05b23b459eaed612a6160cd964da40496295d0136d4b546074b",
-    "tools/kore-vol/tests/library.rs": "d60585f209e0d3fd1ea21f305a6c32eed23236c770c8f1bfff19f369e22c2ee3"
+    "tools/kore-vol/tests/library.rs": "a2e943e86b00edf9a3fffbd3894fa5bca581e1495d30e72f0dc661bc7b90fc0e"
   }
 }

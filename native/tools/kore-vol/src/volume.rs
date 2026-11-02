@@ -14,8 +14,9 @@ use kore_driver::block::{
     image::{Access, ImageError, ImageFile},
 };
 use kore_svc_dagfs::{
-    ANY_REVISION, DurableService, FsError, Handle, Name, ObjectKind, Rights, SYSTEM_APPS_VIEW,
-    SYSTEM_LIBS_VIEW, SYSTEM_SHARE_VIEW, SYSTEM_WORKSPACE_DIR, SessionId, block_on,
+    ANY_REVISION, DurableService, FsError, Handle, Name, ObjectKind, OpenedObject, Rights,
+    SYSTEM_APPS_VIEW, SYSTEM_LIBS_VIEW, SYSTEM_SHARE_VIEW, SYSTEM_WORKSPACE_DIR, SessionId,
+    block_on,
     bounds::{MAX_OBJECTS, MAX_PATH_DEPTH},
     durable::{Located, note},
     face_home_label,
@@ -330,6 +331,10 @@ fn fs<T>(shown: &str, result: Result<T, FsError>) -> Result<T, VolError> {
 /// Walk from the persisted root along `names`, every step a directory,
 /// holding one handle at a time. Missing directories are created when
 /// `create`, else the walk answers `None`.
+///
+/// Every handle it opens is either answered or closed, whatever a step
+/// meets: a session holds few, and a [`Mount`] lives as long as its caller
+/// browses.
 fn walk(
     volume: &Volume,
     names: &[Name],
@@ -341,21 +346,24 @@ fn walk(
     for (depth, part) in names.iter().enumerate() {
         let shown = display(&names[..=depth]);
         let next = match engine.open_at(SESSION, at, part, rights) {
-            Ok(opened) => Some(opened.handle),
-            Err(FsError::NotFound) if create => Some(
-                fs(
-                    &shown,
-                    block_on(engine.create(SESSION, at, part, ObjectKind::Directory)),
-                )?
-                .handle,
-            ),
-            Err(FsError::NotFound) => None,
-            Err(error) => return Err(VolError::Fs(shown, error)),
+            Ok(opened) => Ok(Some(opened.handle)),
+            Err(FsError::NotFound) if create => fs(
+                &shown,
+                block_on(engine.create(SESSION, at, part, ObjectKind::Directory)),
+            )
+            .map(|created| Some(created.handle)),
+            Err(FsError::NotFound) => Ok(None),
+            Err(error) => Err(VolError::Fs(shown.clone(), error)),
         };
-        fs(&shown, engine.close(SESSION, at))?;
-        match next {
-            Some(next) => at = next,
-            None => return Ok(None),
+        let closed = fs(&shown, engine.close(SESSION, at));
+        match (next, closed) {
+            (Ok(Some(next)), Ok(())) => at = next,
+            (Ok(None), Ok(())) => return Ok(None),
+            (Ok(Some(next)), Err(error)) => {
+                let _ = engine.close(SESSION, next);
+                return Err(error);
+            }
+            (Ok(None), Err(error)) | (Err(error), _) => return Err(error),
         }
     }
     Ok(Some(at))
@@ -484,43 +492,49 @@ impl Mount {
             }
             return Err(VolError::NotFound(shown));
         };
-        let stat = fs(&shown, engine.stat(SESSION, at))?;
-        let listing = if stat.kind.is_dir() {
-            let mut entries = Vec::new();
-            let mut cursor = 0;
-            loop {
-                let page = fs(&shown, engine.list(SESSION, at, cursor))?;
-                for entry in &page.entries {
-                    if entry.kind.is_dir() {
-                        entries.push(Listed {
-                            name: entry.name.as_str().to_owned(),
-                            kind: Kind::Directory,
-                            len: 0,
-                        });
-                        continue;
-                    }
-                    let opened = fs(
-                        &shown,
-                        engine.open_at(SESSION, at, &entry.name, Rights::READ),
-                    )?;
-                    fs(&shown, engine.close(SESSION, opened.handle))?;
+        // The handle closes whatever the listing meets.
+        let listing = self.listing(at, &shown);
+        let closed = fs(&shown, engine.close(SESSION, at));
+        let listing = listing?;
+        closed?;
+        Ok(listing)
+    }
+
+    fn listing(&self, at: Handle, shown: &str) -> Result<Listing, VolError> {
+        let engine = self.volume.engine();
+        let stat = fs(shown, engine.stat(SESSION, at))?;
+        if !stat.kind.is_dir() {
+            return Ok(Listing::File { len: stat.len });
+        }
+        let mut entries = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let page = fs(shown, engine.list(SESSION, at, cursor))?;
+            for entry in &page.entries {
+                if entry.kind.is_dir() {
                     entries.push(Listed {
                         name: entry.name.as_str().to_owned(),
-                        kind: Kind::File,
-                        len: opened.len,
+                        kind: Kind::Directory,
+                        len: 0,
                     });
+                    continue;
                 }
-                match page.next {
-                    Some(next) => cursor = next,
-                    None => break,
-                }
+                let opened = fs(
+                    shown,
+                    engine.open_at(SESSION, at, &entry.name, Rights::READ),
+                )?;
+                fs(shown, engine.close(SESSION, opened.handle))?;
+                entries.push(Listed {
+                    name: entry.name.as_str().to_owned(),
+                    kind: Kind::File,
+                    len: opened.len,
+                });
             }
-            Listing::Directory(entries)
-        } else {
-            Listing::File { len: stat.len }
-        };
-        fs(&shown, engine.close(SESSION, at))?;
-        Ok(listing)
+            match page.next {
+                Some(next) => cursor = next,
+                None => return Ok(Listing::Directory(entries)),
+            }
+        }
     }
 
     /// Copy the file terminal `face` sees at `path` into `out`, and answer
@@ -538,20 +552,38 @@ impl Mount {
             .ok_or_else(|| VolError::NotFound(shown.clone()))?;
         let parent = walk(&self.volume, parents, Rights::READ, false)?
             .ok_or_else(|| VolError::NotFound(shown.clone()))?;
-        let file = match engine.open_at(SESSION, parent, last, Rights::READ) {
+        let opened = engine.open_at(SESSION, parent, last, Rights::READ);
+        let closed = fs(&shown, engine.close(SESSION, parent));
+        let file = match opened {
             Ok(opened) => opened,
             Err(FsError::NotFound) => return Err(VolError::NotFound(shown)),
             Err(error) => return Err(VolError::Fs(shown, error)),
         };
-        fs(&shown, engine.close(SESSION, parent))?;
-        if file.kind.is_dir() {
-            return Err(VolError::Fs(shown, FsError::IsDirectory));
-        }
+        // The file's handle closes whatever the copy meets: a sink that has
+        // had enough (a preview's bound) is an everyday end, not a leak.
+        let copied = match closed {
+            Ok(()) if file.kind.is_dir() => Err(VolError::Fs(shown.clone(), FsError::IsDirectory)),
+            Ok(()) => self.copy(&file, &shown, out),
+            Err(error) => Err(error),
+        };
+        let released = fs(&shown, engine.close(SESSION, file.handle));
+        let len = copied?;
+        released?;
+        Ok(len)
+    }
+
+    fn copy<W: Write + ?Sized>(
+        &self,
+        file: &OpenedObject,
+        shown: &str,
+        out: &mut W,
+    ) -> Result<u64, VolError> {
+        let engine = self.volume.engine();
         let mut chunk = vec![0; CHUNK];
         let mut offset = 0;
         while offset < file.len {
             let read = fs(
-                &shown,
+                shown,
                 block_on(engine.read(SESSION, file.handle, offset, &mut chunk)),
             )?;
             if read == 0 {
@@ -561,7 +593,6 @@ impl Mount {
             offset += read as u64;
         }
         out.flush().map_err(VolError::Output)?;
-        fs(&shown, engine.close(SESSION, file.handle))?;
         Ok(offset)
     }
 
