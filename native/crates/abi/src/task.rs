@@ -402,6 +402,13 @@ pub mod role {
     /// early. Both ends are founder-stamped chain wiring, outside every
     /// manifest profile.
     pub const BOOT_SETTLE: u16 = 47;
+    /// A non-invocable selector for the launcher's current filesystem view —
+    /// its cwd — moved in beside an ordinary launch whose paths the launcher
+    /// spelled from that cwd's route. It carries REVOKE only, like
+    /// [`FS_GRANT_TARGET`]: the child presents it once, so the filesystem
+    /// confirms the route still names the very directory the view is bound
+    /// to, and can neither invoke nor delegate it.
+    pub const FS_VIEW_ANCHOR: u16 = 48;
     /// First caller-assigned role — roles `>=` this are convention-defined.
     pub const USER_BASE: u16 = 0x8000;
 }
@@ -455,8 +462,8 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
     DESKTOP_BOOTSTRAP_WINDOW_SLOTS + 2 * DESKTOP_CONTROLLER_CAPACITY;
 
 /// Live immutable image-generation peers the boot catalogue can hold at once:
-/// the 44-row bootstrap catalogue — the desktop's `files`, its documents
-/// `editor`, `photos` and `power-ui`, the screenshot writer `capture`, beside
+/// the 45-row bootstrap catalogue — the desktop's `files`, its documents
+/// `editor`, `photos`, `settings` and `power-ui`, the screenshot writer `capture`, beside
 /// the native filesystem verbs `append`, `sync` and `pack`, the two
 /// WebAssembly rows, `wasm-witness` and `wasm`, `jsapp`, the JS app host,
 /// `inference` / `model-data-witness`, and `shell`, the guest shell `term`
@@ -467,7 +474,7 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
 /// separately from the interactive reservation below because the two grow for
 /// unrelated reasons: this one when a row joins the catalogue, that one when
 /// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 49;
+pub const BOOTSTRAP_IMAGE_PEERS: usize = 50;
 
 /// Bootstrap face-supply sizing. Image and runtime grow their face tables and
 /// rings on demand; this reserves enough initial memory for the boot catalogue

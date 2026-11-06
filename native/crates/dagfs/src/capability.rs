@@ -46,6 +46,14 @@ pub struct FsViewCapability {
 pub const FS_GRANT_TARGET_RIGHTS: CapRights = CapRights::REVOKE;
 pub const FS_GRANT_TARGET_DELEGATE_RIGHTS: CapRights = CapRights::DERIVE.union(CapRights::REVOKE);
 
+/// A cwd anchor carries, like a grant target, no invocation or delegation
+/// authority. It identifies one of the launcher's own views to the service
+/// ([`crate::FsRequest::MatchView`]) so a command can confirm that the route
+/// it was told names the directory that view is bound to, and nothing more:
+/// it cannot be invoked as a cwd, and the service matches it only against a
+/// view of the presenting task's own.
+pub const FS_VIEW_ANCHOR_RIGHTS: CapRights = CapRights::REVOKE;
+
 impl FsViewCapability {
     pub const DELEGABLE_RIGHTS: CapRights = CapRights::ACCESS
         .union(CapRights::DERIVE)
@@ -94,6 +102,12 @@ impl FsViewCapability {
             self.endpoint.slot(),
             Self::INVOCATION_DELEGATE_RIGHTS,
         )
+    }
+
+    /// A REVOKE-only selector of this view ([`FS_VIEW_ANCHOR_RIGHTS`]), for a
+    /// command that must confirm a route still names it.
+    pub fn derive_anchor(&self) -> Option<ChanSendToken> {
+        verbs::derive_owned_chan_send_with_rights(self.endpoint.slot(), FS_VIEW_ANCHOR_RIGHTS)
     }
 
     pub fn derive_binding(&self) -> Option<ChanSendToken> {

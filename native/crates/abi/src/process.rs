@@ -507,21 +507,17 @@ pub const PROCESS_ARG_BYTES: usize = 272;
 /// the payload at opposite sides of the task-lifecycle handoff; they are never
 /// simultaneously live.
 ///
-/// So this bound is policy, not geometry: the shared payload is
-/// [`PROCESS_OUTPUT_BYTES`] wide, and a context may use any of it without
-/// growing the page or touching the wire. What sets the number is the
-/// largest context anyone builds, which is the bootstrap command catalogue
-/// `help` reads — [`MAX_COMMAND_SNAPSHOT_ENTRIES`](crate::command::MAX_COMMAND_SNAPSHOT_ENTRIES)
-/// rows of name, usage and summary plus four framing bytes each. The
-/// catalogue has 40 rows, including the delegated Lua worker. Its complete
-/// snapshot no longer fits 2560 bytes. 3072 carries the current catalogue
-/// and remains within the existing 3208-byte alternating payload; no page
-/// layout or command-output capacity changes.
-pub const PROCESS_CONTEXT_BYTES: usize = 3072;
-const _: () = assert!(
-    PROCESS_CONTEXT_BYTES <= PROCESS_OUTPUT_BYTES,
-    "context borrows the output payload and cannot outgrow it"
-);
+/// So the bound is that payload, [`PROCESS_OUTPUT_BYTES`] wide: a context may
+/// use all of it without growing the page or touching the wire. The largest
+/// context anyone builds is the bootstrap command catalogue `help` reads —
+/// [`MAX_COMMAND_SNAPSHOT_ENTRIES`](crate::command::MAX_COMMAND_SNAPSHOT_ENTRIES)
+/// rows of name, usage and summary plus four framing bytes each. Its
+/// complete snapshot outgrew 2560 bytes at 40 rows, and with the DagFS
+/// verbs' usage lines naming their options it needs 3087 at 45, past the
+/// 3072 that followed. A bound below the payload only leaves a round number
+/// to outgrow. Widening it moves no offset and gives no byte a new meaning,
+/// so the process ABI keeps its version.
+pub const PROCESS_CONTEXT_BYTES: usize = PROCESS_OUTPUT_BYTES;
 /// Header bytes before the argument and alternating payload arrays: 8 fixed
 /// (`abi`/`flags`/`arg_len`/`output_len`) + the embedded [`TelemetrySnapshot`]
 /// (240 — the IOMMU and timer censuses plus the manifold's own state) + the launcher's

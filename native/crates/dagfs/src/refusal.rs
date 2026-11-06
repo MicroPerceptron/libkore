@@ -38,6 +38,22 @@ pub enum Refusal {
     Usage(&'static [u8]),
 }
 
+/// Why a launch's position was not confirmed ([`crate::Fs::confirm_position`]).
+///
+/// Its own vocabulary rather than a [`Refusal`] arm: confirming the route a
+/// launcher spelled a line through is a launch-protocol step, taken once
+/// before any verb runs, and no filesystem caller that never confirms one
+/// (a WASI host, a script's file library) has a case to handle for it.
+#[derive(Debug)]
+pub enum Unconfirmed {
+    /// The route no longer names the launcher's current directory: that
+    /// directory was renamed or moved after it was entered. Nothing ran.
+    Moved,
+    /// The service refused, the pair failed, or a position arrived without
+    /// the anchor that alone gives it meaning.
+    Refused(Refusal),
+}
+
 impl From<Refusal> for Stop {
     fn from(refusal: Refusal) -> Self {
         Self::Refused(refusal)

@@ -575,6 +575,11 @@ pub fn encode_req(req: &FsRequest) -> FsReqWire {
             w.rights = rights.bits();
             w.window_offset = U32::new(announced.index());
         }
+        FsRequest::MatchView { handle, announced } => {
+            w.op = FsReqWire::OP_MATCH_VIEW;
+            w.handle = U64::new(handle.to_bits());
+            w.window_offset = U32::new(announced.index());
+        }
         FsRequest::AdmitPeer { part, announced } => {
             w.op = FsReqWire::OP_ADMIT_PEER;
             w.kind = peer_part_code(part);
@@ -1040,6 +1045,16 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
             FsRequest::BindView {
                 handle,
                 rights,
+                announced: SlotRef::from_wire(w.window_offset.get()),
+            }
+        }
+        FsReqWire::OP_MATCH_VIEW => {
+            // Not a rights verb: a set mask already refused above.
+            if w.kind != 0 || !control_payload_except_handle_is_empty(w) {
+                return None;
+            }
+            FsRequest::MatchView {
+                handle,
                 announced: SlotRef::from_wire(w.window_offset.get()),
             }
         }
@@ -1713,6 +1728,7 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         | FsRequest::RegisterPrivateView { .. }
         | FsRequest::ApplyView { .. }
         | FsRequest::BindView { .. }
+        | FsRequest::MatchView { .. }
         | FsRequest::Close { .. }
         | FsRequest::Rename { .. }
         | FsRequest::Relocate { .. }
@@ -1851,6 +1867,7 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
         | FsRequest::RegisterPrivateView { .. }
         | FsRequest::ApplyView { .. }
         | FsRequest::BindView { .. }
+        | FsRequest::MatchView { .. }
         | FsRequest::Close { .. }
         | FsRequest::Rename { .. }
         | FsRequest::Relocate { .. }

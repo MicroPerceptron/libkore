@@ -8,7 +8,7 @@
 //! `&AtomicU32` inside a window some map verb returned.  This registry is
 //! the bridge: every verb that installs a held slot into this task's
 //! address space [`note`]s `(base, len, slot)` here, every unmap
-//! [`forget`]s it, and [`locate`] turns a word's address back into the
+//! [`forget_exact`]s it, and [`locate`] turns a word's address back into the
 //! `(slot, offset)` pair the kernel wants.  That is what makes the rung
 //! **automatic** for existing callers — `event::wait_past` and the futex
 //! consult it and fall back to the doorbell park when the word is not in
@@ -117,7 +117,8 @@ impl<const N: usize> Registry<N> {
         false
     }
 
-    /// Release the entry noted at `base`, if any.  Idempotent.
+    /// Release the entries noted at `base`, if any. Test-only broad cleanup.
+    #[cfg(test)]
     fn forget(&self, base: usize) {
         if base == FREE || base == CLAIMING {
             return;
@@ -126,6 +127,24 @@ impl<const N: usize> Registry<N> {
             let _ = entry
                 .base
                 .compare_exchange(base, FREE, Ordering::AcqRel, Ordering::Relaxed);
+        }
+    }
+
+    /// Forget only the caller's exact view. A retired owner may drop after a
+    /// replacement has been noted at the same VA or slot index.
+    fn forget_exact(&self, base: usize, slot: SlotRef, owner: usize) {
+        if base == FREE || base == CLAIMING {
+            return;
+        }
+        for entry in &self.entries {
+            if entry.base.load(Ordering::Acquire) == base
+                && entry.slot.load(Ordering::Relaxed) == slot.index()
+                && entry.owner.load(Ordering::Relaxed) == owner
+            {
+                let _ = entry
+                    .base
+                    .compare_exchange(base, FREE, Ordering::AcqRel, Ordering::Relaxed);
+            }
         }
     }
 
@@ -243,12 +262,23 @@ pub(crate) fn note(base: *const u8, len: usize, slot: SlotRef) {
     }
 }
 
-/// Forget the window installed at `base` — the unmap face.
+/// Broad cleanup by VA, retained for registry tests only.
+#[cfg(test)]
 pub(crate) fn forget(base: *const u8) {
     #[cfg(feature = "heap")]
     MAPPED.forget(base as usize);
     #[cfg(not(feature = "heap"))]
     let _ = base;
+}
+
+/// Forget one retired view without touching a replacement at its former VA.
+pub(crate) fn forget_exact(base: *const u8, slot: SlotRef) {
+    #[cfg(feature = "heap")]
+    if let Some(owner) = current_thread() {
+        MAPPED.forget_exact(base as usize, slot, owner);
+    }
+    #[cfg(not(feature = "heap"))]
+    let _ = (base, slot);
 }
 
 /// Forget every window installed under `slot` — the unmap face that names
@@ -377,6 +407,21 @@ mod tests {
         table.forget(0x1000);
         assert_eq!(table.locate(0x1010, 1), None);
         assert_eq!(table.locate(0x1010, 2), None, "the second entry at the base is released too");
+    }
+
+    #[test]
+    fn exact_retirement_preserves_replacement_and_sibling_thread() {
+        let table = Registry::<4>::new();
+        let old = SlotRef::from_wire(3);
+        let replacement = SlotRef::from_wire(5);
+        assert!(table.note(0x1000, 0x100, old, 1));
+        assert!(table.note(0x1000, 0x100, old, 2));
+        table.forget_exact(0x1000, old, 1);
+        assert_eq!(table.locate(0x1010, 1), None);
+        assert_eq!(table.locate(0x1010, 2), Some((old, 0x10)));
+        assert!(table.note(0x1000, 0x100, replacement, 1));
+        table.forget_exact(0x1000, old, 1);
+        assert_eq!(table.locate(0x1010, 1), Some((replacement, 0x10)));
     }
 
     #[test]

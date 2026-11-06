@@ -164,7 +164,8 @@ pub mod wire;
 pub use authority::{AuthorityKind, AuthorityQuota, EdgeProof, GrantId, Handle, Rights, SessionId};
 pub use client::process_face;
 pub use client::{
-    DirEntry, FS_GRANT_TARGET_DELEGATE_RIGHTS, FS_GRANT_TARGET_RIGHTS, FilesystemFace, FsClient,
+    DirEntry, FS_GRANT_TARGET_DELEGATE_RIGHTS, FS_GRANT_TARGET_RIGHTS, FS_VIEW_ANCHOR_RIGHTS,
+    FilesystemFace, FsClient,
     FsViewCapability, GrantEntry, IdentifyVersionFailure, LentVersion, Opened, PendingVersion,
     ReleasePendingVersionFailure, ReleaseVersionFailure, RingFs, RingFsError,
     RingReleasePendingVersionFailure, RingReleaseVersionFailure, SearchResultPage, Stat, Transport,

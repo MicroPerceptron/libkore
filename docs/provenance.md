@@ -265,3 +265,56 @@ QEMU 8.2 TCG on the gate's topology: 19/19 services and beacons, `first-shell:
 ready`, `app-store: seeded 44/44`, `home-skeleton: homes: 1/1`. After the machine
 was stopped, the host-side `kore-vol` read the volume that guest had formatted
 and populated. These are emulator results, not physical-hardware acceptance.
+
+## Kore main, with the host volume procedure merged
+
+The export now records Kore `7074bda28c416ffe34562857ee43cbc883482782`, main
+once MicroPerceptron/kore#1475 landed. That pull request was merged by rebase,
+so the four `tools/kore-vol` commits the previous export named are on main as
+`e39d7308`, `99ef4b86`, `3445d543` and `9d616ce0`, and the exported
+`tools/kore-vol` is byte-identical to `ab6e7b15`'s. `7074bda2` itself makes the
+kernel access the ACPI PM1 registers at their width; it changes nothing in the
+closure.
+
+Main took 52 commits between `e5e0b96a` and the merge. Eleven reach the
+closure, which keeps its 26 packages and now holds 382 files (`kore-window`
+gains `desktop.rs`):
+
+- DagFS. A cwd anchor, and `FsRequest::MatchView` to confirm that a remembered
+  route still names the launcher's view (`45e7d02b`, across `kore-dagfs`,
+  `kore-svc-dagfs` and `kore-abi`); `.` adds no path step, and `path::resolve`
+  folds `..` and rooted paths (`87fa74e5`); the service reaps a dead view by
+  probing its lineage in the kernel instead of trusting its record
+  (`77f00903`, with `kore-rt`'s `probe_chan_send_lineage`).
+- `kore-abi`: a launch context may fill the payload it borrows;
+  `PROCESS_CONTEXT_BYTES` is `PROCESS_OUTPUT_BYTES`, and `PROCESS_IO_ABI`
+  stays 13 (`44abeeca`).
+- `kore-rt`: a mapped view's registry entry is retired exactly once
+  (`602ab362`).
+- `kore-driver`: `IntakeError::failed_before_device_publish` tells a DMA
+  import refused at its CPU view from one refused at device publication
+  (`8eacc00e`).
+- `kore-window` and `kore-app`: System Settings (`047f82f2`, `751fa23c`,
+  `387b9a08`), and the dock's capacity without the window runtime feature
+  (`afa21902`).
+- The services' `boot.toml` digests, resealed twice: over Wasmtime 48.0.8
+  (`89a85e45`) and over the POSIX shims (`0ed97d12`).
+
+No exported manifest changed, so `native/Cargo.lock` did not. The DagFS
+on-disk format stays at version 5 (`DIGEST_FORMAT_VERSION`).
+
+Locally, with the pinned nightly, the gate set the previous section lists passed
+again on this export: `cargo test` for the workspace (every feature except
+`test-foreign`), the native `kore-rt`/`kore-dagfs` suites, the exported
+`kore-vol` suites (1 unit, 9 CLI, 6 library) and, as root over loop devices,
+its device suite (4), `kore-host`'s volume tests (2), the tool tests, the
+no-default-feature check, Clippy and documentation with warnings denied, the
+three Kore user-target checks for `kore-std`/`kore-ffi`/`kore-entry`,
+`check-alloc-symbols`, `check-entry`, Miri, the owner graph, the native drift
+check and the local-composition fixture. The declaration half of
+`bindings-check` ran without Zig: cbindgen 0.29.4 regenerates
+`extern/c/include/kore.h` byte-identical, and the C consumers compile for all
+three ISAs. The Zig namespace and the `stdlib.h`/`pthread.h` aliases derive from
+that header's function list alone, so they are current as well. Not run locally:
+`zig fmt`, `test-foreign`, the rest of `bindings-check` and `kore-lua`'s
+Kore-target build; CI's host job runs them.

@@ -16,6 +16,11 @@ use kore_abi::{
 use kore_rt::svc::{PeerBundlePart, PeerId};
 use kore_svc_output::service::{OutputRequest, OutputResponse};
 
+use crate::appearance::Density;
+use crate::desktop::{DesktopRequest, DesktopState, Mode};
+const PREPARE_SETTINGS: u8 = 0x52;
+const DESKTOP: u8 = 0x53;
+
 const OUTPUT: u8 = 0x80;
 const ADMIT: u8 = 0x40;
 const TAKE: u8 = 0x41;
@@ -43,7 +48,7 @@ const SHELL_ACTION: u8 = 0x4d;
 /// Bound on one window's published tab strip.
 pub const MAX_TABS: usize = 8;
 /// Bound on the compositor-drawn dock catalog.
-pub const MAX_DOCK_ITEMS: usize = 8;
+pub const MAX_DOCK_ITEMS: usize = crate::MAX_DOCK_ITEMS;
 /// NUL-padded printable-ASCII bytes carried by one dock label.
 pub const DOCK_LABEL_BYTES: usize = 24;
 
@@ -363,7 +368,9 @@ impl ShellAction {
     const fn words(action: Option<Self>) -> (u64, u64, u64) {
         match action {
             None => (0, 0, 0),
-            Some(Self::Launch { version, index }) => (1, version as u64 | ((index as u64) << 16), 0),
+            Some(Self::Launch { version, index }) => {
+                (1, version as u64 | ((index as u64) << 16), 0)
+            }
             Some(Self::Open { object, kind }) => (2, object, kind.code() as u64),
             Some(Self::OpenWith {
                 version,
@@ -448,10 +455,17 @@ impl kore_rt::svc::SvcProtocol for WindowWire {
         index == 0
     }
     fn request_grants(request: &SurReqWire) -> usize {
-        usize::from(matches!(
-            decode_req(request),
-            Some(DisplayRequest::Surface(request)) if surface::request_carries_grant(&request)
-        ))
+        usize::from(
+            matches!(
+                decode_req(request),
+                Some(DisplayRequest::Desktop(
+                    DesktopRequest::CreateWallpaper { .. }
+                ))
+            ) || matches!(
+                decode_req(request),
+                Some(DisplayRequest::Surface(request)) if surface::request_carries_grant(&request)
+            ),
+        )
     }
     fn init_pair_window(
         window: &mut [u8],
@@ -577,6 +591,12 @@ impl LayoutHints {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayRequest {
+    /// Controller-only: authorize this admission for desktop preferences.
+    PrepareSettings {
+        preference: Preference,
+        icon: u64,
+    },
+    Desktop(DesktopRequest),
     Output(OutputRequest),
     Surface(SurfaceRequest),
     AdmitPeer {
@@ -645,11 +665,14 @@ pub enum DisplayRequest {
     /// Controller verb: give back the frozen frame for `ticket` without
     /// writing it (the writer could not be launched). A frame a writer
     /// was admitted for is retired by that writer's teardown instead.
-    ReleaseCapture { ticket: u32 },
+    ReleaseCapture {
+        ticket: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayResponse {
+    Desktop(DesktopState),
     Output(OutputResponse),
     Surface(SurfaceResponse),
     Accepted,
@@ -683,6 +706,34 @@ pub enum ControlRefusal {
 pub fn encode_req(request: &DisplayRequest) -> SurReqWire {
     let mut w = surface::encode_req(&SurfaceRequest::Query);
     match *request {
+        DisplayRequest::PrepareSettings { preference, icon } => {
+            w.op = PREPARE_SETTINGS;
+            let (kind, value) = preference.words();
+            w.a = kind.into();
+            w.b = value.into();
+            w.c = icon.into();
+        }
+        DisplayRequest::Desktop(request) => {
+            w.op = DESKTOP;
+            match request {
+                DesktopRequest::Query => {}
+                DesktopRequest::RestoreComplete => w.subject = 4.into(),
+                DesktopRequest::Appearance { mode, density } => {
+                    w.subject = 1.into();
+                    w.a = (mode as u64).into();
+                    w.b = (density.quarters() as u64).into();
+                }
+                DesktopRequest::CreateWallpaper { width, height } => {
+                    w.subject = 2.into();
+                    w.a = u64::from(width).into();
+                    w.b = u64::from(height).into();
+                }
+                DesktopRequest::ApplyWallpaper { surface } => {
+                    w.subject = 3.into();
+                    w.a = surface.into();
+                }
+            }
+        }
         DisplayRequest::Surface(request) => return surface::encode_req(&request),
         DisplayRequest::Output(request) => {
             let out = kore_svc_output::wire::encode_req(&request);
@@ -803,6 +854,24 @@ pub fn encode_req(request: &DisplayRequest) -> SurReqWire {
 
 pub fn decode_req(w: &SurReqWire) -> Option<DisplayRequest> {
     let request = match w.op {
+        PREPARE_SETTINGS => DisplayRequest::PrepareSettings {
+            preference: Preference::from_words(w.a.get(), w.b.get())?,
+            icon: w.c.get(),
+        },
+        DESKTOP => DisplayRequest::Desktop(match w.subject.get() {
+            0 => DesktopRequest::Query,
+            4 => DesktopRequest::RestoreComplete,
+            1 => DesktopRequest::Appearance {
+                mode: Mode::from_code(u8::try_from(w.a.get()).ok()?)?,
+                density: Density::from_quarters(u8::try_from(w.b.get()).ok()?)?,
+            },
+            2 if w.a.get() != 0 && w.b.get() != 0 => DesktopRequest::CreateWallpaper {
+                width: u16::try_from(w.a.get()).ok()?,
+                height: u16::try_from(w.b.get()).ok()?,
+            },
+            3 if w.a.get() != 0 => DesktopRequest::ApplyWallpaper { surface: w.a.get() },
+            _ => return None,
+        }),
         ADMIT => DisplayRequest::AdmitPeer {
             part: match w.a.get() {
                 0 => PeerBundlePart::Ring,
@@ -933,6 +1002,12 @@ pub fn encode_rep(response: &DisplayResponse, grants: u8) -> SurRepWire {
     // overwrites the tag and its own fields.
     let mut w = surface::encode_rep(&SurfaceResponse::Destroyed { surface: 0 }, grants);
     match *response {
+        DisplayResponse::Desktop(state) => {
+            w.tag = DESKTOP;
+            w.id = (state.mode as u64).into();
+            w.a = u64::from(state.density.quarters()).into();
+            w.b = (u64::from(state.width) | u64::from(state.height) << 16).into();
+        }
         DisplayResponse::Surface(response) => return surface::encode_rep(&response, grants),
         DisplayResponse::Output(response) => {
             let out = kore_svc_output::wire::encode_rep(&response, grants);
@@ -984,6 +1059,16 @@ pub fn encode_rep(response: &DisplayResponse, grants: u8) -> SurRepWire {
 
 pub fn decode_rep(w: &SurRepWire) -> Option<(DisplayResponse, u8)> {
     let response = match w.tag {
+        DESKTOP
+            if w.b.get() >> 32 == 0 && w.b.get() as u16 != 0 && (w.b.get() >> 16) as u16 != 0 =>
+        {
+            DisplayResponse::Desktop(DesktopState {
+                mode: Mode::from_code(u8::try_from(w.id.get()).ok()?)?,
+                density: Density::from_quarters(u8::try_from(w.a.get()).ok()?)?,
+                width: w.b.get() as u16,
+                height: (w.b.get() >> 16) as u16,
+            })
+        }
         ACCEPTED => DisplayResponse::Accepted,
         ADMITTED => DisplayResponse::Admitted {
             peer: PeerId::from_arrival(u16::try_from(w.id.get()).ok()?)?,
@@ -1059,6 +1144,26 @@ pub fn reply_matches(w: &SurReqWire, response: &DisplayResponse, grants: u8) -> 
         return false;
     };
     match (request, *response) {
+        (
+            DisplayRequest::Desktop(DesktopRequest::CreateWallpaper { .. }),
+            DisplayResponse::Surface(SurfaceResponse::SurfaceMade { .. }),
+        ) => grants == 1,
+        (DisplayRequest::Desktop(_), DisplayResponse::Surface(SurfaceResponse::Refused { .. })) => {
+            grants == 0
+        }
+        (
+            DisplayRequest::Desktop(DesktopRequest::Query | DesktopRequest::Appearance { .. }),
+            DisplayResponse::Desktop(_),
+        ) => grants == 0,
+        (
+            DisplayRequest::Desktop(DesktopRequest::ApplyWallpaper { .. } | DesktopRequest::RestoreComplete)
+            | DisplayRequest::PrepareSettings { .. },
+            DisplayResponse::Accepted,
+        ) => grants == 0,
+        (
+            DisplayRequest::Desktop(_) | DisplayRequest::PrepareSettings { .. },
+            DisplayResponse::ControlRefused(_),
+        ) => grants == 0,
         (DisplayRequest::Surface(_), DisplayResponse::Surface(response)) => {
             surface::reply_matches(w, &response, grants)
         }
@@ -1222,6 +1327,43 @@ mod tests {
             wire.grants = 1;
             assert_eq!(decode_rep(&wire), None);
         }
+    }
+
+    #[test]
+    fn desktop_requests_and_state_are_strict_and_grants_are_correlated() {
+        use kore_rt::svc::SvcProtocol;
+        let state = DesktopState { mode: Mode::System, density: Density::Double, width: 1920, height: 1200 };
+        let requests = [
+            DisplayRequest::PrepareSettings { preference: Preference::Tile, icon: 42 },
+            DisplayRequest::Desktop(DesktopRequest::Query),
+            DisplayRequest::Desktop(DesktopRequest::RestoreComplete),
+            DisplayRequest::Desktop(DesktopRequest::Appearance { mode: state.mode, density: state.density }),
+            DisplayRequest::Desktop(DesktopRequest::CreateWallpaper { width: state.width, height: state.height }),
+            DisplayRequest::Desktop(DesktopRequest::ApplyWallpaper { surface: 42 }),
+        ];
+        for request in requests {
+            let wire = encode_req(&request);
+            assert_eq!(decode_req(&wire), Some(request));
+            assert_eq!(WindowWire::request_grants(&wire), usize::from(matches!(request, DisplayRequest::Desktop(DesktopRequest::CreateWallpaper { .. }))));
+            let mut invalid = wire; invalid.d = 1.into();
+            assert_eq!(decode_req(&invalid), None);
+            assert!(reply_matches(&wire, &DisplayResponse::ControlRefused(ControlRefusal::AccessDenied), 0));
+            assert!(!reply_matches(&wire, &DisplayResponse::Accepted, 1));
+        }
+        let reply = DisplayResponse::Desktop(state);
+        assert!(reply_matches(&encode_req(&requests[2]), &DisplayResponse::Accepted, 0));
+        assert!(!reply_matches(&encode_req(&requests[2]), &reply, 0));
+        assert_eq!(decode_rep(&encode_rep(&reply, 0)), Some((reply, 0)));
+        assert_eq!(decode_rep(&encode_rep(&reply, 1)), None);
+        for invalid in [
+            DesktopRequest::CreateWallpaper { width: 0, height: 1 },
+            DesktopRequest::ApplyWallpaper { surface: 0 },
+        ] { assert_eq!(decode_req(&encode_req(&DisplayRequest::Desktop(invalid))), None); }
+        let mut bad = encode_req(&requests[3]); bad.a = 3.into();
+        assert_eq!(decode_req(&bad), None);
+        let mut bad = encode_req(&requests[3]); bad.b = 11.into();
+        assert_eq!(decode_req(&bad), None);
+        assert!(!reply_matches(&encode_req(&requests[4]), &reply, 0));
     }
 
     /// The capture vocabulary rides the controller face byte-exactly: a
@@ -1560,7 +1702,7 @@ mod tests {
         let mut wire = publish;
         wire.a = (1 | (1 << 16) | (1 << 24) | (2 << 32)).into();
         assert_eq!(decode_req(&wire), None);
-        wire.a = (1 | (9 << 24) | (2 << 32)).into();
+        wire.a = (1 | (((MAX_DOCK_ITEMS + 1) as u64) << 24) | (2 << 32)).into();
         assert_eq!(decode_req(&wire), None);
         // Undefined flag bits and handler bits no document class has fail
         // closed; the defined running bit decodes to the flagged row, and
@@ -1656,7 +1798,7 @@ mod tests {
             })),
             0,
         );
-        with.b = (4 | (8 << 16)).into();
+        with.b = (4 | ((MAX_DOCK_ITEMS as u64) << 16)).into();
         assert_eq!(decode_rep(&with), None, "a row past the dock");
         with.b = 0.into();
         assert_eq!(decode_rep(&with), None, "no catalog version");
@@ -1671,10 +1813,26 @@ mod tests {
         assert_eq!(decode_rep(&wire), None);
         wire.id = 1.into();
         assert_eq!(decode_rep(&wire), None);
-        wire.a = (1 | (8 << 16)).into();
+        wire.a = (1 | ((MAX_DOCK_ITEMS as u64) << 16)).into();
         assert_eq!(decode_rep(&wire), None);
         wire.a = (1 | (1 << 24)).into();
         assert_eq!(decode_rep(&wire), None);
+    }
+
+    #[test]
+    fn the_ninth_dock_row_round_trips_publication_and_launch() {
+        let request = DisplayRequest::PublishDockItem {
+            version: 1,
+            index: 8,
+            count: 9,
+            item: DockItem::from_label(DOCK_KIND_APPLICATION, "Skylilt").unwrap(),
+        };
+        assert_eq!(decode_req(&encode_req(&request)), Some(request));
+        let response = DisplayResponse::ShellAction(Some(ShellAction::Launch {
+            version: 1,
+            index: 8,
+        }));
+        assert_eq!(decode_rep(&encode_rep(&response, 0)), Some((response, 0)));
     }
 
     #[test]

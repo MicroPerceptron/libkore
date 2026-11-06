@@ -429,6 +429,34 @@ impl<P: crate::provider::StorageProvider> FsService<P> {
                     Err(error) => FsResponse::Refused(error),
                 };
             }
+            FsRequest::MatchView { handle, announced } => {
+                let Some(mut input) = sv.returned_input(announced) else {
+                    return FsResponse::Refused(FsError::AccessDenied);
+                };
+                let Some(returned) = input.take() else {
+                    return FsResponse::Refused(FsError::AccessDenied);
+                };
+                let anchor = match returned.try_into_chan_send(crate::FS_VIEW_ANCHOR_RIGHTS) {
+                    Ok(anchor) => anchor,
+                    Err(_) => return FsResponse::Refused(FsError::AccessDenied),
+                };
+                if anchor.rights() != crate::FS_VIEW_ANCHOR_RIGHTS {
+                    let _ = anchor.try_retire();
+                    return FsResponse::Refused(FsError::AccessDenied);
+                }
+                let scope = kore_rt::cap::verbs::capability_scope_rid(
+                    anchor.slot(),
+                    kore_abi::cap::ResourceKind::ChanSend,
+                    crate::FS_VIEW_ANCHOR_RIGHTS,
+                );
+                if anchor.try_retire().is_err() {
+                    return FsResponse::Refused(FsError::AccessDenied);
+                }
+                return match scope {
+                    Some(scope) => self.match_view(session, handle, scope),
+                    None => FsResponse::Refused(FsError::AccessDenied),
+                };
+            }
             _ => self.dispatch_mapped_async(session, &req).await,
         }
     }

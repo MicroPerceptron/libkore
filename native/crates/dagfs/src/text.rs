@@ -5,7 +5,10 @@
 /// A whitespace splitter over one completed command line.
 ///
 /// Borrowed, never copied: a command line is a `&[u8]` the caller already
-/// holds bounded, so there is nothing here to size.
+/// holds bounded, so there is nothing here to size. Copying the splitter
+/// copies only its position, so a verb can look ahead (count its operands)
+/// without consuming them.
+#[derive(Clone, Copy, Debug)]
 pub struct Args<'a> {
     rest: &'a [u8],
 }

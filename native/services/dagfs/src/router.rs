@@ -535,6 +535,10 @@ pub(crate) fn route(request: FsRequest, has_system: bool) -> Result<RoutedReques
                 },
             )
         }
+        MatchView { handle, announced } => {
+            let (store, handle) = split_handle(handle);
+            RoutedRequest::One(store, MatchView { handle, announced })
+        }
     };
 
     if matches!(routed, RoutedRequest::One(Store::System, _)) && !has_system {

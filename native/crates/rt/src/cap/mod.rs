@@ -3131,13 +3131,16 @@ impl MappedLeaseView {
     /// precise share-list edge and PTE before reporting success.
     pub fn try_retire_outcome(&mut self) -> RetireOutcome {
         let lease = self.lease;
+        let was_live = self.owned.is_live();
+        let slot = self.owned.slot();
         let outcome = self
             .owned
             .retire_via(|view| crate::cap::verbs::retire_owned_view(view, lease));
-        if outcome.is_closed() {
+        if was_live && outcome.is_closed() {
             // The PTE is gone (or the lineage is dead): a word in this window
-            // can no longer be named through it.
-            mapped::forget(self.base.as_ptr());
+            // can no longer be named through it. A later drop must not forget
+            // a replacement that reused this VA.
+            mapped::forget_exact(self.base.as_ptr(), slot);
         }
         outcome
     }
@@ -3994,7 +3997,12 @@ impl DmaWindow {
             };
         };
         let parent = view.lease;
+        let was_live = view.owned.is_live();
+        let slot = view.owned.slot();
         let outcome = view.owned.retire_via(|slot| retire(slot, parent));
+        if was_live && outcome.is_closed() {
+            mapped::forget_exact(view.base.as_ptr(), slot);
+        }
         if outcome.is_closed() {
             self.cpu = core::ptr::null_mut();
         }
@@ -4284,6 +4292,17 @@ mod retirement_tests {
         }
     }
 
+    #[test]
+    fn dropping_retired_view_preserves_replacement_at_same_va() {
+        let mut bytes = [0u8; 8];
+        let retired = mapped_test_view(&mut bytes);
+        let replacement = SlotRef::from_wire(46);
+        mapped::note(bytes.as_ptr(), bytes.len(), replacement);
+        drop(retired);
+        assert_eq!(mapped::locate(bytes.as_ptr()), Some((replacement, 0)));
+        mapped::forget_exact(bytes.as_ptr(), replacement);
+    }
+
     fn writable_test_code(bytes: &mut [u8]) -> WritableCode {
         WritableCode {
             view: mapped_test_view(bytes),
@@ -4415,6 +4434,7 @@ mod retirement_tests {
         let mut bytes = [0u8; 8];
         let mut view = mapped_test_view(&mut bytes);
         view.owned = core::mem::ManuallyDrop::new(live_slot(42));
+        mapped::note(bytes.as_ptr(), bytes.len(), SlotRef::from_wire(42));
         let mut window = DmaWindow::new(bytes.as_mut_ptr(), 0x4000, 8, live_slot(43))
             .with_device_leaf(live_slot(45))
             .with_cpu_view(view);
@@ -4441,6 +4461,7 @@ mod retirement_tests {
             RetireOutcome::Retired
         );
         assert!(window.cpu().is_null());
+        assert_eq!(mapped::locate(bytes.as_ptr()), None);
         assert!(
             window._owned.slot().is_some(),
             "allocation remains available for hand-back"
@@ -4449,9 +4470,17 @@ mod retirement_tests {
             window.retire_cpu_via(|_, _| panic!("already retired")),
             RetireOutcome::AlreadyDead
         );
+        let replacement = SlotRef::from_wire(46);
+        mapped::note(bytes.as_ptr(), bytes.len(), replacement);
         let mut lease = window
             .try_into_lease()
             .expect("both named children are closed");
+        assert_eq!(
+            mapped::locate(bytes.as_ptr()),
+            Some((replacement, 0)),
+            "the old view's drop must preserve a new view at its VA"
+        );
+        mapped::forget_exact(bytes.as_ptr(), replacement);
         assert_eq!(lease.slot(), Some(SlotRef::from_wire(43)));
         assert!(lease.is_live());
         lease.owned.release_reservation();

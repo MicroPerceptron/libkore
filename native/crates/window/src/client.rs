@@ -1114,6 +1114,112 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
         })
     }
 
+    /// Read or change preferences on a Settings-authorized pair.
+    pub async fn desktop(
+        &mut self,
+        request: crate::desktop::DesktopRequest,
+    ) -> Result<Response, ClientError> {
+        // Shared uploads must retain their returned owner in `wallpaper`.
+        if matches!(request, crate::desktop::DesktopRequest::CreateWallpaper { .. }) {
+            return Err(ClientError::Protocol);
+        }
+        let reply = self
+            .control
+            .call(&Request::Desktop(request))
+            .await
+            .map_err(|_| ClientError::Transport)?;
+        match reply.response {
+            Response::ControlRefused(reason) => Err(ClientError::Refused(reason)),
+            Response::Surface(SurfaceResponse::Refused { refusal, .. }) => {
+                Err(ClientError::SurfaceRefused(refusal))
+            }
+            response => Ok(response),
+        }
+    }
+
+    /// Upload an output-sized wallpaper through one temporary shared surface.
+    /// Cleanup keeps its exact view and lane in `tombstone` until revocation
+    /// settles; no mapping is reused after an ambiguous response.
+    pub async fn wallpaper(
+        &mut self,
+        width: u16,
+        height: u16,
+        mut pixel: impl FnMut(u32, u32) -> u32,
+    ) -> Result<(), ClientError> {
+        self.retire_tombstone().await?;
+        let mut reply = self
+            .control
+            .call(&Request::Desktop(
+                crate::desktop::DesktopRequest::CreateWallpaper { width, height },
+            ))
+            .await
+            .map_err(|_| ClientError::Transport)?;
+        let (surface, stride, bytes) = match reply.response {
+            Response::Surface(SurfaceResponse::SurfaceMade {
+                surface,
+                stride,
+                bytes,
+            }) => (surface, stride, bytes),
+            Response::ControlRefused(reason) => return Err(ClientError::Refused(reason)),
+            Response::Surface(SurfaceResponse::Refused { refusal, .. }) => {
+                return Err(ClientError::SurfaceRefused(refusal));
+            }
+            _ => return Err(ClientError::Protocol),
+        };
+        self.tombstone = Some(BackingTombstone {
+            surface,
+            owner: reply.retained[0].take().map(CleanupOwner::Returned),
+            destroyed: false,
+            lane: None,
+        });
+        let Some(CleanupOwner::Returned(returned)) =
+            self.tombstone.as_mut().and_then(|t| t.owner.take())
+        else {
+            return Err(ClientError::Protocol);
+        };
+        let view = match returned.try_into_stashed_view(Rights::ACCESS | Rights::MODIFY) {
+            Ok(view) => view,
+            Err(returned) => {
+                self.tombstone.as_mut().unwrap().owner = Some(CleanupOwner::Returned(returned));
+                return Err(ClientError::Protocol);
+            }
+        };
+        self.tombstone.as_mut().unwrap().owner = Some(CleanupOwner::View(view));
+        let lane = self.surface_lanes.claim().ok_or(ClientError::Busy)?;
+        self.tombstone.as_mut().unwrap().lane = Some(lane);
+        let Some(CleanupOwner::View(view)) = self.tombstone.as_ref().and_then(|t| t.owner.as_ref())
+        else {
+            return Err(ClientError::Protocol);
+        };
+        let mapped =
+            verbs::map_stashed_view_surface_lane(view, lane).ok_or(ClientError::Mapping)?;
+        let info = SurfaceInfo::checked(surface, width, height, stride, bytes, mapped.len())?;
+        if mapped.cast::<u8>().as_ptr().addr() % 4 != 0 {
+            return Err(ClientError::Geometry);
+        }
+        for y in 0..u32::from(height) {
+            for x in 0..u32::from(width) {
+                // SAFETY: checked stride and span; this process is the upload's sole
+                // writer, and the compositor reads only after the following call.
+                unsafe {
+                    mapped
+                        .cast::<u32>()
+                        .as_ptr()
+                        .add(y as usize * info.stride / 4 + x as usize)
+                        .write(pixel(x, y));
+                }
+            }
+        }
+        let applied = self
+            .desktop(crate::desktop::DesktopRequest::ApplyWallpaper { surface })
+            .await;
+        let cleanup = self.retire_tombstone().await;
+        match applied? {
+            Response::Accepted => cleanup,
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
     async fn create_backing(&mut self, config: Configure) -> Result<(), ClientError> {
         debug_assert!(self.current.is_none());
         debug_assert!(self.tombstone.is_none());

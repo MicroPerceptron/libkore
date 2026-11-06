@@ -28,7 +28,9 @@ pub enum FsError {
     AccessDenied,
     /// An edge the handle's proof depends on is gone or retired.
     AccessLost,
-    /// The expected revision did not match the current file revision.
+    /// An expectation the caller stated no longer holds: the expected
+    /// revision did not match the current file revision, or a route no
+    /// longer names the directory a view is bound to.
     Conflict,
     /// The operation would have made the containment graph cyclic.
     Cycle,

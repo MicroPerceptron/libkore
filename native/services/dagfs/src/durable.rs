@@ -1509,7 +1509,9 @@ impl MountedFs {
                 };
                 let host_control = matches!(
                     request,
-                    FsRequest::BindView { .. } | FsRequest::GrantView { .. }
+                    FsRequest::BindView { .. }
+                        | FsRequest::GrantView { .. }
+                        | FsRequest::MatchView { .. }
                 );
                 let span = request
                     .needs_window()

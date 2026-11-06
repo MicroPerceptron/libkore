@@ -11,7 +11,7 @@
 //! facilities it names (a headless engine needs the filesystem, heap, engine
 //! plan and channel space a JavaScript application's window does). Which
 //! window — its face and wake topology — is the exact `Window`,
-//! `FilesWindow`, `PowerWindow`, `AcceleratedWindow` or `EngineWindow`
+//! `FilesWindow`, `PowerWindow`, `AcceleratedWindow`, `EngineWindow` or `SettingsWindow`
 //! preset the whole profile matches. A legal superset is a different
 //! profile, not an automatically compatible variant: callers must never infer
 //! window topology by testing a subset of profile bits, and a window profile
@@ -157,6 +157,22 @@ impl AppBundle for PowerWindow {
     const WAKE: WakeTopology = PowerWindow::WAKE;
 }
 
+/// Settings composes storage, metered image decoding, power and a window.
+pub enum SettingsWindow {}
+impl SettingsWindow {
+    pub const PROFILE: u32 = EngineWindow::PROFILE | PROFILE_SYSTEM_POWER;
+    pub const WINDOW_FACE: Option<WindowFace> = FilesWindow::WINDOW_FACE;
+    pub const FILESYSTEM_FACE: Option<FilesystemFace> = FilesWindow::FILESYSTEM_FACE;
+    pub const WAKE: WakeTopology = WakeTopology::SharedWindowService;
+}
+impl sealed::Sealed for SettingsWindow {}
+impl AppBundle for SettingsWindow {
+    const PROFILE: u32 = Self::PROFILE;
+    const WINDOW_FACE: Option<WindowFace> = Self::WINDOW_FACE;
+    const FILESYSTEM_FACE: Option<FilesystemFace> = Self::FILESYSTEM_FACE;
+    const WAKE: WakeTopology = Self::WAKE;
+}
+
 /// A window application composed with one private recyclable accelerator
 /// face. The service and compositor share the process executor's wake root;
 /// accelerator completion channels remain explicit per-client grants.
@@ -223,7 +239,7 @@ impl WindowBundle {
                 face: WindowFace::STANDALONE,
                 wake: WakeTopology::SharedWindowService,
             })
-        } else if profile == FilesWindow::PROFILE {
+        } else if profile == FilesWindow::PROFILE || profile == SettingsWindow::PROFILE {
             Some(Self {
                 profile,
                 face: WindowFace::WITH_FILESYSTEM,
@@ -263,7 +279,7 @@ impl WindowBundle {
 /// closed inert presets; implementation coordinates remain explicitly named.
 pub mod prelude {
     pub use crate::{
-        AcceleratedWindow, Command, EngineWindow, FilesWindow, FsCommand, PowerWindow, Window,
+        AcceleratedWindow, Command, EngineWindow, FilesWindow, FsCommand, PowerWindow, SettingsWindow, Window,
     };
 }
 
@@ -275,6 +291,7 @@ const _: () = {
     assert!(profile_valid(PowerWindow::PROFILE));
     assert!(profile_valid(AcceleratedWindow::PROFILE));
     assert!(profile_valid(EngineWindow::PROFILE));
+    assert!(profile_valid(SettingsWindow::PROFILE));
     // Every window preset declares the window; no command preset does.
     assert!(Command::PROFILE & PROFILE_WINDOW == 0);
     assert!(FsCommand::PROFILE & PROFILE_WINDOW == 0);
@@ -283,6 +300,7 @@ const _: () = {
     assert!(PowerWindow::PROFILE & PROFILE_WINDOW != 0);
     assert!(AcceleratedWindow::PROFILE & PROFILE_WINDOW != 0);
     assert!(EngineWindow::PROFILE & PROFILE_WINDOW != 0);
+    assert!(SettingsWindow::PROFILE & PROFILE_WINDOW != 0);
     assert!(WindowFace::WITH_FILESYSTEM.ring() != FilesystemFace::CANONICAL.control_ring());
     assert!(WindowFace::WITH_FILESYSTEM.ring() != FilesystemFace::CANONICAL.data_window());
     assert!(WindowFace::WITH_FILESYSTEM.request_kick() != FilesystemFace::CANONICAL.request_kick());
@@ -335,6 +353,7 @@ mod tests {
                 assert_eq!(classified.unwrap().wake(), WakeTopology::Window);
             } else if profile == FilesWindow::PROFILE
                 || profile == PowerWindow::PROFILE
+                || profile == SettingsWindow::PROFILE
                 || profile == AcceleratedWindow::PROFILE
                 || profile == EngineWindow::PROFILE
             {
@@ -362,6 +381,7 @@ mod tests {
             Window::PROFILE,
             FilesWindow::PROFILE,
             PowerWindow::PROFILE,
+            SettingsWindow::PROFILE,
             AcceleratedWindow::PROFILE,
             EngineWindow::PROFILE,
         ] {

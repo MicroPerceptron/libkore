@@ -47,5 +47,5 @@ exec_client = true
 # `dagfs_heap_supply_holds_every_session` holds this row to it; the rest is
 # room for the proofs open handles carry, allocated per open at their depth.
 heap_supply_bytes = 0x00D0_0000
-digest_x86_64  = "blake3:8faa0db97b89d58586459e90cebb07c3b660de207242d3fb6cd306b8d4f51b30"
-digest_aarch64 = "blake3:d008d5648dbdc08a000176dd0048215c27a9fd3be9b030348346b6a199cd4140"
+digest_x86_64  = "blake3:2f00411e60e4c43e73c1290e225c8d1908f27e3ff36bf1d3be7709200bb5c454"
+digest_aarch64 = "blake3:d8ce59acf3bdf5bb66912e3be2477c3a1de50c97614f66c83138f3fce1995680"

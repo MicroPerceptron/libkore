@@ -301,6 +301,15 @@ pub enum ClassStage {
 }
 
 impl IntakeError {
+    /// A committed CPU-view refusal has not reached the device-publish step
+    /// of a DMA import. Earlier CPU/sublease owners retain their normal
+    /// retirement path, with no GPU translation to contain. A code-zero map
+    /// fault can mean uncertain transport; all other intake failures remain
+    /// conservatively uncertain here.
+    pub const fn failed_before_device_publish(self) -> bool {
+        matches!(self, Self::DmaMap { code } if code < 0x80 && code & 7 == 4 && code >> 3 >= 1 && code >> 3 <= 6)
+    }
+
     /// Stable, allocation-free hardware diagnostic. Low byte is the intake
     /// class; upper bytes retain the class-specific stage/status detail.
     pub const fn diagnostic_code(self) -> u64 {
@@ -3432,6 +3441,22 @@ fn validate_declaration<B: DeviceBinding>() -> Result<(u8, Option<InterruptBlock
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpu_view_denial_precedes_dma_publication() {
+        assert!(!super::IntakeError::DmaMap {
+            code: kore_rt::cap::verbs::DmaMapFault::Map(0).code(),
+        }.failed_before_device_publish());
+        for status in 1..=6 {
+            assert!(super::IntakeError::DmaMap {
+                code: kore_rt::cap::verbs::DmaMapFault::Map(status).code(),
+            }.failed_before_device_publish());
+            assert!(!super::IntakeError::DmaMap {
+                code: kore_rt::cap::verbs::DmaMapFault::Publish(status).code(),
+            }.failed_before_device_publish());
+        }
+        assert!(!super::IntakeError::DmaUnavailable.failed_before_device_publish());
+    }
+
     #[test]
     fn remote_loan_release_requires_confirmed_retirement_and_preserves_busy_siblings() {
         let arena = test_arena::TestArena::<4096>::new();

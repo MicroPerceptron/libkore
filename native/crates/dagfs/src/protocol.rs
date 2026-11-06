@@ -301,6 +301,15 @@ pub enum FsRequest {
         rights: Rights,
         announced: kore_abi::session::SlotRef,
     },
+    /// Whether `handle` routes to the object the returned view endpoint is
+    /// bound to — a launcher's cwd anchor ([`crate::FS_VIEW_ANCHOR_RIGHTS`]),
+    /// which identifies one of this task's views without conveying it.
+    /// `Done` when it does; `Conflict` when that view is bound elsewhere.
+    /// `announced` is return-post correlation only.
+    MatchView {
+        handle: Handle,
+        announced: kore_abi::session::SlotRef,
+    },
     /// Land one aggregate diagnostic snapshot ([`FsSystemStatusWire`]) in
     /// the caller's data window: the serving frontend's load beside the
     /// storage backend's posture. Any attached session may ask — the record

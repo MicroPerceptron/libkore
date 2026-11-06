@@ -176,6 +176,10 @@ fn every_request() -> Vec<FsRequest> {
             rights: Rights::READ_ONLY,
             announced: SlotRef::from_wire(36),
         },
+        FsRequest::MatchView {
+            handle: h,
+            announced: SlotRef::from_wire(36),
+        },
         FsRequest::AdmitPeer {
             part: PeerBundlePart::Ring,
             announced: SlotRef::from_wire(37),

@@ -4807,7 +4807,15 @@ impl FsReqWire {
     /// refresh replies at once, and the client asks
     /// [`MAINTAIN_STATUS`](Self::MAINTAIN_STATUS) until the phase is idle.
     pub const OP_STOR_MAINTAIN: u8 = 64;
-    pub const OP_MAX: u8 = Self::OP_STOR_MAINTAIN;
+    /// Whether `handle` routes to the very object one returned view endpoint
+    /// is bound to: a launcher's cwd anchor, carrying only REVOKE, so it
+    /// identifies the view without conveying it. Answered `Done` when it
+    /// does; `CONFLICT` when the view is bound to another object, as an
+    /// expectation that no longer holds; `ACCESS_LOST` when the view's own
+    /// route no longer validates. The view must belong to the caller's task.
+    /// `window_offset` is return-post correlation.
+    pub const OP_MATCH_VIEW: u8 = 65;
+    pub const OP_MAX: u8 = Self::OP_MATCH_VIEW;
 
     /// [`OP_STOR_MAINTAIN`](Self::OP_STOR_MAINTAIN): report only.
     pub const MAINTAIN_STATUS: u8 = 0;

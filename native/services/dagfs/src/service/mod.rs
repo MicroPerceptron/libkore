@@ -624,6 +624,28 @@ impl<P: StorageProvider> FsService<P> {
         })
     }
 
+    /// [`FsRequest::MatchView`] once its anchor has authenticated `scope`:
+    /// whether `handle` routes to the object the view bound under `scope` —
+    /// a task's root, or a cwd pinned below it — is rooted at.
+    fn match_view(&self, session: SessionId, handle: Handle, scope: u64) -> FsResponse {
+        let bound = self
+            .invocation_views
+            .iter()
+            .flatten()
+            .find_map(|view| (view.scope == scope).then_some((view.grant, view.task_session)));
+        // A selector this store binds no view under names a directory
+        // elsewhere — another store's, or one since retired — so the route
+        // cannot be naming it: the expectation no longer holds.
+        let Some((view, task)) = bound else {
+            return FsResponse::Refused(FsError::Conflict);
+        };
+        match self.engine.matches_view(session, handle, view, task) {
+            Ok(true) => FsResponse::Done,
+            Ok(false) => FsResponse::Refused(FsError::Conflict),
+            Err(error) => FsResponse::Refused(error),
+        }
+    }
+
     fn register_invocation_view_inner(
         &mut self,
         session: SessionId,
@@ -705,18 +727,24 @@ impl<P: StorageProvider> FsService<P> {
 
     fn reap_dead_invocation_views(&mut self) {
         for slot in 0..self.invocation_views.len() {
+            // Only the kernel can say a canary died. Its binder's revocation
+            // retires an ancestor tag and leaves this held record, scope id
+            // and all, exactly as it was, so reading the record would keep
+            // every dead view registered: its pinned grant held, its table
+            // slot taken, and its scope id answering `AlreadyExists` once the
+            // binder's channel ids come round again.
             let dead = self.invocation_views[slot]
                 .as_ref()
                 .and_then(|view| view.canary.as_ref())
                 .is_some_and(|canary| {
-                    verbs::capability_scope_rid(
-                        canary.slot(),
-                        kore_abi::cap::ResourceKind::ChanSend,
-                        kore_abi::cap::Rights::ACCESS,
-                    )
-                    .is_none()
+                    verbs::probe_chan_send_lineage(canary.slot()) == verbs::ChanLineage::Dead
                 });
-            if dead && let Some(view) = self.invocation_views[slot].take() {
+            if dead && let Some(mut view) = self.invocation_views[slot].take() {
+                // The dead canary's name is released, not dropped: retiring
+                // a revoked lineage settles `AlreadyDead` and frees the slot.
+                if let Some(canary) = view.canary.take() {
+                    let _ = canary.try_retire();
+                }
                 match view.owner {
                     InvocationViewOwner::Pinned { issuer } => {
                         let _ = block_on(self.engine.revoke(issuer, view.grant));
@@ -2544,6 +2572,7 @@ impl<P: StorageProvider> FsService<P> {
             | FsRequest::GrantView { .. }
             | FsRequest::ApplyView { .. }
             | FsRequest::BindView { .. }
+            | FsRequest::MatchView { .. }
             | FsRequest::AdmitPeer { .. }
             | FsRequest::TakeAdmission
             | FsRequest::RetirePeer { .. }
@@ -4372,6 +4401,75 @@ mod recyclable_session_tests {
         let session = SessionId::new(next.slot() as u16);
         assert!(service.engine.open_root(session, Rights::READ).is_ok());
         assert!(service.peer_closed(next.arrival(), PeerClose::Orderly));
+    }
+
+    #[test]
+    fn a_cwd_anchor_matches_its_view_through_renames_and_answers_no_other_task() {
+        let mut service = RamService::default();
+        let task_a = SessionId::new(FIRST_TASK_VIEW_SESSION as u16);
+        let task_b = SessionId::new(FIRST_TASK_VIEW_SESSION as u16 + 1);
+        install_private_task_view(&mut service, 0xA0, task_a, Rights::ALL);
+        install_private_task_view(&mut service, 0xB0, task_b, Rights::ALL);
+        let name = |text| Name::new(text).unwrap();
+
+        // `cd proj` in task A: one command pins the cwd under scope 0xA1.
+        let binder = admit_view(&mut service, 0x102, 0xA0, Rights::ALL);
+        let root = service.engine.open_root(binder, Rights::ALL).unwrap();
+        for directory in ["proj", "work"] {
+            block_on(service.engine.create(binder, root.handle, &name(directory), ObjectKind::Directory))
+                .unwrap();
+        }
+        let proj = service
+            .engine
+            .open_at(binder, root.handle, &name("proj"), Rights::ALL)
+            .unwrap();
+        service
+            .register_invocation_view(binder, proj.handle, Rights::ALL, 0xA1)
+            .unwrap();
+        assert!(service.peer_closed(0x102, PeerClose::Orderly));
+
+        // A later command of the same task walks the remembered route.
+        let command = admit_view(&mut service, 0x103, 0xA0, Rights::ALL);
+        let root = service.engine.open_root(command, Rights::ALL).unwrap();
+        let walk = |service: &RamService, text| {
+            service
+                .engine
+                .open_at(command, root.handle, &name(text), Rights::READ)
+                .unwrap()
+                .handle
+        };
+        assert_eq!(service.match_view(command, walk(&service, "proj"), 0xA1), FsResponse::Done);
+        assert_eq!(service.match_view(command, root.handle, 0xA0), FsResponse::Done);
+        assert_eq!(
+            service.match_view(command, walk(&service, "work"), 0xA1),
+            FsResponse::Refused(FsError::Conflict)
+        );
+
+        // The cwd is renamed, and another directory takes its old name. The
+        // view still holds the same directory, now `old`; the remembered
+        // route names a stranger, and the anchor says so.
+        service.engine.rename(command, root.handle, &name("proj"), &name("old")).unwrap();
+        service.engine.rename(command, root.handle, &name("work"), &name("proj")).unwrap();
+        assert_eq!(
+            service.match_view(command, walk(&service, "proj"), 0xA1),
+            FsResponse::Refused(FsError::Conflict)
+        );
+        assert_eq!(service.match_view(command, walk(&service, "old"), 0xA1), FsResponse::Done);
+        assert_eq!(
+            service.match_view(command, walk(&service, "old"), 0xC0),
+            FsResponse::Refused(FsError::Conflict),
+            "a selector this store binds no view under names nothing here"
+        );
+
+        // Task B's command learns nothing about task A's cwd.
+        let other = admit_view(&mut service, 0x104, 0xB0, Rights::ALL);
+        let other_root = service.engine.open_root(other, Rights::ALL).unwrap();
+        assert_eq!(
+            service.match_view(other, other_root.handle, 0xA1),
+            FsResponse::Refused(FsError::AccessDenied)
+        );
+        assert!(service.peer_closed(0x103, PeerClose::Orderly));
+        assert!(service.peer_closed(0x104, PeerClose::Orderly));
     }
 
     #[test]

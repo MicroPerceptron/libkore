@@ -460,6 +460,27 @@ impl<P: StorageProvider> Engine<P> {
         self.auth.pin_route(session, route, rights)
     }
 
+    /// Whether `handle` routes to the object the view rooted at `view` is
+    /// bound to: a cwd anchor's check that the route a launcher spelled from
+    /// its cwd still names that cwd. The view must be `task`'s own — the
+    /// stable ancestor of the handle's route — so a selector of another
+    /// task's view answers nothing about it. A view whose route no longer
+    /// validates is `AccessLost`, as any handle through a retired edge.
+    pub(crate) fn matches_view(
+        &self,
+        session: SessionId,
+        handle: Handle,
+        view: GrantId,
+        task: SessionId,
+    ) -> FsResult<bool> {
+        let route = self.route(session, handle)?;
+        let (_, ancestor) = self.auth.stable_ancestor(session, route.grant)?;
+        if ancestor != task {
+            return Err(FsError::AccessDenied);
+        }
+        Ok(self.auth.validated_edge(view)?.root() == route.object)
+    }
+
     /// Complete an empty dynamic session with an attenuated descendant of a
     /// pinned structural view.
     pub(crate) fn install_view_root(

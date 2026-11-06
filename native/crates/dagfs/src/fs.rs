@@ -38,7 +38,7 @@ use kore_rt::{
 };
 
 use crate::{
-    DagfsProtocol, FS_GRANT_TARGET_RIGHTS, FsRequest, FsResponse, FsViewCapability, Handle,
+    DagfsProtocol, FS_GRANT_TARGET_RIGHTS, FS_VIEW_ANCHOR_RIGHTS, FsRequest, FsResponse, FsViewCapability, Handle,
     Refusal, RingFs, bounds::MAX_HANDLES_PER_SESSION, process_face,
 };
 
@@ -94,6 +94,10 @@ pub struct Fs<'w, 't> {
     /// endpoint carries REVOKE only, so it cannot be used as a cwd or further
     /// delegated by the command.
     pub(crate) grant_target: Option<HeldChanSendToken>,
+    /// Optional one-shot selector for the launcher's own cwd view, delivered
+    /// with a line whose paths the launcher spelled from that cwd's route
+    /// ([`Fs::confirm_position`]). REVOKE only, like the grant target.
+    pub(crate) view_anchor: Option<HeldChanSendToken>,
     /// This launch's storage ring, when its founding delivered one
     /// ([`role::STOR_RING`] and [`role::STOR_TARGET`]): set up on the first
     /// read that streams through it ([`crate::stor::FacadeRing`]).
@@ -157,6 +161,10 @@ impl<'w, 't> Fs<'w, 't> {
             .bootstrap()
             .handle(role::FS_GRANT_TARGET, 0)
             .and_then(|slot| verbs::take_chan_send(slot, FS_GRANT_TARGET_RIGHTS));
+        let view_anchor = rt
+            .bootstrap()
+            .handle(role::FS_VIEW_ANCHOR, 0)
+            .and_then(|slot| verbs::take_chan_send(slot, FS_VIEW_ANCHOR_RIGHTS));
         let pair = SvcClient::new(
             transport,
             rings,
@@ -211,6 +219,7 @@ impl<'w, 't> Fs<'w, 't> {
             _data_lease: data_lease,
             view_binding,
             grant_target,
+            view_anchor,
             ring,
             ring_files: 0,
             ring_note: "unused",

@@ -44,8 +44,8 @@ use crate::{
 };
 
 pub use crate::{
-    DirEntry, FS_GRANT_TARGET_DELEGATE_RIGHTS, FS_GRANT_TARGET_RIGHTS, FilesystemFace,
-    FsViewCapability,
+    DirEntry, FS_GRANT_TARGET_DELEGATE_RIGHTS, FS_GRANT_TARGET_RIGHTS, FS_VIEW_ANCHOR_RIGHTS,
+    FilesystemFace, FsViewCapability,
 };
 
 /// Bytes written by [`FsRequest::LendVersion`] or
@@ -1114,6 +1114,25 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         let reply = self
             .pair
             .call_with_exact_return(&request, self.return_tx, capability)
+            .await?;
+        self.finish(reply).map_err(ReturnCallError::AfterTransfer)
+    }
+
+    /// Whether `handle` routes to the object the returned `anchor` view is
+    /// bound to ([`FsRequest::MatchView`]): `Done`, or `Refused(Conflict)`
+    /// when that view is bound elsewhere. The anchor is consumed either way.
+    pub async fn match_view<C: ReturnCapability>(
+        &mut self,
+        handle: Handle,
+        anchor: C,
+    ) -> Result<FsResponse, ReturnCallError<C>> {
+        let request = FsRequest::MatchView {
+            handle,
+            announced: self.return_land,
+        };
+        let reply = self
+            .pair
+            .call_with_exact_return(&request, self.return_tx, anchor)
             .await?;
         self.finish(reply).map_err(ReturnCallError::AfterTransfer)
     }

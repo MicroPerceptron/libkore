@@ -70,7 +70,9 @@ mod walk;
 pub mod wire;
 
 #[cfg(feature = "runtime")]
-pub use capability::{FS_GRANT_TARGET_DELEGATE_RIGHTS, FS_GRANT_TARGET_RIGHTS, FsViewCapability};
+pub use capability::{
+    FS_GRANT_TARGET_DELEGATE_RIGHTS, FS_GRANT_TARGET_RIGHTS, FS_VIEW_ANCHOR_RIGHTS, FsViewCapability,
+};
 #[cfg(feature = "runtime")]
 pub use client::{
     FilesystemFace as ClientFace, FsClient, GrantEntry, IdentifyVersionFailure, LentVersion,
@@ -93,7 +95,7 @@ pub use name::Name;
 pub use object::{ANY_REVISION, ObjectId, ObjectKind, ObjectSubtype, Revision, StableObjectId};
 #[cfg(feature = "runtime")]
 pub use protocol::{DagfsProtocol, FsRequest, FsResponse, MaintainAction};
-pub use refusal::{Refusal, Stop, describe};
+pub use refusal::{Refusal, Stop, Unconfirmed, describe};
 #[cfg(feature = "runtime")]
 pub use search::{
     FreshnessPolicy, MAX_SEARCH_PAGE, MAX_SEARCH_SCAN, MAX_SEARCH_SNIPPET, MAX_SEARCH_WORK,

@@ -1203,28 +1203,41 @@ impl Authority {
     ) -> FsResult<(GrantId, SessionId)> {
         route.rights.require(Rights::SHARE)?;
         let delegated = route.rights.attenuate(rights)?;
-        let mut cursor = Some(route.grant);
+        let (grant, holder) = self.stable_ancestor(session, route.grant)?;
+        let edge = self.validated_edge(grant)?;
+        edge.rights().attenuate(delegated)?;
+        edge.quota().attenuate(route.quota)?;
+        drop(edge);
+        let pinned = self.insert_grant(
+            holder,
+            holder,
+            grant,
+            route.object,
+            delegated,
+            route.quota,
+            None,
+        )?;
+        Ok((pinned, holder))
+    }
+
+    /// The nearest edge on `grant`'s validated lineage held by a session
+    /// other than `session`, and its holder: the stable invocation view a
+    /// recyclable process descends from. [`Self::pin_route`] pins beneath
+    /// it, and a cwd anchor is matched against its task by it.
+    pub(crate) fn stable_ancestor(
+        &self,
+        session: SessionId,
+        grant: GrantId,
+    ) -> FsResult<(GrantId, SessionId)> {
+        let mut cursor = Some(grant);
         for _ in 0..MAX_LINEAGE_DEPTH {
             let grant = cursor.ok_or(FsError::AccessDenied)?;
             let edge = self.validated_edge(grant)?;
             let holder = edge.holder();
-            cursor = edge.parent();
-            if holder == session {
-                continue;
+            if holder != session {
+                return Ok((grant, holder));
             }
-            edge.rights().attenuate(delegated)?;
-            edge.quota().attenuate(route.quota)?;
-            drop(edge);
-            let pinned = self.insert_grant(
-                holder,
-                holder,
-                grant,
-                route.object,
-                delegated,
-                route.quota,
-                None,
-            )?;
-            return Ok((pinned, holder));
+            cursor = edge.parent();
         }
         Err(FsError::AccessLost)
     }
