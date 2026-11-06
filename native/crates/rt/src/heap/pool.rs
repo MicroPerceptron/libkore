@@ -9,13 +9,16 @@
 //! # Why power-of-two classes
 //!
 //! Classes are the powers of two from [`MIN_BLOCK`] (16 B) up to
-//! [`LARGE_THRESHOLD`] (8 KiB).  The choice is deliberate: it makes the
+//! [`LARGE_THRESHOLD`] (64 KiB).  The choice is deliberate: it makes the
 //! **alignment contract fall out for free**.  A request folds its size and
 //! its alignment into one figure — `need = max(size, align)` — and the class
-//! is `ceil_pow2(need)`.  Blocks of a class are laid out contiguously from a
-//! class-aligned offset, so every block is `class_size`-aligned; since
-//! `class_size >= need >= align` and both are powers of two, the block is
-//! `align`-aligned by construction (see the `Heap` carve path).  Coarser than
+//! is `ceil_pow2(need)`.  In the shared lane ([`carve_lane`]) blocks of a
+//! class are laid out contiguously from a class-aligned offset, so every block
+//! is `class_size`-aligned; since `class_size >= need >= align` and both are
+//! powers of two, the block is `align`-aligned by construction (see the `Heap`
+//! carve path).  A large class's blocks are page-aligned instead (whole pages
+//! after a header page), and the `Heap` sends a large request aligned past a
+//! page to the huge route, so the contract holds there too.  Coarser than
 //! mimalloc's ~3-bit-mantissa classes — up to 2x internal waste — but the
 //! correctness argument is a one-liner, which is the right trade for a
 //! from-scratch allocator whose first duty is *never hand back a bad pointer*.
@@ -33,11 +36,48 @@ pub(crate) const MIN_BLOCK: usize = 16;
 
 /// The largest segregated class.  A `need` above this is a "huge" request the
 /// `Heap` serves from a dedicated whole-extent allocation, not a free-list.
-pub(crate) const LARGE_THRESHOLD: usize = 8192;
+///
+/// 64 KiB, up from 8 KiB: a huge extent is a mapping's grain (64 KiB) at
+/// the least, so every request between the two cost a whole one — and a
+/// compiler's working set lives there.  Compiling CPython on the host
+/// harness asked 59,024 times for 8–16 KiB, 37,116 for 16–32 KiB and
+/// 16,035 for 32–64 KiB (137 MiB live at their peak), and mapped 364 MiB
+/// for them as huge extents.  As classes they recycle exactly and share
+/// class-sized extents ([`carve_lane`]).
+pub(crate) const LARGE_THRESHOLD: usize = 64 * 1024;
 
 /// Number of segregated size classes — the powers of two in
-/// `[MIN_BLOCK, LARGE_THRESHOLD]`, i.e. `16, 32, …, 8192` (indices `0..=9`).
-pub(crate) const NUM_CLASSES: usize = 10;
+/// `[MIN_BLOCK, LARGE_THRESHOLD]`, i.e. `16, 32, …, 65536` (indices `0..=12`).
+pub(crate) const NUM_CLASSES: usize = 13;
+
+/// The last class that carves from the shard's shared bump extent: 8 KiB.
+/// Classes above it carve from extents of their own ([`carve_lane`]).
+pub(crate) const SHARED_LANE_TOP_CLASS: usize = 9;
+
+/// Carve lanes per shard: the shared one, then one per class above
+/// [`SHARED_LANE_TOP_CLASS`] (16, 32 and 64 KiB).
+pub(crate) const NUM_LANES: usize = NUM_CLASSES - SHARED_LANE_TOP_CLASS;
+
+/// Which of a shard's current extents class `class` carves fresh blocks
+/// from.
+///
+/// Small classes share one bump extent: a 16 B block after a 4 KiB one
+/// costs at most that much alignment padding, and a 64 KiB extent holds
+/// many of either.  A block of 16 KiB and up carved from a shared extent
+/// would pad the cursor to its own size on every alternation with a small
+/// class — up to the block's size lost per carve — and a 64 KiB block does
+/// not fit a 64 KiB extent at all once the header is at its base.  So each
+/// large class carves from extents of its own (`Heap::pool_extent_bytes`):
+/// a header page, then its blocks back to back — one in a shard's first,
+/// twice the last's in each later one, up to eight.
+#[inline]
+pub(crate) const fn carve_lane(class: usize) -> usize {
+    if class <= SHARED_LANE_TOP_CLASS {
+        0
+    } else {
+        class - SHARED_LANE_TOP_CLASS
+    }
+}
 
 // The class table and the huge threshold are one definition, pinned so a later
 // edit to one constant that desyncs the other fails the build, not a test.
@@ -45,6 +85,8 @@ const _: () = {
     assert!(MIN_BLOCK << (NUM_CLASSES - 1) == LARGE_THRESHOLD);
     assert!(MIN_BLOCK.is_power_of_two());
     assert!(LARGE_THRESHOLD.is_power_of_two());
+    assert!(MIN_BLOCK << SHARED_LANE_TOP_CLASS == 8192);
+    assert!(NUM_LANES == 4);
 };
 
 /// Round `x` up to a multiple of `align` (a power of two).  The workhorse for
@@ -81,12 +123,12 @@ pub(crate) const fn is_huge(need: usize) -> bool {
 ///
 /// Caller guarantees `!is_huge(need)`; the result is in `0..NUM_CLASSES` and
 /// [`class_size`] of it is `>= need`.  `need = 1..16 → 0`, `17..32 → 1`, …,
-/// `4097..8192 → 9`.
+/// `32769..65536 → 12`.
 #[inline]
 pub(crate) fn class_index(need: usize) -> usize {
     debug_assert!(!is_huge(need));
     let block = need.max(MIN_BLOCK).next_power_of_two();
-    // `block` is a power of two in `[16, 8192]`, so `trailing_zeros` is its
+    // `block` is a power of two in `[16, 65536]`, so `trailing_zeros` is its
     // log2; subtract log2(MIN_BLOCK)=4 to index from the first class.
     (block.trailing_zeros() - MIN_BLOCK.trailing_zeros()) as usize
 }
@@ -188,7 +230,9 @@ mod tests {
     #[test]
     fn class_size_always_covers_the_request() {
         // The core allocator guarantee: the served block is ≥ the ask.
-        for need in [1usize, 8, 15, 16, 31, 33, 100, 1000, 4096, 8191, 8192] {
+        for need in [
+            1usize, 8, 15, 16, 31, 33, 100, 1000, 4096, 8191, 8192, 8193, 16384, 40_000, 65536,
+        ] {
             let sz = class_size(class_index(need));
             assert!(sz >= need, "class {sz} must cover need {need}");
             assert!(sz.is_power_of_two());

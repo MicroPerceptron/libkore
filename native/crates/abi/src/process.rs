@@ -23,7 +23,7 @@
 //! bounded grace before it revokes the task; a child that never reads its
 //! input simply meets the revoke (`res/LIFECYCLE_HARDENING.md` §3).
 
-use zerocopy::byteorder::little_endian::{U16, U32};
+use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Boot-role used by the generic process-I/O view.
@@ -130,12 +130,60 @@ pub const PROCESS_STDIO_TO_PARENT_SEQUENCE_OFFSET: usize =
 /// [`PROCESS_STDIO_TO_PARENT_SEQUENCE_OFFSET`]. The child sends on the
 /// output-wake channel only after atomically observing this as set.
 pub const PROCESS_STDIO_PARENT_WAITING_OFFSET: usize = PROCESS_STDIO_TO_PARENT_SEQUENCE_OFFSET + 4;
+/// The stream's **profile**: one little-endian `u32` of launcher-declared
+/// facts about the stream's far end, on a line of its own. The launcher writes
+/// it while it formats the page, before the child's view is conveyed, and
+/// neither side writes it again, so a child reads it once at attach. Bits
+/// this ABI does not define are written zero and read as absent.
+pub const PROCESS_STDIO_PROFILE_OFFSET: usize = PROCESS_STDIO_TO_PARENT_SEQUENCE_OFFSET + 64;
+/// Profile bit: the far end is a **terminal**. The launcher answers each
+/// `InputReady` with a line its terminal edited and echoed, and renders
+/// output through a terminal that decodes ANSI escape sequences (kore's
+/// shell profile, `crates/terminal`). A launcher that captures or replays
+/// the stream — a tool worker, a boot witness — leaves it clear, so a
+/// program that asks whether its standard streams are a terminal (`isatty`)
+/// is told the truth either way.
+pub const PROCESS_STDIO_PROFILE_TERMINAL: u32 = 1 << 0;
+/// Every profile bit this ABI defines.
+pub const PROCESS_STDIO_PROFILE_DEFINED: u32 = PROCESS_STDIO_PROFILE_TERMINAL;
 /// End of the live process-stream layout. Each directional coordination tuple
 /// occupies a complete 64-byte line, so the two hot publication sequences do
 /// not share a line. The opposite-writer waiting flag intentionally joins its
-/// sequence and is touched only across park transitions. The rest of the page
-/// is reserved and zeroed when the launcher formats it.
-pub const PROCESS_STDIO_LAYOUT_BYTES: usize = PROCESS_STDIO_TO_PARENT_SEQUENCE_OFFSET + 64;
+/// sequence and is touched only across park transitions; the profile follows
+/// on its own line.
+/// Binary output uses the same shared page and wake protocol as text. Two
+/// 512-byte records plus the SPSC header fit in the previously reserved tail.
+pub const PROCESS_BULK_OFFSET: usize = PROCESS_STDIO_PROFILE_OFFSET + 64;
+pub const PROCESS_BULK_CAPACITY: u32 = 2;
+pub const PROCESS_BULK_PAYLOAD: usize = 512 - 16;
+pub const PROCESS_BULK_RING_BYTES: usize = 192 + PROCESS_BULK_CAPACITY as usize * 512;
+pub const PROCESS_STDIO_LAYOUT_BYTES: usize = PROCESS_BULK_OFFSET + PROCESS_BULK_RING_BYTES;
+
+/// Bounded binary fragment, interpreted only by a consumer that requested it.
+/// Offsets and tags correlate fragments; no pointers or authority cross here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+pub struct ProcessBulkChunk {
+    pub tag: U64,
+    pub offset: U32,
+    len: U16,
+    reserved: U16,
+    payload: [u8; PROCESS_BULK_PAYLOAD],
+}
+impl ProcessBulkChunk {
+    pub fn new(tag: u64, offset: u32, bytes: &[u8]) -> Result<Self, ProcessStreamError> {
+        if bytes.is_empty() || bytes.len() > PROCESS_BULK_PAYLOAD { return Err(ProcessStreamError::Invalid); }
+        let mut record = Self { tag: U64::new(tag), offset: U32::new(offset), len: U16::new(bytes.len() as u16),
+            reserved: U16::new(0), payload: [0; PROCESS_BULK_PAYLOAD] };
+        record.payload[..bytes.len()].copy_from_slice(bytes);
+        Ok(record)
+    }
+    pub fn bytes(&self) -> Result<&[u8], ProcessStreamError> {
+        let len = usize::from(self.len.get());
+        if self.reserved.get() != 0 || len == 0 || len > self.payload.len() { return Err(ProcessStreamError::Invalid); }
+        Ok(&self.payload[..len])
+    }
+}
 
 /// Maximum bytes carried by one input record.
 pub const PROCESS_STDIN_CHUNK_BYTES: usize = 24;
@@ -424,6 +472,9 @@ const _: () = {
     assert!(core::mem::align_of::<ProcessInputChunk>() == 1);
     assert!(core::mem::size_of::<ProcessOutputEvent>() == 32);
     assert!(core::mem::align_of::<ProcessOutputEvent>() == 1);
+    assert!(core::mem::size_of::<ProcessBulkChunk>() == 512);
+    assert!(core::mem::align_of::<ProcessBulkChunk>() == 1);
+    assert!(PROCESS_BULK_OFFSET % 64 == 0);
     assert!(PROCESS_STDIN_RING_OFFSET % 64 == 0);
     assert!(PROCESS_OUTPUT_RING_OFFSET % 64 == 0);
     assert!(PROCESS_STDIO_TO_CHILD_SEQUENCE_OFFSET % 64 == 0);
@@ -456,21 +507,17 @@ pub const PROCESS_ARG_BYTES: usize = 272;
 /// the payload at opposite sides of the task-lifecycle handoff; they are never
 /// simultaneously live.
 ///
-/// So this bound is policy, not geometry: the shared payload is
-/// [`PROCESS_OUTPUT_BYTES`] wide, and a context may use any of it without
-/// growing the page or touching the wire. What sets the number is the
-/// largest context anyone builds, which is the bootstrap command catalogue
-/// `help` reads — [`MAX_COMMAND_SNAPSHOT_ENTRIES`](crate::command::MAX_COMMAND_SNAPSHOT_ENTRIES)
-/// rows of name, usage and summary plus four framing bytes each. The
-/// catalogue has 40 rows, including the delegated Lua worker. Its complete
-/// snapshot no longer fits 2560 bytes. 3072 carries the current catalogue
-/// and remains within the existing 3208-byte alternating payload; no page
-/// layout or command-output capacity changes.
-pub const PROCESS_CONTEXT_BYTES: usize = 3072;
-const _: () = assert!(
-    PROCESS_CONTEXT_BYTES <= PROCESS_OUTPUT_BYTES,
-    "context borrows the output payload and cannot outgrow it"
-);
+/// So the bound is that payload, [`PROCESS_OUTPUT_BYTES`] wide: a context may
+/// use all of it without growing the page or touching the wire. The largest
+/// context anyone builds is the bootstrap command catalogue `help` reads —
+/// [`MAX_COMMAND_SNAPSHOT_ENTRIES`](crate::command::MAX_COMMAND_SNAPSHOT_ENTRIES)
+/// rows of name, usage and summary plus four framing bytes each. Its
+/// complete snapshot outgrew 2560 bytes at 40 rows, and with the DagFS
+/// verbs' usage lines naming their options it needs 3087 at 45, past the
+/// 3072 that followed. A bound below the payload only leaves a round number
+/// to outgrow. Widening it moves no offset and gives no byte a new meaning,
+/// so the process ABI keeps its version.
+pub const PROCESS_CONTEXT_BYTES: usize = PROCESS_OUTPUT_BYTES;
 /// Header bytes before the argument and alternating payload arrays: 8 fixed
 /// (`abi`/`flags`/`arg_len`/`output_len`) + the embedded [`TelemetrySnapshot`]
 /// (240 — the IOMMU and timer censuses plus the manifold's own state) + the launcher's
@@ -883,7 +930,11 @@ mod tests {
         assert_eq!(PROCESS_STDIO_CHILD_WAITING_OFFSET, 2436);
         assert_eq!(PROCESS_STDIO_TO_PARENT_SEQUENCE_OFFSET, 2496);
         assert_eq!(PROCESS_STDIO_PARENT_WAITING_OFFSET, 2500);
-        assert_eq!(PROCESS_STDIO_LAYOUT_BYTES, 2560);
+        assert_eq!(PROCESS_STDIO_PROFILE_OFFSET, 2560);
+        assert_eq!(PROCESS_STDIO_PROFILE_TERMINAL, 1);
+        assert_eq!(PROCESS_STDIO_PROFILE_DEFINED, PROCESS_STDIO_PROFILE_TERMINAL);
+        assert_eq!(PROCESS_STDIO_LAYOUT_BYTES, 3840);
+        assert!(PROCESS_STDIO_LAYOUT_BYTES <= PROCESS_STDIO_BYTES);
         assert_eq!(core::mem::size_of::<ProcessInputChunk>(), 32);
         assert_eq!(core::mem::size_of::<ProcessOutputEvent>(), 32);
 

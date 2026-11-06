@@ -24,6 +24,8 @@
 //! | `OpenGrant` | — | grant id | — | — | — |
 //! | `Close`/`Stat`/`Sync` | object | — | — | — | — |
 //! | `List` | directory | — | — | cursor | — |
+//! | `Parents` | object | — | — | cursor | — |
+//! | `Locate` | anchor | stable identity | — | — | — |
 //! | `Create` | parent | — | — | — | `name` |
 //! | `Read` | file | — | file offset | length | — |
 //! | `WriteAt` | file | — | file offset | length | — |
@@ -53,6 +55,7 @@ use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use crate::{
     AuthorityQuota, FsError, FsRequest, FsResponse, GrantId, Handle, Name, ObjectId, ObjectKind,
     ProviderError, Rights, SearchCursor, SearchQuery, SessionId, bounds::MAX_NAME_LEN,
+    protocol::MaintainAction,
 };
 
 /// The engine's inline name bound and the wire's name field must agree, or a
@@ -226,6 +229,26 @@ pub fn encode_req(req: &FsRequest) -> FsReqWire {
             w.op = FsReqWire::OP_LIST;
             w.handle = U64::new(handle.to_bits());
             w.length = U32::new(cursor);
+            w.window_offset = U32::new(window_offset);
+        }
+        FsRequest::Parents {
+            handle,
+            cursor,
+            window_offset,
+        } => {
+            w.op = FsReqWire::OP_PARENTS;
+            w.handle = U64::new(handle.to_bits());
+            w.length = U32::new(cursor);
+            w.window_offset = U32::new(window_offset);
+        }
+        FsRequest::Locate {
+            handle,
+            stable,
+            window_offset,
+        } => {
+            w.op = FsReqWire::OP_LOCATE;
+            w.handle = U64::new(handle.to_bits());
+            w.handle2 = U64::new(stable.get());
             w.window_offset = U32::new(window_offset);
         }
         FsRequest::ListGrants { window_offset } => {
@@ -552,6 +575,11 @@ pub fn encode_req(req: &FsRequest) -> FsReqWire {
             w.rights = rights.bits();
             w.window_offset = U32::new(announced.index());
         }
+        FsRequest::MatchView { handle, announced } => {
+            w.op = FsReqWire::OP_MATCH_VIEW;
+            w.handle = U64::new(handle.to_bits());
+            w.window_offset = U32::new(announced.index());
+        }
         FsRequest::AdmitPeer { part, announced } => {
             w.op = FsReqWire::OP_ADMIT_PEER;
             w.kind = peer_part_code(part);
@@ -598,6 +626,24 @@ pub fn encode_req(req: &FsRequest) -> FsReqWire {
         }
         FsRequest::StorInspect => {
             w.op = FsReqWire::OP_STOR_INSPECT;
+        }
+        FsRequest::StorMaintain {
+            action,
+            window_offset,
+        } => {
+            w.op = FsReqWire::OP_STOR_MAINTAIN;
+            w.window_offset = U32::new(window_offset);
+            w.kind = match action {
+                MaintainAction::Status => FsReqWire::MAINTAIN_STATUS,
+                MaintainAction::Scan => FsReqWire::MAINTAIN_SCAN,
+                MaintainAction::RefreshStale => FsReqWire::MAINTAIN_REFRESH_STALE,
+                MaintainAction::RefreshRange { first, count } => {
+                    w.handle = U64::new(u64::from(first));
+                    w.handle2 = U64::new(u64::from(count));
+                    FsReqWire::MAINTAIN_REFRESH_RANGE
+                }
+                MaintainAction::Cancel => FsReqWire::MAINTAIN_CANCEL,
+            };
         }
     }
     w
@@ -666,6 +712,7 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
             | FsReqWire::OP_SEARCH
             | FsReqWire::OP_DEFER_COMMITS
             | FsReqWire::OP_SET_SYSTEM_SEED
+            | FsReqWire::OP_STOR_MAINTAIN
     ) && w.kind != 0
     {
         return None;
@@ -689,6 +736,40 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
             cursor: w.length.get(),
             window_offset: w.window_offset.get(),
         },
+        // Exactly `List`'s operands — handle, cursor, window — and nothing
+        // else: an operand this verb does not read is refused, not ignored.
+        FsReqWire::OP_PARENTS => {
+            if w.handle2.get() != 0
+                || w.offset.get() != 0
+                || w.expected_revision.get() != 0
+                || w.session.get() != 0
+                || !names_are_empty(w)
+            {
+                return None;
+            }
+            FsRequest::Parents {
+                handle,
+                cursor: w.length.get(),
+                window_offset: w.window_offset.get(),
+            }
+        }
+        // The anchor, the identity and the window: nothing else. A zero
+        // identity is no object, refused rather than searched for.
+        FsReqWire::OP_LOCATE => {
+            if w.length.get() != 0
+                || w.offset.get() != 0
+                || w.expected_revision.get() != 0
+                || w.session.get() != 0
+                || !names_are_empty(w)
+            {
+                return None;
+            }
+            FsRequest::Locate {
+                handle,
+                stable: crate::StableObjectId::new(w.handle2.get())?,
+                window_offset: w.window_offset.get(),
+            }
+        }
         FsReqWire::OP_LIST_GRANTS => FsRequest::ListGrants {
             window_offset: w.window_offset.get(),
         },
@@ -967,6 +1048,16 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
                 announced: SlotRef::from_wire(w.window_offset.get()),
             }
         }
+        FsReqWire::OP_MATCH_VIEW => {
+            // Not a rights verb: a set mask already refused above.
+            if w.kind != 0 || !control_payload_except_handle_is_empty(w) {
+                return None;
+            }
+            FsRequest::MatchView {
+                handle,
+                announced: SlotRef::from_wire(w.window_offset.get()),
+            }
+        }
         FsReqWire::OP_ADMIT_PEER => {
             if !control_payload_is_empty(w) {
                 return None;
@@ -1011,6 +1102,34 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
                 FsReqWire::OP_STOR_KICK => FsRequest::StorKick,
                 FsReqWire::OP_STOR_INSPECT => FsRequest::StorInspect,
                 _ => FsRequest::StorDetach,
+            }
+        }
+        FsReqWire::OP_STOR_MAINTAIN => {
+            // Only a forced refresh carries operands: its first bucket and
+            // count. Every other action rides `kind` alone.
+            if w.offset.get() != 0
+                || w.expected_revision.get() != 0
+                || w.length.get() != 0
+                || !names_are_empty(w)
+            {
+                return None;
+            }
+            let (first, count) = (w.handle.get(), w.handle2.get());
+            let action = match w.kind {
+                FsReqWire::MAINTAIN_REFRESH_RANGE => MaintainAction::RefreshRange {
+                    first: u32::try_from(first).ok()?,
+                    count: u32::try_from(count).ok()?,
+                },
+                _ if first != 0 || count != 0 => return None,
+                FsReqWire::MAINTAIN_STATUS => MaintainAction::Status,
+                FsReqWire::MAINTAIN_SCAN => MaintainAction::Scan,
+                FsReqWire::MAINTAIN_REFRESH_STALE => MaintainAction::RefreshStale,
+                FsReqWire::MAINTAIN_CANCEL => MaintainAction::Cancel,
+                _ => return None,
+            };
+            FsRequest::StorMaintain {
+                action,
+                window_offset: w.window_offset.get(),
             }
         }
         FsReqWire::OP_STOR_GRANT_VERSION => {
@@ -1066,6 +1185,12 @@ fn blank_rep() -> FsRepWire {
     }
 }
 
+/// The wire status for a refusal. Public as the frozen numeric vocabulary a
+/// startup witness also prints (`kore-svc-dagfs`'s recovery refusal).
+pub fn fs_status_code(err: FsError) -> u8 {
+    status_of(err)
+}
+
 /// The wire status for a refusal.
 fn status_of(err: FsError) -> u8 {
     match err {
@@ -1100,7 +1225,7 @@ fn status_of(err: FsError) -> u8 {
 /// A provider failure's cause, as the refusal's `kind` byte carries it.
 /// Frozen: append, never renumber. Zero is no cause, from an encoder that
 /// predates the byte, and decodes as [`ProviderError::Media`].
-fn provider_code(error: ProviderError) -> u8 {
+pub fn provider_code(error: ProviderError) -> u8 {
     match error {
         ProviderError::Exhausted => 1,
         ProviderError::PlacementsFull => 2,
@@ -1263,7 +1388,7 @@ pub fn encode_rep(rep: &FsResponse, grants: u8) -> FsRepWire {
             w.status = FsRepWire::STATUS_OK;
             w.count = U32::new(entries);
         }
-        FsResponse::SystemStatusReported { len } => {
+        FsResponse::SystemStatusReported { len } | FsResponse::StorMaintained { len } => {
             w.status = FsRepWire::STATUS_OK;
             w.count = U32::new(len);
         }
@@ -1448,7 +1573,13 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
     }
 
     // Only a listing may set flags, and `FLAG_MORE` is the only defined bit.
-    let listing = matches!(request, FsRequest::List { .. } | FsRequest::Search { .. });
+    let listing = matches!(
+        request,
+        FsRequest::List { .. }
+            | FsRequest::Parents { .. }
+            | FsRequest::Locate { .. }
+            | FsRequest::Search { .. }
+    );
     if w.flags & !FsRepWire::FLAG_MORE != 0 {
         return None;
     }
@@ -1478,7 +1609,7 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
             links: w.count.get(),
             grants: w.cursor.get(),
         },
-        FsRequest::List { .. } => FsResponse::Listed {
+        FsRequest::List { .. } | FsRequest::Parents { .. } | FsRequest::Locate { .. } => FsResponse::Listed {
             entries: w.count.get(),
             next: if w.flags & FsRepWire::FLAG_MORE != 0 {
                 Some(w.cursor.get())
@@ -1495,6 +1626,7 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
             entries: w.count.get(),
         },
         FsRequest::SystemStatus { .. } => FsResponse::SystemStatusReported { len: w.count.get() },
+        FsRequest::StorMaintain { .. } => FsResponse::StorMaintained { len: w.count.get() },
         FsRequest::Read { .. } | FsRequest::ReadVersion { .. } => FsResponse::Transferred {
             count: w.count.get(),
         },
@@ -1596,6 +1728,7 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         | FsRequest::RegisterPrivateView { .. }
         | FsRequest::ApplyView { .. }
         | FsRequest::BindView { .. }
+        | FsRequest::MatchView { .. }
         | FsRequest::Close { .. }
         | FsRequest::Rename { .. }
         | FsRequest::Relocate { .. }
@@ -1698,7 +1831,9 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
         | FsRequest::OpenGrant { .. }
         | FsRequest::Create { .. } => matches!(response, FsResponse::Opened { .. }),
         FsRequest::Stat { .. } => matches!(response, FsResponse::Stat { .. }),
-        FsRequest::List { .. } => matches!(response, FsResponse::Listed { .. }),
+        FsRequest::List { .. } | FsRequest::Parents { .. } | FsRequest::Locate { .. } => {
+            matches!(response, FsResponse::Listed { .. })
+        }
         FsRequest::ListGrants { .. } => matches!(response, FsResponse::GrantsListed { .. }),
         FsRequest::SystemStatus { .. } => {
             matches!(response, FsResponse::SystemStatusReported { .. })
@@ -1727,10 +1862,12 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
         }
         FsRequest::StorTarget { .. } => matches!(response, FsResponse::StorTargetAdopted { .. }),
         FsRequest::StorInspect => matches!(response, FsResponse::StorInspected { .. }),
+        FsRequest::StorMaintain { .. } => matches!(response, FsResponse::StorMaintained { .. }),
         FsRequest::RegisterSystemView { .. }
         | FsRequest::RegisterPrivateView { .. }
         | FsRequest::ApplyView { .. }
         | FsRequest::BindView { .. }
+        | FsRequest::MatchView { .. }
         | FsRequest::Close { .. }
         | FsRequest::Rename { .. }
         | FsRequest::Relocate { .. }
@@ -1853,6 +1990,82 @@ mod tests {
         let mut wide = encode_rep(&FsResponse::StorGranted { grant: 1, bytes: 1 }, 0);
         wide.handle = U64::new(1 << 32);
         assert_eq!(decode_rep_for(&FsRequest::StorGrantPack, &wide), None);
+    }
+
+    /// `Locate` carries its anchor, the identity and the window, and
+    /// nothing else; a zero identity is no object and is refused.
+    #[test]
+    fn locate_round_trips_and_refuses_stray_operands() {
+        let request = FsRequest::Locate {
+            handle: Handle::from_bits(7),
+            stable: crate::StableObjectId::new(0x2a).unwrap(),
+            window_offset: 64,
+        };
+        let wire = encode_req(&request);
+        assert_eq!(decode_req(&wire), Some(request));
+        let reply = FsResponse::Listed {
+            entries: 1,
+            next: None,
+        };
+        assert!(reply_matches(&request, &reply));
+        assert_eq!(decode_rep_for(&request, &encode_rep(&reply, 0)), Some((reply, 0)));
+        let mut zero = wire;
+        zero.handle2 = U64::new(0);
+        assert_eq!(decode_req(&zero), None);
+        let mut stray = wire;
+        stray.length = U32::new(1);
+        assert_eq!(decode_req(&stray), None);
+        let mut stray = wire;
+        stray.offset = U64::new(1);
+        assert_eq!(decode_req(&stray), None);
+    }
+
+    /// Every maintenance action survives the wire; only a forced refresh
+    /// carries operands, and an operand on any other action — or a range
+    /// past `u32` — is refused.
+    #[test]
+    fn stor_maintain_round_trips_and_refuses_stray_operands() {
+        for action in [
+            MaintainAction::Status,
+            MaintainAction::Scan,
+            MaintainAction::RefreshStale,
+            MaintainAction::RefreshRange { first: 7, count: u32::MAX },
+            MaintainAction::Cancel,
+        ] {
+            let req = FsRequest::StorMaintain {
+                action,
+                window_offset: 512,
+            };
+            assert!(req.needs_window());
+            assert_eq!(decode_req(&encode_req(&req)), Some(req));
+            let reply = FsResponse::StorMaintained { len: 100 + 8 * 1024 };
+            assert!(reply_matches(&req, &reply));
+            assert_eq!(decode_rep_for(&req, &encode_rep(&reply, 0)), Some((reply, 0)));
+        }
+        let mut stray = encode_req(&FsRequest::StorMaintain {
+            action: MaintainAction::Scan,
+            window_offset: 0,
+        });
+        stray.handle = U64::new(1);
+        assert_eq!(decode_req(&stray), None);
+        let mut wide = encode_req(&FsRequest::StorMaintain {
+            action: MaintainAction::RefreshRange { first: 0, count: 1 },
+            window_offset: 0,
+        });
+        wide.handle2 = U64::new(1 << 32);
+        assert_eq!(decode_req(&wide), None);
+        let mut unknown = encode_req(&FsRequest::StorMaintain {
+            action: MaintainAction::Status,
+            window_offset: 0,
+        });
+        unknown.kind = 5;
+        assert_eq!(decode_req(&unknown), None);
+        let mut length = encode_req(&FsRequest::StorMaintain {
+            action: MaintainAction::Status,
+            window_offset: 0,
+        });
+        length.length = U32::new(1);
+        assert_eq!(decode_req(&length), None);
     }
 
     /// The pack lane's retired op codes decode to nothing: a peer still

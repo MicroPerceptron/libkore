@@ -3,11 +3,18 @@
 #![no_std]
 
 pub mod appearance;
+pub mod capture;
 #[cfg(feature = "runtime")]
 pub mod channel;
 #[cfg(feature = "runtime")]
 pub mod client;
 pub mod command;
+pub mod cursor;
+pub mod desktop;
+pub mod document;
+pub mod menu;
+pub mod notify;
+pub mod pick;
 #[cfg(feature = "runtime")]
 pub mod configure;
 #[cfg(feature = "runtime")]
@@ -24,6 +31,8 @@ pub mod wire;
 /// Six windows fit the retained chrome scene and two buffers each fit the
 /// sixteen-slot surface engine. Controllers reserve separate serving peers.
 pub const BOOTSTRAP_WINDOW_SLOTS: usize = kore_abi::task::DESKTOP_BOOTSTRAP_WINDOW_SLOTS;
+/// Dock entries in one published desktop catalogue, including the terminal.
+pub const MAX_DOCK_ITEMS: usize = 9;
 
 /// Bounded number of in-flight surface commits.
 #[cfg(feature = "runtime")]

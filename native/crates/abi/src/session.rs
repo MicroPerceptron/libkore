@@ -233,7 +233,8 @@ pub const DERIVE_KIND_I2C_HID_RECORD: u8 = 0xf3;
 
 /// `Derive × PhysRegion` lifecycle observation for MM supply accounting.
 /// The operation writes one bind-inert [`SupplyReleaseReport`] for a returned
-/// tracked supply, or refuses when no completed return is pending.
+/// tracked supply, or refuses with [`Status::WouldBlock`] when no completed
+/// return is pending on the named lane — a poll's ordinary miss, not a fault.
 ///
 /// `0xf2` is the next unused high flavor below
 /// [`DERIVE_KIND_I2C_HID_RECORD`].
@@ -858,6 +859,131 @@ impl ProtectReq {
     pub const WIRE: usize = 24;
 }
 
+/// `Derive × AddrSpace` (the caller's **own** space, verified by
+/// page-table root exactly as [`DERIVE_KIND_SET_TP`] is) that **sets the
+/// calling thread's fault upcall** to [`FaultUpcallReq`] — the delivery a
+/// runtime with its own trap handling (a wasm engine's guard regions,
+/// `res/WASM_PLATFORM.md` §12) needs, the way a POSIX runtime needs
+/// `sigaction` and `sigaltstack`.  An *effect*, not a derivation: it mints
+/// no child and the result slot stays vacant.  `MODIFY` on the space
+/// authorizes it, the write projection `SET_TP` takes.
+///
+/// **Delivery.**  A synchronous user fault the kernel would otherwise end
+/// the process for — after the pager has refused it — is delivered to the
+/// thread that raised it, unless that thread is already on its upcall
+/// stack.  The kernel keeps the fault's record and returns to user mode at
+/// `entry`, with the stack pointer at `stack_hi` and the C ABI's first
+/// five argument registers holding [`UPCALL_ARGS`]: the faulting `pc`, the
+/// frame pointer at the fault, whether the fault names an address, the
+/// address, and its [`FaultKind`](crate::crash::FaultKind).  Every other
+/// register holds what it held at the fault.  An extended-state refusal is
+/// the kernel's own policy and is never delivered.
+///
+/// **In an upcall exactly while on its stack.**  The kernel keeps no upcall
+/// state: the handler leaves `[stack_lo, stack_hi]` when it resumes the
+/// faulting code's recovery path, and stays on it when it gives up.  The
+/// top is on it: the delivery leaves the stack pointer there, and a
+/// trampoline whose handler returned reaches its decline with it there
+/// again.  So a fault raised with the stack pointer in that range ends the
+/// process:
+///
+/// - at `decline`, the handler's trap instruction for "not mine", the
+///   record reported is the fault the upcall was given, flagged
+///   [`UPCALL_DECLINED`](crate::crash::CaptureFlags::UPCALL_DECLINED);
+/// - anywhere else, the nested fault itself, flagged
+///   [`IN_UPCALL`](crate::crash::CaptureFlags::IN_UPCALL) with the
+///   upcall's fault's `pc` beside it.
+///
+/// A zero `entry` clears the thread's upcall.  The kernel reads and writes
+/// no user memory to deliver one.
+///
+/// `0xdb` is the next unused selector below [`DERIVE_KIND_WAKE_WORD`];
+/// distinct from every other `AddrSpace`-subject flavor (`SET_TP` =
+/// `0xfd`, `PROTECT` = `0xfa`, `ARENA_EXTEND` = `0xf7`).
+pub const DERIVE_KIND_FAULT_UPCALL: u8 = 0xdb;
+
+/// How many argument registers an upcall's entry receives
+/// ([`DERIVE_KIND_FAULT_UPCALL`]): `pc`, frame pointer, has-address,
+/// address, kind — `rdi`..`r8` on x86-64, `x0`..`x4` on AArch64, `a0`..`a4`
+/// on RISC-V.
+pub const UPCALL_ARGS: usize = 5;
+
+/// Argument payload for the [`DERIVE_KIND_FAULT_UPCALL`] flavor.  LE,
+/// unaligned-safe, 32 bytes.
+///
+/// All four addresses are user-half — below the kernel half's first
+/// address, so canonical in the active paging model — `stack_hi` too,
+/// since a delivery returns to user mode with the stack pointer there.
+/// `stack_lo < stack_hi`, both 16-byte aligned; the range includes any
+/// guard pages below the usable stack, so a handler that overflows its
+/// stack is still inside it.  `entry == 0` clears the upcall, and then the
+/// other three fields must be zero too.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, TryFromBytes, KnownLayout, Immutable, Unaligned)]
+pub struct FaultUpcallReq {
+    /// Where a delivered fault resumes the thread.
+    pub entry: U64,
+    /// The handler's "not mine" trap instruction.
+    pub decline: U64,
+    /// The lowest byte of the upcall stack, guard pages included.
+    pub stack_lo: U64,
+    /// One past the highest byte: the stack pointer a delivery sets.
+    pub stack_hi: U64,
+}
+
+impl FaultUpcallReq {
+    /// Wire size.
+    pub const WIRE: usize = 32;
+}
+
+/// `Derive × MemLease` **reservation release**: remove from the caller's own
+/// `RESERVE` window (`geom::RESERVE`) every page this lessor committed there
+/// — the views its carves were mapped as with
+/// [`ViewMapWindow::Reserve`] — inside the page range a
+/// [`ReserveReleaseReq`] names.  The teardown half of a runtime's own
+/// reservations: a wasm memory dropped, its committed pages unmapped in one
+/// session.
+///
+/// `MODIFY` on the subject: the release mutates the lease's record of where
+/// its pages are mapped, as the grant return does.  Only the subject's own
+/// pages (and those of lessors carved beneath it) in the caller's own space
+/// are touched — another supply's, a region's, and every other space's stay
+/// where they are — and only whole commits: a commit that straddles the
+/// range's edge refuses the release ([`Status::Malformed`]) before any page
+/// is touched.  Only bind-inert pages, too: a page in the range that a view
+/// capability names is that capability's to unmap, and refuses the release
+/// ([`Status::Denied`]) as whole.  A supply that is closing refuses
+/// ([`Status::Revoked`]): its teardown is removing the pages.  The pages
+/// stay spent, as every view's are under the supply's monotone cursors.
+///
+/// A post-commit effect, and the session's only invocation: the unmap cannot
+/// be undone, so it runs once nothing else can refuse.  The result slot is
+/// untouched.
+///
+/// `0xda` is the next unused selector below [`DERIVE_KIND_FAULT_UPCALL`];
+/// distinct from every other flavor a `MemLease` subject takes
+/// ([`DERIVE_KIND_WAKE_WORD`], [`DERIVE_KIND_OWNED_MAP`],
+/// [`DERIVE_KIND_IOVA_ANON`], [`DERIVE_KIND_EXEC_SEAL`]).
+pub const DERIVE_KIND_RESERVE_RELEASE: u8 = 0xda;
+
+/// Argument payload for [`DERIVE_KIND_RESERVE_RELEASE`]: the page range of
+/// the caller's `RESERVE` window, `[page, page + pages)` in
+/// [`RESERVE_PAGE_BYTES`] units.  LE, unaligned-safe, 8 bytes.  `pages` is
+/// non-zero and the range lies inside the window.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, TryFromBytes, KnownLayout, Immutable, Unaligned)]
+pub struct ReserveReleaseReq {
+    /// The first page of the range, counted from the window's base.
+    pub page: U32,
+    /// The range's length in pages.
+    pub pages: U32,
+}
+
+impl ReserveReleaseReq {
+    /// Wire size.
+    pub const WIRE: usize = 8;
+}
+
 /// Retired selector for the former derive-an-executable-alias operation.
 ///
 /// Frozen ABI values are never reused.  New code uses
@@ -981,6 +1107,16 @@ pub enum Status {
     FabricRouteCapacity = 16,
     /// The registration capability could not authorize a route child.
     FabricRouteCapability = 17,
+    /// A park carrying `WAIT_WORD` resolved by its **word arm** (EVENT.md
+    /// §6): the session committed, the caller parked on a memory word,
+    /// and either a `wake_word` on the same memory or an idle CPU's
+    /// hardware monitor observing the store woke it — not a delivery,
+    /// reap, deadline, or IRQ.  The standing post is left standing
+    /// (exactly [`Deadline`](Self::Deadline)'s rule).  The return is
+    /// never a promise about the word's value: the caller re-reads the
+    /// word, the contract `futex` teaches.  Additive on the frozen
+    /// vocabulary.
+    Word = 18,
 }
 
 /// Hard cap on a session's invocation count — heapless, fixed-capacity
@@ -1098,6 +1234,31 @@ bitflags! {
         /// delivery and sleep payloads in the park block. The kernel binds
         /// the arena record and resolves the endpoint from the held capability.
         const WAIT_IRQ_SELECTED = 1 << 5;
+        /// Park the caller after commit until a **store to a watched
+        /// memory word** is observed (EVENT.md §6 — the kernel
+        /// address-wait): the [`WordWaitReq`] names a held memory lease or
+        /// view (the *subject*, by arena slot — authority is the mapping,
+        /// never an address), a byte offset within it, and the `u32` value
+        /// the caller last read.  The kernel keys its waiter on the word's
+        /// **physical** identity, so every mapping of the same memory
+        /// names the same wait; a `wake_word` on any of them (or, on an
+        /// idle CPU, the hardware monitor seeing the store) resolves
+        /// [`Status::Word`].  A word that already differs from `expected`
+        /// at park time resolves `Word` without parking — the `futex`
+        /// contract.
+        ///
+        /// Always bounded: requires [`WAIT_SLEEP`](Self::WAIT_SLEEP) (a
+        /// deadline win resolves [`Status::Deadline`]).  Composes with a
+        /// **standing** [`WAIT_DELIVERY`](Self::WAIT_DELIVERY) post (±
+        /// [`WAIT_IRQ`](Self::WAIT_IRQ)) under the first-wins rule —
+        /// delivery is checked first as the one destructive edge, then the
+        /// word, then revocation/deadline/IRQ.  Malformed with an
+        /// in-session post, [`WAIT_DELIVERY_ALT`](Self::WAIT_DELIVERY_ALT),
+        /// or [`WAIT_TASK`](Self::WAIT_TASK), and without `WAIT_SLEEP`.
+        /// Revocation of the subject's lease unparks its waiters
+        /// [`Status::Revoked`].  The request is the **last** park-block
+        /// member.
+        const WAIT_WORD = 1 << 6;
     }
 }
 
@@ -1122,6 +1283,7 @@ bitflags! {
 /// | any of the above + `WAIT_IRQ`                | unchanged — legacy default route |
 /// | above + `WAIT_IRQ_SELECTED`                  | append [`IrqParkReq`] |
 /// | any of the above + `WAIT_TASK`               | unchanged — the staged join derive carries its own subject |
+/// | any of the above + `WAIT_WORD`               | append [`WordWaitReq`] (always last; `WAIT_SLEEP` mandatory) |
 ///
 /// A flagged session whose argument region cannot supply the block
 /// refuses [`Status::Malformed`] before anything commits.  Ordinary
@@ -1158,6 +1320,34 @@ pub struct IrqParkReq {
 
 impl IrqParkReq {
     pub const WIRE: usize = 8;
+}
+
+/// Argument payload for a **`WAIT_WORD`** park (EVENT.md §6): the memory
+/// word the caller waits on, named by *authority* — an arena slot holding
+/// a memory lease or a mapped view — plus a byte offset within that
+/// subject's span and the value the caller last observed.  The kernel
+/// resolves the slot through the caller's holdings to the word's
+/// physical identity; a raw address never crosses.  Rides the park block
+/// as its last member (see [`SleepReq`]'s convention table).  LE
+/// byteorder (`align(1)`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, KnownLayout, Immutable, Unaligned)]
+pub struct WordWaitReq {
+    /// Arena slot of the held `MemLease` (or mapped view) the word lives in.
+    pub subject: U32,
+    /// Byte offset of the `u32` word from the subject's base; 4-aligned and
+    /// `offset + 4 <= span`.
+    pub offset: U32,
+    /// The value the caller last read; the park refuses to sleep (resolves
+    /// [`Status::Word`]) if the word already differs.
+    pub expected: U32,
+    /// Reserved; must be zero.
+    pub reserved: U32,
+}
+
+impl WordWaitReq {
+    /// Wire size (repr(C), 4+4+4+4).
+    pub const WIRE: usize = 16;
 }
 
 /// Argument payload for a **park-on-standing-post** `WAIT_DELIVERY`
@@ -1205,7 +1395,7 @@ pub struct SessionHeader {
     /// ABI version of this descriptor layout ([`DESCRIPTOR_ABI`]).
     pub abi: U16,
     /// Session flags ([`SessionFlags`]): `WAIT_DELIVERY` / `WAIT_IRQ` /
-    /// `WAIT_SLEEP` / `WAIT_TASK` / `WAIT_DELIVERY_ALT`, all honored by the engine; unknown bits refuse
+    /// `WAIT_SLEEP` / `WAIT_TASK` / `WAIT_DELIVERY_ALT` / `WAIT_WORD`, all honored by the engine; unknown bits refuse
     /// [`Status::Malformed`].
     pub flags: U16,
     /// Reserved; must be zero. Frozen additive headroom.
@@ -1238,6 +1428,17 @@ const _: () = {
     assert!(size_of::<FoundReq>() == FoundReq::WIRE);
     assert!(size_of::<SleepReq>() == SleepReq::WIRE);
     assert!(size_of::<IrqParkReq>() == IrqParkReq::WIRE);
+    assert!(size_of::<WordWaitReq>() == WordWaitReq::WIRE);
+    assert!(size_of::<WakeWordReq>() == WakeWordReq::WIRE);
+    // WAKE_WORD takes a MemLease / view subject: it shares that subject with
+    // the lease self-verbs, so it must be distinct from every flavor that
+    // can name one, and it owns the next free high-band byte.
+    assert!(DERIVE_KIND_WAKE_WORD != DERIVE_KIND_DEVICE_CLAIM_DMA_RETIRE);
+    assert!(DERIVE_KIND_WAKE_WORD != DERIVE_KIND_DEVICE_CLAIM_QUIESCE);
+    assert!(DERIVE_KIND_WAKE_WORD != DERIVE_KIND_DEVICE_CLAIM_CLOSE);
+    assert!(DERIVE_KIND_WAKE_WORD != DERIVE_KIND_EXEC_SEAL);
+    assert!(DERIVE_KIND_WAKE_WORD != DERIVE_KIND_DEVICE_ACTIVATE);
+    assert!((crate::cap::ResourceKind::DeviceMmu as u16) < DERIVE_KIND_WAKE_WORD as u16);
     assert!(size_of::<ExitReq>() == ExitReq::WIRE);
     assert!(size_of::<DeviceActivateReq>() == DeviceActivateReq::WIRE);
     assert!(size_of::<GuestFoundReq>() == GuestFoundReq::WIRE);
@@ -1246,6 +1447,8 @@ const _: () = {
     assert!(size_of::<NoticeReq>() == NoticeReq::WIRE);
     assert!(size_of::<TpReq>() == TpReq::WIRE);
     assert!(size_of::<ProtectReq>() == ProtectReq::WIRE);
+    assert!(size_of::<FaultUpcallReq>() == FaultUpcallReq::WIRE);
+    assert!(size_of::<ReserveReleaseReq>() == ReserveReleaseReq::WIRE);
     assert!(size_of::<PortReq>() == PortReq::WIRE);
     // The self-verb discriminants share one space above `ResourceKind`
     // and are told apart by SUBJECT kind, not by value — `SET_TP` and
@@ -1278,6 +1481,25 @@ const _: () = {
     assert!(DERIVE_KIND_ARENA_EXTEND != DERIVE_KIND_IOVA_ANON);
     assert!(DERIVE_KIND_ARENA_EXTEND != DERIVE_KIND_EXEC_SEAL);
     assert!((crate::cap::ResourceKind::MemoryController as u16) < DERIVE_KIND_ARENA_EXTEND as u16);
+    // FAULT_UPCALL is the fourth AddrSpace self-verb: pairwise distinct
+    // from the other three for the same reason they are from each other.
+    assert!(DERIVE_KIND_FAULT_UPCALL != DERIVE_KIND_SET_TP);
+    assert!(DERIVE_KIND_FAULT_UPCALL != DERIVE_KIND_PROTECT);
+    assert!(DERIVE_KIND_FAULT_UPCALL != DERIVE_KIND_ARENA_EXTEND);
+    assert!((crate::cap::ResourceKind::MemoryController as u16) < DERIVE_KIND_FAULT_UPCALL as u16);
+    // RESERVE_RELEASE takes a MemLease subject, so it must differ from every
+    // flavor that can name one — WAKE_WORD's list, plus WAKE_WORD itself.
+    assert!(DERIVE_KIND_RESERVE_RELEASE != DERIVE_KIND_WAKE_WORD);
+    assert!(DERIVE_KIND_RESERVE_RELEASE != DERIVE_KIND_OWNED_MAP);
+    assert!(DERIVE_KIND_RESERVE_RELEASE != DERIVE_KIND_IOVA_ANON);
+    assert!(DERIVE_KIND_RESERVE_RELEASE != DERIVE_KIND_EXEC_SEAL);
+    assert!(DERIVE_KIND_RESERVE_RELEASE != DERIVE_KIND_DEVICE_CLAIM_DMA_RETIRE);
+    assert!(DERIVE_KIND_RESERVE_RELEASE != DERIVE_KIND_DEVICE_CLAIM_QUIESCE);
+    assert!(DERIVE_KIND_RESERVE_RELEASE != DERIVE_KIND_DEVICE_CLAIM_CLOSE);
+    assert!(DERIVE_KIND_RESERVE_RELEASE != DERIVE_KIND_DEVICE_ACTIVATE);
+    assert!(
+        (crate::cap::ResourceKind::MemoryController as u16) < DERIVE_KIND_RESERVE_RELEASE as u16
+    );
     // DEVICE_ACTIVATE shares the PciDevice subject with resource derives but
     // owns the next high-band byte; keep it distinct from every effect flavor.
     assert!(DERIVE_KIND_DEVICE_ACTIVATE != DERIVE_KIND_ARENA_EXTEND);
@@ -1336,7 +1558,7 @@ const _: () = {
 /// Their authenticated subject kinds disambiguate both pairs. This table is a
 /// vocabulary, not a uniqueness proof; the pairwise same-subject assertions
 /// above carry the distinctness that matters.
-const DERIVE_FLAVORS: [u8; 35] = [
+const DERIVE_FLAVORS: [u8; 38] = [
     DERIVE_KIND_TASK_IDENTITY,
     DERIVE_KIND_TASK_NAME,
     DERIVE_KIND_PROCESS_DRAIN,
@@ -1372,6 +1594,9 @@ const DERIVE_FLAVORS: [u8; 35] = [
     DERIVE_KIND_DEVICE_CLAIM_CLOSE,
     DERIVE_KIND_DEVICE_CLAIM_QUIESCE,
     DERIVE_KIND_DEVICE_CLAIM_DMA_RETIRE,
+    DERIVE_KIND_WAKE_WORD,
+    DERIVE_KIND_FAULT_UPCALL,
+    DERIVE_KIND_RESERVE_RELEASE,
 ];
 
 /// Is `kind` a byte this ABI's `Derive` speaks? — the low, append-only
@@ -1550,6 +1775,7 @@ impl Committed {
             15 => Status::FabricRouteInfeasible,
             16 => Status::FabricRouteCapacity,
             17 => Status::FabricRouteCapability,
+            18 => Status::Word,
             _ => Status::Malformed,
         }
     }
@@ -1776,6 +2002,34 @@ pub const DERIVE_KIND_DEVICE_CLAIM_QUIESCE: u8 = 0xe4;
 /// Uses DeviceClaimCloseReq and returns DeviceClaimDmaReport, never a regrant.
 pub const DERIVE_KIND_DEVICE_CLAIM_DMA_RETIRE: u8 = 0xe3;
 
+/// **Wake the waiters of a memory word** (EVENT.md §6 — the producer half
+/// of the kernel address-wait).  A post-commit **effect** on a held
+/// `MemLease` / mapped-view subject with `MODIFY` ("you may wake what you
+/// can write"): the [`WakeWordReq`] names the byte offset and how many
+/// parked waiters of that word's *physical* identity to release.  Mints
+/// nothing; the result slot is the subject's own (inert).  Replaces the
+/// notice-mode send for a producer that shares the memory but holds no
+/// send end — the `futex` provisioning gap and the SPMD hub relay.
+/// The store itself is the caller's; this only publishes it to parked
+/// waiters, so a caller stores first and wakes second.
+pub const DERIVE_KIND_WAKE_WORD: u8 = 0xdc;
+
+/// Argument payload for [`DERIVE_KIND_WAKE_WORD`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, KnownLayout, Immutable, Unaligned)]
+pub struct WakeWordReq {
+    /// Byte offset of the `u32` word from the subject's base; 4-aligned and
+    /// `offset + 4 <= span`.
+    pub offset: U32,
+    /// Maximum waiters to release (`u32::MAX` = all); `0` is malformed.
+    pub count: U32,
+}
+
+impl WakeWordReq {
+    /// Wire size (repr(C), 4+4).
+    pub const WIRE: usize = 8;
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, TryFromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct DeviceClaimCloseReq {
@@ -1919,6 +2173,12 @@ pub enum ViewMapWindow {
     /// like [`Map`](Self::Map)'s but task-level and off the per-thread stride
     /// every view shares. Stamped for founded tasks only.
     Heap,
+    /// The task's reservation window (`geom::RESERVE`, GEOM_ABI v8): the view
+    /// lands at the exact page [`ViewMapReq::page`] names, where a runtime
+    /// commits the next pages of an address range it reserved for itself (a
+    /// guarded wasm memory growing). No cursor: an occupied page refuses, as
+    /// a [`Surfaces`](Self::Surfaces) lane does.
+    Reserve,
 }
 
 /// One of the two fixed, reusable halves of a task's `SURFACES` window.
@@ -1952,13 +2212,15 @@ impl ViewMapWindow {
             Self::Map => crate::task::geom::MAP,
             Self::Surfaces => crate::task::geom::SURFACES,
             Self::Heap => crate::task::geom::HEAP,
+            Self::Reserve => crate::task::geom::RESERVE,
         }
     }
 }
 
 /// The whole-view map request for [`DERIVE_KIND_VIEW_MAP`]. No caller-supplied
 /// VA, length, destination space or access mask: each is derived from the
-/// receiver's stamped geometry and authenticated view. Reserved bytes are zero.
+/// receiver's stamped geometry and authenticated view — the one placement a
+/// caller picks is a page of its own `RESERVE` window, never an address.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, TryFromBytes, KnownLayout, Immutable, Unaligned)]
 pub struct ViewMapReq {
@@ -1969,8 +2231,18 @@ pub struct ViewMapReq {
     /// [`VIEW_MAP_SINK`], or zero. (Formerly the first reserved byte, so a
     /// zeroed request keeps its meaning.)
     pub flags: u8,
-    pub reserved: [u8; 4],
+    /// For `RESERVE`, the page of the window the view's first page lands on,
+    /// in [`RESERVE_PAGE_BYTES`] units; zero for every other window.
+    /// (Formerly the four reserved bytes, so a zeroed request keeps its
+    /// meaning.)
+    pub page: U32,
 }
+
+/// The unit of a `RESERVE` page index ([`ViewMapReq::page`],
+/// [`ReserveReleaseReq`]): 4 KiB on every target, the page kore's user
+/// targets link for (`max-page-size=4096`, `res/IMAGE.md` §7). A `u32` of
+/// them spans 16 TiB, past any window the layout can stamp.
+pub const RESERVE_PAGE_BYTES: u64 = 0x1000;
 
 /// [`ViewMapReq::flags`]: when the lessor's lease dies under this mapping,
 /// repoint its pages at the receiver space's sink page instead of unmapping
@@ -1984,10 +2256,13 @@ impl ViewMapReq {
     pub const WIRE: usize = 8;
 
     pub fn placement(&self) -> Option<ViewMapWindow> {
-        if self.reserved != [0; 4] || self.flags & !VIEW_MAP_SINK != 0 {
+        if self.flags & !VIEW_MAP_SINK != 0 {
             return None;
         }
         if self.sink() && self.window.get() != crate::task::geom::MAP {
+            return None;
+        }
+        if self.page.get() != 0 && self.window.get() != crate::task::geom::RESERVE {
             return None;
         }
         match self.window.get() {
@@ -1996,6 +2271,7 @@ impl ViewMapReq {
             crate::task::geom::SURFACES if SurfaceMapLane::from_wire(self.lane).is_some() => {
                 Some(ViewMapWindow::Surfaces)
             }
+            crate::task::geom::RESERVE if self.lane == 0 => Some(ViewMapWindow::Reserve),
             _ => None,
         }
     }
@@ -2010,6 +2286,11 @@ impl ViewMapReq {
         (self.placement() == Some(ViewMapWindow::Surfaces))
             .then(|| SurfaceMapLane::from_wire(self.lane))
             .flatten()
+    }
+
+    /// The `RESERVE` page the view lands on, for a valid `RESERVE` request.
+    pub fn reserve_page(&self) -> Option<u32> {
+        (self.placement() == Some(ViewMapWindow::Reserve)).then(|| self.page.get())
     }
 }
 
@@ -4976,6 +5257,65 @@ mod tests {
         }
     }
 
+    /// The fault upcall's request is a frozen 32-byte block of four LE
+    /// addresses, and its selector is registered, distinct from the other
+    /// `AddrSpace` self-verbs, with the byte below it still failing closed.
+    #[test]
+    fn fault_upcall_request_layout_is_frozen() {
+        use zerocopy::TryFromBytes;
+
+        let mut bytes = [0u8; FaultUpcallReq::WIRE];
+        for (i, word) in [0x1000u64, 0x1010, 0x7000_0000, 0x7001_0000]
+            .iter()
+            .enumerate()
+        {
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let (req, rest) = FaultUpcallReq::try_ref_from_prefix(&bytes[..]).expect("decodes");
+        assert!(rest.is_empty());
+        assert_eq!(
+            (
+                req.entry.get(),
+                req.decline.get(),
+                req.stack_lo.get(),
+                req.stack_hi.get()
+            ),
+            (0x1000, 0x1010, 0x7000_0000, 0x7001_0000)
+        );
+        assert!(FaultUpcallReq::try_ref_from_prefix(&bytes[..FaultUpcallReq::WIRE - 1]).is_err());
+
+        assert!(derive_kind_known(DERIVE_KIND_FAULT_UPCALL));
+        for other in [
+            DERIVE_KIND_SET_TP,
+            DERIVE_KIND_PROTECT,
+            DERIVE_KIND_ARENA_EXTEND,
+        ] {
+            assert_ne!(DERIVE_KIND_FAULT_UPCALL, other);
+        }
+        assert_eq!(DERIVE_KIND_WAKE_WORD - 1, DERIVE_KIND_FAULT_UPCALL);
+    }
+
+    #[test]
+    fn reserve_release_request_layout_is_frozen() {
+        use zerocopy::TryFromBytes;
+
+        let mut bytes = [0u8; ReserveReleaseReq::WIRE];
+        bytes[0..4].copy_from_slice(&0x10_0000u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x10_4000u32.to_le_bytes());
+        let (req, rest) = ReserveReleaseReq::try_ref_from_prefix(&bytes[..]).expect("decodes");
+        assert!(rest.is_empty());
+        assert_eq!((req.page.get(), req.pages.get()), (0x10_0000, 0x10_4000));
+        assert!(
+            ReserveReleaseReq::try_ref_from_prefix(&bytes[..ReserveReleaseReq::WIRE - 1]).is_err()
+        );
+
+        assert!(derive_kind_known(DERIVE_KIND_RESERVE_RELEASE));
+        assert_eq!(DERIVE_KIND_FAULT_UPCALL - 1, DERIVE_KIND_RESERVE_RELEASE);
+        assert!(
+            !derive_kind_known(DERIVE_KIND_RESERVE_RELEASE - 1),
+            "the next future flavor fails closed"
+        );
+    }
     #[test]
     fn line_and_i2c_gpio_flavors_are_known_without_aliasing() {
         assert!(derive_kind_known(DERIVE_KIND_IRQ_ROUTE_LINE));
@@ -5320,7 +5660,8 @@ mod tests {
                 (window == ViewMapWindow::Surfaces).then_some(SurfaceMapLane::First)
             );
             // Byte 3 is the flags byte: the sink bit is admitted on MAP only,
-            // an unknown bit never. Bytes 4.. stay reserved.
+            // an unknown bit never. Bytes 4.. are the RESERVE page, zero
+            // for every other window.
             let mut sink = bytes;
             sink[3] = VIEW_MAP_SINK;
             let (req, _) = ViewMapReq::try_ref_from_prefix(&sink).unwrap();
@@ -5352,7 +5693,7 @@ mod tests {
             window: ViewMapWindow::Map.role().into(),
             lane: SurfaceMapLane::Second as u8,
             flags: 0,
-            reserved: [0; 4],
+            page: 0.into(),
         };
         assert_eq!(invalid_map_lane.placement(), None);
         for role in [
@@ -5365,16 +5706,36 @@ mod tests {
                 window: role.into(),
                 lane: 0,
                 flags: 0,
-                reserved: [0; 4],
+                page: 0.into(),
             };
             assert_eq!(req.placement(), None);
         }
+        // RESERVE takes its page from bytes 4..8 — any page, the window's
+        // bounds are the kernel's to check — and neither a lane nor a sink.
+        for page in [0u32, 1, 0x10_0400, u32::MAX] {
+            let mut bytes = [0u8; ViewMapReq::WIRE];
+            bytes[..2].copy_from_slice(&ViewMapWindow::Reserve.role().to_le_bytes());
+            bytes[4..8].copy_from_slice(&page.to_le_bytes());
+            let (req, _) = ViewMapReq::try_ref_from_prefix(&bytes).unwrap();
+            assert_eq!(req.placement(), Some(ViewMapWindow::Reserve));
+            assert_eq!(req.reserve_page(), Some(page));
+            assert_eq!(req.surface_lane(), None);
+            let mut lane = bytes;
+            lane[2] = 1;
+            let (req, _) = ViewMapReq::try_ref_from_prefix(&lane).unwrap();
+            assert_eq!((req.placement(), req.reserve_page()), (None, None));
+            let mut sink = bytes;
+            sink[3] = VIEW_MAP_SINK;
+            let (req, _) = ViewMapReq::try_ref_from_prefix(&sink).unwrap();
+            assert_eq!((req.placement(), req.reserve_page()), (None, None));
+        }
+        assert_eq!(second.reserve_page(), None);
         // The sink flag is admitted on MAP alone; an unknown flag refuses.
         let sink = ViewMapReq {
             window: ViewMapWindow::Map.role().into(),
             lane: 0,
             flags: VIEW_MAP_SINK,
-            reserved: [0; 4],
+            page: 0.into(),
         };
         assert_eq!(sink.placement(), Some(ViewMapWindow::Map));
         assert!(sink.sink());

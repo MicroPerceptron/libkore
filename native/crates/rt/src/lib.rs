@@ -104,6 +104,8 @@ pub mod pace;
 pub mod pinned;
 pub mod process;
 pub mod random;
+#[cfg(feature = "heap")]
+pub mod reserve;
 pub mod room;
 pub mod service;
 pub mod session;
@@ -118,6 +120,7 @@ pub mod termination;
 pub mod thread;
 pub mod thread_controller;
 pub mod transport;
+pub mod upcall;
 #[cfg(feature = "validate")]
 pub mod validate;
 pub mod wake;
@@ -128,8 +131,8 @@ pub use block::{block_on, block_on_pinned, try_block_on};
 pub use chan::{CapRx, ChanRx, ChanTx, Delivery, NoticeRx};
 pub use entry::run_service;
 pub use executor::{
-    Executor, TaskStorage, enable_irq_parks, next_wake_until, retire_irq_parks, sleep_for,
-    sleep_until,
+    Executor, NoticeHold, NoticeSink, TaskStorage, enable_irq_parks, next_wake_until,
+    retire_irq_parks, sleep_for, sleep_until,
 };
 pub use exit::ExitCode;
 #[cfg(feature = "heap")]

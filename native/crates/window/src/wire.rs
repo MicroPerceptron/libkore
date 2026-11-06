@@ -14,6 +14,12 @@
 
 use kore_abi::session::DISPLAY_FORMAT_XRGB8888;
 use kore_abi::svc::{CommitWire, MAX_COMMIT_RECTS, SurRectWire, SurRepWire, SurReqWire};
+
+use crate::capture::{CaptureFrame, CaptureMode};
+use crate::cursor::Cursor;
+use crate::document::DocumentKind;
+use crate::menu::MENU_PLANE_BYTES;
+use crate::pick::PICK_NAME_BYTES;
 use zerocopy::little_endian::{U16, U32, U64};
 
 /// Grant channels a surface client pre-pins — exactly one: it carries
@@ -36,20 +42,39 @@ pub fn split_surface_aux(aux: &mut [u8]) -> Option<(&mut [u8], &mut [u8])> {
     Some((commits, &mut tail[..output]))
 }
 
+/// The planes of a window pair's auxiliary tail, in lease order.
+pub struct WindowAux<'a> {
+    pub commits: &'a mut [u8],
+    pub output: &'a mut [u8],
+    /// The event channel (`crate::channel`, `res/EVENT.md`): the
+    /// compositor's level state and event records, with one conditional
+    /// wake.
+    pub events: &'a mut [u8],
+    /// The window's context menu as it asks for it ([`crate::menu`]): the
+    /// app writes, the compositor snapshots on `ShowMenu`.
+    pub menu: &'a mut [u8],
+}
+
 /// Window clients share the same four capability auxiliaries as surface
-/// clients. The event channel (`crate::channel`, `res/EVENT.md`) occupies
-/// the pair's remaining bytes, not a fifth endpoint: the compositor's
-/// level state and event records, with one conditional wake.
-pub fn split_window_aux(aux: &mut [u8]) -> Option<(&mut [u8], &mut [u8], &mut [u8])> {
+/// clients. The event channel and the menu plane occupy the pair's
+/// remaining bytes, not a fifth endpoint.
+pub fn split_window_aux(aux: &mut [u8]) -> Option<WindowAux<'_>> {
     let commits = kore_ring::spsc::region_bytes::<CommitWire>(crate::COMMIT_CAP);
     let output = kore_ring::spsc::region_bytes::<kore_abi::svc::OutChunk>(TERMINAL_OUTPUT_CAP);
     let channel = crate::channel::region_bytes();
-    if aux.len() < commits.checked_add(output)?.checked_add(channel)? {
+    let total = commits.checked_add(output)?.checked_add(channel)?.checked_add(MENU_PLANE_BYTES)?;
+    if aux.len() < total {
         return None;
     }
     let (commits, tail) = aux.split_at_mut(commits);
     let (output, tail) = tail.split_at_mut(output);
-    Some((commits, output, &mut tail[..channel]))
+    let (events, tail) = tail.split_at_mut(channel);
+    Some(WindowAux {
+        commits,
+        output,
+        events,
+        menu: &mut tail[..MENU_PLANE_BYTES],
+    })
 }
 
 /// The backend-free wire marker — what a *client* names to speak the
@@ -80,10 +105,7 @@ impl kore_rt::svc::SvcProtocol for SurfaceWire {
     }
 
     fn request_grants(request: &Self::ReqWire) -> usize {
-        usize::from(matches!(
-            decode_req(request),
-            Some(SurfaceRequest::CreateSurface { .. })
-        ))
+        usize::from(decode_req(request).is_some_and(|request| request_carries_grant(&request)))
     }
 
     fn init_pair_window(
@@ -96,11 +118,11 @@ impl kore_rt::svc::SvcProtocol for SurfaceWire {
         let Some(plane) = window.get_mut(at..) else {
             return Err(kore_ring::spsc::RingError::TooSmall);
         };
-        let (commits, output, events) =
-            split_window_aux(plane).ok_or(kore_ring::spsc::RingError::TooSmall)?;
-        kore_ring::spsc::init::<CommitWire>(commits, crate::COMMIT_CAP)?;
-        kore_ring::spsc::init::<kore_abi::svc::OutChunk>(output, TERMINAL_OUTPUT_CAP)?;
-        crate::channel::init(events)
+        let aux = split_window_aux(plane).ok_or(kore_ring::spsc::RingError::TooSmall)?;
+        kore_ring::spsc::init::<CommitWire>(aux.commits, crate::COMMIT_CAP)?;
+        kore_ring::spsc::init::<kore_abi::svc::OutChunk>(aux.output, TERMINAL_OUTPUT_CAP)?;
+        aux.menu.fill(0);
+        crate::channel::init(aux.events)
     }
 
     fn encode_req(req: &Self::Request) -> Self::ReqWire {
@@ -156,6 +178,38 @@ pub enum SurfaceRequest {
     /// controller, the compositor and the app tearing one window down in
     /// three orders at once.
     RequestClose,
+    /// The cursor this window shows while the pointer is over its content
+    /// ([`crate::cursor`]). It holds until the window asks again; the
+    /// compositor's own pixels choose for themselves.
+    SetCursor { cursor: Cursor },
+    /// Ask this window's controller to open the filesystem object with
+    /// stable identity `object` (never zero) in the default handler for
+    /// its `kind` ([`DocumentKind::Unknown`]: the document app). Inert: the
+    /// controller decides, and the identity is data the opened window
+    /// locates from its own root.
+    OpenObject { object: u64, kind: DocumentKind },
+    /// Draw the context menu this window encoded in its menu plane
+    /// (`len` bytes, [`crate::menu`]) at the content-relative anchor
+    /// `(x, y)`. `serial` (nonzero) names it in the
+    /// [`Event::Menu`](crate::event::Event::Menu) that ends it.
+    ShowMenu { x: i32, y: i32, len: u16, serial: u32 },
+    /// A capture writer's one verb (`res/SCREENSHOTS.md`): lend the frozen
+    /// frame this pair was admitted for. The reply's one grant reads it
+    /// and cannot write it. Any other peer is refused.
+    TakeCapture,
+    /// Ask the user, through this window's controller, to choose a file of
+    /// the types `types` accepts: a nonzero mask over `kore_kit::kinds`
+    /// rows. `serial` (nonzero) names the pick in the
+    /// [`Event::Picked`](crate::event::Event::Picked) that ends it
+    /// ([`crate::pick`]). Inert: the controller launches the picker.
+    PickObject { types: u64, serial: u32 },
+    /// Bind this window, launched for a pick, to that pick by the token it
+    /// was launched with.
+    ClaimPick { token: u64 },
+    /// Answer the pick this window claimed: `object` is the chosen file's
+    /// stable identity, or zero if the user cancelled; its name is the
+    /// first `len` bytes of this window's menu plane (none when cancelled).
+    Picked { token: u64, object: u64, len: u8 },
 }
 
 /// The surface-class reply vocabulary.
@@ -194,6 +248,21 @@ pub enum SurfaceResponse {
     /// raised under (never zero).  Idempotent — a window already asked to
     /// close answers this again rather than refusing.
     CloseRequested { serial: u64 },
+    /// The window's cursor is now `cursor`, echoed.
+    CursorSet { cursor: Cursor },
+    /// The open is queued for this window's controller, echoed.
+    OpenQueued { object: u64 },
+    /// The menu is open; its plane may be reused. The serial, echoed.
+    MenuShown { serial: u32 },
+    /// The frozen frame; its read-only view rides the reply's one grant.
+    Capture(CaptureFrame),
+    /// The pick is queued for this window's controller. The serial, echoed.
+    PickQueued { serial: u32 },
+    /// This window is the pick's picker now. The token, echoed.
+    PickClaimed { token: u64 },
+    /// The answer is delivered and the pick has ended; the plane may be
+    /// reused. The token, echoed.
+    PickAnswered { token: u64 },
     /// The refusal, echoing the subject the verb named (zero if none).
     Refused {
         refusal: SurfaceRefusal,
@@ -356,6 +425,38 @@ pub fn encode_req(req: &SurfaceRequest) -> SurReqWire {
         SurfaceRequest::RequestClose => {
             w.op = SurReqWire::OP_REQUEST_CLOSE;
         }
+        SurfaceRequest::SetCursor { cursor } => {
+            w.op = SurReqWire::OP_SET_CURSOR;
+            w.a = U64::new(cursor.code());
+        }
+        SurfaceRequest::OpenObject { object, kind } => {
+            w.op = SurReqWire::OP_OPEN_OBJECT;
+            w.a = U64::new(object);
+            w.b = U64::new(u64::from(kind.code()));
+        }
+        SurfaceRequest::ShowMenu { x, y, len, serial } => {
+            w.op = SurReqWire::OP_SHOW_MENU;
+            w.a = U64::new(u64::from(x as u32) | u64::from(y as u32) << 32);
+            w.b = U64::new(u64::from(len) | u64::from(serial) << 32);
+        }
+        SurfaceRequest::TakeCapture => {
+            w.op = SurReqWire::OP_TAKE_CAPTURE;
+        }
+        SurfaceRequest::PickObject { types, serial } => {
+            w.op = SurReqWire::OP_PICK_OBJECT;
+            w.a = U64::new(types);
+            w.b = U64::new(u64::from(serial));
+        }
+        SurfaceRequest::ClaimPick { token } => {
+            w.op = SurReqWire::OP_CLAIM_PICK;
+            w.a = U64::new(token);
+        }
+        SurfaceRequest::Picked { token, object, len } => {
+            w.op = SurReqWire::OP_PICKED;
+            w.a = U64::new(token);
+            w.b = U64::new(object);
+            w.c = U64::new(u64::from(len));
+        }
     }
     w
 }
@@ -381,6 +482,56 @@ fn raw_decode_req(w: &SurReqWire) -> Option<SurfaceRequest> {
             surface: w.subject.get(),
         },
         SurReqWire::OP_REQUEST_CLOSE => SurfaceRequest::RequestClose,
+        SurReqWire::OP_SET_CURSOR => SurfaceRequest::SetCursor {
+            cursor: Cursor::from_code(w.a.get())?,
+        },
+        SurReqWire::OP_OPEN_OBJECT => {
+            let object = w.a.get();
+            if object == 0 {
+                return None;
+            }
+            SurfaceRequest::OpenObject {
+                object,
+                kind: DocumentKind::from_code(w.b.get())?,
+            }
+        }
+        SurReqWire::OP_SHOW_MENU => {
+            let (a, b) = (w.a.get(), w.b.get());
+            let (len, serial) = (b as u16, (b >> 32) as u32);
+            if len == 0 || usize::from(len) > MENU_PLANE_BYTES || serial == 0 {
+                return None;
+            }
+            SurfaceRequest::ShowMenu {
+                x: a as u32 as i32,
+                y: (a >> 32) as u32 as i32,
+                len,
+                serial,
+            }
+        }
+        SurReqWire::OP_TAKE_CAPTURE => SurfaceRequest::TakeCapture,
+        SurReqWire::OP_PICK_OBJECT => {
+            let (types, serial) = (w.a.get(), u32::try_from(w.b.get()).ok()?);
+            if types == 0 || serial == 0 {
+                return None;
+            }
+            SurfaceRequest::PickObject { types, serial }
+        }
+        SurReqWire::OP_CLAIM_PICK => {
+            let token = w.a.get();
+            if token == 0 {
+                return None;
+            }
+            SurfaceRequest::ClaimPick { token }
+        }
+        SurReqWire::OP_PICKED => {
+            let (token, object) = (w.a.get(), w.b.get());
+            let len = u8::try_from(w.c.get()).ok()?;
+            // A choice carries its name and a cancel none.
+            if token == 0 || usize::from(len) > PICK_NAME_BYTES || (object == 0) != (len == 0) {
+                return None;
+            }
+            SurfaceRequest::Picked { token, object, len }
+        }
         _ => return None,
     })
 }
@@ -394,10 +545,40 @@ pub fn decode_req(w: &SurReqWire) -> Option<SurfaceRequest> {
 /// The grant-count law: which tags carry authority beside their bytes.
 pub const fn reply_grants(rep: &SurfaceResponse) -> u8 {
     match rep {
-        // The backing's detached window view.
-        SurfaceResponse::SurfaceMade { .. } => 1,
+        // The backing's detached window view; the frozen frame's
+        // read-only view.
+        SurfaceResponse::SurfaceMade { .. } | SurfaceResponse::Capture(_) => 1,
         _ => 0,
     }
+}
+
+/// The verbs whose answer carries a grant: what a client reserves a landing
+/// for before it asks.
+pub const fn request_carries_grant(request: &SurfaceRequest) -> bool {
+    matches!(
+        request,
+        SurfaceRequest::CreateSurface { .. } | SurfaceRequest::TakeCapture
+    )
+}
+
+/// The capture word `Capture.a` carries: `width ‖ height << 16 ‖ mode << 32
+/// ‖ screen << 40 ‖ density << 48`.
+const fn capture_word(frame: &CaptureFrame) -> u64 {
+    frame.width as u64
+        | (frame.height as u64) << 16
+        | (frame.mode.code() as u64) << 32
+        | (frame.screen as u64) << 40
+        | (frame.density.quarters() as u64) << 48
+}
+
+/// `Capture.d`'s bit 32: the window gave no frame in time, and its backing
+/// was copied as it stood ([`CaptureFrame::synced`] is `false`).
+const CAPTURE_UNSYNCED: u64 = 1 << 32;
+
+/// The placement word `Capture.d` carries: `x ‖ y << 16`, and
+/// [`CAPTURE_UNSYNCED`].
+const fn placement_word(frame: &CaptureFrame) -> u64 {
+    frame.x as u64 | (frame.y as u64) << 16 | if frame.synced { 0 } else { CAPTURE_UNSYNCED }
 }
 
 /// Lower a response to its wire form (total).  `grants` is the count
@@ -461,6 +642,38 @@ pub fn encode_rep(rep: &SurfaceResponse, grants: u8) -> SurRepWire {
             w.tag = SurRepWire::TAG_CLOSE_REQUESTED;
             w.a = U64::new(serial);
         }
+        SurfaceResponse::CursorSet { cursor } => {
+            w.tag = SurRepWire::TAG_CURSOR_SET;
+            w.a = U64::new(cursor.code());
+        }
+        SurfaceResponse::OpenQueued { object } => {
+            w.tag = SurRepWire::TAG_OPEN_QUEUED;
+            w.a = U64::new(object);
+        }
+        SurfaceResponse::MenuShown { serial } => {
+            w.tag = SurRepWire::TAG_MENU_SHOWN;
+            w.a = U64::new(u64::from(serial));
+        }
+        SurfaceResponse::Capture(frame) => {
+            w.tag = SurRepWire::TAG_CAPTURE;
+            w.id = U64::new(frame.freeze_ns);
+            w.a = U64::new(capture_word(&frame));
+            w.b = U64::new(frame.wall_ns.unwrap_or(0));
+            w.c = U64::new(frame.uptime_ns);
+            w.d = U64::new(placement_word(&frame));
+        }
+        SurfaceResponse::PickQueued { serial } => {
+            w.tag = SurRepWire::TAG_PICK_QUEUED;
+            w.a = U64::new(u64::from(serial));
+        }
+        SurfaceResponse::PickClaimed { token } => {
+            w.tag = SurRepWire::TAG_PICK_CLAIMED;
+            w.a = U64::new(token);
+        }
+        SurfaceResponse::PickAnswered { token } => {
+            w.tag = SurRepWire::TAG_PICK_ANSWERED;
+            w.a = U64::new(token);
+        }
         SurfaceResponse::Refused { refusal, subject } => {
             w.tag = SurRepWire::TAG_REFUSED;
             w.refusal = refusal.code();
@@ -500,6 +713,44 @@ fn raw_decode_rep(w: &SurRepWire) -> Option<SurfaceResponse> {
             presented_at: w.d.get(),
         },
         SurRepWire::TAG_CLOSE_REQUESTED => SurfaceResponse::CloseRequested { serial: w.a.get() },
+        SurRepWire::TAG_CURSOR_SET => SurfaceResponse::CursorSet {
+            cursor: Cursor::from_code(w.a.get())?,
+        },
+        SurRepWire::TAG_OPEN_QUEUED => SurfaceResponse::OpenQueued { object: w.a.get() },
+        SurRepWire::TAG_MENU_SHOWN => SurfaceResponse::MenuShown {
+            serial: u32::try_from(w.a.get()).ok()?,
+        },
+        SurRepWire::TAG_CAPTURE => {
+            let (a, d) = (w.a.get(), w.d.get());
+            if a >> 56 != 0 || d >> 33 != 0 {
+                return None;
+            }
+            let mode = CaptureMode::from_code((a >> 32) as u8)?;
+            let synced = d & CAPTURE_UNSYNCED == 0;
+            // Only a window can be copied unsynchronized: a screen or
+            // region is the compositor's own complete frame.
+            if !synced && mode != CaptureMode::Window {
+                return None;
+            }
+            SurfaceResponse::Capture(CaptureFrame {
+                width: a as u16,
+                height: (a >> 16) as u16,
+                mode,
+                screen: (a >> 40) as u8,
+                density: crate::appearance::Density::from_quarters((a >> 48) as u8)?,
+                wall_ns: (w.b.get() != 0).then_some(w.b.get()),
+                uptime_ns: w.c.get(),
+                freeze_ns: w.id.get(),
+                x: d as u16,
+                y: (d >> 16) as u16,
+                synced,
+            })
+        }
+        SurRepWire::TAG_PICK_QUEUED => SurfaceResponse::PickQueued {
+            serial: u32::try_from(w.a.get()).ok()?,
+        },
+        SurRepWire::TAG_PICK_CLAIMED => SurfaceResponse::PickClaimed { token: w.a.get() },
+        SurRepWire::TAG_PICK_ANSWERED => SurfaceResponse::PickAnswered { token: w.a.get() },
         SurRepWire::TAG_REFUSED => SurfaceResponse::Refused {
             refusal: SurfaceRefusal::from_code(w.refusal)?,
             subject: w.id.get(),
@@ -598,6 +849,24 @@ pub fn reply_matches(request: &SurReqWire, response: &SurfaceResponse, grants: u
         // A close raised under no configure serial names a window that was
         // never presented; the compositor refuses that instead.
         (SurfaceRequest::RequestClose, SurfaceResponse::CloseRequested { serial }) => serial != 0,
+        // The echo names the cursor asked for, never another.
+        (SurfaceRequest::SetCursor { cursor }, SurfaceResponse::CursorSet { cursor: got }) => {
+            cursor == got
+        }
+        (SurfaceRequest::OpenObject { object, .. }, SurfaceResponse::OpenQueued { object: got }) => {
+            object == got
+        }
+        (SurfaceRequest::ShowMenu { serial, .. }, SurfaceResponse::MenuShown { serial: got }) => {
+            serial == got
+        }
+        (SurfaceRequest::TakeCapture, SurfaceResponse::Capture(frame)) => frame.is_valid(),
+        (SurfaceRequest::PickObject { serial, .. }, SurfaceResponse::PickQueued { serial: got }) => {
+            serial == got
+        }
+        (SurfaceRequest::ClaimPick { token }, SurfaceResponse::PickClaimed { token: got })
+        | (SurfaceRequest::Picked { token, .. }, SurfaceResponse::PickAnswered { token: got }) => {
+            token == got
+        }
         _ => false,
     }
 }
@@ -668,6 +937,104 @@ pub const SURFACE_FORMAT_XRGB8888: u8 = DISPLAY_FORMAT_XRGB8888;
 
 #[cfg(test)]
 mod tests {
+    use crate::capture::{CaptureFrame, CaptureMode};
+
+    fn frame() -> CaptureFrame {
+        CaptureFrame {
+            width: 1280,
+            height: 800,
+            mode: CaptureMode::Screen,
+            screen: 0,
+            density: crate::appearance::Density::OneHalf,
+            wall_ns: Some(1_800_000_000_000_000_000),
+            uptime_ns: 42_000_000_000,
+            freeze_ns: 1_234_567,
+            x: 0,
+            y: 0,
+            synced: true,
+        }
+    }
+
+    /// A window's placement and its sync travel with the lend; only a window
+    /// may arrive unsynchronized, and stray placement bits refuse it.
+    #[test]
+    fn a_window_capture_carries_its_placement_and_sync() {
+        let window = CaptureFrame {
+            mode: CaptureMode::Window,
+            width: 640,
+            height: 400,
+            x: 312,
+            y: 0xfffe,
+            synced: false,
+            ..frame()
+        };
+        let region = CaptureFrame {
+            mode: CaptureMode::Region,
+            x: 7,
+            y: 9,
+            ..frame()
+        };
+        for frame in [window, CaptureFrame { synced: true, ..window }, region] {
+            let response = SurfaceResponse::Capture(frame);
+            assert_eq!(decode_rep(&encode_rep(&response, 1)), Some((response, 1)));
+        }
+        let unsynced_screen = SurfaceResponse::Capture(CaptureFrame {
+            synced: false,
+            ..frame()
+        });
+        assert_eq!(
+            decode_rep(&encode_rep(&unsynced_screen, 1)),
+            None,
+            "a screen is always the compositor's own complete frame"
+        );
+        let mut stray = encode_rep(&SurfaceResponse::Capture(window), 1);
+        stray.d = (stray.d.get() | 1 << 40).into();
+        assert_eq!(decode_rep(&stray), None);
+    }
+
+    /// A capture lend is one grant, byte-exact, and pairs only with the
+    /// verb that asked for it.
+    #[test]
+    fn a_capture_lend_round_trips_with_its_one_grant() {
+        let request = encode_req(&SurfaceRequest::TakeCapture);
+        assert_eq!(decode_req(&request), Some(SurfaceRequest::TakeCapture));
+        assert!(request_carries_grant(&SurfaceRequest::TakeCapture));
+        assert_eq!(
+            <SurfaceWire as kore_rt::svc::SvcProtocol>::request_grants(&request),
+            1
+        );
+        for frame in [frame(), CaptureFrame { wall_ns: None, ..frame() }] {
+            let response = SurfaceResponse::Capture(frame);
+            assert_eq!(reply_grants(&response), 1);
+            let wire = encode_rep(&response, 1);
+            assert_eq!(decode_rep(&wire), Some((response, 1)));
+            assert!(reply_matches(&request, &response, 1));
+            assert!(!reply_matches(&request, &response, 0), "the lend must ride it");
+            assert_eq!(decode_rep(&encode_rep(&response, 0)), None);
+            let status = encode_req(&SurfaceRequest::Status { surface: 1 });
+            assert!(!reply_matches(&status, &response, 1));
+            // The picker and screenshot protocols share this wire, but a
+            // pick must never consume the capture writer's read-only grant.
+            let pick = encode_req(&SurfaceRequest::PickObject { types: 1, serial: 1 });
+            assert_ne!(pick.op, request.op);
+            assert!(!reply_matches(&pick, &response, 1));
+            let queued = SurfaceResponse::PickQueued { serial: 1 };
+            assert_ne!(encode_rep(&queued, 0).tag, wire.tag);
+            assert!(!reply_matches(&request, &queued, 0));
+        }
+        let empty = SurfaceResponse::Capture(CaptureFrame {
+            height: 0,
+            ..frame()
+        });
+        assert!(!reply_matches(&request, &empty, 1), "a lend with no pixels");
+        let mut stray = encode_rep(&SurfaceResponse::Capture(frame()), 1);
+        stray.a = (stray.a.get() | 1 << 56).into();
+        assert_eq!(decode_rep(&stray), None);
+        let mut density = encode_rep(&SurfaceResponse::Capture(frame()), 1);
+        density.a = (density.a.get() & !(0xff << 48) | 1 << 48).into();
+        assert_eq!(decode_rep(&density), None, "a density no screen draws at");
+    }
+
     use super::*;
     use kore_rt::svc::SvcProtocol;
     use zerocopy::{FromBytes, IntoBytes};
@@ -800,7 +1167,7 @@ mod tests {
         }
     }
 
-    fn every_request() -> [SurfaceRequest; 6] {
+    fn every_request() -> [SurfaceRequest; 14] {
         [
             SurfaceRequest::Query,
             SurfaceRequest::CreateSurface {
@@ -820,10 +1187,40 @@ mod tests {
             SurfaceRequest::DestroySurface { surface: 0x11 },
             SurfaceRequest::Status { surface: 0x2002 },
             SurfaceRequest::RequestClose,
+            SurfaceRequest::SetCursor {
+                cursor: Cursor::Default,
+            },
+            SurfaceRequest::SetCursor {
+                cursor: Cursor::Progress,
+            },
+            SurfaceRequest::OpenObject {
+                object: 0x5eed,
+                kind: DocumentKind::Unknown,
+            },
+            SurfaceRequest::OpenObject {
+                object: u64::MAX,
+                kind: DocumentKind::Image,
+            },
+            SurfaceRequest::ShowMenu {
+                x: -12,
+                y: 4000,
+                len: MENU_PLANE_BYTES as u16,
+                serial: u32::MAX,
+            },
+            SurfaceRequest::PickObject {
+                types: u64::MAX,
+                serial: u32::MAX,
+            },
+            SurfaceRequest::ClaimPick { token: u64::MAX },
+            SurfaceRequest::Picked {
+                token: 0x7071_ce4e,
+                object: u64::MAX,
+                len: PICK_NAME_BYTES as u8,
+            },
         ]
     }
 
-    fn every_response() -> [SurfaceResponse; 7] {
+    fn every_response() -> [SurfaceResponse; 13] {
         [
             SurfaceResponse::Info {
                 width: 1920,
@@ -855,7 +1252,119 @@ mod tests {
                 subject: 0,
             },
             SurfaceResponse::CloseRequested { serial: 0x2A },
+            SurfaceResponse::CursorSet {
+                cursor: Cursor::Text,
+            },
+            SurfaceResponse::OpenQueued { object: 0x5eed },
+            SurfaceResponse::MenuShown { serial: 7 },
+            SurfaceResponse::PickQueued { serial: 3 },
+            SurfaceResponse::PickClaimed { token: 0x7071_ce4e },
+            SurfaceResponse::PickAnswered { token: 0x7071_ce4e },
         ]
+    }
+
+    /// A pick is answered only by its own serial's echo, a claim and an
+    /// answer only by their token's, none carries a grant, and a pick of no
+    /// types, a zero serial or token, or an answer whose name contradicts
+    /// its object refuses.
+    #[test]
+    fn picks_are_answered_only_by_their_own_serial_or_token() {
+        let pick = SurfaceRequest::PickObject { types: 0b1100, serial: 4 };
+        let wire = encode_req(&pick);
+        assert_eq!(SurfaceWire::request_grants(&wire), 0);
+        assert_eq!(decode_req(&wire), Some(pick));
+        assert!(reply_matches(&wire, &SurfaceResponse::PickQueued { serial: 4 }, 0));
+        assert!(!reply_matches(&wire, &SurfaceResponse::PickQueued { serial: 5 }, 0));
+        assert!(!reply_matches(&wire, &SurfaceResponse::MenuShown { serial: 4 }, 0));
+        let claim = encode_req(&SurfaceRequest::ClaimPick { token: 9 });
+        assert!(reply_matches(&claim, &SurfaceResponse::PickClaimed { token: 9 }, 0));
+        assert!(!reply_matches(&claim, &SurfaceResponse::PickAnswered { token: 9 }, 0));
+        let answer = encode_req(&SurfaceRequest::Picked { token: 9, object: 0x77, len: 9 });
+        assert!(reply_matches(&answer, &SurfaceResponse::PickAnswered { token: 9 }, 0));
+        assert!(!reply_matches(&answer, &SurfaceResponse::PickAnswered { token: 8 }, 0));
+        let cancel = SurfaceRequest::Picked { token: 9, object: 0, len: 0 };
+        assert_eq!(decode_req(&encode_req(&cancel)), Some(cancel));
+        for bad in [
+            SurfaceRequest::PickObject { types: 0, serial: 4 },
+            SurfaceRequest::PickObject { types: 1, serial: 0 },
+            SurfaceRequest::ClaimPick { token: 0 },
+            SurfaceRequest::Picked { token: 0, object: 1, len: 1 },
+            SurfaceRequest::Picked { token: 9, object: 1, len: 0 },
+            SurfaceRequest::Picked { token: 9, object: 0, len: 1 },
+            SurfaceRequest::Picked { token: 9, object: 1, len: PICK_NAME_BYTES as u8 + 1 },
+        ] {
+            assert_eq!(decode_req(&encode_req(&bad)), None, "{bad:?}");
+        }
+        // The serial's word holds a `u32`; its high bits are not spare.
+        let mut stray = wire;
+        stray.b = U64::new(stray.b.get() | 1 << 40);
+        assert_eq!(decode_req(&stray), None);
+    }
+
+    /// A menu request is answered only by its own serial's echo, carries
+    /// no grant, and an empty or oversized plane or a zero serial refuses.
+    #[test]
+    fn a_menu_request_is_answered_only_by_its_own_serial() {
+        let show = SurfaceRequest::ShowMenu {
+            x: 40,
+            y: -3,
+            len: 96,
+            serial: 9,
+        };
+        let wire = encode_req(&show);
+        assert_eq!(SurfaceWire::request_grants(&wire), 0);
+        assert_eq!(decode_req(&wire), Some(show));
+        assert!(reply_matches(&wire, &SurfaceResponse::MenuShown { serial: 9 }, 0));
+        assert!(!reply_matches(&wire, &SurfaceResponse::MenuShown { serial: 8 }, 0));
+        assert!(!reply_matches(&wire, &SurfaceResponse::OpenQueued { object: 9 }, 0));
+        for (len, serial) in [(0, 9), (MENU_PLANE_BYTES as u16 + 1, 9), (96, 0)] {
+            let bad = encode_req(&SurfaceRequest::ShowMenu {
+                x: 0,
+                y: 0,
+                len,
+                serial,
+            });
+            assert_eq!(decode_req(&bad), None, "len {len} serial {serial}");
+        }
+        // The length's spare high bits are not the serial's to borrow.
+        let mut stray = wire;
+        stray.b = U64::new(stray.b.get() | 1 << 20);
+        assert_eq!(decode_req(&stray), None);
+        // An open names a kind a class has, or refuses.
+        let mut open = encode_req(&SurfaceRequest::OpenObject {
+            object: 1,
+            kind: DocumentKind::Text,
+        });
+        open.b = U64::new(DocumentKind::ALL.len() as u64);
+        assert_eq!(decode_req(&open), None);
+    }
+
+    /// A cursor request is answered only by the echo of the cursor it
+    /// named, carries no grant, and a code no cursor has refuses at decode.
+    #[test]
+    fn a_cursor_request_is_answered_only_by_its_own_echo() {
+        for cursor in Cursor::ALL {
+            let wire = encode_req(&SurfaceRequest::SetCursor { cursor });
+            assert_eq!(SurfaceWire::request_grants(&wire), 0);
+            assert_eq!(decode_req(&wire), Some(SurfaceRequest::SetCursor { cursor }));
+            for echoed in Cursor::ALL {
+                let held = SurfaceResponse::CursorSet { cursor: echoed };
+                assert_eq!(reply_matches(&wire, &held, 0), echoed == cursor);
+            }
+        }
+        let mut stray = encode_req(&SurfaceRequest::SetCursor {
+            cursor: Cursor::Text,
+        });
+        stray.a = U64::new(Cursor::ALL.len() as u64);
+        assert_eq!(decode_req(&stray), None);
+        let mut reply = encode_rep(
+            &SurfaceResponse::CursorSet {
+                cursor: Cursor::Text,
+            },
+            0,
+        );
+        reply.a = U64::new(u64::MAX);
+        assert_eq!(decode_rep(&reply), None);
     }
 
     /// A close request answers only under a live configure serial, and a

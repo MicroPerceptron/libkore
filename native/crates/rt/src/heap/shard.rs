@@ -24,7 +24,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr};
 
 use super::Extent;
-use super::pool::{self, NUM_CLASSES};
+use super::pool::{self, NUM_CLASSES, NUM_LANES};
 
 /// The number of shards.  A design constant, not a discovery: the ceiling on
 /// concurrently-allocating tasks that each get a lock-free lane before two must
@@ -47,9 +47,11 @@ pub(crate) struct Shard {
     /// drains.  One per class so a drain is targeted and the class of a remote
     /// block is implicit in which stack holds it (no per-block class tag).
     remote: [AtomicPtr<u8>; NUM_CLASSES],
-    /// The pool [`Extent`](super::Extent) this shard bump-carves fresh blocks
-    /// from, or null before its first grow.  Owner-only.
-    current: UnsafeCell<*mut Extent>,
+    /// The pool [`Extent`](super::Extent)s this shard bump-carves fresh
+    /// blocks from, one per carve lane ([`pool::carve_lane`]: the small
+    /// classes' shared extent, then one per large class), each null before
+    /// its first grow.  Owner-only.
+    current: [UnsafeCell<*mut Extent>; NUM_LANES],
     /// Debug-only single-owner detector: set while a thread is inside this
     /// shard's owner-only region ([`Shard::owner_guard`]).  A second concurrent
     /// entry — the exact precondition for the `UnsafeCell` data race a
@@ -77,7 +79,7 @@ impl Shard {
         Self {
             local: [const { UnsafeCell::new(core::ptr::null_mut()) }; NUM_CLASSES],
             remote: [const { AtomicPtr::new(core::ptr::null_mut()) }; NUM_CLASSES],
-            current: UnsafeCell::new(core::ptr::null_mut()),
+            current: [const { UnsafeCell::new(core::ptr::null_mut()) }; NUM_LANES],
             owner_active: AtomicBool::new(false),
         }
     }
@@ -159,24 +161,27 @@ impl Shard {
         reclaimed
     }
 
-    /// The pool extent this shard is carving from (null before the first grow).
+    /// The pool extent this shard is carving `lane` from (null before the
+    /// lane's first grow).
     ///
     /// # Safety
     /// Owner-only read.
     #[inline]
-    pub(crate) unsafe fn current(&self) -> *mut Extent {
+    pub(crate) unsafe fn current(&self, lane: usize) -> *mut Extent {
+        debug_assert!(lane < NUM_LANES);
         // SAFETY: owner-only access (caller contract).
-        unsafe { *self.current.get() }
+        unsafe { *self.current[lane].get() }
     }
 
-    /// Set the pool extent this shard carves from (after a grow).
+    /// Set the pool extent this shard carves `lane` from (after a grow).
     ///
     /// # Safety
     /// Owner-only write.
     #[inline]
-    pub(crate) unsafe fn set_current(&self, extent: *mut Extent) {
+    pub(crate) unsafe fn set_current(&self, lane: usize, extent: *mut Extent) {
+        debug_assert!(lane < NUM_LANES);
         // SAFETY: owner-only access (caller contract).
-        unsafe { *self.current.get() = extent }
+        unsafe { *self.current[lane].get() = extent }
     }
 
     /// Enter this shard's owner-only region, returning a guard that marks it busy

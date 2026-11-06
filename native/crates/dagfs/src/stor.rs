@@ -31,7 +31,8 @@ use kore_rt::svc::{ReturnCapability, ReturnLeaseSource};
 use kore_rt::transport as rt_transport;
 
 use crate::client::{LentVersion, RingFs, RingFsError};
-use crate::{Fs, FsError, FsRequest, FsResponse, ProviderError};
+use crate::{Fs, FsError, FsRequest, FsResponse, MaintainAction, ProviderError};
+use kore_abi::svc::{PackBucketWire, PackMaintenanceWire};
 
 pub use kore_abi::stor::{Class, GrantId, StorStatus};
 /// What every ring call answers when it does not succeed.
@@ -920,6 +921,26 @@ impl<T: rt_transport::Transport> RingFs<'_, '_, T> {
         }
     }
 
+    /// Ask the pack region's maintenance job for `action`; its report lands
+    /// in the data window at `window_offset`. Answers the bytes landed —
+    /// lift them with [`read_pack_report`].
+    pub async fn stor_maintain(
+        &mut self,
+        action: MaintainAction,
+        window_offset: u32,
+    ) -> Result<u32, Refusal> {
+        match self
+            .stor_call(&FsRequest::StorMaintain {
+                action,
+                window_offset,
+            })
+            .await?
+        {
+            FsResponse::StorMaintained { len } => Ok(len),
+            _ => Err(Refusal::Pair),
+        }
+    }
+
     /// Send the notice a parked row is owed, unconditionally — a lost-wake
     /// probe: work that completes only after this was never seen.
     pub async fn stor_kick(&mut self) -> Result<(), Refusal> {
@@ -1056,6 +1077,8 @@ impl Fs<'_, '_> {
     /// ring grant ([`stor_grant_version`](Self::stor_grant_version)) and
     /// [`read_version`](Self::read_version) read, unchanged by later writes,
     /// until [`release_version`](Self::release_version).
+    /// Keep `file` open until the lease is released: pinning the bytes does
+    /// not replace the view's authority, which grant/read revalidate.
     pub async fn lend_version(&mut self, file: &crate::View) -> Result<LentVersion, Refusal> {
         let pending = match self.client.lend_version(file.handle(), 0).await {
             Ok(pending) => pending,
@@ -1175,6 +1198,46 @@ impl Fs<'_, '_> {
     pub async fn stor_inspect(&mut self) -> Result<StorCounters, Refusal> {
         self.client.stor_inspect().await
     }
+
+    /// See [`RingFs::stor_maintain`]: the report, lifted from the start of
+    /// the data window. Valid until the next request that uses the window.
+    pub async fn stor_maintain(&mut self, action: MaintainAction) -> Result<PackReport<'_>, Refusal> {
+        let len = self.client.stor_maintain(action, 0).await?;
+        read_pack_report(self.window(), 0, len).map_err(Refusal::Fs)
+    }
+}
+
+/// The pack region's maintenance report as a client reads it: the summary
+/// and one record per bucket, in region order.
+pub struct PackReport<'w> {
+    pub summary: PackMaintenanceWire,
+    pub buckets: &'w [PackBucketWire],
+}
+
+/// Lift the `len` bytes a [`FsRequest::StorMaintain`] landed at
+/// `window_offset`: a [`PackMaintenanceWire`] and exactly its `entries`
+/// bucket records, each field inside its vocabulary.
+pub fn read_pack_report(window: &[u8], window_offset: u32, len: u32) -> Result<PackReport<'_>, FsError> {
+    use zerocopy::FromBytes;
+    let at = usize::try_from(window_offset).map_err(|_| FsError::Range)?;
+    let end = at
+        .checked_add(usize::try_from(len).map_err(|_| FsError::Range)?)
+        .ok_or(FsError::Range)?;
+    let bytes = window.get(at..end).ok_or(FsError::Range)?;
+    let (head, rest) = bytes
+        .split_at_checked(PackMaintenanceWire::BYTES)
+        .ok_or(FsError::Range)?;
+    let summary = PackMaintenanceWire::read_from_bytes(head).map_err(|_| FsError::Range)?;
+    let entries = usize::from(summary.entries.get());
+    if rest.len() != entries * PackBucketWire::BYTES
+        || entries > usize::from(summary.buckets.get())
+        || summary.phase > PackMaintenanceWire::PHASE_DRAINING
+        || summary.outcome > PackMaintenanceWire::OUTCOME_FAULTED
+    {
+        return Err(FsError::Range);
+    }
+    let buckets = <[PackBucketWire]>::ref_from_bytes(rest).map_err(|_| FsError::Range)?;
+    Ok(PackReport { summary, buckets })
 }
 
 #[cfg(test)]

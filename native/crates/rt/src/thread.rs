@@ -595,6 +595,46 @@ pub struct WorkerCap {
     pub rights: kore_abi::cap::Rights,
 }
 
+impl WorkerCap {
+    /// **The process heap, endowed** — `role::HEAP@0`: the position a
+    /// thread must hold for the global allocator to grow on it.
+    ///
+    /// The allocator is process-wide memory, but its grow is
+    /// capability-gated per task: a thread that finds the shared heap
+    /// window short carves its own extent off the supply it holds
+    /// (`heap::source`), and sharing the parent's address space does not
+    /// make the parent's holding reachable. Every thread that runs code
+    /// which may allocate is founded holding this, whatever else it is
+    /// endowed with. The parent keeps the supply and the child receives a
+    /// whole-span sublease with carve and map authority only; REVOKE stays
+    /// with the parent, which tears the sublease down.
+    pub fn heap(supply: SlotRef) -> Self {
+        use kore_abi::cap::{ResourceKind, Rights};
+        Self {
+            role: role::HEAP,
+            index: 0,
+            subject: supply,
+            kind: ResourceKind::MemLease as u16 as u8,
+            rights: Rights::ACCESS | Rights::MODIFY | Rights::DERIVE,
+        }
+    }
+}
+
+/// [`WorkerCap::heap`] over this thread's own `role::HEAP@0` — `None` when
+/// the task was founded without a heap supply (its allocator cannot grow
+/// on any thread), or before the thread is anchored.
+#[cfg(target_os = "none")]
+pub(crate) fn heap_endowment() -> Option<WorkerCap> {
+    let rt = crate::entry::thread_context()?;
+    Some(WorkerCap::heap(rt.bootstrap().handle(role::HEAP, 0)?))
+}
+
+/// Off metal no thread founds another; there is no heap to endow.
+#[cfg(not(target_os = "none"))]
+pub(crate) fn heap_endowment() -> Option<WorkerCap> {
+    None
+}
+
 /// Build exactly the capability namespace a spawned worker receives.
 ///
 /// This stays target-independent so host tests can pin a subtle shared-space
@@ -798,7 +838,7 @@ pub fn spawn_with_doorbell(entry: fn(), extra: &[WorkerCap]) -> Option<DoorbellW
         let _ = pair.root.try_retire();
         return None;
     };
-    let Some(heap) = rt.bootstrap().handle(role::HEAP, 0) else {
+    let Some(heap) = heap_endowment() else {
         let _ = pair.send.try_retire();
         let _ = pair.root.try_retire();
         let _ = wake.send.try_retire();
@@ -836,13 +876,7 @@ pub fn spawn_with_doorbell(entry: fn(), extra: &[WorkerCap]) -> Option<DoorbellW
         kind: ResourceKind::ChanSend as u16 as u8,
         rights: verbs::NOTICE_RIGHTS,
     };
-    caps[2] = WorkerCap {
-        role: role::HEAP,
-        index: 0,
-        subject: heap,
-        kind: ResourceKind::MemLease as u16 as u8,
-        rights: Rights::ACCESS | Rights::MODIFY | Rights::DERIVE,
-    };
+    caps[2] = heap;
     caps[3..3 + extra.len()].copy_from_slice(extra);
     let Some(thread) = spawn_with(entry, &caps[..3 + extra.len()]) else {
         let _ = pair.send.try_retire();
@@ -906,6 +940,9 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap]) -> Option<Thread> {
     // here, seven times, against nothing.
     let owner = crate::entry::geometry::thread_owner_identity()?;
     let index = claim_thread_index()?;
+    // The index may have belonged to a dead sibling: its noted windows must
+    // not become this thread's (`cap::mapped::forget_thread`).
+    crate::cap::mapped::forget_thread(index as usize);
     let mut w = BANDS.windows(index)?;
     let tls = match template {
         Some(t) => Some(t.place(w.map)?),
@@ -1132,6 +1169,20 @@ fn stamp_stage(
             return None;
         }
     }
+    // `geom::RESERVE` is the one task-level window a thread IS stamped: its
+    // placement is exact and keeps no cursor, so there is no second cursor
+    // to put on one span (#428), and the stamp is what makes the kernel keep
+    // this thread's exact-VA shares out of the task's reservations too, as
+    // it does the task's own (`refuse_reserve_window`).  Copied from the
+    // spawning thread's geometry, which carries it in turn.
+    if let Some(reserve) = crate::entry::thread_context()
+        .and_then(|rt| rt.geom())
+        .and_then(|g| g.window_of(geom::RESERVE))
+    {
+        if !gblock.push_window(geom::RESERVE, 0, reserve) {
+            return None;
+        }
+    }
     let stage_va = w.stage.base();
     let stack_top = stack_base + stack_len;
     // SAFETY: the provisioning session just mapped the whole `w.stage`
@@ -1170,6 +1221,34 @@ fn stamp_stage(
     Some(())
 }
 
+/// The widest planned gang endowment: the star's mesh at the widest chunk
+/// (own recv, hub send, the founder's send, and a send per chunk sibling —
+/// `MESH_CEILING + 2`), closed with the heap.
+#[cfg(any(target_os = "none", test))]
+const PLANNED_CAPS: usize = crate::star::MESH_CEILING + 3;
+
+/// The fill pattern of an endowment buffer, never read past its length.
+#[cfg(any(target_os = "none", test))]
+const VACANT_CAP: WorkerCap = WorkerCap {
+    role: 0,
+    index: 0,
+    subject: SlotRef::from_wire(0),
+    kind: 0,
+    rights: kore_abi::cap::Rights::empty(),
+};
+
+/// Close the `filled` capabilities planned in `out` with `heap`, the
+/// process heap when the task holds one: the endowment's new length, or
+/// `None` when the heap does not fit.
+#[cfg(any(target_os = "none", test))]
+fn close_with_heap(out: &mut [WorkerCap], filled: usize, heap: Option<WorkerCap>) -> Option<usize> {
+    let Some(heap) = heap else {
+        return Some(filled);
+    };
+    *out.get_mut(filled)? = heap;
+    filled.checked_add(1)
+}
+
 /// **The gang founding** (G5 — `res/SPMD.md` §7): found `out.len()` SPMD
 /// workers of one region in TWO sessions total — one provisioning
 /// session mapping every worker's stack, runtime-block, and staging
@@ -1181,6 +1260,15 @@ fn stamp_stage(
 /// for compute workers, false for the star's hub, which must neither
 /// occupy a class-best pin nor count in a reservation batch
 /// (`spawn_spmd` chunks a wide launch across calls).
+///
+/// `heap` closes every **planned** endowment — none, or the star's mesh —
+/// with the process heap ([`WorkerCap::heap`]): a compute worker runs
+/// caller code, and caller code allocates. Without it a worker can only
+/// bump what thread 0 already mapped into the shared heap window, and its
+/// first allocation that finds the window short is refused (#1316). An
+/// explicit `endows` list is the caller's whole endowment and takes no
+/// heap: the star's hub, its one caller, runs only `star::hub_main`,
+/// which posts notices and parks and never allocates.
 ///
 /// Returns whether EVERY worker founded (`Status::Ok`).  Once the
 /// founding session has committed, `out` is populated with a join
@@ -1199,6 +1287,7 @@ pub(crate) fn spawn_gang_workers(
     pin: bool,
     endows: &[&[WorkerCap]],
     star: Option<&crate::star::StarPlan>,
+    heap: Option<WorkerCap>,
     out: &mut [Option<Thread>],
 ) -> bool {
     use crate::session::MAX_SESSION_FOUNDS;
@@ -1217,9 +1306,12 @@ pub(crate) fn spawn_gang_workers(
     // list per worker (the hub founding's shape), or a star plan —
     // whose per-worker kick-mesh endows name PEER BANDS and therefore
     // cannot exist yet: they are built below, after the claims loop
-    // fixes every member's band.  A meshed chunk is invocation-bounded
-    // at [`MESH_CEILING`](crate::star::MESH_CEILING) (n·(n+6) invocations).
-    if !endows.is_empty() && (endows.len() != n || star.is_some()) {
+    // fixes every member's band.  A planned endowment (absent or the
+    // mesh) is closed with `heap`; an explicit one is complete as given.
+    // A meshed chunk is invocation-bounded at
+    // [`MESH_CEILING`](crate::star::MESH_CEILING) (n·(n+7) invocations,
+    // the heap included).
+    if !endows.is_empty() && (endows.len() != n || star.is_some() || heap.is_some()) {
         return false;
     }
     if star.is_some() && n > crate::star::MESH_CEILING {
@@ -1374,40 +1466,40 @@ pub(crate) fn spawn_gang_workers(
     if committed.status() != kore_abi::session::Status::Ok {
         return false;
     }
-    // ── The star's kick mesh, buildable only now: every member's band
-    //    is claimed, so each worker's peer sends can be NAMED
-    //    (`DOORBELL@PEER_BASE+band` — the futex lookup's arithmetic).
-    //    One vacant WorkerCap is the fill pattern; the lens bound what
-    //    is read. ──
-    let vacant_cap = WorkerCap {
-        role: 0,
-        index: 0,
-        subject: SlotRef::from_wire(0),
-        kind: 0,
-        rights: kore_abi::cap::Rights::empty(),
-    };
-    let mut mesh_store = [[vacant_cap; { crate::star::MESH_CEILING + 2 }]; MAX_SESSION_FOUNDS];
-    let mut mesh_lens = [0usize; MAX_SESSION_FOUNDS];
-    if let Some(plan) = star {
+    // ── The planned endowments, buildable only now: every member's band
+    //    is claimed, so the star's peer sends can be NAMED
+    //    (`DOORBELL@PEER_BASE+band` — the futex lookup's arithmetic),
+    //    and each plan is closed with the heap.  One vacant WorkerCap is
+    //    the fill pattern; the lens bound what is read. ──
+    let mut planned = [[VACANT_CAP; PLANNED_CAPS]; MAX_SESSION_FOUNDS];
+    let mut planned_lens = [0usize; MAX_SESSION_FOUNDS];
+    if endows.is_empty() {
         let mut bands = [(0usize, 0u32); MAX_SESSION_FOUNDS];
         for (k, claim) in claims.iter().take(n).enumerate() {
             let Some(c) = claim else { return false };
             bands[k] = (first_worker as usize + k, c.index);
         }
         for k in 0..n {
-            let Some(filled) =
-                plan.worker_endow_mesh(first_worker as usize + k, &bands[..n], &mut mesh_store[k])
-            else {
+            let meshed = match star {
+                Some(plan) => match plan.worker_endow_mesh(
+                    first_worker as usize + k,
+                    &bands[..n],
+                    &mut planned[k],
+                ) {
+                    Some(filled) => filled,
+                    None => return false,
+                },
+                None => 0,
+            };
+            let Some(filled) = close_with_heap(&mut planned[k], meshed, heap) else {
                 return false;
             };
-            mesh_lens[k] = filled;
+            planned_lens[k] = filled;
         }
     }
     let endow_for = |k: usize| -> &[WorkerCap] {
-        if star.is_some() {
-            &mesh_store[k][..mesh_lens[k]]
-        } else if endows.is_empty() {
-            &[]
+        if endows.is_empty() {
+            &planned[k][..planned_lens[k]]
         } else {
             endows[k]
         }
@@ -2313,19 +2405,77 @@ mod tests {
         }
     }
 
+    /// The heap endowment is a carve-and-map sublease of the parent's
+    /// supply, under the name the allocator's grow looks up: never the
+    /// teardown right, which stays with the parent.
     #[test]
-    fn worker_bootstrap_installs_an_explicit_heap_supply() {
+    fn the_heap_endowment_is_a_carve_and_map_sublease() {
         use kore_abi::cap::{ResourceKind, Rights};
 
+        let heap = WorkerCap::heap(SlotRef::from_wire(71));
+        assert_eq!((heap.role, heap.index), (role::HEAP, 0));
+        assert_eq!(heap.subject, SlotRef::from_wire(71));
+        assert_eq!(heap.kind, ResourceKind::MemLease as u16 as u8);
+        assert_eq!(heap.rights, Rights::ACCESS | Rights::MODIFY | Rights::DERIVE);
+        assert!(!heap.rights.contains(Rights::REVOKE));
+    }
+
+    /// A planned gang endowment — none, or the star's mesh — is closed
+    /// with the heap, so every compute worker can grow the allocator; a
+    /// task without a heap adds nothing, and a heap that does not fit is
+    /// refused rather than dropped (#1316).
+    #[test]
+    fn a_planned_gang_endowment_closes_with_the_heap() {
+        let heap = WorkerCap::heap(SlotRef::from_wire(71));
+        let doorbell = WorkerCap {
+            role: role::DOORBELL,
+            ..VACANT_CAP
+        };
+
+        let mut starless = [VACANT_CAP; PLANNED_CAPS];
+        assert_eq!(close_with_heap(&mut starless, 0, Some(heap)), Some(1));
+        assert_eq!((starless[0].role, starless[0].index), (role::HEAP, 0));
+
+        // The widest mesh still leaves the heap its place.
+        let widest = 2 + crate::star::MESH_CEILING;
+        let mut meshed = [doorbell; PLANNED_CAPS];
+        assert_eq!(close_with_heap(&mut meshed, widest, Some(heap)), Some(widest + 1));
+        assert_eq!(meshed[widest].role, role::HEAP);
+        assert!(meshed[..widest].iter().all(|cap| cap.role == role::DOORBELL));
+
+        let mut unendowed = [VACANT_CAP; PLANNED_CAPS];
+        assert_eq!(close_with_heap(&mut unendowed, 3, None), Some(3));
+        assert_eq!(unendowed[3].role, 0);
+
+        let mut full = [doorbell; 2];
+        assert_eq!(close_with_heap(&mut full, 2, Some(heap)), None);
+    }
+
+    /// A meshed worker's planned endowment, the heap included, is a lawful
+    /// founding endowment at the widest chunk.
+    #[test]
+    fn the_widest_planned_endowment_fits_a_founding() {
+        assert!(PLANNED_CAPS <= MAX_WORKER_CAPS);
+        let mut plan = [VACANT_CAP; PLANNED_CAPS];
+        for (i, cap) in plan.iter_mut().enumerate() {
+            *cap = WorkerCap {
+                role: role::DOORBELL,
+                index: crate::futex::PEER_BASE + i as u16,
+                ..VACANT_CAP
+            };
+        }
+        let heap = WorkerCap::heap(SlotRef::from_wire(71));
+        assert_eq!(close_with_heap(&mut plan, PLANNED_CAPS - 1, Some(heap)), Some(PLANNED_CAPS));
+        let block = worker_boot_block(&plan).expect("the widest planned endowment fits a boot block");
+        let bootstrap = kore_abi::task::Bootstrap::of(&block).expect("worker block validates");
+        assert!(bootstrap.handle(role::HEAP, 0).is_some());
+    }
+
+    #[test]
+    fn worker_bootstrap_installs_an_explicit_heap_supply() {
         let parent_heap = SlotRef::from_wire(71);
-        let block = worker_boot_block(&[WorkerCap {
-            role: role::HEAP,
-            index: 0,
-            subject: parent_heap,
-            kind: ResourceKind::MemLease as u16 as u8,
-            rights: Rights::ACCESS | Rights::MODIFY | Rights::DERIVE,
-        }])
-        .expect("one runtime heap endowment fits");
+        let block = worker_boot_block(&[WorkerCap::heap(parent_heap)])
+            .expect("one runtime heap endowment fits");
         let bootstrap = kore_abi::task::Bootstrap::of(&block).expect("worker block validates");
 
         assert_eq!(

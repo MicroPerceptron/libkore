@@ -393,6 +393,22 @@ pub mod role {
     /// launcher keeps that arena mapped. Exec-synthesized, like
     /// [`STOR_RING`].
     pub const STOR_TARGET: u16 = 46;
+    /// Init's one-shot **boot-settled** lane to the compositor (#1332): a
+    /// channel the founder mints for this lane alone. The compositor's block
+    /// names its receive end, and init's names the only send leaf. Init
+    /// sends once, when its boot work is done, and the compositor's welcome
+    /// holds its first frame until then, leaving the cores to boot. No other
+    /// task receives either end, so no one else can release the welcome
+    /// early. Both ends are founder-stamped chain wiring, outside every
+    /// manifest profile.
+    pub const BOOT_SETTLE: u16 = 47;
+    /// A non-invocable selector for the launcher's current filesystem view —
+    /// its cwd — moved in beside an ordinary launch whose paths the launcher
+    /// spelled from that cwd's route. It carries REVOKE only, like
+    /// [`FS_GRANT_TARGET`]: the child presents it once, so the filesystem
+    /// confirms the route still names the very directory the view is bound
+    /// to, and can neither invoke nor delegate it.
+    pub const FS_VIEW_ANCHOR: u16 = 48;
     /// First caller-assigned role — roles `>=` this are convention-defined.
     pub const USER_BASE: u16 = 0x8000;
 }
@@ -446,17 +462,19 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
     DESKTOP_BOOTSTRAP_WINDOW_SLOTS + 2 * DESKTOP_CONTROLLER_CAPACITY;
 
 /// Live immutable image-generation peers the boot catalogue can hold at once:
-/// the 40-row bootstrap catalogue — the desktop's `editor` and `power-ui`
-/// beside the native filesystem verbs `append`, `sync` and `pack`, the two
-/// WebAssembly rows, `wasm-witness` and `wasm`, `inference` /
-/// `model-data-witness`, and `shell`, the guest shell `term` opens — plus the
-/// founded shell, the graphical terminal, and three extraction parsers.
+/// the 45-row bootstrap catalogue — the desktop's `files`, its documents
+/// `editor`, `photos`, `settings` and `power-ui`, the screenshot writer `capture`, beside
+/// the native filesystem verbs `append`, `sync` and `pack`, the two
+/// WebAssembly rows, `wasm-witness` and `wasm`, `jsapp`, the JS app host,
+/// `inference` / `model-data-witness`, and `shell`, the guest shell `term`
+/// opens — plus the founded shell, the graphical terminal, and three
+/// extraction parsers.
 /// Exec asserts this covers its catalogue (`kore-svc-exec`), the one place
 /// that sees both.  Named
 /// separately from the interactive reservation below because the two grow for
 /// unrelated reasons: this one when a row joins the catalogue, that one when
 /// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 45;
+pub const BOOTSTRAP_IMAGE_PEERS: usize = 50;
 
 /// Bootstrap face-supply sizing. Image and runtime grow their face tables and
 /// rings on demand; this reserves enough initial memory for the boot catalogue
@@ -574,6 +592,22 @@ pub mod geom {
     /// tasks, absent for spawned threads, whose growth stays on their stride
     /// because their holdings die with them.
     pub const HEAP: u16 = 10;
+    /// The task's **reservation window** (GEOM_ABI v8) — address space a
+    /// runtime reserves for itself and commits page by page: Wasmtime's
+    /// guarded linear memories, each a 4 GiB range with a guard on either
+    /// side of which only what the guest has grown to is mapped
+    /// (`res/WASM_PLATFORM.md` §12).  Stamping it maps nothing.  The task
+    /// commits a carve of a supply it holds at an exact page of the window
+    /// ([`ViewMapWindow::Reserve`](crate::session::ViewMapWindow::Reserve))
+    /// and releases a page range of it
+    /// ([`DERIVE_KIND_RESERVE_RELEASE`](crate::session::DERIVE_KIND_RESERVE_RELEASE)).
+    ///
+    /// The one task-level window with no cursor: placement is the caller's
+    /// and the page table is its only state — a commit over a mapped page
+    /// refuses — so there is nothing per thread to keep apart, and a spawned
+    /// thread is stamped the task's own window where [`HEAP`](Self::HEAP)
+    /// and its siblings are stamped none.
+    pub const RESERVE: u16 = 11;
 }
 
 /// One startup handle: a delegated capability tagged by [`role`] (+ an instance
@@ -788,20 +822,22 @@ impl Default for BootBlock {
 /// task-level [`geom::DEVICE`] BAR window — stamped only for a row that claims
 /// a PCI function with a large BAR (the NPU's 16 MiB BAR0).  v7 widens the
 /// table (10 → 12) and adds the task-level [`geom::HEAP`] window, leaving one
-/// entry spare as v4 did.
-pub const GEOM_ABI: u16 = 7;
+/// entry spare as v4 did.  v8 names that twelfth entry: the
+/// [`geom::RESERVE`] window, the first stamped for spawned threads as well.
+pub const GEOM_ABI: u16 = 8;
 
 /// Window capacity of a [`GeomBlock`] — design-bounded like the handle table.
 /// A task learns at most a handful of founder-mapped windows (scratch, slots,
 /// map cursor, heap, ring); the v4 widening added a tenth entry, now named by
-/// [`geom::DEVICE`] (v5), and v7 widened to twelve for [`geom::HEAP`].
+/// [`geom::DEVICE`] (v5), v7 widened to twelve for [`geom::HEAP`], and v8
+/// spent the twelfth on [`geom::RESERVE`].
 pub const MAX_GEOM_WINDOWS: usize = 12;
-// Eleven founder entries are now stampable (SCRATCH, SLOTS, MAP, LINK,
-// THREAD_BLOCK, APERTURE, TRANSIENT, SLOTS_EXT, SURFACES — display row only —
-// DEVICE — device-claiming rows only — and HEAP); one entry is spare.  A
+// Twelve founder entries are now stampable (SCRATCH, SLOTS, MAP, LINK,
+// THREAD_BLOCK, APERTURE, TRANSIENT, SLOTS_EXT, SURFACES, DEVICE, HEAP and
+// RESERVE), and the founder stamps every one: the table is full.  A
 // thirteenth window needs a `MAX_GEOM_WINDOWS` bump (a wire change, the
 // GEOM_ABI v4/v7 precedent).
-const _: () = assert!(11 <= MAX_GEOM_WINDOWS);
+const _: () = assert!(12 <= MAX_GEOM_WINDOWS);
 
 /// One geometry window: a `(va, len)` the founder mapped, tagged by [`geom`]
 /// role (+ an `index` so a task could hold several of one kind).  24 bytes,

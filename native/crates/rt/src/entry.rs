@@ -44,6 +44,7 @@
 use kore_abi::clock::ClockPage;
 use kore_abi::founding::FoundingBlock;
 use kore_abi::image::{IMAGE_ABI, LdBlock};
+use kore_abi::identity::IdentityBlock;
 use kore_abi::machine::MachineBlock;
 use kore_abi::session::SlotRef;
 use kore_abi::task::{BootBlock, Bootstrap, BootstrapError, GeomBlock, role};
@@ -123,6 +124,22 @@ const _: () = assert!(
     "the machine block must preserve its natural alignment"
 );
 
+/// Byte offset of the **build-identity block**
+/// ([`IdentityBlock`](kore_abi::identity::IdentityBlock)) — the seventh
+/// block: the running kernel's build stamp, kernel-stamped at spawn so
+/// `status sys` and a screenshot can name the image they ran on
+/// ([`kernel_build`]). A zeroed region reads `abi == 0` and exposes nothing.
+pub const IDENTITY_BLOCK_AT: usize = MACHINE_BLOCK_AT + core::mem::size_of::<MachineBlock>();
+
+const _: () = assert!(
+    IDENTITY_BLOCK_AT + core::mem::size_of::<IdentityBlock>() <= BOOT_PAGE_BYTES,
+    "the frozen boot-page blocks must fit one page"
+);
+const _: () = assert!(
+    IDENTITY_BLOCK_AT.is_multiple_of(core::mem::align_of::<IdentityBlock>()),
+    "the identity block must preserve its natural alignment"
+);
+
 /// Why the entry refused to come up (fail-closed: a task with an
 /// invalid boot page never reaches `main`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +165,7 @@ pub struct Rt {
     clock: Option<&'static ClockPage>,
     founding: Option<&'static FoundingBlock>,
     machine: Option<&'static MachineBlock>,
+    identity: Option<&'static IdentityBlock>,
     page: &'static [u8],
 }
 
@@ -269,6 +287,14 @@ impl Rt {
     /// pre-record founder or a zeroed region.
     pub fn machine(&self) -> Option<&'static MachineBlock> {
         self.machine
+    }
+
+    /// The running kernel's build stamp (`KORE_BUILD_STAMP`), kernel
+    /// testimony on this task's boot page. Ambient data like the machine
+    /// block: reading it grants nothing. `None` on a pre-record founder or
+    /// a zeroed region.
+    pub fn kernel_build(&self) -> Option<&'static str> {
+        self.identity?.stamp()
     }
 
     /// The immutable parent-written boot page.
@@ -393,6 +419,11 @@ pub fn boot_context(page: &'static [u8]) -> Result<Rt, EntryError> {
         .and_then(|b| LdBlock::ref_from_prefix(b).ok())
         .map(|(ld, _)| ld)
         .filter(|ld| ld.abi.get() == IMAGE_ABI);
+    let identity = page
+        .get(IDENTITY_BLOCK_AT..)
+        .and_then(|b| IdentityBlock::ref_from_prefix(b).ok())
+        .map(|(identity, _)| identity)
+        .filter(|identity| identity.stamp().is_some());
     // **Install the geometry statics** (metal only) before any verb or the trap
     // transport runs — they replace the hand-copied `M2B_SCRATCH_VA`/`SLOTS_VA`
     // constants with the founder's actual mapping, learned from the boot page.
@@ -429,6 +460,7 @@ pub fn boot_context(page: &'static [u8]) -> Result<Rt, EntryError> {
         clock,
         founding,
         machine,
+        identity,
         page,
     })
 }
@@ -1741,28 +1773,14 @@ fn worker_caps_with_heap(
     declared: &crate::service::WorkerEndowment,
     out: &mut [crate::thread::WorkerCap; crate::thread::MAX_WORKER_CAPS],
 ) -> Option<usize> {
-    use kore_abi::cap::{ResourceKind, Rights};
     use kore_abi::task::role;
 
-    // The global allocator is process-wide memory but its grow operation is
-    // capability-gated per task. A worker therefore needs its own explicit
-    // lessor position over the founder-seeded supply; sharing the parent's VAS
-    // does not make the parent's holding reachable. The no-arg self-kind
-    // MemLease derive is the session engine's founding/endowment attenuation:
-    // the parent keeps the supply and the child receives a whole-span sublease.
+    // A worker allocates, so it is founded holding the process heap
+    // (`WorkerCap::heap` says why its own position is needed).
     if declared.len() >= out.len() {
         return None;
     }
-    out[0] = crate::thread::WorkerCap {
-        role: role::HEAP,
-        index: 0,
-        subject: heap,
-        kind: ResourceKind::MemLease as u16 as u8,
-        // Heap growth needs only carve + map authority. The parent retains
-        // REVOKE over this sub-lessor; the worker does not receive teardown
-        // authority it never exercises.
-        rights: Rights::ACCESS | Rights::MODIFY | Rights::DERIVE,
-    };
+    out[0] = crate::thread::WorkerCap::heap(heap);
     for (i, cap) in declared.caps().enumerate() {
         // HEAP@0 is runtime infrastructure, not a service-selected device
         // authority. Reject a duplicate instead of letting boot stamping fail
@@ -2212,6 +2230,37 @@ fn runtime_slots_after(top: u32) -> Option<RuntimeSlots> {
 }
 
 #[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use zerocopy::IntoBytes;
+
+    /// A boot page with a valid boot block and, optionally, an identity
+    /// block written as the kernel writes it.
+    fn page(identity: Option<&[u8]>) -> &'static [u8] {
+        let page = std::vec![0u8; BOOT_PAGE_BYTES].leak();
+        let boot = kore_abi::task::BootBlock::new();
+        page[BOOT_BLOCK_AT..][..core::mem::size_of_val(&boot)].copy_from_slice(boot.as_bytes());
+        if let Some(bytes) = identity {
+            page[IDENTITY_BLOCK_AT..][..bytes.len()].copy_from_slice(bytes);
+        }
+        page
+    }
+
+    #[test]
+    fn the_kernel_build_reads_off_the_boot_page_and_fails_closed() {
+        let stamped = IdentityBlock::new("304bfef9ca08-dirty").unwrap();
+        let rt = boot_context(page(Some(stamped.as_bytes()))).unwrap();
+        assert_eq!(rt.kernel_build(), Some("304bfef9ca08-dirty"));
+        // A founder that predates the block leaves the region zero.
+        assert_eq!(boot_context(page(None)).unwrap().kernel_build(), None);
+        // A damaged block names no build, rather than a wrong one.
+        let mut damaged = stamped;
+        damaged.stamp[0] = 0;
+        assert_eq!(boot_context(page(Some(damaged.as_bytes()))).unwrap().kernel_build(), None);
+    }
+}
+
+#[cfg(test)]
 mod runtime_slot_tests {
     use super::*;
 
@@ -2441,6 +2490,24 @@ pub fn run_service<S: crate::service::SystemService>(rt: Rt) -> ! {
     run_main(rt, serve::<S>)
 }
 
+/// **How many fixed serving pairs this row was founded with** — the
+/// protocol's [`SERVE_PAIRS`](crate::svc::SvcProtocol::SERVE_PAIRS) plus one
+/// per manifest row that declares this service among its `clients` (the
+/// founder stamps the total as [`SERVICE_PAIR_COUNT_DATUM`] whenever the two
+/// differ). A service that numbers its own pairs — a per-pair meter, or a
+/// recyclable peer's slot that must never land on a fixed pair — counts this,
+/// not the protocol constant: the declared clients' pairs follow the
+/// protocol's and are just as fixed. `None` for a count no host can attach.
+///
+/// [`SERVICE_PAIR_COUNT_DATUM`]: kore_abi::task::SERVICE_PAIR_COUNT_DATUM
+pub fn service_pair_count<S: crate::service::SystemService>(rt: &Rt) -> Option<usize> {
+    let count = rt
+        .bootstrap()
+        .datum(role::SVC_RING, kore_abi::task::SERVICE_PAIR_COUNT_DATUM)
+        .map_or(S::SERVE_PAIRS, |value| value as usize);
+    (count >= S::SERVE_PAIRS && count != 0 && count <= crate::svc::MAX_SERVE_PAIRS).then_some(count)
+}
+
 /// The service ladder **as a root future** — what `#[kore_rt::main]`
 /// drives for the canned service shape:
 ///
@@ -2457,14 +2524,6 @@ pub fn run_service<S: crate::service::SystemService>(rt: Rt) -> ! {
 /// implementation rather than two that drift — which is what happened
 /// while services bypassed it: this ladder grew endowment resolution and
 /// the readiness beacon, and `run_main` did not.
-fn service_pair_count<S: crate::service::SystemService>(rt: &Rt) -> Option<usize> {
-    let count = rt
-        .bootstrap()
-        .datum(role::SVC_RING, kore_abi::task::SERVICE_PAIR_COUNT_DATUM)
-        .map_or(S::SERVE_PAIRS, |value| value as usize);
-    (count >= S::SERVE_PAIRS && count != 0 && count <= crate::svc::MAX_SERVE_PAIRS).then_some(count)
-}
-
 pub async fn serve<S: crate::service::SystemService>(rt: Rt) -> ! {
     use crate::service::Bundle;
     if !service_ready::<S>(&rt) {
@@ -2695,6 +2754,12 @@ async fn serve_forever_with_return_targets<S: crate::service::SystemService>(
     #[cfg(feature = "heap")]
     if let Some(arena) = host.service().minted_pair_arena() {
         if !host.enable_minted_growth(arena) {
+            return;
+        }
+    }
+    #[cfg(feature = "heap")]
+    if let Some(arena) = host.service().peer_arena() {
+        if !host.enable_peer_growth(arena) {
             return;
         }
     }

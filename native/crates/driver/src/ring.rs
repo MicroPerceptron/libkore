@@ -8,8 +8,9 @@
 //! Ordering (easy for a unit double to forgive, load-bearing on hardware): a staged
 //! entry is published to the device with a **release** fence before the
 //! doorbell ([`SubRing::ring`]); a completion read takes an **acquire**
-//! fence after a matching validity bit ([`CompRing::poll`]), so the rest of
-//! the entry is observed coherently.
+//! fence after a matching validity bit ([`CompRing::poll`]), then reads the
+//! published entry again. Payload copied before the validity observation may
+//! belong to the previous generation and is never returned.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, fence};
@@ -32,6 +33,8 @@ pub trait SqEntry: Copy {
 
 /// A **completion-ring entry** — the device is the single writer and flips a
 /// per-entry validity bit on each wrap; the reader polls it.
+/// Once published, the device must leave the entry stable until the consumer
+/// acknowledges it or returns ownership through the device's ring protocol.
 pub trait CqEntry: Copy {
     /// Whether this entry has been published for the expected `phase`
     /// (NVMe: the CQE status **Phase** bit; xHCI: the event TRB **Cycle**
@@ -263,25 +266,30 @@ impl<E: CqEntry, B: Dma> CompRing<E, B> {
 
     /// **Poll one completion** (non-blocking): read the head slot; if it
     /// carries the expected phase the device has published it — take an
-    /// acquire fence, advance the head, flip the expected phase on wrap, and
-    /// return it.  `None` when the head slot is still stale.
+    /// acquire fence and re-read the entry before advancing the head and
+    /// flipping the expected phase on wrap. `None` when the head is stale.
     ///
     /// The caller acknowledges (NVMe: ring the CQ head doorbell; xHCI: write
     /// ERDP) — per-completion or once-per-drain, its choice.
     pub fn poll(&mut self) -> Option<E> {
         // SAFETY: `buf` is `capacity * size_of::<E>()` device-visible bytes;
         // `head < capacity`; the entry is naturally aligned.
-        let entry = unsafe {
-            (self.buf.cpu() as *const E)
-                .add(self.head as usize)
-                .read_volatile()
-        };
-        if !entry.valid(self.phase) {
+        let slot = unsafe { (self.buf.cpu() as *const E).add(self.head as usize) };
+        // SAFETY: the slot is within the live DMA buffer as established above.
+        let observed = unsafe { slot.read_volatile() };
+        if !observed.valid(self.phase) {
             return None;
         }
-        // The validity bit matched: the device published this entry — observe
-        // the rest of it coherently.
+        // A wide volatile read can lower to several loads: the old payload
+        // may have been copied before a device write, with the new validity
+        // bit read afterward. An acquire fence cannot repair that snapshot.
+        // Re-read only after publication; the device cannot reuse this slot
+        // until the caller acknowledges the advanced head.
         fence(Ordering::Acquire);
+        // SAFETY: same live slot; matching validity grants a stable entry until
+        // the caller's later device acknowledgment. Volatile prevents reuse of
+        // the pre-acquire snapshot even on strongly ordered architectures.
+        let entry = unsafe { slot.read_volatile() };
         self.head = (self.head + 1) % self.capacity;
         if self.head == 0 {
             self.phase = !self.phase;
@@ -447,6 +455,56 @@ mod tests {
             ring.poll().is_none(),
             "old entry is stale after the phase flip"
         );
+    }
+
+    #[test]
+    fn completion_body_is_observed_after_publication() {
+        // Model a split DMA read: the consumer copied the old body, then
+        // the device published the new body before the validity observation.
+        // The validity hook schedules that interleaving deterministically;
+        // no host thread or probabilistic timing is needed.
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct RacingCompletion {
+            payload: u64,
+            live_payload: *mut u64,
+        }
+        impl CqEntry for RacingCompletion {
+            fn valid(&self, phase: bool) -> bool {
+                if !phase {
+                    return false;
+                }
+                // SAFETY: the test points this at the live ring slot's first
+                // field, and the buffer outlives this synchronous callback.
+                unsafe { self.live_payload.write_volatile(42) };
+                true
+            }
+        }
+        // Typed, caller-owned storage preserves alignment without an allocator.
+        struct DeviceBuffer<'a>(&'a core::cell::UnsafeCell<RacingCompletion>);
+        impl Dma for DeviceBuffer<'_> {
+            fn cpu(&self) -> *mut u8 {
+                self.0.get().cast()
+            }
+            fn iova(&self) -> IovaAddr {
+                IovaAddr(0x4000)
+            }
+            fn len(&self) -> usize {
+                core::mem::size_of::<RacingCompletion>()
+            }
+        }
+        let memory = core::cell::UnsafeCell::new(RacingCompletion {
+            payload: 7,
+            live_payload: core::ptr::null_mut(),
+        });
+        // SAFETY: initialize the self-pointer before any ring read; memory
+        // stays at this address until the borrowing ring has been dropped.
+        unsafe { (*memory.get()).live_payload = memory.get().cast::<u64>() };
+        let mut ring = CompRing::<RacingCompletion, _>::new(DeviceBuffer(&memory), 1);
+        assert_eq!(ring.poll().expect("published completion").payload, 42);
+        assert_eq!(ring.head(), 0);
+        assert!(!ring.phase());
+        assert!(ring.poll().is_none(), "one publication is consumed once");
     }
 
     #[test]

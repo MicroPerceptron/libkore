@@ -3,9 +3,12 @@ export ZIG
 
 .PHONY: test check fmt docs owners cross miri native-check
 
+# `kore-vol` is the exported host root (kore-host's procedure), tested against
+# this distribution's own lockfile rather than Kore's workspace.
 test:
 	cargo test --locked --workspace --all-features
 	cargo test --locked --manifest-path native/Cargo.toml -p kore-rt -p kore-dagfs --features kore-dagfs/runtime
+	cargo test --locked --manifest-path native/Cargo.toml -p kore-vol
 	python3 -m unittest discover -s tools -p 'test_*.py'
 
 check:
@@ -14,7 +17,7 @@ check:
 	python3 tools/check-native.py
 
 fmt:
-	cargo fmt -p kore-std -p libkore-consumer -p kore-ffi -p kore-entry -p kore-wasi -p kore-lua --check
+	cargo fmt -p kore-std -p libkore-consumer -p kore-ffi -p kore-entry -p kore-wasi -p kore-lua -p kore-host --check
 	$(ZIG) fmt --check build.zig build.zig.zon crates/ffi/tests/consumer.zig extern/zig/src/root.zig extern/zig/src/allocator.zig
 
 docs:
@@ -45,8 +48,10 @@ cross:
 	python3 tools/check-alloc-symbols.py
 	python3 tools/check-entry.py
 
+# kore-host drives real image files under POSIX record locks, which Miri does
+# not model; `make test` exercises its procedure.
 miri:
-	cargo miri test --locked --workspace --all-features --exclude kore-wasi
+	cargo miri test --locked --workspace --all-features --exclude kore-wasi --exclude kore-host
 	cargo miri test --locked --manifest-path native/Cargo.toml -p kore-rt erased_poll_and_drop
 
 native-check:

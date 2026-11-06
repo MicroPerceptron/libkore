@@ -27,6 +27,7 @@ fn view_placement_requests_only_a_window_not_more_authority() {
         ViewMapWindow::Map,
         ViewMapWindow::Surfaces,
         ViewMapWindow::Heap,
+        ViewMapWindow::Reserve,
     ] {
         let mut builder = SessionBuilder::new();
         builder
@@ -47,7 +48,7 @@ fn view_placement_requests_only_a_window_not_more_authority() {
         assert_eq!(req.placement(), Some(window));
         assert_eq!(req.lane, 0);
         assert_eq!(req.flags, 0);
-        assert_eq!(req.reserved, [0; 4]);
+        assert_eq!(req.page.get(), 0);
         assert!(!req.sink());
     }
 
@@ -65,7 +66,7 @@ fn view_placement_requests_only_a_window_not_more_authority() {
     assert_eq!(req.placement(), Some(ViewMapWindow::Map));
     assert!(req.sink());
     assert_eq!(req.flags, kore_abi::session::VIEW_MAP_SINK);
-    assert_eq!(req.reserved, [0; 4]);
+    assert_eq!(req.page.get(), 0);
 
     let mut builder = SessionBuilder::new();
     builder
@@ -83,6 +84,54 @@ fn view_placement_requests_only_a_window_not_more_authority() {
     assert_eq!(
         req.surface_lane(),
         Some(kore_abi::session::SurfaceMapLane::Second)
+    );
+
+    // A reservation commit names the window and its page, nothing more.
+    let mut builder = SessionBuilder::new();
+    builder
+        .map_view_reserved(SlotRef::from_wire(2), 0x10_0400, SlotRef::from_wire(3))
+        .unwrap();
+    let mut out = [0u8; DESCRIPTOR_MAX];
+    let len = builder.finish(&mut out).unwrap();
+    let (_, invs, args) = parse(&out[..len]);
+    assert_eq!(invs[0].kind, DERIVE_KIND_VIEW_MAP);
+    assert_eq!(invs[0].requested, 0);
+    let (req, _) = ViewMapReq::try_ref_from_prefix(args).unwrap();
+    assert_eq!(req.placement(), Some(ViewMapWindow::Reserve));
+    assert_eq!(req.reserve_page(), Some(0x10_0400));
+    assert!(!req.sink());
+}
+
+#[test]
+fn a_reservation_release_names_its_lessor_and_range_only() {
+    use kore_abi::session::{DERIVE_KIND_RESERVE_RELEASE, ReserveReleaseReq};
+    use zerocopy::TryFromBytes;
+
+    let mut builder = SessionBuilder::new();
+    builder
+        .release_reserved(SlotRef::from_wire(4), 0x10_0000, 0x10_4000)
+        .unwrap();
+    let mut out = [0u8; DESCRIPTOR_MAX];
+    let len = builder.finish(&mut out).unwrap();
+    let (_, invs, args) = parse(&out[..len]);
+    assert_eq!(invs.len(), 1);
+    assert_eq!(invs[0].op.get(), OpCode::Derive as u16);
+    assert_eq!(invs[0].kind, DERIVE_KIND_RESERVE_RELEASE);
+    assert_eq!(invs[0].requested, 0);
+    assert_eq!(invs[0].subject.get(), 4);
+    assert_eq!(invs[0].result.get(), 4, "no result is assigned");
+    let (req, rest) = ReserveReleaseReq::try_ref_from_prefix(args).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!((req.page.get(), req.pages.get()), (0x10_0000, 0x10_4000));
+
+    // A post-commit effect stands alone.
+    let mut builder = SessionBuilder::new();
+    builder
+        .map_view_reserved(SlotRef::from_wire(2), 0, SlotRef::from_wire(3))
+        .unwrap();
+    assert_eq!(
+        builder.release_reserved(SlotRef::from_wire(4), 0, 1),
+        Err(BuildError::EffectMustStandAlone)
     );
 }
 
@@ -2108,6 +2157,171 @@ fn selected_irq_is_encoded_after_deadline_and_preserves_argument_offsets() {
         assert_eq!(invs[0].arg.get(), 32);
         let (notice, _) = NoticeReq::try_ref_from_prefix(&args[32..]).unwrap();
         assert_eq!((notice.cookie.get(), notice.payload.get()), (0xab, 0xcd));
+    }
+}
+
+/// The word arm (`res/EVENT.md` §6) rides the park block as its **last**
+/// member — after `ParkReq ‖ SleepReq` (and `IrqParkReq` when a route is
+/// selected) — whatever order the methods were called in, and every
+/// staged argument is relocated past the whole block.
+#[test]
+fn word_wait_is_encoded_last_in_the_park_block_and_relocates_args() {
+    use kore_abi::session::{IrqParkReq, NoticeReq, ParkReq, SleepReq, WordWaitReq};
+    use zerocopy::TryFromBytes;
+    for route in [None, Some(19)] {
+        let mut b = SessionBuilder::new();
+        b.notice(SlotRef::from_wire(2), 0xab, 0xcd).unwrap();
+        // Word first, deliberately: method order must not move it.
+        b.wait_word(SlotRef::from_wire(9), 64, 0x1122_3344);
+        if let Some(route) = route {
+            b.wait_irq_on(SlotRef::from_wire(route));
+        }
+        b.park_standing(11, 4, 23).wait_sleep(9_000);
+        let mut bytes = [0u8; DESCRIPTOR_MAX];
+        let n = b.finish(&mut bytes).unwrap();
+        assert_eq!(n, b.encoded_len().unwrap());
+        let (header, invs, args) = parse(&bytes[..n]);
+        let mut flags = SessionFlags::WAIT_DELIVERY | SessionFlags::WAIT_SLEEP | SessionFlags::WAIT_WORD;
+        if route.is_some() {
+            flags |= SessionFlags::WAIT_IRQ | SessionFlags::WAIT_IRQ_SELECTED;
+        }
+        assert_eq!(header.flags.get(), flags.bits());
+        let (park, tail) = ParkReq::try_ref_from_prefix(args).unwrap();
+        assert_eq!((park.chan.get(), park.slot.get(), park.recv_tag.get()), (11, 4, 23));
+        let (sleep, mut tail) = SleepReq::try_ref_from_prefix(tail).unwrap();
+        assert_eq!(sleep.deadline_ns.get(), 9_000);
+        if let Some(route) = route {
+            let (irq, rest) = IrqParkReq::try_ref_from_prefix(tail).unwrap();
+            assert_eq!(irq.slot.get(), route);
+            tail = rest;
+        }
+        let (word, _) = WordWaitReq::try_ref_from_prefix(tail).unwrap();
+        assert_eq!(word.subject.get(), 9);
+        assert_eq!(word.offset.get(), 64);
+        assert_eq!(word.expected.get(), 0x1122_3344);
+        assert_eq!(word.reserved.get(), 0);
+        let block = 16 + 8 + route.map_or(0, |_| IrqParkReq::WIRE) + WordWaitReq::WIRE;
+        assert_eq!(invs[0].arg.get() as usize, block, "arg relocated past the block");
+        let (notice, _) = NoticeReq::try_ref_from_prefix(&args[block..]).unwrap();
+        assert_eq!((notice.cookie.get(), notice.payload.get()), (0xab, 0xcd));
+    }
+}
+
+/// The executor's word park — header 8 + `ParkReq` 16 + `SleepReq` 8 +
+/// `WordWaitReq` 16 — is exactly 48 bytes: it fits the x86-64 caller-saved
+/// GPR carrier with nothing to spare, so the rung costs no descriptor
+/// scratch (the same budget the two-post park was priced against).  The
+/// bare word park (no doorbell) is 32.
+#[test]
+fn word_park_shapes_fit_the_inline_carrier_exactly() {
+    for doorbell in [false, true] {
+        let mut b = SessionBuilder::new();
+        if doorbell {
+            b.park_standing(7, 5, 0x1234);
+        }
+        b.wait_word(SlotRef::from_wire(9), 4, 1).wait_sleep(42);
+        let expect = if doorbell { 48 } else { 32 };
+        assert_eq!(b.encoded_len().unwrap(), expect);
+        let mut bytes = [0u8; 48];
+        let n = b.finish(&mut bytes).unwrap();
+        assert_eq!(n, expect);
+        let (_, invs, args) = parse(&bytes[..n]);
+        assert!(invs.is_empty());
+        let off = if doorbell { 16 + 8 } else { 8 };
+        assert_eq!(u32::from_le_bytes(args[off..off + 4].try_into().unwrap()), 9);
+        assert_eq!(u32::from_le_bytes(args[off + 4..off + 8].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(args[off + 8..off + 12].try_into().unwrap()), 1);
+    }
+}
+
+/// `WAIT_WORD` requires `WAIT_SLEEP`: the shape is refused before a byte
+/// is written, at `encoded_len` (the transport's carrier choice) and so at
+/// `finish`.
+#[test]
+fn a_word_wait_without_a_deadline_is_refused_before_encoding() {
+    let mut b = SessionBuilder::new();
+    b.wait_word(SlotRef::from_wire(9), 4, 1);
+    assert_eq!(b.encoded_len(), Err(BuildError::UnboundedWordWait));
+    let mut bytes = [0u8; DESCRIPTOR_MAX];
+    assert_eq!(b.finish(&mut bytes), Err(BuildError::UnboundedWordWait));
+    // A standing post does not bound it either.
+    b.park_standing(7, 5, 0x1234);
+    assert_eq!(b.encoded_len(), Err(BuildError::UnboundedWordWait));
+    // The deadline does.
+    b.wait_sleep(1);
+    assert!(b.encoded_len().is_ok());
+}
+
+/// `wake_word` lowers onto the effect derive exactly as `activate_device`
+/// does: the subject's own slot as the inert result, no rights, the
+/// `WakeWordReq { offset, count }` bytes as its argument — and it stands
+/// alone.
+#[test]
+fn wake_word_stages_the_standalone_effect_with_its_payload() {
+    use kore_abi::session::{DERIVE_KIND_WAKE_WORD, WakeWordReq};
+    use zerocopy::TryFromBytes;
+    let mut b = SessionBuilder::new();
+    b.wake_word(SlotRef::from_wire(13), 64, u32::MAX).unwrap();
+    let mut bytes = [0u8; DESCRIPTOR_MAX];
+    let n = b.finish(&mut bytes).unwrap();
+    assert_eq!(n, 8 + 16 + WakeWordReq::WIRE);
+    let (header, invs, args) = parse(&bytes[..n]);
+    assert_eq!(header.flags.get(), 0);
+    assert_eq!(invs.len(), 1);
+    assert_eq!(invs[0].op.get(), OpCode::Derive as u16);
+    assert_eq!(invs[0].kind, DERIVE_KIND_WAKE_WORD);
+    assert_eq!(invs[0].requested, 0);
+    assert_eq!(invs[0].subject.get(), 13);
+    assert_eq!(invs[0].result.get(), 13, "inert: the subject's own slot");
+    let (req, _) = WakeWordReq::try_ref_from_prefix(&args[invs[0].arg.get() as usize..]).unwrap();
+    assert_eq!((req.offset.get(), req.count.get()), (64, u32::MAX));
+
+    // An effect: nothing may follow it, and it may not follow anything.
+    assert_eq!(
+        b.notice(SlotRef::from_wire(2), 1, 2),
+        Err(BuildError::EffectMustStandAlone)
+    );
+    let mut after = SessionBuilder::new();
+    after.notice(SlotRef::from_wire(2), 1, 2).unwrap();
+    assert_eq!(
+        after.wake_word(SlotRef::from_wire(13), 0, 1),
+        Err(BuildError::EffectMustStandAlone)
+    );
+    let mut flagged = SessionBuilder::new();
+    flagged.wait_sleep(1);
+    assert_eq!(
+        flagged.wake_word(SlotRef::from_wire(13), 0, 1),
+        Err(BuildError::EffectMustStandAlone)
+    );
+}
+
+/// `encoded_len` and `finish` agree on every word shape the runtime emits,
+/// so the transport's carrier choice is never wrong by the block.
+#[test]
+fn encoded_len_matches_finish_for_every_word_shape() {
+    let shapes: [fn(&mut SessionBuilder); 4] = [
+        |b| {
+            b.wait_word(SlotRef::from_wire(9), 4, 1).wait_sleep(1);
+        },
+        |b| {
+            b.park_standing(7, 5, 3).wait_word(SlotRef::from_wire(9), 4, 1).wait_sleep(1);
+        },
+        |b| {
+            b.park_standing(7, 5, 3)
+                .wait_irq_on(SlotRef::from_wire(19))
+                .wait_word(SlotRef::from_wire(9), 4, 1)
+                .wait_sleep(1);
+        },
+        |b| {
+            b.notice(SlotRef::from_wire(2), 1, 2).unwrap();
+            b.park_standing(7, 5, 3).wait_word(SlotRef::from_wire(9), 4, 1).wait_sleep(1);
+        },
+    ];
+    for shape in shapes {
+        let mut b = SessionBuilder::new();
+        shape(&mut b);
+        let mut bytes = [0u8; DESCRIPTOR_MAX];
+        assert_eq!(b.finish(&mut bytes).unwrap(), b.encoded_len().unwrap());
     }
 }
 

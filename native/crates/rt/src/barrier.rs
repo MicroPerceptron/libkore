@@ -276,6 +276,70 @@ pub(crate) fn wait_while(word: &AtomicU32, expected: u32) {
     }
 }
 
+/// Wait for the **next job** rather than for a sibling: [`wait_while`]'s
+/// fast path first, backing off while nothing arrives.
+///
+/// [`wait_while`]'s budget is a scheduling-jitter window — up to 64 µs of
+/// spin before each park, and a [`PARK_SLICE`] re-check — because a barrier
+/// sibling is microseconds away. An idle resident worker waits on a
+/// submitter that may be seconds away, and paying that budget on every
+/// slice is a duty cycle, not a jitter window: ~64 µs spent spinning per
+/// ~314 µs, forever, per idle worker. Sampling a two-core guest showed the
+/// idle SPMD gangs of the terminal and compositor holding ~30% of all CPU
+/// in exactly that spin while a game rendered.
+///
+/// So only the first wait after a job keeps the full two-tier budget (a
+/// back-to-back submit, the common in-frame case, still resolves in the
+/// spin). Each slice that rides out with the word unmoved drops the spin and
+/// doubles the slice, up to [`IDLE_SLICE_MAX`]. A submit's kick ends the
+/// park at any slice length; the slice only bounds a *missed* kick, now at
+/// [`IDLE_SLICE_MAX`] rather than [`PARK_SLICE`] once idle.
+pub(crate) fn wait_while_idle(word: &AtomicU32, expected: u32) {
+    wait_while_idle_with(
+        word,
+        expected,
+        |spin, slice| {
+            if spin {
+                futex::wait_barrier(word, expected, Some(slice))
+            } else {
+                futex::wait_idle(word, expected, Some(slice))
+            }
+        },
+        || {
+            crate::hint::wait_on(word, expected, SPIN_SLICE);
+        },
+    );
+}
+
+/// One wait policy for the live futex transport and scripted wake interleavings.
+/// The callbacks return after each bounded wait; the shared job word alone
+/// decides whether a notification actually published work.
+fn wait_while_idle_with(
+    word: &AtomicU32,
+    expected: u32,
+    mut wait: impl FnMut(bool, Duration) -> futex::WaitOutcome,
+    mut unsupported: impl FnMut(),
+) {
+    use core::sync::atomic::Ordering;
+    let mut slice = PARK_SLICE;
+    let mut spin = true;
+    while word.load(Ordering::SeqCst) == expected {
+        let outcome = wait(spin, slice);
+        match outcome {
+            futex::WaitOutcome::Unsupported => {
+                unsupported();
+            }
+            // A wake without a job is noise, not a new burst.
+            futex::WaitOutcome::TimedOut | futex::WaitOutcome::Woken => {
+                spin = false;
+                slice = next_idle_slice(slice);
+            }
+            // Retry: the word is the truth; the loop head re-reads.
+            _ => {}
+        }
+    }
+}
+
 /// The monitored-turn cap for a thread that cannot park.
 ///
 /// The futex's own spin tier uses 1 µs turns for the same reason (its
@@ -283,11 +347,150 @@ pub(crate) fn wait_while(word: &AtomicU32, expected: u32) {
 /// bound on how long a monitor that never fires can hold the core.
 const SPIN_SLICE: Duration = Duration::from_micros(1);
 
+/// Where the idle ladder stops: the longest a resident worker **between
+/// jobs** sleeps before re-reading the job word on its own.
+///
+/// [`PARK_SLICE`] prices the residual of a wait a kick is coming for.  A
+/// worker idling between jobs has no kick coming: nothing it rides the
+/// slice for ever arrives, so at a quarter-millisecond it re-enters the
+/// futex four thousand times a second — a monitored spin and a kernel
+/// park each time — for as long as its region lives, per worker, per
+/// gang.  Two terminal seats' render gangs so held three of a 4-CPU
+/// acceptance machine's cores at idle, and a program compiling on the
+/// fourth was sampled running one time in six.  The ladder doubles the
+/// slice from [`PARK_SLICE`] while the word stays put and a job resets
+/// it, so an idle gang costs the machine what an idle thread should.
+/// The cap is one display frame: the submit's kick still ends a park
+/// the instant the job is stored, so the slice bounds only the kick
+/// the mesh misses — a first frame after a long idle, at worst, lands a
+/// frame late; the next job starts the ladder over.
+pub(crate) const IDLE_SLICE_MAX: Duration = Duration::from_millis(16);
+
+/// The next rung of the idle ladder: double, to [`IDLE_SLICE_MAX`].
+pub(crate) fn next_idle_slice(slice: Duration) -> Duration {
+    slice.saturating_mul(2).min(IDLE_SLICE_MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
     use std::thread;
+
+    #[test]
+    fn idle_timeouts_drop_spin_but_notifications_still_require_a_new_job() {
+        let job = AtomicU32::new(1);
+        let mut calls = 0;
+        let mut previous = PARK_SLICE;
+        let mut reached_ceiling = false;
+        wait_while_idle_with(
+            &job,
+            1,
+            |spin, slice| {
+                assert!(calls < 16, "a published job must end the wait");
+                assert_eq!(spin, calls == 0, "idle retries must not spin again");
+                assert!(slice >= previous && slice <= IDLE_SLICE_MAX);
+                if calls == 0 {
+                    assert_eq!(slice, PARK_SLICE);
+                }
+                previous = slice;
+                reached_ceiling |= slice == IDLE_SLICE_MAX;
+                calls += 1;
+                match calls {
+                    // A spurious notice must not manufacture a job or reset
+                    // the wait to its busy first-turn posture.
+                    5 => futex::WaitOutcome::Woken,
+                    8 => futex::WaitOutcome::Retry,
+                    12 => {
+                        job.store(2, Ordering::SeqCst);
+                        futex::WaitOutcome::Woken
+                    }
+                    _ => futex::WaitOutcome::TimedOut,
+                }
+            },
+            || panic!("supported transport must not take the fallback"),
+        );
+        assert_eq!(calls, 12);
+        assert!(
+            reached_ceiling,
+            "idle waits should reach their bounded backoff"
+        );
+
+        // After completing this job, a back-to-back submission gets the fast
+        // first turn again; an old idle history does not slow a fresh burst.
+        wait_while_idle_with(
+            &job,
+            2,
+            |spin, slice| {
+                assert!(spin);
+                assert_eq!(slice, PARK_SLICE);
+                job.store(3, Ordering::SeqCst);
+                futex::WaitOutcome::Retry
+            },
+            || panic!("supported transport must not take the fallback"),
+        );
+    }
+
+    #[test]
+    fn idle_wait_checks_a_published_job_before_parking_and_after_fallback() {
+        let job = AtomicU32::new(2);
+        wait_while_idle_with(
+            &job,
+            1,
+            |_, _| panic!("already-published work must not park"),
+            || panic!("already-published work must not wait"),
+        );
+        let mut waits = 0;
+        wait_while_idle_with(
+            &job,
+            2,
+            |_, _| {
+                waits += 1;
+                futex::WaitOutcome::Unsupported
+            },
+            || job.store(3, Ordering::SeqCst),
+        );
+        assert_eq!(waits, 1, "a fallback-observed submission must end the wait");
+    }
+
+    /// The idle ladder climbs by doubling and stops at its cap, so an
+    /// idle worker's re-check rate falls geometrically and never past
+    /// one frame.
+    #[test]
+    fn the_idle_ladder_doubles_to_its_cap() {
+        let mut slice = PARK_SLICE;
+        let mut rungs = 0;
+        while slice < IDLE_SLICE_MAX {
+            let next = next_idle_slice(slice);
+            assert_eq!(next, (slice * 2).min(IDLE_SLICE_MAX));
+            slice = next;
+            rungs += 1;
+        }
+        assert_eq!(slice, IDLE_SLICE_MAX);
+        assert_eq!(next_idle_slice(IDLE_SLICE_MAX), IDLE_SLICE_MAX);
+        // 250 µs doubles six times to 16 ms.
+        assert_eq!(rungs, 6);
+    }
+
+    /// An idle worker still returns the moment the word moves, however
+    /// far its slice has climbed: a store ends the wait, and one that
+    /// precedes the wait is seen before any park.
+    #[test]
+    fn an_idle_wait_ends_when_the_word_moves() {
+        static JOB: AtomicU32 = AtomicU32::new(0);
+        // Already moved: no park at all.
+        JOB.store(1, Ordering::SeqCst);
+        wait_while_idle(&JOB, 0);
+        // Moved while waiting, after enough rungs for the slice to climb.
+        let waiter = thread::spawn(|| wait_while_idle(&JOB, 1));
+        thread::sleep(Duration::from_millis(5));
+        JOB.store(2, Ordering::SeqCst);
+        let _ = futex::wake(&JOB);
+        waiter
+            .join()
+            .expect("the idle waiter returns once the word moved");
+        assert_eq!(JOB.load(Ordering::SeqCst), 2);
+    }
 
     /// The property a barrier exists for: nothing published before an
     /// arrival is unobserved after the release. Each worker counts itself

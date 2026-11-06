@@ -159,6 +159,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -269,6 +279,7 @@ dependencies = [
  "kore-ring",
  "kore-rt",
  "kore-scrub",
+ "rustix",
  "virtio-accel-core",
  "zerocopy",
 ]
@@ -301,6 +312,21 @@ dependencies = [
  "heapless",
  "kore-abi",
  "zerocopy",
+]
+
+[[package]]
+name = "kore-nvme"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "crc",
+ "gpt_disk_types",
+ "kore-abi",
+ "kore-driver",
+ "kore-nvme",
+ "kore-ring",
+ "kore-rt",
+ "kore-svc-swap",
 ]
 
 [[package]]
@@ -348,12 +374,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-svc-block"
+version = "0.0.1"
+dependencies = [
+ "kore-abi",
+ "kore-driver",
+ "kore-nvme",
+ "kore-rt",
+ "kore-svc-device",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-svc-dagfs"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "crc",
+ "heapless",
+ "kore-abi",
+ "kore-collections",
+ "kore-dagfs",
+ "kore-driver",
+ "kore-nvme",
+ "kore-ring",
+ "kore-rt",
+ "kore-svc-block",
+ "kore-svc-extract",
+ "kore-svc-extract-worker-c",
+ "kore-svc-extract-worker-rust",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-svc-device"
+version = "0.0.0"
+dependencies = [
+ "heapless",
+ "kore-abi",
+ "kore-rt",
+]
+
+[[package]]
 name = "kore-svc-extract"
 version = "0.0.1"
 dependencies = [
  "blake3",
  "heapless",
  "kore-rt",
+]
+
+[[package]]
+name = "kore-svc-extract-worker-c"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "cc",
+ "heapless",
+ "kore-svc-extract",
+ "kore-svc-extract-worker-rust",
 ]
 
 [[package]]
@@ -371,6 +450,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-svc-mm"
+version = "0.0.0"
+dependencies = [
+ "kore-abi",
+ "kore-rt",
+]
+
+[[package]]
 name = "kore-svc-output"
 version = "0.0.1"
 dependencies = [
@@ -381,8 +468,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-svc-swap"
+version = "0.0.1"
+dependencies = [
+ "kore-abi",
+ "kore-rt",
+ "kore-svc-mm",
+ "lz4_flex",
+]
+
+[[package]]
 name = "kore-uart"
 version = "0.0.0"
+
+[[package]]
+name = "kore-vol"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "kore-driver",
+ "kore-svc-dagfs",
+ "rustix",
+]
 
 [[package]]
 name = "kore-window"
@@ -402,10 +509,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 
 [[package]]
 name = "memchr"
@@ -462,6 +581,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
 ]
 
 [[package]]
@@ -613,6 +745,21 @@ name = "virtio-accel-transport"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7747200a37db419a82c884730d5c31d1d80a6b4d14cc3de312064e4793dc289"
+
+[[package]]
+name = "windows-link"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
+]
 
 [[package]]
 name = "winnow"

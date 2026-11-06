@@ -6,15 +6,21 @@
 //! presets exactly before exec and the window controller transfer affine
 //! capabilities through their existing transactions.
 //!
-//! The exact `Window`, `FilesWindow`, and `PowerWindow` bit combinations are reserved launch
-//! presets. A legal superset is a different profile, not an automatically
-//! compatible variant: callers must never infer window topology by testing a
-//! subset of profile bits.
+//! A window is declared, never inferred: every window preset carries
+//! `PROFILE_WINDOW`, and a profile without it is never a window, whatever
+//! facilities it names (a headless engine needs the filesystem, heap, engine
+//! plan and channel space a JavaScript application's window does). Which
+//! window — its face and wake topology — is the exact `Window`,
+//! `FilesWindow`, `PowerWindow`, `AcceleratedWindow`, `EngineWindow` or `SettingsWindow`
+//! preset the whole profile matches. A legal superset is a different
+//! profile, not an automatically compatible variant: callers must never infer
+//! window topology by testing a subset of profile bits, and a window profile
+//! that matches no preset launches nowhere.
 #![no_std]
 
 use kore_abi::image::{
-    PROFILE_ACCELERATOR, PROFILE_CHANNELS, PROFILE_FILESYSTEM, PROFILE_HEAP, PROFILE_SYSTEM_POWER,
-    profile_valid,
+    PROFILE_ACCELERATOR, PROFILE_CHANNELS, PROFILE_ENGINE, PROFILE_FILESYSTEM, PROFILE_HEAP,
+    PROFILE_SYSTEM_POWER, PROFILE_WINDOW, profile_valid,
 };
 pub use kore_dagfs::FilesystemFace;
 pub use kore_window::WindowFace;
@@ -93,11 +99,11 @@ impl AppBundle for FsCommand {
 }
 
 /// A standalone window application with heap and bounded channel-space
-/// facilities.
+/// facilities. Every window preset is this profile plus its own faces.
 pub enum Window {}
 
 impl Window {
-    pub const PROFILE: u32 = PROFILE_HEAP | PROFILE_CHANNELS;
+    pub const PROFILE: u32 = PROFILE_HEAP | PROFILE_CHANNELS | PROFILE_WINDOW;
     pub const WINDOW_FACE: Option<WindowFace> = Some(WindowFace::STANDALONE);
     pub const FILESYSTEM_FACE: Option<FilesystemFace> = None;
     pub const WAKE: WakeTopology = WakeTopology::Window;
@@ -116,7 +122,7 @@ impl AppBundle for Window {
 pub enum FilesWindow {}
 
 impl FilesWindow {
-    pub const PROFILE: u32 = PROFILE_HEAP | PROFILE_CHANNELS | PROFILE_FILESYSTEM;
+    pub const PROFILE: u32 = Window::PROFILE | PROFILE_FILESYSTEM;
     pub const WINDOW_FACE: Option<WindowFace> = Some(WindowFace::WITH_FILESYSTEM);
     pub const FILESYSTEM_FACE: Option<FilesystemFace> = Some(FilesystemFace::CANONICAL);
     pub const WAKE: WakeTopology = WakeTopology::SharedWindowService;
@@ -151,6 +157,22 @@ impl AppBundle for PowerWindow {
     const WAKE: WakeTopology = PowerWindow::WAKE;
 }
 
+/// Settings composes storage, metered image decoding, power and a window.
+pub enum SettingsWindow {}
+impl SettingsWindow {
+    pub const PROFILE: u32 = EngineWindow::PROFILE | PROFILE_SYSTEM_POWER;
+    pub const WINDOW_FACE: Option<WindowFace> = FilesWindow::WINDOW_FACE;
+    pub const FILESYSTEM_FACE: Option<FilesystemFace> = FilesWindow::FILESYSTEM_FACE;
+    pub const WAKE: WakeTopology = WakeTopology::SharedWindowService;
+}
+impl sealed::Sealed for SettingsWindow {}
+impl AppBundle for SettingsWindow {
+    const PROFILE: u32 = Self::PROFILE;
+    const WINDOW_FACE: Option<WindowFace> = Self::WINDOW_FACE;
+    const FILESYSTEM_FACE: Option<FilesystemFace> = Self::FILESYSTEM_FACE;
+    const WAKE: WakeTopology = Self::WAKE;
+}
+
 /// A window application composed with one private recyclable accelerator
 /// face. The service and compositor share the process executor's wake root;
 /// accelerator completion channels remain explicit per-client grants.
@@ -170,6 +192,29 @@ impl AppBundle for AcceleratedWindow {
     const WINDOW_FACE: Option<WindowFace> = AcceleratedWindow::WINDOW_FACE;
     const FILESYSTEM_FACE: Option<FilesystemFace> = AcceleratedWindow::FILESYSTEM_FACE;
     const WAKE: WakeTopology = AcceleratedWindow::WAKE;
+}
+
+/// A window application composed with the canonical filesystem face whose
+/// launch hosts an execution engine: [`FilesWindow`] plus `PROFILE_ENGINE`,
+/// so exec also provisions the per-launch mm face its guests' memory is
+/// reserved on. The filesystem and mm faces and the compositor share the
+/// process executor's wake root, as `FilesWindow`'s do.
+pub enum EngineWindow {}
+
+impl EngineWindow {
+    pub const PROFILE: u32 = FilesWindow::PROFILE | PROFILE_ENGINE;
+    pub const WINDOW_FACE: Option<WindowFace> = Some(WindowFace::WITH_FILESYSTEM);
+    pub const FILESYSTEM_FACE: Option<FilesystemFace> = Some(FilesystemFace::CANONICAL);
+    pub const WAKE: WakeTopology = WakeTopology::SharedWindowService;
+}
+
+impl sealed::Sealed for EngineWindow {}
+
+impl AppBundle for EngineWindow {
+    const PROFILE: u32 = EngineWindow::PROFILE;
+    const WINDOW_FACE: Option<WindowFace> = EngineWindow::WINDOW_FACE;
+    const FILESYSTEM_FACE: Option<FilesystemFace> = EngineWindow::FILESYSTEM_FACE;
+    const WAKE: WakeTopology = EngineWindow::WAKE;
 }
 
 /// The window-capable preset selected by an authenticated image profile.
@@ -194,7 +239,7 @@ impl WindowBundle {
                 face: WindowFace::STANDALONE,
                 wake: WakeTopology::SharedWindowService,
             })
-        } else if profile == FilesWindow::PROFILE {
+        } else if profile == FilesWindow::PROFILE || profile == SettingsWindow::PROFILE {
             Some(Self {
                 profile,
                 face: WindowFace::WITH_FILESYSTEM,
@@ -204,6 +249,12 @@ impl WindowBundle {
             Some(Self {
                 profile,
                 face: WindowFace::STANDALONE,
+                wake: WakeTopology::SharedWindowService,
+            })
+        } else if profile == EngineWindow::PROFILE {
+            Some(Self {
+                profile,
+                face: WindowFace::WITH_FILESYSTEM,
                 wake: WakeTopology::SharedWindowService,
             })
         } else {
@@ -224,10 +275,12 @@ impl WindowBundle {
     }
 }
 
-/// Small import surface for application source. It contains only the five
+/// Small import surface for application source. It contains only the
 /// closed inert presets; implementation coordinates remain explicitly named.
 pub mod prelude {
-    pub use crate::{AcceleratedWindow, Command, FilesWindow, FsCommand, PowerWindow, Window};
+    pub use crate::{
+        AcceleratedWindow, Command, EngineWindow, FilesWindow, FsCommand, PowerWindow, SettingsWindow, Window,
+    };
 }
 
 const _: () = {
@@ -237,6 +290,17 @@ const _: () = {
     assert!(profile_valid(FilesWindow::PROFILE));
     assert!(profile_valid(PowerWindow::PROFILE));
     assert!(profile_valid(AcceleratedWindow::PROFILE));
+    assert!(profile_valid(EngineWindow::PROFILE));
+    assert!(profile_valid(SettingsWindow::PROFILE));
+    // Every window preset declares the window; no command preset does.
+    assert!(Command::PROFILE & PROFILE_WINDOW == 0);
+    assert!(FsCommand::PROFILE & PROFILE_WINDOW == 0);
+    assert!(Window::PROFILE & PROFILE_WINDOW != 0);
+    assert!(FilesWindow::PROFILE & PROFILE_WINDOW != 0);
+    assert!(PowerWindow::PROFILE & PROFILE_WINDOW != 0);
+    assert!(AcceleratedWindow::PROFILE & PROFILE_WINDOW != 0);
+    assert!(EngineWindow::PROFILE & PROFILE_WINDOW != 0);
+    assert!(SettingsWindow::PROFILE & PROFILE_WINDOW != 0);
     assert!(WindowFace::WITH_FILESYSTEM.ring() != FilesystemFace::CANONICAL.control_ring());
     assert!(WindowFace::WITH_FILESYSTEM.ring() != FilesystemFace::CANONICAL.data_window());
     assert!(WindowFace::WITH_FILESYSTEM.request_kick() != FilesystemFace::CANONICAL.request_kick());
@@ -250,10 +314,13 @@ mod tests {
     fn presets_are_exact_and_faces_do_not_collide() {
         assert_eq!(Command::PROFILE, 0);
         assert_eq!(FsCommand::PROFILE, PROFILE_FILESYSTEM);
-        assert_eq!(Window::PROFILE, PROFILE_HEAP | PROFILE_CHANNELS);
+        assert_eq!(
+            Window::PROFILE,
+            PROFILE_HEAP | PROFILE_CHANNELS | PROFILE_WINDOW
+        );
         assert_eq!(
             FilesWindow::PROFILE,
-            PROFILE_HEAP | PROFILE_CHANNELS | PROFILE_FILESYSTEM
+            PROFILE_HEAP | PROFILE_CHANNELS | PROFILE_WINDOW | PROFILE_FILESYSTEM
         );
         assert_eq!(Window::WINDOW_FACE, Some(WindowFace::STANDALONE));
         assert_eq!(FsCommand::FILESYSTEM_FACE, Some(FilesystemFace::CANONICAL));
@@ -264,9 +331,15 @@ mod tests {
         assert_eq!(FilesWindow::FILESYSTEM_FACE, FsCommand::FILESYSTEM_FACE);
         assert_eq!(
             AcceleratedWindow::PROFILE,
-            PROFILE_HEAP | PROFILE_CHANNELS | PROFILE_ACCELERATOR
+            PROFILE_HEAP | PROFILE_CHANNELS | PROFILE_WINDOW | PROFILE_ACCELERATOR
         );
         assert_eq!(AcceleratedWindow::WINDOW_FACE, Some(WindowFace::STANDALONE));
+        assert_eq!(
+            EngineWindow::PROFILE,
+            PROFILE_HEAP | PROFILE_CHANNELS | PROFILE_WINDOW | PROFILE_FILESYSTEM | PROFILE_ENGINE
+        );
+        assert_eq!(EngineWindow::WINDOW_FACE, FilesWindow::WINDOW_FACE);
+        assert_eq!(EngineWindow::FILESYSTEM_FACE, FilesWindow::FILESYSTEM_FACE);
     }
 
     #[test]
@@ -280,7 +353,9 @@ mod tests {
                 assert_eq!(classified.unwrap().wake(), WakeTopology::Window);
             } else if profile == FilesWindow::PROFILE
                 || profile == PowerWindow::PROFILE
+                || profile == SettingsWindow::PROFILE
                 || profile == AcceleratedWindow::PROFILE
+                || profile == EngineWindow::PROFILE
             {
                 assert_eq!(
                     classified.unwrap().wake(),
@@ -291,6 +366,36 @@ mod tests {
                     classified, None,
                     "legal profile {profile:#x} aliased a preset"
                 );
+            }
+        }
+    }
+
+    /// The facilities a window is built from are not a window: each preset
+    /// without its declaration is a headless profile, and launches as one.
+    /// `lua-tool-worker` is exactly the engine window's facilities — the
+    /// filesystem, heap, engine plan and channel space — and runs headless
+    /// for inference and init.
+    #[test]
+    fn a_window_preset_without_its_declaration_is_headless() {
+        for preset in [
+            Window::PROFILE,
+            FilesWindow::PROFILE,
+            PowerWindow::PROFILE,
+            SettingsWindow::PROFILE,
+            AcceleratedWindow::PROFILE,
+            EngineWindow::PROFILE,
+        ] {
+            assert_eq!(WindowBundle::from_profile(preset & !PROFILE_WINDOW), None);
+        }
+        assert_eq!(
+            WindowBundle::from_profile(
+                PROFILE_FILESYSTEM | PROFILE_HEAP | PROFILE_ENGINE | PROFILE_CHANNELS
+            ),
+            None
+        );
+        for profile in 0..=kore_abi::image::PROFILE_KNOWN {
+            if profile & PROFILE_WINDOW == 0 {
+                assert_eq!(WindowBundle::from_profile(profile), None, "{profile:#x}");
             }
         }
     }

@@ -44,17 +44,29 @@ mod metal {
         Indeterminate,
     }
 
-    /// Result of a non-consuming lineage probe on a receive endpoint.
+    /// Result of a non-consuming lineage probe on a channel endpoint
+    /// ([`probe_chan_recv_lineage`], [`probe_chan_send_lineage`]).
     ///
     /// `Dead` is positive kernel evidence that the endpoint or an ancestor was
-    /// revoked. `Live` means a same-kind descendant was derived and then
-    /// retired without changing the probed parent. Everything else preserves
-    /// the caller's reconciliation state for a later retry.
+    /// revoked. `Live` is positive evidence the kernel bound it live: a
+    /// same-kind descendant was derived and then retired without changing the
+    /// probed parent, or (a send endpoint only) the derive was refused for a
+    /// right the parent lacks, which the kernel checks only after liveness.
+    /// Everything else preserves the caller's reconciliation state for a
+    /// later retry.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum ChanRecvLineage {
+    pub enum ChanLineage {
         Live,
         Dead,
         Retryable,
+    }
+
+    /// The face of a channel a lineage probe derives from.
+    #[cfg(any(test, target_os = "none"))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ChanFace {
+        Send,
+        Recv,
     }
 
     /// Why a direct Found result could not become the caller's exact task
@@ -208,11 +220,19 @@ mod metal {
 
     #[cfg(any(test, target_os = "none"))]
     #[inline]
-    fn classify_chan_recv_probe(committed: kore_abi::session::Committed) -> ChanRecvLineage {
+    fn classify_chan_probe(committed: kore_abi::session::Committed, face: ChanFace) -> ChanLineage {
+        use kore_abi::session::Status;
+
         match (committed.status(), committed.failing_index()) {
-            (kore_abi::session::Status::Ok, 0) => ChanRecvLineage::Live,
-            (kore_abi::session::Status::Revoked, 0) => ChanRecvLineage::Dead,
-            _ => ChanRecvLineage::Retryable,
+            (Status::Ok, 0) => ChanLineage::Live,
+            (Status::Revoked, 0) => ChanLineage::Dead,
+            // A send endpoint may carry no DERIVE (a bound filesystem view's
+            // identity canary does not). Binding the parent checks
+            // authenticity and liveness first, and a bind fault is `Forged`
+            // or `Revoked`, never `Denied`: a derive refused for the missing
+            // right proves the lineage live, and created nothing.
+            (Status::Denied, 0) if face == ChanFace::Send => ChanLineage::Live,
+            _ => ChanLineage::Retryable,
         }
     }
 
@@ -943,6 +963,10 @@ mod metal {
     /// may use the number only to correlate an already-presented capability
     /// with an immutable service-owned binding. Every effect still names the
     /// original slot and is re-authenticated by the kernel.
+    ///
+    /// Nor is it a liveness test: an ancestor's revocation leaves this record
+    /// unchanged, so a dead lineage keeps answering its scope id. Ask the
+    /// kernel instead ([`probe_chan_send_lineage`], [`probe_chan_recv_lineage`]).
     #[cfg(target_os = "none")]
     pub fn capability_scope_rid(
         slot: SlotRef,
@@ -1505,52 +1529,96 @@ mod metal {
     /// caller-owned `TaskToken` reaps a child, without retaining a second task
     /// handle or consuming a still-running child's canary.
     #[cfg(target_os = "none")]
-    pub fn probe_chan_recv_lineage(parent: SlotRef) -> ChanRecvLineage {
+    pub fn probe_chan_recv_lineage(parent: SlotRef) -> ChanLineage {
+        probe_chan_lineage(parent, ChanFace::Recv)
+    }
+
+    /// Probe whether a held send endpoint's complete lineage is still live,
+    /// without revoking or using it.
+    ///
+    /// The send-side twin of [`probe_chan_recv_lineage`], and the only sound
+    /// liveness test for an endpoint an ancestor may have revoked: revocation
+    /// retires the ancestor's tag, and every descendant dies through its
+    /// stamped chain *without* its record being rewritten, so a held record
+    /// keeps reading as present (and its scope id as current) after its
+    /// lineage is dead. Only a kernel bind tells. An endpoint without DERIVE
+    /// (an identity canary) is answered by the refusal of the derive, which
+    /// the kernel reaches only once the bind has proven it live.
+    #[cfg(target_os = "none")]
+    pub fn probe_chan_send_lineage(parent: SlotRef) -> ChanLineage {
+        probe_chan_lineage(parent, ChanFace::Send)
+    }
+
+    /// One derive-and-retire transaction against `parent`'s `face`.
+    #[cfg(target_os = "none")]
+    fn probe_chan_lineage(parent: SlotRef, face: ChanFace) -> ChanLineage {
         use crate::session::SessionBuilder;
         use crate::transport::{Transport, TrapTransport};
 
         let Some(mut child) = crate::cap::OwnedSlot::reserve() else {
-            return ChanRecvLineage::Retryable;
+            return ChanLineage::Retryable;
         };
         let mut probe = SessionBuilder::new();
-        let Ok(staged) =
-            probe.derive_chan_recv(parent, crate::cap::CHANNEL_ENDPOINT_RIGHTS, child.slot())
-        else {
-            return ChanRecvLineage::Retryable;
+        let staged = match face {
+            ChanFace::Recv => {
+                probe.derive_chan_recv(parent, crate::cap::CHANNEL_ENDPOINT_RIGHTS, child.slot())
+            }
+            // Any subset of the parent's rights names a valid descendant; a
+            // dead parent refuses `Revoked` whatever is asked.
+            ChanFace::Send => match authority_record(parent, kore_abi::cap::ResourceKind::ChanSend) {
+                Some(rights) => probe.derive_chan_send(parent, rights, child.slot()),
+                None => return ChanLineage::Retryable,
+            },
+        };
+        let Ok(staged) = staged else {
+            return ChanLineage::Retryable;
         };
         // The probe result is a transactional witness only. Kill it in the
         // same session so a live-parent probe cannot accumulate descendants;
         // the local result name is then settled as AlreadyDead below.
         if probe.revoke(staged.into()).is_err() {
-            return ChanRecvLineage::Retryable;
+            return ChanLineage::Retryable;
         }
         let Ok(committed) = TrapTransport::new().commit_now(&probe) else {
             child.quarantine_unknown_publish();
-            return ChanRecvLineage::Retryable;
+            return ChanLineage::Retryable;
         };
-        match classify_chan_recv_probe(committed) {
-            ChanRecvLineage::Live => {
-                let owner = ChanRecvToken::new(child);
-                match owner.try_retire() {
-                    Ok(_) => ChanRecvLineage::Live,
-                    Err(_) => ChanRecvLineage::Retryable,
+        match classify_chan_probe(committed, face) {
+            // A refused derive published nothing: the reservation is free.
+            ChanLineage::Live if committed.status() != kore_abi::session::Status::Ok => {
+                ChanLineage::Live
+            }
+            ChanLineage::Live => {
+                let retired = match face {
+                    ChanFace::Recv => crate::cap::ChanRecvToken::new(child).try_retire().is_ok(),
+                    ChanFace::Send => crate::cap::ChanSendToken::new(child).try_retire().is_ok(),
+                };
+                if retired {
+                    ChanLineage::Live
+                } else {
+                    ChanLineage::Retryable
                 }
             }
-            ChanRecvLineage::Dead => ChanRecvLineage::Dead,
-            ChanRecvLineage::Retryable => {
+            ChanLineage::Dead => ChanLineage::Dead,
+            ChanLineage::Retryable => {
                 if committed.failing_index() != 0
                     || committed.raw() as u16 > kore_abi::session::Status::AltDelivery as u16
                 {
                     child.quarantine_unknown_publish();
                 }
-                ChanRecvLineage::Retryable
+                ChanLineage::Retryable
             }
         }
     }
 
     #[cfg(not(target_os = "none"))]
-    pub fn probe_chan_recv_lineage(_parent: SlotRef) -> ChanRecvLineage {
-        ChanRecvLineage::Retryable
+    pub fn probe_chan_recv_lineage(_parent: SlotRef) -> ChanLineage {
+        ChanLineage::Retryable
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn probe_chan_send_lineage(_parent: SlotRef) -> ChanLineage {
+        ChanLineage::Retryable
     }
 
     /// Derive one locally retained endpoint below `source`.
@@ -2969,6 +3037,99 @@ mod metal {
         }
     }
 
+    /// Outcome of one blocking wait on a memory word — the kernel
+    /// address-wait (`res/EVENT.md` §6).  Every answer is a hint about the
+    /// *wait*, never a promise about the word: the caller re-reads it, the
+    /// `futex` contract.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WordWait {
+        /// The word was seen to differ from `expected` (at park time, or a
+        /// `wake_word` on the same memory fired).
+        Changed,
+        /// The deadline expired first; the word may or may not have moved.
+        Deadline,
+        /// The subject's lease died while this task was parked.
+        Revoked,
+        /// The kernel's bounded waiter board was full — nothing parked; the
+        /// caller re-checks and parks again.
+        WouldBlock,
+    }
+
+    /// Why [`wait_word`] could not complete one word-backed wait.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WordWaitError {
+        /// The target has no live parking trap or descriptor scratch.
+        TransportUnavailable,
+        /// The kernel refused the wait session with this status — a
+        /// malformed request (offset outside the subject, misaligned), a
+        /// subject that is not held memory, or a forged slot.
+        Refused(kore_abi::session::Status),
+    }
+
+    /// Park this thread until the `u32` at byte `offset` of the held memory
+    /// `subject` (a lease or mapped view, by arena slot — see
+    /// [`mapped::locate`](crate::cap::mapped::locate)) differs from
+    /// `expected`, or `deadline_ns` (absolute monotonic nanoseconds) passes
+    /// — the **sleep-or-word park** (`WAIT_WORD | WAIT_SLEEP`, no doorbell
+    /// arm).  The kernel keys the wait on the word's physical identity, so
+    /// a [`wake_word`] on any mapping of the same memory resolves it.
+    ///
+    /// The bare-thread twin of the executor's word arm
+    /// (`executor::next_wake_on_word`): a thread with no doorbell — a
+    /// worker sharing a window and nothing else — can wait here, which is
+    /// the provisioning gap the `futex` module documents closing.  Deadline
+    /// discipline is [`wait_interrupt_until`]'s: name one absolute instant
+    /// and park against it for the whole retry loop.
+    pub fn wait_word(
+        subject: SlotRef,
+        offset: u32,
+        expected: u32,
+        deadline_ns: u64,
+    ) -> Result<WordWait, WordWaitError> {
+        use crate::session::SessionBuilder;
+        use crate::transport::{ParkTransport, TrapTransport};
+        use kore_abi::session::Status;
+
+        let mut wait = SessionBuilder::new();
+        wait.wait_word(subject, offset, expected).wait_sleep(deadline_ns);
+        let committed = TrapTransport::new()
+            .commit_word_park(&wait)
+            .map_err(|_| WordWaitError::TransportUnavailable)?;
+        match committed.status() {
+            Status::Word => Ok(WordWait::Changed),
+            Status::Deadline => Ok(WordWait::Deadline),
+            Status::Revoked => Ok(WordWait::Revoked),
+            Status::WouldBlock => Ok(WordWait::WouldBlock),
+            status => Err(WordWaitError::Refused(status)),
+        }
+    }
+
+    /// One **synchronous** wake of up to `count` waiters parked on the
+    /// `u32` at byte `offset` of the held memory `subject` (`MODIFY`) —
+    /// the producer half of the kernel address-wait, and [`post_notice`]'s
+    /// twin for a producer that shares the memory but holds no send end.
+    /// The caller stores first and wakes second.  `true` on `Status::Ok`;
+    /// `false` on any refusal — a droppable kick, exactly as for a notice:
+    /// a waiter that was not yet parked re-reads the word before it parks.
+    #[cfg(target_os = "none")]
+    pub fn wake_word(subject: SlotRef, offset: u32, count: u32) -> bool {
+        use crate::session::SessionBuilder;
+        use crate::transport::{Transport, TrapTransport};
+
+        let mut b = SessionBuilder::new();
+        if b.wake_word(subject, offset, count).is_err() {
+            return false;
+        }
+        TrapTransport::new()
+            .commit_now(&b)
+            .is_ok_and(|c| c.status() == kore_abi::session::Status::Ok)
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn wake_word(_subject: SlotRef, _offset: u32, _count: u32) -> bool {
+        false
+    }
+
     /// **Park until `deadline_ns`** (absolute monotonic nanoseconds) — the
     /// pure `WAIT_SLEEP` sliver (USERLAND.md §3.4.2): no doorbell, no
     /// route, just the per-CPU timer wheel.  The thread shape (#407): a
@@ -3127,7 +3288,11 @@ mod metal {
     /// [`MappedLeaseView`]: crate::cap::MappedLeaseView
     #[inline]
     pub fn retire_mapped_view(view: SlotRef, lease: SlotRef) -> RetireOutcome {
-        retire_owned_view(view, lease)
+        let outcome = retire_owned_view(view, lease);
+        if outcome.is_closed() {
+            crate::cap::mapped::forget_slot(view);
+        }
+        outcome
     }
 
     /// Carve one affine DMA sub-lease, map its CPU face, zero it, and only then
@@ -4096,11 +4261,15 @@ mod metal {
         use crate::transport::{Transport, TrapTransport};
 
         let report_slot = crate::entry::geometry::report_slot()?;
+        // The view's arena slot stays the subject after the map (the record
+        // is not consumed) — captured before the token is spent so the
+        // window can be named to the kernel address-wait by that slot.
+        let subject = view.slot();
         let mut b = SessionBuilder::new();
         if sink {
-            b.map_view_sink(view.slot(), report_slot).ok()?;
+            b.map_view_sink(subject, report_slot).ok()?;
         } else {
-            b.derive_raw(view.slot(), Rights::empty(), 0, report_slot, None)
+            b.derive_raw(subject, Rights::empty(), 0, report_slot, None)
                 .ok()?;
         }
         let committed = TrapTransport::new().commit_now(&b).ok()?;
@@ -4117,10 +4286,9 @@ mod metal {
         if g.len == 0 {
             return None;
         }
-        Some(NonNull::slice_from_raw_parts(
-            NonNull::new(g.base as *mut u8)?,
-            g.len as usize,
-        ))
+        let base = NonNull::new(g.base as *mut u8)?;
+        crate::cap::mapped::note(base.as_ptr(), g.len as usize, subject);
+        Some(NonNull::slice_from_raw_parts(base, g.len as usize))
     }
 
     /// Map a runtime-owned detached view while retaining the affine arena
@@ -4150,8 +4318,12 @@ mod metal {
                 map_stashed_view_request(view, Some(kore_abi::session::SurfaceMapLane::First))
             }
             // The heap window places the task's own heap-supply carves
-            // (`heap::source`), never a peer's view.
-            kore_abi::session::ViewMapWindow::Heap => None,
+            // (`heap::source`), never a peer's view; the reservation window
+            // holds only commits a `reserve::Reservation` made and will
+            // release, never a view something else still names.
+            kore_abi::session::ViewMapWindow::Heap | kore_abi::session::ViewMapWindow::Reserve => {
+                None
+            }
         }
     }
 
@@ -4178,14 +4350,15 @@ mod metal {
         use crate::transport::{Transport, TrapTransport};
 
         let report_slot = crate::entry::geometry::report_slot()?;
+        let subject = view.slot()?;
         let mut b = SessionBuilder::new();
         match surface_lane {
             Some(lane) => b
-                .map_view_surface_lane(view.slot()?, lane, report_slot)
+                .map_view_surface_lane(subject, lane, report_slot)
                 .ok()?,
             None => b
                 .map_view_in(
-                    view.slot()?,
+                    subject,
                     kore_abi::session::ViewMapWindow::Map,
                     report_slot,
                 )
@@ -4204,10 +4377,9 @@ mod metal {
         if geom.len == 0 {
             return None;
         }
-        Some(NonNull::slice_from_raw_parts(
-            NonNull::new(geom.base as *mut u8)?,
-            geom.len as usize,
-        ))
+        let base = NonNull::new(geom.base as *mut u8)?;
+        crate::cap::mapped::note(base.as_ptr(), geom.len as usize, subject);
+        Some(NonNull::slice_from_raw_parts(base, geom.len as usize))
     }
 
     #[cfg(not(target_os = "none"))]
@@ -4270,10 +4442,10 @@ mod metal {
         if g.len == 0 {
             return None;
         }
-        Some(NonNull::slice_from_raw_parts(
-            NonNull::new(g.base as *mut u8)?,
-            g.len as usize,
-        ))
+        // A whole-lease map: the lease itself names the window.
+        let base = NonNull::new(g.base as *mut u8)?;
+        crate::cap::mapped::note(base.as_ptr(), g.len as usize, lease);
+        Some(NonNull::slice_from_raw_parts(base, g.len as usize))
     }
 
     /// Off the metal userland targets — the honest typed refusal (there is no
@@ -4314,10 +4486,10 @@ mod metal {
         if g.len == 0 {
             return None;
         }
-        Some(NonNull::slice_from_raw_parts(
-            NonNull::new(g.base as *mut u8)?,
-            g.len as usize,
-        ))
+        // A whole-lease map: the lease itself names the window.
+        let base = NonNull::new(g.base as *mut u8)?;
+        crate::cap::mapped::note(base.as_ptr(), g.len as usize, lease);
+        Some(NonNull::slice_from_raw_parts(base, g.len as usize))
     }
 
     /// Off the metal userland targets — the honest typed refusal (there is no
@@ -4445,9 +4617,13 @@ mod metal {
         {
             return false;
         }
-        TrapTransport::new()
+        let mapped = TrapTransport::new()
             .commit_now(&b)
-            .is_ok_and(|committed| committed.status() == kore_abi::session::Status::Ok)
+            .is_ok_and(|committed| committed.status() == kore_abi::session::Status::Ok);
+        if mapped && let Ok(len) = usize::try_from(len) {
+            crate::cap::mapped::note(va as usize as *const u8, len, result);
+        }
+        mapped
     }
 
     #[cfg(not(target_os = "none"))]
@@ -5199,6 +5375,10 @@ mod metal {
         let Ok(committed) = TrapTransport::new().commit_now(&b) else {
             return false;
         };
+        // A revoked slot names no window any more, whatever it was: drop any
+        // registry entry that still points at it, or a later wait would hand
+        // the kernel a dead slot (or, once reused, someone else's).
+        crate::cap::mapped::forget_slot(slot);
         committed.status() == kore_abi::session::Status::Ok
     }
 
@@ -5376,6 +5556,59 @@ mod metal {
     #[cfg(not(target_os = "none"))]
     pub fn slot_is_chan_send(_slot: SlotRef, _required: kore_abi::cap::Rights) -> bool {
         false
+    }
+
+    /// The supply tag an [`InvocationWitness`] delivered into `slot` vouches
+    /// for, or `None` when the slot holds anything else.
+    ///
+    /// The kernel mints the witness from one executable endpoint for one
+    /// exact held supply, moves it before that supply through the same
+    /// endpoint in one session, and refuses a later `Found` that delivers
+    /// the witness without that exact supply. Its resource id is the
+    /// supply's tag index, and tags are never reissued, so a receiver that
+    /// holds both can tell which landed supply belongs to which invocation.
+    /// This reads the authenticated record as metadata; the founding commit
+    /// still performs the authoritative check.
+    ///
+    /// [`InvocationWitness`]: kore_abi::cap::ResourceKind::InvocationWitness
+    #[cfg(target_os = "none")]
+    pub fn delivered_invocation_supply(slot: SlotRef) -> Option<kore_abi::cap::Tag> {
+        use kore_abi::cap::{CapRecord, ResourceKind, Tag};
+
+        let ptr = crate::entry::geometry::slot_record_va(slot)?;
+        // SAFETY: the R/O `SLOTS_VA` alias over this task's own slot records
+        // (the `take_delivery` argument above); `slot` was range-checked by
+        // `slot_record_va`, and the kernel is the sole writer.
+        let record = unsafe { core::ptr::read_volatile(ptr as *const CapRecord) };
+        (!record.cid.is_null() && record.kind == ResourceKind::InvocationWitness as u16)
+            .then(|| Tag(record.scope_id()))
+    }
+
+    /// Off the metal userland targets — no live record to inspect.
+    #[cfg(not(target_os = "none"))]
+    pub fn delivered_invocation_supply(_slot: SlotRef) -> Option<kore_abi::cap::Tag> {
+        None
+    }
+
+    /// The revocation tag of a memory lease delivered into `slot`, or `None`
+    /// when the slot holds anything else. A rendezvous move keeps the moved
+    /// lease's identity, so this is the tag an
+    /// [`delivered_invocation_supply`] witness names for it.
+    #[cfg(target_os = "none")]
+    pub fn delivered_lease_tag(slot: SlotRef) -> Option<kore_abi::cap::Tag> {
+        use kore_abi::cap::{CapRecord, ResourceKind};
+
+        let ptr = crate::entry::geometry::slot_record_va(slot)?;
+        // SAFETY: as in `delivered_invocation_supply`.
+        let record = unsafe { core::ptr::read_volatile(ptr as *const CapRecord) };
+        (!record.cid.is_null() && record.kind == ResourceKind::MemLease as u16)
+            .then(|| record.cid.tag())
+    }
+
+    /// Off the metal userland targets — no live record to inspect.
+    #[cfg(not(target_os = "none"))]
+    pub fn delivered_lease_tag(_slot: SlotRef) -> Option<kore_abi::cap::Tag> {
+        None
     }
 
     /// **The metal take-handle** (Phase S; Phase-A checkpoint C) — read a
@@ -5943,22 +6176,41 @@ mod metal {
         }
 
         #[test]
-        fn receive_lineage_probe_requires_positive_live_or_dead_evidence() {
+        fn lineage_probes_require_positive_live_or_dead_evidence() {
+            for face in [ChanFace::Recv, ChanFace::Send] {
+                assert_eq!(classify_chan_probe(committed(Status::Ok, 0), face), ChanLineage::Live);
+                assert_eq!(
+                    classify_chan_probe(committed(Status::Revoked, 0), face),
+                    ChanLineage::Dead
+                );
+                assert_eq!(
+                    classify_chan_probe(committed(Status::WouldBlock, 0), face),
+                    ChanLineage::Retryable
+                );
+                assert_eq!(
+                    classify_chan_probe(committed(Status::Ok, 1), face),
+                    ChanLineage::Retryable
+                );
+                // A forged or wrong-holder record proves nothing either way.
+                assert_eq!(
+                    classify_chan_probe(committed(Status::Forged, 0), face),
+                    ChanLineage::Retryable
+                );
+            }
+            // A send endpoint without DERIVE is answered by the derive's
+            // refusal, which the kernel reaches only after binding it live; a
+            // receive parent always carries DERIVE, so there it means nothing.
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::Ok, 0)),
-                ChanRecvLineage::Live
+                classify_chan_probe(committed(Status::Denied, 0), ChanFace::Send),
+                ChanLineage::Live
             );
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::Revoked, 0)),
-                ChanRecvLineage::Dead
+                classify_chan_probe(committed(Status::Denied, 0), ChanFace::Recv),
+                ChanLineage::Retryable
             );
             assert_eq!(
-                classify_chan_recv_probe(committed(Status::WouldBlock, 0)),
-                ChanRecvLineage::Retryable
-            );
-            assert_eq!(
-                classify_chan_recv_probe(committed(Status::Ok, 1)),
-                ChanRecvLineage::Retryable
+                classify_chan_probe(committed(Status::Denied, 1), ChanFace::Send),
+                ChanLineage::Retryable
             );
         }
 

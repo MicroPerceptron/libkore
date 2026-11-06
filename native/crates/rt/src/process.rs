@@ -1,6 +1,7 @@
 //! Generic foreground-process launch/result and streaming-I/O pages.
 
 pub mod interrupt;
+pub mod words;
 
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -17,9 +18,11 @@ use kore_abi::process::{
 use kore_abi::process::{
     PROCESS_OUTPUT_RING_OFFSET, PROCESS_OUTPUT_WAKE_COOKIE, PROCESS_STDIN_WAKE_COOKIE,
     PROCESS_STDIO_CHILD_WAITING_OFFSET, PROCESS_STDIO_PARENT_WAITING_OFFSET,
+    PROCESS_STDIO_PROFILE_DEFINED, PROCESS_STDIO_PROFILE_OFFSET, PROCESS_STDIO_PROFILE_TERMINAL,
     PROCESS_STDIO_RING_BYTES, PROCESS_STDIO_RING_CAPACITY, PROCESS_STDIO_RINGS_BYTES,
     PROCESS_STDIO_TO_CHILD_SEQUENCE_OFFSET, PROCESS_STDIO_TO_PARENT_SEQUENCE_OFFSET,
-    ProcessInputChunk, ProcessIo, ProcessIoError, ProcessOutputEvent,
+    ProcessInputChunk, ProcessIo, ProcessIoError, ProcessOutputEvent, ProcessBulkChunk,
+    PROCESS_BULK_OFFSET, PROCESS_BULK_RING_BYTES, PROCESS_BULK_CAPACITY,
 };
 use kore_abi::session::{Notice, SlotRef};
 use kore_ring::spsc::{self, Consumer, Full, Producer, RingError};
@@ -517,6 +520,7 @@ impl ProcessStdioParkTicket<'_> {
 pub struct ProcessStdioParent<'w, 't, T: Transport> {
     stdin: Producer<'w, ProcessInputChunk>,
     output: Consumer<'w, ProcessOutputEvent>,
+    bulk: Consumer<'w, ProcessBulkChunk>,
     peer: ProcessStdioPeer<'w, 't, T>,
 }
 
@@ -536,6 +540,7 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
         let Self {
             stdin: _,
             output: _,
+            bulk: _,
             peer,
         } = self;
         peer.close_after_recv_root_revoked();
@@ -554,7 +559,7 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
         assert!(core::ptr::eq(drain.source, self.peer.observed));
         self.peer.waiting.store(1, Ordering::SeqCst);
         self.peer.observed.load(Ordering::SeqCst) == drain.sequence
-            && self.output.outstanding() == 0
+            && self.output.outstanding() == 0 && self.bulk.outstanding() == 0
     }
 
     /// Enqueue one canonical-input record and notify the child. [`Full`]
@@ -574,6 +579,12 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
         Some((record, self.peer.signal().await))
     }
 
+    /// Consume binary output through the same capacity-notification seam.
+    pub async fn try_recv_bulk(&mut self) -> Option<(ProcessBulkChunk, ProcessStdioWake)> {
+        let record = self.bulk.pop()?;
+        Some((record, self.peer.signal().await))
+    }
+
     /// Advisory free slots in the input producer.
     pub fn stdin_capacity_left(&self) -> u32 {
         self.stdin.capacity_left()
@@ -585,9 +596,9 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
         self.stdin.capacity().saturating_sub(self.stdin.capacity_left())
     }
 
-    /// Advisory published output events awaiting this parent.
+    /// Advisory published text/control and binary records awaiting this parent.
     pub fn output_outstanding(&self) -> u32 {
-        self.output.outstanding()
+        self.output.outstanding() + self.bulk.outstanding()
     }
 
     /// Recheck the rings/peer epoch, take one hardware-monitor turn when
@@ -600,10 +611,11 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
     ) -> Result<(), ProcessStdioWaitError> {
         let stdin = &self.stdin;
         let output = &self.output;
+        let bulk = &self.bulk;
         self.peer
             .park_after_drain_inner(
                 drain,
-                || wait_for.satisfied(output.outstanding() != 0, stdin.capacity_left() != 0),
+                || wait_for.satisfied(output.outstanding() != 0 || bulk.outstanding() != 0, stdin.capacity_left() != 0),
                 None,
             )
             .await
@@ -626,10 +638,11 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
     ) -> Result<ProcessStdioPark, ProcessStdioWaitError> {
         let stdin = &self.stdin;
         let output = &self.output;
+        let bulk = &self.bulk;
         self.peer
             .park_after_drain_inner(
                 drain,
-                || wait_for.satisfied(output.outstanding() != 0, stdin.capacity_left() != 0),
+                || wait_for.satisfied(output.outstanding() != 0 || bulk.outstanding() != 0, stdin.capacity_left() != 0),
                 Some(delta_ns),
             )
             .await
@@ -641,7 +654,10 @@ impl<T: Transport> ProcessStdioParent<'_, '_, T> {
 pub struct ProcessStdioChild<'w, 't, T: Transport> {
     stdin: Consumer<'w, ProcessInputChunk>,
     output: Producer<'w, ProcessOutputEvent>,
+    bulk: Producer<'w, ProcessBulkChunk>,
     peer: ProcessStdioPeer<'w, 't, T>,
+    /// What the launcher declared about the far end, read at attach.
+    profile: StdioProfile,
 }
 
 impl<'w, T: Transport> ProcessStdioChild<'w, '_, T> {
@@ -652,9 +668,17 @@ impl<'w, T: Transport> ProcessStdioChild<'w, '_, T> {
         let Self {
             stdin: _,
             output: _,
+            bulk: _,
             peer,
+            profile: _,
         } = self;
         peer.close_after_recv_root_revoked();
+    }
+
+    /// What the launcher declared about this stream's far end — whether it
+    /// is a terminal.
+    pub fn profile(&self) -> StdioProfile {
+        self.profile
     }
 
     /// Snapshot the parent-to-child sequence before a total drain.
@@ -696,6 +720,15 @@ impl<'w, T: Transport> ProcessStdioChild<'w, '_, T> {
     ) -> Result<ProcessStdioWake, Full> {
         self.output.push(record)?;
         Ok(self.peer.signal_now())
+    }
+
+    /// Publish binary output; Full leaves ownership with the caller.
+    pub fn send_bulk_now(&mut self, record: ProcessBulkChunk) -> Result<ProcessStdioWake, Full> {
+        self.bulk.push(record)?;
+        Ok(self.peer.signal_now())
+    }
+    pub fn bulk_unconsumed(&self) -> u32 {
+        self.bulk.capacity().saturating_sub(self.bulk.capacity_left())
     }
 
     /// Advisory published input records awaiting this child.
@@ -838,11 +871,13 @@ const _: () = {
         spsc::region_bytes::<ProcessOutputEvent>(PROCESS_STDIO_RING_CAPACITY)
             == PROCESS_STDIO_RING_BYTES
     );
+    assert!(spsc::region_bytes::<ProcessBulkChunk>(PROCESS_BULK_CAPACITY) == PROCESS_BULK_RING_BYTES);
 };
 
 struct StdioRegions<'w> {
     stdin: &'w mut [u8],
     output: &'w mut [u8],
+    bulk: &'w mut [u8],
     to_child: &'w AtomicU32,
     child_waiting: &'w AtomicU32,
     to_parent: &'w AtomicU32,
@@ -857,6 +892,8 @@ fn stdio_regions(window: &mut [u8]) -> Result<StdioRegions<'_>, RingError> {
         return Err(RingError::Misaligned);
     }
     let page = &mut window[..kore_abi::process::PROCESS_STDIO_BYTES];
+    let (page, bulk) = page.split_at_mut(PROCESS_BULK_OFFSET);
+    let bulk = &mut bulk[..PROCESS_BULK_RING_BYTES];
     let (rings, signals) = page.split_at_mut(PROCESS_STDIO_RINGS_BYTES);
     let (stdin, output) = rings.split_at_mut(PROCESS_OUTPUT_RING_OFFSET);
     let output = &mut output[..PROCESS_STDIO_RING_BYTES];
@@ -884,6 +921,7 @@ fn stdio_regions(window: &mut [u8]) -> Result<StdioRegions<'_>, RingError> {
     Ok(StdioRegions {
         stdin,
         output,
+        bulk,
         to_child,
         child_waiting,
         to_parent,
@@ -891,13 +929,47 @@ fn stdio_regions(window: &mut [u8]) -> Result<StdioRegions<'_>, RingError> {
     })
 }
 
+/// What a launcher declares about its stream's far end
+/// ([`PROCESS_STDIO_PROFILE_OFFSET`]): written once when it formats the page,
+/// read once when the child attaches. Only bits the ABI defines are ever
+/// represented, so a page written by a newer launcher reads here as what
+/// this ABI can name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StdioProfile(u32);
+
+impl StdioProfile {
+    /// Nothing declared: a stream a launcher captures or replays.
+    pub const PLAIN: Self = Self(0);
+    /// The far end is a terminal ([`PROCESS_STDIO_PROFILE_TERMINAL`]): lines
+    /// edited and echoed by it, output rendered by its ANSI decoder.
+    pub const TERMINAL: Self = Self(PROCESS_STDIO_PROFILE_TERMINAL);
+
+    /// Whether the far end is a terminal — what a program asks with `isatty`.
+    pub const fn is_terminal(self) -> bool {
+        self.0 & PROCESS_STDIO_PROFILE_TERMINAL != 0
+    }
+
+    /// The profile word as the page carries it.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// The profile a page's word declares: the bits this ABI defines.
+    pub const fn from_bits(word: u32) -> Self {
+        Self(word & PROCESS_STDIO_PROFILE_DEFINED)
+    }
+}
+
 /// Format a fresh stream page before the launcher transfers the child's
-/// sibling view.
+/// sibling view, declaring its far end as `profile`.
 ///
 /// The entire page is cleared, including the ABI-reserved suffix, before the
-/// two fixed-depth rings and the directional sequence lines are published.
-/// The returned affine token is the only safe parent attachment.
-pub fn init_stdio(window: &mut [u8]) -> Result<PreparedProcessStdio<'_>, RingError> {
+/// profile, the two fixed-depth rings and the directional sequence lines are
+/// published. The returned affine token is the only safe parent attachment.
+pub fn init_stdio(
+    window: &mut [u8],
+    profile: StdioProfile,
+) -> Result<PreparedProcessStdio<'_>, RingError> {
     if window.len() < kore_abi::process::PROCESS_STDIO_BYTES {
         return Err(RingError::TooSmall);
     }
@@ -905,14 +977,26 @@ pub fn init_stdio(window: &mut [u8]) -> Result<PreparedProcessStdio<'_>, RingErr
         return Err(RingError::Misaligned);
     }
     window[..kore_abi::process::PROCESS_STDIO_BYTES].fill(0);
+    window[PROCESS_STDIO_PROFILE_OFFSET..PROCESS_STDIO_PROFILE_OFFSET + 4]
+        .copy_from_slice(&profile.bits().to_le_bytes());
     let regions = stdio_regions(window)?;
     spsc::init::<ProcessInputChunk>(regions.stdin, PROCESS_STDIO_RING_CAPACITY)?;
     spsc::init::<ProcessOutputEvent>(regions.output, PROCESS_STDIO_RING_CAPACITY)?;
+    spsc::init::<ProcessBulkChunk>(regions.bulk, PROCESS_BULK_CAPACITY)?;
     Ok(PreparedProcessStdio {
         base: window.as_mut_ptr(),
         len: kore_abi::process::PROCESS_STDIO_BYTES,
         _window: PhantomData,
     })
+}
+
+/// The profile a formatted page declares. The word is written before the
+/// child's view exists and never again, so a plain read is the whole
+/// protocol.
+fn page_profile(window: &[u8]) -> StdioProfile {
+    let mut word = [0u8; 4];
+    word.copy_from_slice(&window[PROCESS_STDIO_PROFILE_OFFSET..PROCESS_STDIO_PROFILE_OFFSET + 4]);
+    StdioProfile::from_bits(u32::from_le_bytes(word))
 }
 
 /// Bind the parent end. `output_recv` is `None` only for a stream host,
@@ -930,6 +1014,7 @@ unsafe fn bind_parent<'w, 't, T: Transport>(
     Ok(ProcessStdioParent {
         stdin: spsc::producer::<ProcessInputChunk>(regions.stdin)?,
         output: spsc::consumer::<ProcessOutputEvent>(regions.output)?,
+        bulk: spsc::consumer::<ProcessBulkChunk>(regions.bulk)?,
         peer: ProcessStdioPeer {
             transport,
             send: stdin_send,
@@ -957,10 +1042,16 @@ unsafe fn bind_child<'w, 't, T: Transport>(
 ) -> Result<ProcessStdioChild<'w, 't, T>, RingError> {
     // SAFETY: the caller owns this local mapping attachment for `'w`.
     let window = unsafe { core::slice::from_raw_parts_mut(base, len) };
+    if window.len() < kore_abi::process::PROCESS_STDIO_BYTES {
+        return Err(RingError::TooSmall);
+    }
+    let profile = page_profile(window);
     let regions = stdio_regions(window)?;
     Ok(ProcessStdioChild {
+        profile,
         stdin: spsc::consumer::<ProcessInputChunk>(regions.stdin)?,
         output: spsc::producer::<ProcessOutputEvent>(regions.output)?,
+        bulk: spsc::producer::<ProcessBulkChunk>(regions.bulk)?,
         peer: ProcessStdioPeer {
             transport,
             send: output_send,
@@ -984,7 +1075,23 @@ fn split_stdio<'w, 'p, 'c, P: Transport, C: Transport>(
     parent_transport: &'p P,
     child_transport: &'c C,
 ) -> Result<(ProcessStdioParent<'w, 'p, P>, ProcessStdioChild<'w, 'c, C>), RingError> {
-    let prepared = init_stdio(window)?;
+    split_stdio_as(
+        window,
+        StdioProfile::PLAIN,
+        parent_transport,
+        child_transport,
+    )
+}
+
+/// [`split_stdio`] over a page whose launcher declared `profile`.
+#[cfg(test)]
+fn split_stdio_as<'w, 'p, 'c, P: Transport, C: Transport>(
+    window: &'w mut [u8],
+    profile: StdioProfile,
+    parent_transport: &'p P,
+    child_transport: &'c C,
+) -> Result<(ProcessStdioParent<'w, 'p, P>, ProcessStdioChild<'w, 'c, C>), RingError> {
+    let prepared = init_stdio(window, profile)?;
     let (base, len) = prepared.into_raw();
     // SAFETY: this is the same-address-space test form of the cross-mapping
     // protocol. Exactly one direction-specific producer and consumer are
@@ -1355,12 +1462,13 @@ mod tests {
         assert_eq!(PROCESS_STDIO_CHILD_WAITING_OFFSET, 2436);
         assert_eq!(PROCESS_STDIO_TO_PARENT_SEQUENCE_OFFSET, 2496);
         assert_eq!(PROCESS_STDIO_PARENT_WAITING_OFFSET, 2500);
-        assert_eq!(PROCESS_STDIO_LAYOUT_BYTES, 2560);
+        assert_eq!(PROCESS_STDIO_PROFILE_OFFSET, 2560);
+        assert_eq!(PROCESS_STDIO_LAYOUT_BYTES, 3840);
         assert!(PROCESS_STDIO_LAYOUT_BYTES <= kore_abi::process::PROCESS_STDIO_BYTES);
 
         let mut too_small = [0u8; kore_abi::process::PROCESS_STDIO_BYTES - 1];
         assert!(matches!(
-            init_stdio(&mut too_small),
+            init_stdio(&mut too_small, StdioProfile::PLAIN),
             Err(RingError::TooSmall)
         ));
 
@@ -1368,9 +1476,46 @@ mod tests {
         struct Oversized([u8; kore_abi::process::PROCESS_STDIO_BYTES + 1]);
         let mut oversized = Oversized([0; kore_abi::process::PROCESS_STDIO_BYTES + 1]);
         assert!(matches!(
-            init_stdio(&mut oversized.0[1..]),
+            init_stdio(&mut oversized.0[1..], StdioProfile::PLAIN),
             Err(RingError::Misaligned)
         ));
+    }
+
+    /// The child reads the far end its launcher declared: a terminal is
+    /// told so, a plain stream is not, and a page carrying bits this ABI
+    /// does not define reads as only the bits it does.
+    #[test]
+    fn the_child_reads_the_profile_its_launcher_declared() {
+        let transport = OkTransport::new();
+        for profile in [StdioProfile::PLAIN, StdioProfile::TERMINAL] {
+            let mut page = Page::zeroed();
+            let (_parent, child) =
+                split_stdio_as(&mut page.0, profile, &transport, &transport).unwrap();
+            assert_eq!(child.profile(), profile);
+            assert_eq!(
+                child.profile().is_terminal(),
+                profile == StdioProfile::TERMINAL
+            );
+        }
+        let mut page = Page::zeroed();
+        let prepared = init_stdio(&mut page.0, StdioProfile::TERMINAL).unwrap();
+        let (base, len) = prepared.into_raw();
+        page.0[PROCESS_STDIO_PROFILE_OFFSET..PROCESS_STDIO_PROFILE_OFFSET + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        // SAFETY: the test owns the page for the child's whole life, and only
+        // this one child end is bound.
+        let child = unsafe {
+            bind_child(
+                base,
+                len,
+                &transport,
+                ProcessStdioSend::Test(SlotRef::from_wire(43)),
+                ProcessStdioRecv::Test(SlotRef::from_wire(44)),
+            )
+        }
+        .unwrap();
+        assert_eq!(child.profile(), StdioProfile::TERMINAL);
+        assert!(!StdioProfile::from_bits(0).is_terminal());
     }
 
     #[test]
@@ -1404,9 +1549,31 @@ mod tests {
         assert!(parent.arm_shared_doorbell(parent.begin_drain()));
     }
 
-    /// A stream host binds the parent end with no dedicated receive: it parks
-    /// only through the shared-doorbell fence, never through a notice post it
-    /// does not hold, and closes without disarming a landing it never armed.
+    /// Binary output shares the parent's lost-wakeup fence and capacity wakes.
+    #[test]
+    fn binary_output_is_bounded_and_participates_in_the_shared_doorbell_fence() {
+        let transport = OkTransport::new();
+        let mut page = Page::zeroed();
+        let (mut parent, mut child) = split_stdio(&mut page.0, &transport, &transport).unwrap();
+        assert_eq!(spsc::region_bytes::<ProcessBulkChunk>(PROCESS_BULK_CAPACITY), PROCESS_BULK_RING_BYTES);
+        assert!(parent.arm_shared_doorbell(parent.begin_drain()));
+        let first = ProcessBulkChunk::new(7, 0, &[11; 496]).unwrap();
+        let second = ProcessBulkChunk::new(7, 496, &[22; 4]).unwrap();
+        child.send_bulk_now(first).unwrap();
+        child.send_bulk_now(second).unwrap();
+        assert_eq!(parent.output_outstanding(), PROCESS_BULK_CAPACITY);
+        assert!(child.send_bulk_now(first).is_err());
+        assert!(!parent.arm_shared_doorbell(parent.begin_drain()));
+        assert_eq!(drive(parent.try_recv_bulk()).unwrap().0, first);
+        assert_eq!(child.bulk_unconsumed(), 1);
+        assert_eq!(drive(parent.try_recv_bulk()).unwrap().0, second);
+        assert_eq!(child.bulk_unconsumed(), 0);
+        assert_eq!(parent.output_outstanding(), 0);
+        assert!(parent.arm_shared_doorbell(parent.begin_drain()));
+        child.send_bulk_now(first).unwrap();
+        assert!(!parent.arm_shared_doorbell(parent.begin_drain()));
+    }
+
     #[test]
     fn a_capacity_wait_ignores_unread_input() {
         use ProcessStdioWaitFor::{Capacity, Incoming, IncomingOrCapacity};
@@ -1422,7 +1589,7 @@ mod tests {
     fn a_stream_host_parks_only_through_its_shared_doorbell() {
         let transport = OkTransport::new();
         let mut page = Page::zeroed();
-        let prepared = init_stdio(&mut page.0).unwrap();
+        let prepared = init_stdio(&mut page.0, StdioProfile::PLAIN).unwrap();
         let (base, len) = prepared.into_raw();
         let (mut host, mut child) = unsafe {
             (
@@ -1627,7 +1794,7 @@ mod tests {
         };
         assert!(matches!(result, Err(RingError::BadHeader)));
 
-        let prepared = init_stdio(&mut page.0).unwrap();
+        let prepared = init_stdio(&mut page.0, StdioProfile::PLAIN).unwrap();
         let (base, len) = prepared.into_raw();
         // Attaching either side validates both ring headers and their fixed
         // geometry at the ABI-assigned semantic offsets.

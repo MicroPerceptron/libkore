@@ -8,7 +8,7 @@ use kore_abi::session::{
     DERIVE_KIND_IOVA_ANON, DERIVE_KIND_IRQ_ROUTE_MSIX, DERIVE_KIND_PEER_IOVA, DESCRIPTOR_ABI,
     FoundReq, GuestFoundReq, I2C_HID_QUERY_COUNT, I2cHidReq, INVENTORY_QUERY_COUNT,
     IRQ_AFFINITY_ANY, InventoryReq, Invocation, IrqReq, MAX_FOUND_DELIVERIES, MAX_INVOCATIONS,
-    OpCode, SessionFlags, SlotRef,
+    OpCode, SessionFlags, SlotRef, WakeWordReq, WordWaitReq,
 };
 use kore_abi::task::{SpawnFlags, SpawnReq};
 
@@ -28,11 +28,12 @@ pub use kore_abi::session::MAX_SESSION_FOUNDS;
 const ARGS_MAX: usize = MAX_INVOCATIONS * 24 + MAX_SESSION_FOUNDS * (FoundReq::WIRE - 24);
 
 /// Descriptor bytes a full session needs — the buffer floor for
-/// [`SessionBuilder::finish`].  The `+ 32` is the park block ceiling that
-/// can accompany invocations (`ParkReq` 16 + `SleepReq` 8 + `IrqParkReq` 8). The larger
-/// two-post block is restricted to an empty session and is only 48 bytes
-/// including the header, so it does not raise this full-descriptor bound.
-pub const DESCRIPTOR_MAX: usize = 8 + MAX_INVOCATIONS * 16 + 32 + ARGS_MAX;
+/// [`SessionBuilder::finish`].  The `+ 48` is the park block ceiling that
+/// can accompany invocations (`ParkReq` 16 + `SleepReq` 8 + `IrqParkReq` 8
+/// + `WordWaitReq` 16). The larger two-post block is restricted to an empty
+/// session and is only 48 bytes including the header, so it does not raise
+/// this full-descriptor bound.
+pub const DESCRIPTOR_MAX: usize = 8 + MAX_INVOCATIONS * 16 + 48 + ARGS_MAX;
 
 // A full descriptor must fit the two-page `[layout]` scratch window
 // (`scratch = { bytes = 0x2000 }` in res/boot.toml), priced with
@@ -78,6 +79,12 @@ pub enum BuildError {
     /// The bounded standing-post wait is malformed: an alternate post lacks
     /// its primary, aliases the same channel, or accompanies invocations.
     BadParkShape,
+    /// A [`wait_word`](SessionBuilder::wait_word) arm without a
+    /// [`wait_sleep`](SessionBuilder::wait_sleep) deadline: the kernel
+    /// address-wait is always bounded (`SessionFlags::WAIT_WORD` requires
+    /// `WAIT_SLEEP`), so the shape is refused here, before anything is
+    /// staged against the wire.
+    UnboundedWordWait,
     /// TASK_EXIT requires the typed [`SessionBuilder::exit`] entry point.
     UntypedExit,
 }
@@ -224,6 +231,10 @@ pub struct SessionBuilder {
     sleep: Option<u64>,
     /// Exact held route, emitted after the other park payloads.
     irq: Option<SlotRef>,
+    /// The watched memory word ([`wait_word`](Self::wait_word)) — `(subject,
+    /// offset, expected)`, emitted as the park block's **last** member, the
+    /// `WordWaitReq`.
+    word: Option<(SlotRef, u32, u32)>,
     /// `Found`s staged so far — refused past [`MAX_SESSION_FOUNDS`], the
     /// argument region's exact founding capacity.
     founds: usize,
@@ -243,6 +254,7 @@ impl SessionBuilder {
             park_alt: None,
             sleep: None,
             irq: None,
+            word: None,
             founds: 0,
         }
     }
@@ -298,6 +310,23 @@ impl SessionBuilder {
     pub fn wait_irq_on(&mut self, route: SlotRef) -> &mut Self {
         self.flags |= SessionFlags::WAIT_IRQ | SessionFlags::WAIT_IRQ_SELECTED;
         self.irq = Some(route);
+        self
+    }
+
+    /// Park after commit until the `u32` at byte `offset` inside the held
+    /// memory `subject` (a lease or mapped view, by arena slot) is seen to
+    /// differ from `expected` — [`SessionFlags::WAIT_WORD`], the kernel
+    /// address-wait (`res/EVENT.md` §6).  The kernel keys the wait on the
+    /// word's *physical* identity, so a [`wake_word`](Self::wake_word) on
+    /// any mapping of the same memory resolves it.  Always bounded:
+    /// [`encoded_len`](Self::encoded_len) refuses the shape without a
+    /// [`wait_sleep`](Self::wait_sleep) deadline.  Composes with a standing
+    /// post ([`park_standing`](Self::park_standing)) and a route
+    /// ([`wait_irq`](Self::wait_irq)); the `WordWaitReq` is the park
+    /// block's last member.
+    pub fn wait_word(&mut self, subject: SlotRef, offset: u32, expected: u32) -> &mut Self {
+        self.flags |= SessionFlags::WAIT_WORD;
+        self.word = Some((subject, offset, expected));
         self
     }
 
@@ -554,6 +583,37 @@ impl SessionBuilder {
         .map(|_| ())
     }
 
+    /// `Derive × MemLease × WAKE_WORD` — **release up to `count` waiters**
+    /// parked on the `u32` at byte `offset` of the held memory `subject`
+    /// (`MODIFY`: you may wake what you can write), on every mapping of
+    /// that memory (`res/EVENT.md` §6, the producer half of the kernel
+    /// address-wait).  The store itself is the caller's and must precede
+    /// this effect.  Mints nothing — the result slot is the subject's own,
+    /// inert, exactly [`activate_device`](Self::activate_device)'s
+    /// convention — and must stand alone as a one-invocation session.
+    pub fn wake_word(
+        &mut self,
+        subject: SlotRef,
+        offset: u32,
+        count: u32,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        let mut req = [0u8; WakeWordReq::WIRE];
+        req[0..4].copy_from_slice(&offset.to_le_bytes());
+        req[4..8].copy_from_slice(&count.to_le_bytes());
+        self.derive_raw(
+            subject,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_WAKE_WORD,
+            // No result is assigned; the authenticated subject slot is inert.
+            subject,
+            Some(&req),
+        )
+        .map(|_| ())
+    }
+
     /// Park after commit on the timer wheel until `deadline_ns` (absolute
     /// monotonic nanoseconds) — [`SessionFlags::WAIT_SLEEP`]
     /// (`res/USERLAND.md` §3.4.2).  [`finish`](Self::finish) emits the
@@ -612,7 +672,8 @@ impl SessionBuilder {
                 || inv.kind == kore_abi::session::DERIVE_KIND_TASK_START
                 || inv.kind == kore_abi::session::DERIVE_KIND_ARENA_EXTEND
                 || inv.kind == kore_abi::session::DERIVE_KIND_DEVICE_ACTIVATE
-                || inv.kind == kore_abi::session::DERIVE_KIND_DEVICE_QUIESCE);
+                || inv.kind == kore_abi::session::DERIVE_KIND_DEVICE_QUIESCE
+                || inv.kind == kore_abi::session::DERIVE_KIND_WAKE_WORD);
         self.invs[self.count] = inv;
         self.count += 1;
         self.has_effect = is_effect;
@@ -1029,13 +1090,65 @@ impl SessionBuilder {
     /// Exercise a detached view in a receiver-owned, founder-stamped window.
     /// The held or same-session view needs ACCESS, not delegation authority.
     /// No rights, length or destination address space are caller-selectable.
+    /// `SURFACES` takes its first lane and `RESERVE` its first page; the
+    /// other placements have their own methods.
     pub fn map_view_in(
         &mut self,
         view: impl Into<SlotRef>,
         window: kore_abi::session::ViewMapWindow,
         result: SlotRef,
     ) -> Result<Staged, BuildError> {
-        self.map_view_request(view, window, 0, result)
+        self.map_view_request(view, window, 0, 0, result)
+    }
+
+    /// Commit a view at an exact page of the caller's `RESERVE` window
+    /// ([`ViewMapWindow::Reserve`](kore_abi::session::ViewMapWindow::Reserve)):
+    /// the first page of `[page, page + len)`, in
+    /// [`RESERVE_PAGE_BYTES`](kore_abi::session::RESERVE_PAGE_BYTES) units.
+    /// The kernel refuses a page outside the window or one already mapped;
+    /// authority and length still come from the view.
+    pub fn map_view_reserved(
+        &mut self,
+        view: impl Into<SlotRef>,
+        page: u32,
+        result: SlotRef,
+    ) -> Result<Staged, BuildError> {
+        self.map_view_request(
+            view,
+            kore_abi::session::ViewMapWindow::Reserve,
+            0,
+            page,
+            result,
+        )
+    }
+
+    /// Release `[page, page + pages)` of the caller's `RESERVE` window:
+    /// every view `lessor` (a lease held with `MODIFY`, or a lessor beneath
+    /// it) was committed as there is unmapped
+    /// ([`DERIVE_KIND_RESERVE_RELEASE`](kore_abi::session::DERIVE_KIND_RESERVE_RELEASE)).
+    /// A post-commit effect, so it stands alone, as
+    /// [`wake_word`](Self::wake_word) does.
+    pub fn release_reserved(
+        &mut self,
+        lessor: SlotRef,
+        page: u32,
+        pages: u32,
+    ) -> Result<(), BuildError> {
+        if self.count != 0 || !self.flags.is_empty() {
+            return Err(BuildError::EffectMustStandAlone);
+        }
+        let mut req = [0u8; kore_abi::session::ReserveReleaseReq::WIRE];
+        req[..4].copy_from_slice(&page.to_le_bytes());
+        req[4..].copy_from_slice(&pages.to_le_bytes());
+        self.derive_raw(
+            lessor,
+            Rights::empty(),
+            kore_abi::session::DERIVE_KIND_RESERVE_RELEASE,
+            // No result is assigned; the authenticated subject slot is inert.
+            lessor,
+            Some(&req),
+        )
+        .map(|_| ())
     }
 
     /// Map a held view into the `MAP` window as a **sink** mapping
@@ -1071,6 +1184,7 @@ impl SessionBuilder {
             view,
             kore_abi::session::ViewMapWindow::Surfaces,
             lane as u8,
+            0,
             result,
         )
     }
@@ -1080,11 +1194,13 @@ impl SessionBuilder {
         view: impl Into<SlotRef>,
         window: kore_abi::session::ViewMapWindow,
         lane: u8,
+        page: u32,
         result: SlotRef,
     ) -> Result<Staged, BuildError> {
         let mut req = [0u8; kore_abi::session::ViewMapReq::WIRE];
         req[..2].copy_from_slice(&window.role().to_le_bytes());
         req[2] = lane;
+        req[4..8].copy_from_slice(&page.to_le_bytes());
         self.derive_raw(
             view.into(),
             Rights::empty(),
@@ -2530,6 +2646,16 @@ impl SessionBuilder {
         Ok(Staged(result))
     }
 
+    /// Bytes of the park block the flags describe, in the kore-abi pinned
+    /// order: `ParkReq ‖ ParkReq(alt) ‖ SleepReq ‖ IrqParkReq ‖ WordWaitReq`.
+    fn park_block_len(&self) -> usize {
+        self.park.map_or(0, |_| 16)
+            + self.park_alt.map_or(0, |_| 16)
+            + self.sleep.map_or(0, |_| 8)
+            + self.irq.map_or(0, |_| kore_abi::session::IrqParkReq::WIRE)
+            + self.word.map_or(0, |_| WordWaitReq::WIRE)
+    }
+
     /// Exact byte length of the frozen descriptor this builder will emit.
     ///
     /// **The park block** (the kore-abi flag-gated convention): a
@@ -2550,10 +2676,10 @@ impl SessionBuilder {
                 return Err(BuildError::BadParkShape);
             }
         }
-        let block = self.park.map_or(0, |_| 16)
-            + self.park_alt.map_or(0, |_| 16)
-            + self.sleep.map_or(0, |_| 8)
-            + self.irq.map_or(0, |_| kore_abi::session::IrqParkReq::WIRE);
+        if self.word.is_some() && self.sleep.is_none() {
+            return Err(BuildError::UnboundedWordWait);
+        }
+        let block = self.park_block_len();
         Ok(8 + self.count * 16 + block + self.args_len)
     }
 
@@ -2566,10 +2692,7 @@ impl SessionBuilder {
     /// carrier before writing a byte; both paths then use this one encoder.
     pub fn finish(&self, out: &mut [u8]) -> Result<usize, BuildError> {
         let need = self.encoded_len()?;
-        let block = self.park.map_or(0, |_| 16)
-            + self.park_alt.map_or(0, |_| 16)
-            + self.sleep.map_or(0, |_| 8)
-            + self.irq.map_or(0, |_| kore_abi::session::IrqParkReq::WIRE);
+        let block = self.park_block_len();
         if out.len() < need {
             return Err(BuildError::OutTooSmall);
         }
@@ -2616,6 +2739,14 @@ impl SessionBuilder {
             out[at..at + 4].copy_from_slice(&route.index().to_le_bytes());
             out[at + 4..at + 8].fill(0);
             at += kore_abi::session::IrqParkReq::WIRE;
+        }
+        if let Some((subject, offset, expected)) = self.word {
+            // WordWaitReq: subject@0 ‖ offset@4 ‖ expected@8 ‖ reserved@12.
+            out[at..at + 4].copy_from_slice(&subject.index().to_le_bytes());
+            out[at + 4..at + 8].copy_from_slice(&offset.to_le_bytes());
+            out[at + 8..at + 12].copy_from_slice(&expected.to_le_bytes());
+            out[at + 12..at + 16].fill(0);
+            at += WordWaitReq::WIRE;
         }
         out[at..at + self.args_len].copy_from_slice(&self.args[..self.args_len]);
         Ok(need)

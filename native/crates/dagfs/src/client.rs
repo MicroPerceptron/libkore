@@ -30,8 +30,8 @@ use kore_abi::{
 };
 use kore_rt::{
     svc::{
-        CallError, ReturnCallError, ReturnCapability, ReturnDeriveError, ReturnDeriver,
-        ReturnLeaseSource, StagedReturn, StagedReturnError, SvcClient,
+        CallError, Observation, ReturnCallError, ReturnCapability, ReturnDeriveError,
+        ReturnDeriver, ReturnLeaseSource, StagedReturn, StagedReturnError, SvcClient,
     },
     transport as rt_transport,
 };
@@ -44,8 +44,8 @@ use crate::{
 };
 
 pub use crate::{
-    DirEntry, FS_GRANT_TARGET_DELEGATE_RIGHTS, FS_GRANT_TARGET_RIGHTS, FilesystemFace,
-    FsViewCapability,
+    DirEntry, FS_GRANT_TARGET_DELEGATE_RIGHTS, FS_GRANT_TARGET_RIGHTS, FS_VIEW_ANCHOR_RIGHTS,
+    FilesystemFace, FsViewCapability,
 };
 
 /// Bytes written by [`FsRequest::LendVersion`] or
@@ -189,6 +189,9 @@ pub struct RingFs<'w, 't, T: rt_transport::Transport> {
     /// The per-request transfer limit the service advertised at attach;
     /// the protocol floor until then.
     transfer_limit: u32,
+    /// Opt-in bounded control observations. Expiry keeps the exact request
+    /// outstanding; the owner must resume it or contain the entire face.
+    observation: Observation,
 }
 
 /// Failure of the production ring client, preserving the distinction between
@@ -299,6 +302,7 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
             return_tx,
             return_land,
             transfer_limit: crate::bounds::MAX_TRANSFER as u32,
+            observation: Observation::Settle,
         }
     }
 
@@ -318,8 +322,19 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
 
     /// Issue one ordinary data-only filesystem operation.
     pub async fn call(&mut self, request: &FsRequest) -> Result<FsResponse, CallError> {
-        let reply = self.pair.call(request).await?;
+        let reply = match self.observation {
+            Observation::Settle => self.pair.call(request).await?,
+            observation => self.pair.call_exact(request, observation).await?,
+        };
         self.finish(reply)
+    }
+
+    /// Change ordinary control-call observation only at an idle boundary.
+    /// A timeout never clears correlation or permits a different request.
+    pub fn set_observation(&mut self, observation: Observation) -> bool {
+        if !self.pair.is_idle() { return false; }
+        self.observation = observation;
+        true
     }
 
     /// Whether the exclusive administration pair can publish a new request.
@@ -355,25 +370,18 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         &mut self,
         request: &FsRequest,
     ) -> Result<FsResponse, CallError> {
-        let reply = if self.pair.is_idle() {
-            self.pair.call(request).await?
-        } else {
-            self.pair.resume_exact(request).await?
-        };
-        self.finish(reply)
+        self.call_exact_observed(request, self.observation).await
     }
 
-    /// Give one exact administration request a bounded observation slice.
-    /// Expiry leaves its request correlated on this pair for a later pass.
-    async fn call_exact_bounded(
+    /// [`call_exact`](Self::call_exact) under an explicit observation. An
+    /// expired [`Observation::Slice`] leaves its request correlated on this
+    /// pair for a later call with the same request.
+    async fn call_exact_observed(
         &mut self,
         request: &FsRequest,
-        budget_ns: u64,
+        observation: Observation,
     ) -> Result<FsResponse, CallError> {
-        let reply = match self.pair.resume_exact_bounded(request, budget_ns).await {
-            Err(CallError::NoOutstanding) => self.pair.call_bounded(request, budget_ns).await,
-            result => result,
-        }?;
+        let reply = self.pair.call_exact(request, observation).await?;
         self.finish(reply)
     }
 
@@ -641,7 +649,10 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         budget_ns: u64,
     ) -> Result<u32, RingFsError> {
         match self
-            .call_exact_bounded(&FsRequest::SystemStatus { window_offset }, budget_ns)
+            .call_exact_observed(
+                &FsRequest::SystemStatus { window_offset },
+                Observation::Slice(budget_ns),
+            )
             .await
             .map_err(RingFsError::Infrastructure)?
         {
@@ -1107,6 +1118,25 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         self.finish(reply).map_err(ReturnCallError::AfterTransfer)
     }
 
+    /// Whether `handle` routes to the object the returned `anchor` view is
+    /// bound to ([`FsRequest::MatchView`]): `Done`, or `Refused(Conflict)`
+    /// when that view is bound elsewhere. The anchor is consumed either way.
+    pub async fn match_view<C: ReturnCapability>(
+        &mut self,
+        handle: Handle,
+        anchor: C,
+    ) -> Result<FsResponse, ReturnCallError<C>> {
+        let request = FsRequest::MatchView {
+            handle,
+            announced: self.return_land,
+        };
+        let reply = self
+            .pair
+            .call_with_exact_return(&request, self.return_tx, anchor)
+            .await?;
+        self.finish(reply).map_err(ReturnCallError::AfterTransfer)
+    }
+
     pub async fn grant_view<C: ReturnCapability>(
         &mut self,
         handle: Handle,
@@ -1193,11 +1223,12 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         self.call(&FsRequest::TakeAdmission).await
     }
 
-    pub async fn take_admission_bounded(
+    /// Claim the published verdict as one exact lifecycle request.
+    pub async fn take_admission_observed(
         &mut self,
-        budget_ns: u64,
+        observation: Observation,
     ) -> Result<FsResponse, CallError> {
-        self.call_exact_bounded(&FsRequest::TakeAdmission, budget_ns)
+        self.call_exact_observed(&FsRequest::TakeAdmission, observation)
             .await
     }
 
@@ -1209,12 +1240,12 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         self.call_exact(&FsRequest::RetirePeer { peer }).await
     }
 
-    pub async fn retire_peer_bounded(
+    pub async fn retire_peer_observed(
         &mut self,
         peer: kore_rt::svc::PeerId,
-        budget_ns: u64,
+        observation: Observation,
     ) -> Result<FsResponse, CallError> {
-        self.call_exact_bounded(&FsRequest::RetirePeer { peer }, budget_ns)
+        self.call_exact_observed(&FsRequest::RetirePeer { peer }, observation)
             .await
     }
 
@@ -1228,12 +1259,12 @@ impl<'w, 't, T: rt_transport::Transport> RingFs<'w, 't, T> {
         self.call_exact(&FsRequest::ConfirmRetired { peer }).await
     }
 
-    pub async fn confirm_retired_bounded(
+    pub async fn confirm_retired_observed(
         &mut self,
         peer: kore_rt::svc::PeerId,
-        budget_ns: u64,
+        observation: Observation,
     ) -> Result<FsResponse, CallError> {
-        self.call_exact_bounded(&FsRequest::ConfirmRetired { peer }, budget_ns)
+        self.call_exact_observed(&FsRequest::ConfirmRetired { peer }, observation)
             .await
     }
 }
@@ -1412,6 +1443,40 @@ impl<T: Transport> FsClient<T> {
         match self.checked(&FsRequest::List {
             handle,
             cursor,
+            window_offset,
+        })? {
+            FsResponse::Listed { entries, next } => Ok(ListPage { entries, next }),
+            _ => Err(FsError::ProviderFailure(crate::error::ProviderError::Media)),
+        }
+    }
+
+    /// One page of an object's visible parents, landed in the data window at
+    /// `window_offset` as search-hit records ([`read_parent`]): the
+    /// directories reachable from the handle's authority root that hold an
+    /// edge to it, each with the shortest route from that root.
+    pub fn parents(&mut self, handle: Handle, cursor: u32, window_offset: u32) -> FsResult<ListPage> {
+        match self.checked(&FsRequest::Parents {
+            handle,
+            cursor,
+            window_offset,
+        })? {
+            FsResponse::Listed { entries, next } => Ok(ListPage { entries, next }),
+            _ => Err(FsError::ProviderFailure(crate::error::ProviderError::Media)),
+        }
+    }
+
+    /// Locate the object with identity `stable` from the handle's authority
+    /// root, its route landed at `window_offset` as one search-hit record
+    /// ([`read_located`] reads it).
+    pub fn locate(
+        &mut self,
+        handle: Handle,
+        stable: crate::StableObjectId,
+        window_offset: u32,
+    ) -> FsResult<ListPage> {
+        match self.checked(&FsRequest::Locate {
+            handle,
+            stable,
             window_offset,
         })? {
             FsResponse::Listed { entries, next } => Ok(ListPage { entries, next }),
@@ -1800,6 +1865,46 @@ impl<T: Transport> FsClient<T> {
 
 /// Lift one authority-filtered search hit from service-written window bytes.
 pub fn read_search_hit(window: &[u8], window_offset: u32, index: usize) -> FsResult<SearchHit> {
+    read_hit_record(window, window_offset, index, false)
+}
+
+/// Lift the one `Locate` record from service-written window bytes: the
+/// located object itself, file or directory, whose `path` is its route from
+/// the handle's authority root (empty when it is that root). Structural like
+/// a parent — no score, no snippet — but it names the object, so its kind
+/// and length are whatever the object's are.
+pub fn read_located(window: &[u8], window_offset: u32) -> FsResult<SearchHit> {
+    let located = read_hit_record(window, window_offset, 0, true)?;
+    if located.score.get() != 0 || !located.snippet.is_empty() {
+        return Err(FsError::Range);
+    }
+    Ok(located)
+}
+
+/// Lift one `Parents` record from service-written window bytes: a search-hit
+/// record naming a directory, whose `path` is its route from the handle's
+/// authority root — empty when the parent is that root.  Stricter than a
+/// hit: no score, no snippet, no length.
+pub fn read_parent(window: &[u8], window_offset: u32, index: usize) -> FsResult<SearchHit> {
+    let parent = read_hit_record(window, window_offset, index, true)?;
+    if parent.kind != ObjectKind::Directory
+        || parent.score.get() != 0
+        || !parent.snippet.is_empty()
+        || parent.len != 0
+    {
+        return Err(FsError::Range);
+    }
+    Ok(parent)
+}
+
+/// The record both readers share; `anchor` admits the empty path (the
+/// authority root itself), which a search hit never is.
+fn read_hit_record(
+    window: &[u8],
+    window_offset: u32,
+    index: usize,
+    anchor: bool,
+) -> FsResult<SearchHit> {
     use zerocopy::FromBytes;
     let at = usize::try_from(window_offset)
         .map_err(|_| FsError::Range)?
@@ -1818,12 +1923,15 @@ pub fn read_search_hit(window: &[u8], window_offset: u32, index: usize) -> FsRes
         return Err(FsError::Range);
     }
     let len = usize::from(wire.path_len.get());
-    if len == 0 || len > wire.path.len() || wire.path[len..].iter().any(|byte| *byte != 0) {
+    if (len == 0 && !anchor)
+        || len > wire.path.len()
+        || wire.path[len..].iter().any(|byte| *byte != 0)
+    {
         return Err(FsError::InvalidName);
     }
     let path = core::str::from_utf8(&wire.path[..len]).map_err(|_| FsError::InvalidName)?;
     let mut components = heapless::Vec::new();
-    for component in path.split('/') {
+    for component in path.split('/').filter(|_| len != 0) {
         components
             .push(Name::new(component)?)
             .map_err(|_| FsError::Range)?;
@@ -2145,6 +2253,29 @@ mod exact_attach_tests {
             serve.req.pop().is_none(),
             "retry must not publish another Close"
         );
+    }
+
+    #[test]
+    fn observation_policy_changes_only_at_idle_boundaries() {
+        let transport = RecordingTransport::refusing();
+        let (mut fs, mut serve) = ring_fs(&transport, SlotRef::from_wire(0x41));
+        assert!(fs.set_observation(Observation::Slice(1_000_000)));
+        assert_eq!(fs.observation, Observation::Slice(1_000_000));
+        // A bare host block_on has no executor clock. Exercise the policy
+        // boundary with a retained transport failure; runtime's exact-pair
+        // tests separately cover an actual expired timed observation.
+        assert!(fs.set_observation(Observation::Settle));
+        let request = FsRequest::Close { handle: crate::Handle::from_bits(7) };
+        assert_eq!(crate::block_on(fs.call_exact(&request)), Err(CallError::Transport));
+        assert_eq!(take_request(&mut serve), request);
+        assert!(!fs.set_observation(Observation::Slice(1_000_000)));
+        publish_done(&mut serve);
+        let other = FsRequest::Close { handle: crate::Handle::from_bits(8) };
+        assert_eq!(crate::block_on(fs.call_exact(&other)), Err(CallError::Outstanding));
+        transport.succeed.set(true);
+        assert_eq!(crate::block_on(fs.call_exact(&request)), Ok(FsResponse::Done));
+        assert!(fs.set_observation(Observation::Settle));
+        assert!(serve.req.pop().is_none());
     }
 
     #[test]

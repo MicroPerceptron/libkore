@@ -246,6 +246,10 @@ pub struct SpmdCtx {
     /// or when this same static context later founds another resident epoch.
     /// It is deliberately not reset by [`restage`](Self::restage).
     resident_sequence: core::sync::atomic::AtomicU64,
+    /// The kernel's placement of this region's gang, as reported by the
+    /// first worker through the gate — `0` unknown, else `1 | class << 1 |
+    /// shared << 3` ([`SpmdCtx::placement`]).
+    placement: core::sync::atomic::AtomicU32,
 }
 
 impl SpmdCtx {
@@ -290,7 +294,26 @@ impl SpmdCtx {
             done: Line::new(0),
             complete: Line::new(0),
             resident_sequence: core::sync::atomic::AtomicU64::new(0),
+            placement: core::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// Where the kernel placed this region's gang — the class and whether
+    /// it is time-shared — as the first worker through the gate reported
+    /// it from its own machine block.  `None` before any worker entered,
+    /// off metal, and under a kernel that predates the report; a caller
+    /// then sizes and labels as it always did.
+    pub fn placement(&self) -> Option<kore_abi::machine::GangPlacement> {
+        let word = self.placement.load(Ordering::Acquire);
+        (word & 1 != 0).then(|| kore_abi::machine::GangPlacement {
+            class: match (word >> 1) & 0b11 {
+                0 => kore_abi::machine::GangClass::Performance,
+                1 => kore_abi::machine::GangClass::Standard,
+                2 => kore_abi::machine::GangClass::Efficient,
+                _ => kore_abi::machine::GangClass::LowPowerEfficient,
+            },
+            shared: word & (1 << 3) != 0,
+        })
     }
 
     /// The launched worker count — what a worker strides the tile grid
@@ -435,6 +458,18 @@ impl SpmdCtx {
 /// wait is the barrier's own two-tier slice ([`wait_while`]), so a
 /// staged worker costs a parked thread, not a hot core.
 pub(crate) fn enter(ctx: &'static SpmdCtx) -> bool {
+    // Report the placement the kernel stamped into THIS worker's machine
+    // block (the whole gang shares one batch decision, so any member's
+    // answer is the region's).  One relaxed store per worker, before the
+    // gate: the founder reads it after the region is up.
+    #[cfg(target_os = "none")]
+    if let Some(placed) = crate::entry::thread_context()
+        .and_then(|rt| rt.machine())
+        .and_then(|block| block.gang_placement())
+    {
+        let word = 1 | ((placed.class as u32) << 1) | (u32::from(placed.shared) << 3);
+        ctx.placement.store(word, Ordering::Release);
+    }
     wait_while(&ctx.gate.0, STAGED);
     ctx.gate.0.load(Ordering::SeqCst) == RUN
 }
@@ -651,6 +686,21 @@ pub fn spawn_spmd<const N: usize>(
     launch::<N>(ctx, entry, N, 0, core::ptr::null_mut(), true)
 }
 
+/// The heap a region's compute workers are founded holding: the
+/// process's own, when this binary links the allocator, so code a job
+/// runs may allocate on a worker exactly as on thread 0. A heapless
+/// binary's workers take none — there is no allocator for them to grow.
+#[cfg(all(target_os = "none", feature = "heap"))]
+fn worker_heap() -> Option<crate::thread::WorkerCap> {
+    crate::thread::heap_endowment()
+}
+
+/// Heapless: nothing on a worker can allocate, so nothing is endowed.
+#[cfg(all(target_os = "none", not(feature = "heap")))]
+fn worker_heap() -> Option<crate::thread::WorkerCap> {
+    None
+}
+
 /// The one metal launch, over a runtime `active ≤ N` width.
 ///
 /// `N` is the storage capacity ([`Spmd`]'s array size); `active` is the
@@ -710,6 +760,10 @@ fn launch<const N: usize>(
     } else {
         crate::session::MAX_SESSION_FOUNDS
     };
+    // Every compute worker runs caller code, so each is founded holding
+    // the process heap (`thread::spawn_gang_workers`): asked once here,
+    // derived per worker in its founding.
+    let heap = worker_heap();
     let mut ok = true;
     for (at, end) in founding_sessions(active as u32, ceiling as u32) {
         let founded = crate::thread::spawn_gang_workers(
@@ -719,6 +773,7 @@ fn launch<const N: usize>(
             true,
             &[],
             star_plan.as_ref(),
+            heap,
             &mut workers[at as usize..end as usize],
         );
         if !founded {
@@ -760,6 +815,7 @@ fn launch<const N: usize>(
                             crate::star::HUB,
                             false,
                             &[&hub_caps[..filled]],
+                            None,
                             None,
                             &mut hub_out,
                         )
@@ -856,8 +912,12 @@ pub fn resident_run<F: Fn(&'static SpmdCtx, u32)>(ctx: &'static SpmdCtx, worker:
         // is kicked by the submit over the founder's send.  A long
         // monitored spin here is NOT an option: a spinning worker holds its
         // core against the kernel until the tick, and the launcher may be
-        // sharing it (`res/SPMD.md` §14.2).  The word is the truth.
-        crate::barrier::wait_while(ctx.job_word(), ran);
+        // sharing it (`res/SPMD.md` §14.2).  Nor is riding the phase
+        // slice: between jobs no kick is coming, and a quarter-millisecond
+        // re-check held three cores of a four-CPU machine at idle
+        // (`barrier::IDLE_SLICE_MAX`).  The slice climbs while the word
+        // stays put and starts over with each job.  The word is the truth.
+        crate::barrier::wait_while_idle(ctx.job_word(), ran);
         // A retire flips the gate off RUN, THEN steps `job` to wake us; the
         // SeqCst total order makes the DONE visible once the step that woke
         // us is.
@@ -2230,8 +2290,13 @@ mod tests {
         let meshed = crate::star::MESH_CEILING as u32;
         for ceiling in [meshed, crate::session::MAX_SESSION_FOUNDS as u32] {
             for width in 1..crate::thread::MAX_THREADS {
-                let sessions: std::vec::Vec<(u32, u32)> = founding_sessions(width, ceiling).collect();
-                assert_eq!(sessions.len() as u32, width.div_ceil(ceiling), "width {width}");
+                let sessions: std::vec::Vec<(u32, u32)> =
+                    founding_sessions(width, ceiling).collect();
+                assert_eq!(
+                    sessions.len() as u32,
+                    width.div_ceil(ceiling),
+                    "width {width}"
+                );
                 let mut next = 0;
                 for &(start, end) in &sessions {
                     assert_eq!(start, next, "width {width}: sessions are contiguous");

@@ -7,7 +7,7 @@
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const MIN_BUFFER_BYTES: usize = 1024;
 pub const MAX_FRAMES: usize = 16;
 pub const MESSAGE_BYTES: usize = 256;
@@ -71,6 +71,13 @@ bitflags::bitflags! {
         const REGISTERS_PARTIAL = 64;
         /// The parent-registered RAM buffer received the record before exit.
         const BUFFER_CAPTURED = 128;
+        /// The faulting thread's fault upcall was given this fault and
+        /// declined it (`session::DERIVE_KIND_FAULT_UPCALL`): the record is
+        /// the fault as it was raised, not the upcall's decline.
+        const UPCALL_DECLINED = 256;
+        /// Raised inside the thread's fault upcall, while it handled the
+        /// fault at [`CrashRecord::upcall_pc`].
+        const IN_UPCALL = 512;
     }
 }
 
@@ -104,7 +111,10 @@ pub struct CrashRecord {
     task_name: [u8; 63],
     pub task: crate::task::TaskId,
     pub task_id_quality: u8,
-    reserved: [u8; 223],
+    /// With [`CaptureFlags::IN_UPCALL`]: the `pc` of the fault the upcall
+    /// was handling. Zero otherwise.
+    pub upcall_pc: U64,
+    reserved: [u8; 215],
 }
 impl CrashRecord {
     pub fn set_task_name(&mut self, name: &str) {
@@ -142,7 +152,8 @@ impl CrashRecord {
             task_name: [0; 63],
             task: crate::task::TaskId::from_bytes([0; 16]),
             task_id_quality: 0,
-            reserved: [0; 223],
+            upcall_pc: U64::new(0),
+            reserved: [0; 215],
         }
     }
     pub fn set_register(&mut self, index: usize, value: u64) -> bool {
@@ -159,6 +170,22 @@ impl CrashRecord {
     pub fn set_address(&mut self, address: u64) {
         self.address = U64::new(address);
         self.add_flags(CaptureFlags::ADDRESS_VALID);
+    }
+    /// Mark this fault as raised inside the thread's fault upcall, which
+    /// was handling the fault at `pc`.
+    pub fn set_in_upcall(&mut self, pc: u64) {
+        self.upcall_pc = U64::new(pc);
+        self.add_flags(CaptureFlags::IN_UPCALL);
+    }
+    /// A fault is either one the upcall declined or one raised inside an
+    /// upcall, never both, and only the latter carries an upcall `pc`.
+    fn upcall_evidence_is_consistent(&self) -> bool {
+        let flags = CaptureFlags::from_bits_retain(self.flags.get());
+        if flags.contains(CaptureFlags::IN_UPCALL) {
+            !flags.contains(CaptureFlags::UPCALL_DECLINED)
+        } else {
+            self.upcall_pc.get() == 0
+        }
     }
     pub fn set_message(&mut self, message: &str) {
         let mut len = message.len().min(MESSAGE_BYTES);
@@ -183,7 +210,8 @@ impl CrashRecord {
             && self.registers_valid.get() >> 32 == 0
             && self.frame_count.get() as usize <= MAX_FRAMES
             && self.message_len.get() as usize <= MESSAGE_BYTES
-            && self.reserved == [0; 223]
+            && self.reserved == [0; 215]
+            && self.upcall_evidence_is_consistent()
             && self.reserved_identity.get() == 0
             && crate::task::TaskIdQuality::decode(self.task_id_quality).is_some()
             && self.task_name_len <= 63
@@ -238,11 +266,42 @@ mod tests {
         assert!(r.encode_into(&mut bytes));
         assert_eq!(CrashRecord::decode(&bytes), Some(r));
         assert!(CrashRecord::decode(&bytes[..1023]).is_none());
-        bytes[8] = 3;
-        assert!(CrashRecord::decode(&bytes).is_none());
+        for version in [VERSION - 1, VERSION + 1] {
+            bytes[8..10].copy_from_slice(&version.to_le_bytes());
+            assert!(CrashRecord::decode(&bytes).is_none(), "version {version}");
+        }
         assert!(r.encode_into(&mut bytes));
         bytes[1023] = 1;
         assert!(CrashRecord::decode(&bytes).is_none());
+    }
+    #[test]
+    fn upcall_evidence_round_trips_and_stays_consistent() {
+        let mut nested =
+            CrashRecord::new(Architecture::X86_64, FaultKind::Memory, 0x5000, 0x9000, 6);
+        nested.set_in_upcall(0x4321);
+        let mut bytes = [0; MIN_BUFFER_BYTES];
+        assert!(nested.encode_into(&mut bytes));
+        let back = CrashRecord::decode(&bytes).expect("a nested fault decodes");
+        assert_eq!(back.upcall_pc.get(), 0x4321);
+        assert!(CaptureFlags::from_bits_retain(back.flags.get()).contains(CaptureFlags::IN_UPCALL));
+
+        let mut declined = CrashRecord::new(
+            Architecture::Aarch64,
+            FaultKind::InvalidInstruction,
+            0x10,
+            0x20,
+            0,
+        );
+        declined.add_flags(CaptureFlags::UPCALL_DECLINED);
+        assert!(declined.validate());
+        // Both at once, or an upcall pc without the flag, is not a record.
+        let mut both = declined;
+        both.set_in_upcall(0x30);
+        assert!(!both.validate());
+        let mut stray = CrashRecord::new(Architecture::Riscv64, FaultKind::Memory, 0, 0, 0);
+        stray.upcall_pc = U64::new(1);
+        assert!(!stray.validate());
+        assert!(!stray.encode_into(&mut bytes));
     }
     #[test]
     fn validity_distinguishes_zero_from_missing_and_text_is_utf8_bounded() {

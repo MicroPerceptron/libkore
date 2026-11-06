@@ -1,0 +1,14 @@
+[package]
+name = "kore-svc-block"
+version = "0.0.1"
+edition = "2024"
+description = "Capability-native block-channel provisioner for kore"
+publish = false
+
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+kore-rt = { path = "../../crates/rt" }
+kore-driver = { path = "../../crates/driver", features = ["service"] }
+kore-svc-device = { path = "../device" }
+kore-nvme = { path = "../../drivers/nvme", features = ["alloc"] }
+zerocopy = { version = "0.8", default-features = false }

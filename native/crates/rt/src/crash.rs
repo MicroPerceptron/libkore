@@ -310,6 +310,16 @@ pub fn render(record: &CrashRecord, out: &mut impl Write, color: bool) -> fmt::R
     if flags.contains(CaptureFlags::BUFFER_CAPTURED) {
         out.write_str("note: parent RAM destination captured\n")?;
     }
+    if flags.contains(CaptureFlags::UPCALL_DECLINED) {
+        out.write_str("note: the thread's fault upcall declined this fault\n")?;
+    }
+    if flags.contains(CaptureFlags::IN_UPCALL) {
+        writeln!(
+            out,
+            "note: raised inside the thread's fault upcall, handling the fault at {:#018x}",
+            record.upcall_pc.get()
+        )?;
+    }
     writeln!(
         out,
         "note: {title}; snapshot captured (durability reported separately)"
@@ -341,6 +351,35 @@ mod tests {
         out.clear();
         render(&record, &mut out, false).unwrap();
         assert!(out.contains("invalid or unsupported"));
+    }
+    #[test]
+    fn upcall_evidence_is_reported() {
+        let mut declined =
+            CrashRecord::new(Architecture::X86_64, FaultKind::Memory, 0x1000, 0x2000, 6);
+        declined.add_flags(CaptureFlags::UPCALL_DECLINED);
+        let mut out = std::string::String::new();
+        render(&declined, &mut out, false).unwrap();
+        assert!(
+            out.contains("note: the thread's fault upcall declined this fault"),
+            "{out}"
+        );
+        assert!(!out.contains("inside the thread's fault upcall"), "{out}");
+
+        let mut nested = CrashRecord::new(
+            Architecture::X86_64,
+            FaultKind::InvalidInstruction,
+            0x3000,
+            0x4000,
+            0,
+        );
+        nested.set_in_upcall(0x1000);
+        out.clear();
+        render(&nested, &mut out, false).unwrap();
+        assert!(
+            out.contains("note: raised inside the thread's fault upcall, handling the fault at 0x0000000000001000"),
+            "{out}"
+        );
+        assert!(!out.contains("declined"), "{out}");
     }
     #[test]
     fn preparing_a_buffer_does_not_publish_old_bytes() {

@@ -1,0 +1,16 @@
+# services/block/boot.toml — capability-bounded block-owner row.
+# Founding order lives in res/boot.toml; this fragment declares only the
+# service-local image, bundle, and protocol citations.
+
+# The block provisioner claims an NVMe controller through its own device-
+# broker client face and retains the ordinary device and DMA-supply ancestors.
+# It exposes only a bounded generic block-service endpoint to the filesystem.
+# Device children, DMA supply, and the direct qpair remain inside this task.
+[service]
+image     = "kore-svc-block"
+chain     = true
+endowment = "kore_svc_block::BlockEndowment"
+protocol  = "kore_svc_block::BlockService"
+endows    = ["DMA_POOL@1"]
+digest_x86_64  = "blake3:c852d96c707ed0e95aad161be935fcc8bee5310598ec94f0f3bc75849cf586b0"
+digest_aarch64 = "blake3:98023e83300526b637f67f62bafb1b523cd8657dabe4c980f5133f282d6f3ed0"

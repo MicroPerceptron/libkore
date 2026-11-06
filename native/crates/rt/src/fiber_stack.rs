@@ -28,7 +28,9 @@ pub(crate) const WINDOW_BASE: u64 = 0x7fff_e200_0000;
 
 /// The window's granule capacity: 32 MiB of reservation, no byte mapped by
 /// declaring it. Wasmtime's default async stack is 2 MiB, so fifteen live
-/// fibers fit with their guards — each call parks one.
+/// fibers fit with their guards — each call parks one. The `wasm` command's
+/// are 5.5 MiB (`user/apps/utils/wasm`, a 4 MiB wasm stack), so five fit,
+/// against the one a launch makes.
 pub(crate) const WINDOW_GRANULES: u32 = 8192;
 
 /// **The process's guarded-stack plan.** Carved by [`GuardedStack::new`],

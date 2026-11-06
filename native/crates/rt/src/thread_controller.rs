@@ -8,6 +8,10 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+// Each owner derives the process heap into its children using its own local
+// slot. No creator's slot number is ever forwarded across the controller seam.
+use super::thread::heap_endowment;
+
 const FREE: u64 = 0;
 const BUILD: u64 = 1;
 const REQUEST: u64 = 2;
@@ -401,28 +405,6 @@ fn controller_entry(argument: usize) {
         }
         pause();
     }
-}
-
-// Each owner derives the process heap into its children using its own local
-// slot. No creator's slot number is ever forwarded across the controller seam.
-fn heap_endowment() -> Option<super::thread::WorkerCap> {
-    #[cfg(target_os = "none")]
-    {
-        use kore_abi::{
-            cap::{ResourceKind, Rights},
-            task::role,
-        };
-        let rt = crate::entry::thread_context()?;
-        Some(super::thread::WorkerCap {
-            role: role::HEAP,
-            index: 0,
-            subject: rt.bootstrap().handle(role::HEAP, 0)?,
-            kind: ResourceKind::MemLease as u16 as u8,
-            rights: Rights::ACCESS | Rights::MODIFY | Rights::DERIVE,
-        })
-    }
-    #[cfg(not(target_os = "none"))]
-    None
 }
 
 #[cfg(test)]

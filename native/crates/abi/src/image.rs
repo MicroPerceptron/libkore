@@ -166,6 +166,20 @@ pub const PROFILE_GPU: u32 = 1 << 12;
 /// receives no archive export authority. Missing data refuses the launch.
 pub const PROFILE_MODEL_DATA: u32 = 1 << 13;
 
+/// Launch profile: the launch composes a **window**. Which window — its
+/// face coordinates and its wake topology — is the exact preset the whole
+/// profile matches (`kore_app::WindowBundle`); a window profile that matches
+/// no preset launches nowhere.
+///
+/// Declared, never inferred, because a window's resources are not its own:
+/// every other bit names a facility a headless program may need as much as a
+/// window does. `lua-tool-worker` needs exactly the filesystem, heap, engine
+/// plan and channel space a JavaScript application's window does, so no
+/// combination of those bits could say which of the two a launch is.
+/// Meaningful only beside [`PROFILE_HEAP`] and [`PROFILE_CHANNELS`], the
+/// facilities every window preset is built on.
+pub const PROFILE_WINDOW: u32 = 1 << 14;
+
 pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_FILESYSTEM
     | PROFILE_FS_VIEW_BINDER
@@ -179,15 +193,20 @@ pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_ACCELERATOR
     | PROFILE_ENGINE
     | PROFILE_GPU
-    | PROFILE_MODEL_DATA;
+    | PROFILE_MODEL_DATA
+    | PROFILE_WINDOW;
 
 /// Validate the profile vocabulary and its dependencies: both filesystem
-/// auxiliary endpoint kinds are meaningful only beside an actual FS face.
+/// auxiliary endpoint kinds are meaningful only beside an actual FS face, an
+/// engine only beside a heap, and a window only beside the heap and channel
+/// space every window preset carries.
 pub const fn profile_valid(profile: u32) -> bool {
+    const WINDOW_BASE: u32 = PROFILE_HEAP | PROFILE_CHANNELS;
     profile & !PROFILE_KNOWN == 0
         && (profile & PROFILE_FS_VIEW_BINDER == 0 || profile & PROFILE_FILESYSTEM != 0)
         && (profile & PROFILE_FS_GRANT_TARGET == 0 || profile & PROFILE_FILESYSTEM != 0)
         && (profile & PROFILE_ENGINE == 0 || profile & PROFILE_HEAP != 0)
+        && (profile & PROFILE_WINDOW == 0 || profile & WINDOW_BASE == WINDOW_BASE)
 }
 
 /// Segment ceiling per image — up to eight `PT_LOAD`s plus one `PT_TLS`
@@ -1258,6 +1277,15 @@ mod tests {
         assert!(!profile_valid(PROFILE_FS_VIEW_BINDER));
         assert!(!profile_valid(PROFILE_FS_GRANT_TARGET));
         assert!(!profile_valid(1 << 31));
+
+        // A window stands on the heap and channel space of every window
+        // preset; either missing, the declaration is malformed.
+        assert!(profile_valid(
+            PROFILE_HEAP | PROFILE_CHANNELS | PROFILE_WINDOW
+        ));
+        assert!(!profile_valid(PROFILE_WINDOW));
+        assert!(!profile_valid(PROFILE_HEAP | PROFILE_WINDOW));
+        assert!(!profile_valid(PROFILE_CHANNELS | PROFILE_WINDOW));
     }
 
     #[test]

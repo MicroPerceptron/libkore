@@ -103,6 +103,22 @@ pub trait Uart {
     fn init(&self, regs: &dyn RegisterAccess, cfg: LineConfig);
     /// `true` when the transmit holding register can accept a byte.
     fn tx_ready(&self, regs: &dyn RegisterAccess) -> bool;
+    /// Enable the transmit FIFO where the layout has one, and report how many
+    /// bytes one observed [`tx_ready`](Self::tx_ready) admits before it must
+    /// be polled again.
+    ///
+    /// For a queued console that never waits on the wire: it pushes this many
+    /// bytes each time it finds the transmitter ready, then leaves. Framing
+    /// and line rate are untouched, so the trust-what-you-find rule of
+    /// [`init`](Self::init) still holds.
+    ///
+    /// The default is the conservative contract: a ready transmitter
+    /// guarantees room for one byte. A layout whose ready bit already means
+    /// "room for one more" (PL011's `TXFF`) needs nothing more, because the
+    /// caller polls again before every byte.
+    fn enable_tx_fifo(&self, _regs: &dyn RegisterAccess) -> usize {
+        1
+    }
     /// Push one byte into the transmit holding register.  The caller has
     /// confirmed [`tx_ready`](Self::tx_ready).
     fn tx_byte(&self, regs: &dyn RegisterAccess, byte: u8);
@@ -175,6 +191,15 @@ impl Uart for SerialBackend {
             Self::Uart16550(u) => u.tx_ready(regs),
             Self::Pl011(p) => p.tx_ready(regs),
             Self::Geni(g) => g.tx_ready(regs),
+        }
+    }
+
+    #[inline]
+    fn enable_tx_fifo(&self, regs: &dyn RegisterAccess) -> usize {
+        match self {
+            Self::Uart16550(u) => u.enable_tx_fifo(regs),
+            Self::Pl011(p) => p.enable_tx_fifo(regs),
+            Self::Geni(g) => g.enable_tx_fifo(regs),
         }
     }
 
@@ -619,6 +644,63 @@ mod tests {
         // pull the *same* word again and the assertion would test the mock.
         regs.write32(G_RX_FIFO_STATUS, 0);
         assert!(!uart.rx_ready(&regs));
+    }
+
+    /// A 16550 whose IIR[7:6] answers `fifo_bits` once FCR0 is set: `0b11`
+    /// models a 16550A, `0b10` the original 16550, `0b00` a 16450.
+    struct FifoProbe {
+        fcr: core::cell::Cell<u8>,
+        fifo_bits: u8,
+    }
+
+    impl RegisterAccess for FifoProbe {
+        fn read8(&self, offset: usize) -> u8 {
+            match offset {
+                // IIR: no interrupt pending (bit 0), FIFO state in [7:6].
+                FCR if self.fcr.get() & 1 != 0 => (self.fifo_bits << 6) | 1,
+                FCR => 1,
+                _ => 0,
+            }
+        }
+        fn write8(&self, offset: usize, value: u8) {
+            if offset == FCR {
+                self.fcr.set(value);
+            }
+        }
+        fn read32(&self, _: usize) -> u32 {
+            0
+        }
+        fn write32(&self, _: usize, _: u32) {}
+    }
+
+    #[test]
+    fn a_16550a_enables_its_fifo_and_admits_sixteen_bytes_per_ready() {
+        let regs = FifoProbe {
+            fcr: core::cell::Cell::new(0),
+            fifo_bits: 0b11,
+        };
+        let uart = SerialBackend::new(BackendKind::Uart16550, 1);
+        assert_eq!(uart.enable_tx_fifo(&regs), 16);
+        // Enabled without the clear bits: whatever is queued is kept.
+        assert_eq!(regs.fcr.get(), 0x01);
+    }
+
+    #[test]
+    fn a_part_without_a_usable_fifo_stays_at_one_byte_per_ready() {
+        for fifo_bits in [0b00, 0b10] {
+            let regs = FifoProbe {
+                fcr: core::cell::Cell::new(0),
+                fifo_bits,
+            };
+            assert_eq!(Uart16550::new(1).enable_tx_fifo(&regs), 1);
+        }
+    }
+
+    #[test]
+    fn layouts_without_a_fifo_burst_keep_the_one_byte_contract() {
+        let regs = MockRegisters::new();
+        assert_eq!(SerialBackend::new(BackendKind::Pl011, 4).enable_tx_fifo(&regs), 1);
+        assert_eq!(SerialBackend::new(BackendKind::Geni, 4).enable_tx_fifo(&regs), 1);
     }
 
     #[test]

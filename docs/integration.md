@@ -27,6 +27,22 @@ snapshot must be resolved deliberately upstream; regenerating may not silently
 erase the edit. The snapshot is one source per owner, not a parallel allocator,
 runtime or handle implementation to evolve independently.
 
+## Host programs and the exported host root
+
+`tools/kore-vol` is the export's host root: the offline volume procedure a host
+program drives through `kore-host` (`crates/host`). The exporter follows its path
+dependencies like any other root, so the filesystem service closure it composes —
+`kore-svc-dagfs`, `kore-svc-block`, `kore-svc-device`, `kore-svc-mm`, `kore-svc-swap`
+and `kore-nvme` — is exported byte-exact beside the application owners. Those
+packages exist here only as that procedure's dependencies: a Kore executable's graph
+never reaches them through `kore-std`, and `kore-host` exposes only the volume
+procedure, never the service internals.
+
+A host consumer pins one libkore revision; its `native/provenance.json` names the
+Kore revision whose DagFS format the procedure writes (`kore_host::volume::FORMAT_VERSION`).
+Choose the libkore revision whose export matches the Kore build the host's machines
+boot: the engine refuses a volume a newer Kore wrote, rather than guessing.
+
 ## Composing with a local Kore checkout
 
 Cargo treats a path dependency and a Git dependency as different packages even

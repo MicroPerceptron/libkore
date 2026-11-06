@@ -188,15 +188,16 @@ pub(crate) fn provision(workers: usize) -> Option<StarPlan> {
 
 /// Descriptor invocations one meshed worker costs its gang session in a
 /// chunk of `chunk`: two views, the boot delegate and the Found, plus its
-/// endowment of `chunk + 2` caps (own recv, hub send, the founder's send,
-/// and a peer send per chunk sibling).
+/// endowment of `chunk + 3` caps (own recv, hub send, the founder's send,
+/// a peer send per chunk sibling, and the process heap every compute
+/// worker holds — `thread::spawn_gang_workers`).
 const fn meshed_worker_invocations(chunk: usize) -> usize {
-    4 + chunk + 2
+    4 + chunk + 3
 }
 
 /// The widest chunk one FULLY MESHED gang session can carry — derived
 /// from the descriptor's bounds, never chosen: a chunk of `n` costs
-/// `n·(n + 6)` invocations against [`MAX_INVOCATIONS`], and no session
+/// `n·(n + 7)` invocations against [`MAX_INVOCATIONS`], and no session
 /// founds more than [`MAX_SESSION_FOUNDS`] (seven, at today's 107 and 12).
 /// A wider region founds in several sessions (see [`spmd::launch`]): the
 /// mesh spans a session's chunk, and a cross-chunk waiter is the hub's to

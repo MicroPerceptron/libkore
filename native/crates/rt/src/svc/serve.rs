@@ -151,6 +151,19 @@ fn grant_commit_action(committed: Committed, invocations: usize) -> GrantCommitA
 pub const MAX_SERVE_PAIRS: usize =
     kore_abi::task::DESKTOP_BOOTSTRAP_WINDOW_SLOTS + kore_abi::task::DESKTOP_CONTROLLER_CAPACITY;
 
+/// **What one recyclable serving slot costs a host whose peer table grows**
+/// ([`ServeHost::enable_peer_growth`]): the pair, its generation, its affine
+/// admission resources and its closing note — one element of each table the
+/// growth moves into the named arena. A service sizes the arena it names in
+/// [`SystemService::peer_arena`](crate::service::SystemService::peer_arena)
+/// by this, rather than by a respelled guess at the host's layout.
+pub const fn peer_slot_bytes<S: SystemService>() -> usize {
+    core::mem::size_of::<Option<ServePair<'static, S>>>()
+        + core::mem::size_of::<u16>()
+        + core::mem::size_of::<Option<PeerResources>>()
+        + core::mem::size_of::<Option<(u16, PeerClose)>>()
+}
+
 /// A recyclable serving-peer identity.
 ///
 /// The slot selects one bounded host cell and the generation distinguishes

@@ -11,7 +11,7 @@ use kore_svc_extract::ParserId;
 use crate::{
     DirEntry, Fs, FsError, FsRequest, FsResponse, Name, ObjectKind, ObjectSubtype, Refusal,
     Revision, SearchCursor, SearchHit, SearchQuery, View, WALK_MUTATE, WALK_READ, path,
-    read_dir_entry, read_search_hit,
+    read_dir_entry, read_located, read_parent, read_search_hit,
 };
 
 impl<'w, 't> Fs<'w, 't> {
@@ -172,6 +172,75 @@ impl<'w, 't> Fs<'w, 't> {
             FsResponse::Listed { entries, next } => Ok((entries, next)),
             _ => Err(Refusal::Pair),
         }
+    }
+
+    /// One page of `view`'s visible parents into the window, from `cursor`:
+    /// the directories reachable from its authority root that hold an edge
+    /// to it.  Yields the record count and the cursor to resume at; read
+    /// each with [`Fs::parent`] before the next request.
+    pub async fn parents_page(
+        &mut self,
+        view: &View,
+        cursor: u32,
+    ) -> Result<(u32, Option<u32>), Refusal> {
+        match self
+            .checked(&FsRequest::Parents {
+                handle: view.handle(),
+                cursor,
+                window_offset: 0,
+            })
+            .await?
+        {
+            // A resume cursor that does not advance would page forever.
+            FsResponse::Listed {
+                next: Some(next), ..
+            } if next <= cursor => Err(Refusal::Pair),
+            FsResponse::Listed { entries, next } => Ok((entries, next)),
+            _ => Err(Refusal::Pair),
+        }
+    }
+
+    /// The route from this face's root to the object with identity
+    /// `stable`, spelled as a root-relative path into `out`: how a window
+    /// handed an object's identity opens it. The identity is data — the
+    /// route is opened through this face's own root like any other, and an
+    /// object that root does not reach is `NotFound`.
+    pub async fn locate<const N: usize>(
+        &mut self,
+        stable: crate::StableObjectId,
+        out: &mut heapless::Vec<u8, N>,
+    ) -> Result<(), Refusal> {
+        let root = self.open_root(crate::Rights::READ).await?;
+        let located = self
+            .checked(&FsRequest::Locate {
+                handle: root.handle(),
+                stable,
+                window_offset: 0,
+            })
+            .await;
+        self.close(root).await;
+        match located? {
+            FsResponse::Listed { entries: 1, next: None } => {}
+            _ => return Err(Refusal::Pair),
+        }
+        // The record names the object itself — a file has a length and is
+        // no directory, so this is never the parents reader.
+        let hit = read_located(&self.window[..], 0).map_err(Refusal::Fs)?;
+        out.clear();
+        for (index, name) in hit.path.iter().enumerate() {
+            if index > 0 {
+                out.push(b'/').map_err(|_| Refusal::Fs(FsError::Range))?;
+            }
+            out.extend_from_slice(name.as_bytes()).map_err(|_| Refusal::Fs(FsError::Range))?;
+        }
+        Ok(())
+    }
+
+    /// The `index`th parent of the page the last [`Fs::parents_page`]
+    /// landed: its route from the authority root (`path`, empty for the root
+    /// itself) and its identity — observation data, never authority.
+    pub fn parent(&self, index: usize) -> Result<SearchHit, Refusal> {
+        read_parent(&self.window[..], 0, index).map_err(Refusal::Fs)
     }
 
     /// Visit every entry of the directory at `path`, page by page, copying

@@ -1,0 +1,58 @@
+# services/mm/boot.toml — this service's boot-manifest row (the design
+# lives in res/boot.toml's header).  The row rides beside the crate it
+# endows, redox-style; whether and WHEN it founds is the root manifest's
+# `services` list — founding order and chain adjacency are topology, the
+# root's to declare, never a row's.
+
+# The lessor of last resort: MEM_SUPPLY is the founder-minted heap-grant
+# lease; MEM_REGION (slice D) is the minting authority — a revocable
+# self-kind grant of the boot DRAM region, off which `OP_SUPPLY` mints
+# each spawned child's root supply lease (quota-metered per serving
+# pair; the frames live and die against the region bitmap, so revoking
+# this one endowment reclaims every delegated child supply at once).
+#
+# `shell_client = true` + `exec_client = true` + `SERVE_PAIRS = 4` on the
+# protocol: pair 0
+# stays the founder-era pair, pair 1 is the FIRST SHELL's supply face
+# (prefab-minted before the founding loop, conveyed through the
+# pre-land bundle — the wire `run` allocates child memory over), and
+# pair 2 is INIT's face (delivered at its founding round; quiescent
+# until the respawn slices).  Pair 3 is exec's telemetry client face.
+# The rows declaring mm among their `clients` (the compositor's and image's
+# heap faces) take pairs 4 and 5, after the protocol's.
+# All extra pairs are post-less for returned capabilities. Supply quota uses a
+# separate kernel-authenticated lifecycle report after the complete lease
+# lineage dies and the region bitmap has accepted the frames (#747).
+[service]
+image     = "kore-svc-mm"
+endowment = "kore_svc_mm::MmEndowment"        # <_ as Bundle>::PROFILE, cited verbatim
+protocol  = "kore_svc_mm::MemoryManager"      # <_ as SvcProtocol>::REPLY_GRANTS, cited
+boot_data = "supply_quota"
+# Every engine program holds one per-launch face for its life, and the serve
+# host grows mm's face table from mm's own heap: `kore_svc_mm::HEAP_DEMAND_BYTES`
+# is that heap's floor — the supply reservations provisioned at bind (128 KiB:
+# every lane at a task's adoption ceiling), and every face lane at the host's
+# per-slot cost (2,734 bytes today, x86-64) twice over for the doubling table,
+# about 1.6 MiB — and exec's founder test `mm_heap_supply_holds_every_face`
+# holds this lease to it. The rest of the four MiB is the reservation table's
+# room to grow past its provision, and the two heaps' rounding and class
+# headroom.
+heap_supply_bytes = 0x0040_0000
+# The huge classes' per-client live supply policy, not a reservation or
+# physical-memory promise; the receipt's encoding is independent of it. The
+# 4 KiB class's quota is not manifest data: mm derives it at bind from the
+# class the boot carved, half of it per client (`kore_svc_mm::base_quota_for`),
+# read through the read-only observation grant below.
+# A streamed-MoE engine funds its model arena from the whole 1 GiB reserve
+# (6 GiB on a 16 GB machine) and its expert cache from about 4.5 GiB of the
+# 2 MiB class, plus heap. On a 32 GB machine the same engine holds every
+# expert in RAM: an 8 GiB arena, the NPU drafter's 1 GiB unit and some
+# 15 GiB of expert slots from both classes, about 25 GiB. The budget covers
+# both huge classes of such a machine together; the physical classes, not
+# this quota, remain what bounds everyone else.
+supply_quota_bytes = 27917287424 # 26 GiB
+endows    = ["MEM_SUPPLY@0", "MEM_REGION@0", "SYSTEM_OBSERVE@0"]  # review mirror; asserted === PROFILE.roles
+shell_client = true
+exec_client = true
+digest_x86_64  = "blake3:0c893dbdf58c6c17dd66d424ad025ae0cc5b4eab41a718940f09a3595c32830a"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:f1ffc4cb9f02cc59ef78781fd8a1cba3722d9518b7abb0adb17bf3f7376b9f57"  # res/aarch64/; make boot-digests-aarch64
