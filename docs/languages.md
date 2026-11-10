@@ -20,9 +20,9 @@ A Rust host attaches `Fs` using its real founding face, then moves it into
 `kore_ffi::Session`, after closing any external views opened before handoff.
 The host awaits `Session::run(step, user)` on the existing
 Kore executor. No second executor, global allocator or global filesystem root is
-installed. The C/Zig callback is linked into that same application's image.
-This is not yet an independent C `main`/CRT, registry-published static SDK, or a
-POSIX syscall veneer.
+installed. The C/Zig callback is linked into that same application's image. A C
+program with no Rust host gets one from `libkore.so` ([below](#an-independent-c-program-libkoreso)).
+Neither is a registry-published static SDK or a POSIX syscall veneer.
 
 Each callback receives an opaque context and the preceding completion. Initially
 that completion is `KORE_OP_START`. Queue one operation and return. Submission
@@ -63,6 +63,75 @@ completed turns, the driver yields through the existing native executor, even
 if requests (such as zero-byte reads) complete immediately. C/Zig callbacks must
 return promptly: the adapter does not preempt arbitrary foreign code inside a
 callback.
+
+## An independent C program: `libkore.so`
+
+A C program a compiler writes on Kore (`tcc` at Kore's shell) has no Rust
+host. `kore-c` is its runtime. A distribution builds `libkore.so` from a
+one-line `cdylib` named `kore` over it, linked with `--soname=libkore.so
+--no-undefined` (Kore's `user/runtime/libkore`). It ships the library beside
+the headers, which `kore-c` publishes to that crate's build script as
+`DEP_KORE_INCLUDE`, so they come from the same revision. A program links it with
+`-lkore` and gets:
+
+- every `kore.h` function, and the C names `kore/stdlib.h` and
+  `kore/pthread.h` alias as real symbols (`c-stdlib`), over the process heap
+  `kore-c` installs on the launch's `HEAP` supply;
+- a host on thread 0, entered from the C library's start;
+- `kore_fs_run(step, user, &error)` (`kore/program.h`), which runs a
+  `KoreFsStep` program as the program's filesystem session.
+
+The host is the shape `kore-lua`'s VM bridge has. `main` runs on a main
+thread, a `DoorbellWorker` with a 1 MiB guarded stack
+(`KORE_MAIN_STACK_BYTES`). Thread 0 is the process owner, and keeps the
+executor and the launch's service faces. The two share one request cell and
+one word. Every park is a doorbell park; nothing spins.
+
+- **Filesystem.** `kore_fs_run` from the main thread posts the session and
+  waits. The host attaches the launch's filesystem face on first use, rooted
+  at the directory the program was launched in, and runs `kore-ffi`'s
+  `Session` on its executor. The callbacks run there, as on any native
+  executor, while the caller waits: they must not depend on its
+  thread-local state. A thread that cannot park (any but the main thread)
+  is refused, as is a launch with no face. A quarantined session can never
+  run again.
+- **The end.** The C library's `exit` and `_Exit` call
+  `__kore_program_exit(status, finalize)` after their `atexit` handlers, on
+  whatever thread called them. The first request wins and reaches the host,
+  since threads the program starts inherit a send into its wake channel.
+  - The host waits for a main thread that asked to end itself.
+  - It then raises kore-rt's process barrier, stopping every other thread
+    and running the finalizers only if none was still running. Once a
+    program has started a thread, `kore-ffi`'s thread controller is one of
+    them, so such a program's finalizers do not run; `atexit` handlers
+    always do.
+  - It commits the C status, the wire's `i32`, through the C library's own
+    exit.
+  - An end requested mid-session does not wait for the session.
+  - A panic in the library ends the program the same way, its record
+    published first.
+- **Without a host.** A launch that cannot carry one (no channel space or
+  heap) runs the program on thread 0, as its C library alone would. Then the
+  filesystem session is refused, and only thread 0's exit ends the program.
+
+The C library's half is two weak references. Its start calls
+`__kore_program_start(program, end)` when the program links libkore, and its
+exit calls `__kore_program_exit`. A program without libkore is unchanged. On
+Kore those are the start files Kore ships with TCC. `tools/check-program.py`
+(`make cross`, and CI per ISA) links the shared object as a distribution does
+and checks it:
+
+- a library with no entry point;
+- its soname, nothing needed or undefined;
+- static initial-exec TLS only;
+- exactly the declared ABI exported: `kore.h`, `kore/program.h`, the
+  `c-stdlib` names and the two lifecycle entry points.
+
+Kore's `make keytest-tcc-x86` compiles a C program against these headers at
+Kore's shell, links `libkore.so`, and runs it through every surface above
+(Kore `res/TCC.md` §10). That is boot evidence; this repository's checks are
+compiler and link evidence. Task preparation (`kore_task_*`) still needs a
+Rust host to admit its batch: the independent host does not admit one.
 
 ## Failure and lifetime
 
