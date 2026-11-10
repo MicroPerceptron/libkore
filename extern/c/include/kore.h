@@ -690,7 +690,8 @@ uint32_t kore_futex_available(void);
  * all waits/wakes. All concurrent accesses must be compatible 32-bit atomic
  * operations (C atomic builtins or Zig atomics); never mix ordinary accesses
  * or differently sized atomics. Managed-thread waits are cancellation points:
- * they may exit without stack unwinding, as specified by kore_thread_testcancel.
+ * they may exit without stack unwinding, as specified by kore_thread_testcancel,
+ * and a cancellation requested while the thread waits wakes it to act.
  * Publish the condition with a sequentially consistent atomic store BEFORE waking.
  * No address-space sharing is implied.
  */
@@ -935,7 +936,12 @@ int32_t kore_thread_detach(struct KoreThread *thread);
 
 /**
  * Request deferred cancellation. The target acts at testcancel, join or foreign
- * futex wait. A disabled target retains the request. No asynchronous kill occurs.
+ * futex wait; a target waiting at one is woken to act. A disabled target
+ * retains the request. No asynchronous kill occurs. EAGAIN when no wake the
+ * calling thread sends can reach the target, because it neither started the
+ * controller nor was created through it (create refuses it too). Then no
+ * request is recorded, since a target parked at a cancellation point would
+ * never see it.
  * # Safety
  * thread is a live handle. Borrowing cancel calls may run concurrently with one
  * another, but must finish before a consuming join/detach can free the handle.

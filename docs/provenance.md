@@ -351,3 +351,42 @@ C program (`docs/languages.md`). It is the first libkore package a C program
 on Kore links without a Rust host. Its shared object is a distribution's
 one-line `cdylib` over it. `tools/check-program.py` links that object for the
 three Kore ISAs and checks its shape and its exact exported ABI.
+
+## A cancellation is a wake
+
+The export records Kore `a4ab7234e2fe60b43a1df42f12be8f636255fc7a`, one commit
+past MicroPerceptron/kore#1494's branch head `76fddb9f`. Two of the six
+commits since `0018956a` reach the closure, which keeps its 26 packages and
+382 files:
+
+- `kore-rt`'s futex gains a wait another thread can end, and the wake that
+  ends it (Kore `a4ab7234`). `futex::wait_unless` is `wait` with a caller
+  condition read once the waiter is registered, as the word is, and always
+  parks on the doorbell. `futex::wake_thread` kicks one thread's doorbell
+  rather than a word's waiters, directly or relayed through the caller's hub,
+  and reads the target's registration before it kicks. A condition stored
+  with `SeqCst` before that wake is therefore never missed, and no slice is
+  needed to notice it. Arm, register and check are one function that every
+  doorbell wait shares, and the host suite drives it with the arm injected to
+  pin that order. `futex::current_thread` is public: the band a thread
+  records for its wakers.
+- Its thread controller exposes the rule its own joins used:
+  `Controller::slice` is unbounded where the controller can wake the calling
+  thread, and `UNREACHED_SLICE` where nothing could. `Controller::wakes_threads`
+  says whether a wake the calling thread sends reaches the threads it founded.
+- The services' `boot.toml` digests are #1494's reseal over the parking
+  controller (`76fddb9f`).
+
+No exported manifest changed, so `native/Cargo.lock` did not.
+
+`kore-ffi`'s cancellation points no longer poll. A managed thread records its
+band when it starts; `kore_thread_cancel` stores the request and wakes that
+band; `kore_thread_join` and a managed thread's `kore_futex_wait` wait with
+`wait_unless`, with no timeout of their own. An idle cancellable waiter now
+sleeps until something happens rather than waking every millisecond. Only a
+thread the controller cannot wake keeps the bounded slice, now the
+controller's `UNREACHED_SLICE`. A canceller whose wake cannot reach the
+controller's threads is refused with EAGAIN, as create refuses it, and records
+nothing. A host test drives `request_cancel` to that refusal. The metal
+evidence is Kore's `keytest-tcc-x86`, whose libkore tour cancels a thread
+parked in `pthread_join` and one parked in `kore_futex_wait` with no timeout.

@@ -70,10 +70,12 @@ unsafe extern "C" fn worker(mode: *mut c_void) -> *mut c_void {
             3 => {
                 READY.store(1, Ordering::Release);
                 loop {
-                    // Every foreign wait entry checks cancellation. Independent
-                    // controller workers have no doorbell: preserve Unsupported
-                    // and park via the native deadline helper between retries.
-                    // This witnesses cancellation delivery, not futex wake routing.
+                    // Nothing wakes WORD: only the cancellation ends this wait.
+                    // A worker with a doorbell parks until the request's wake,
+                    // relayed through the controller, arrives. One founded
+                    // without (a starter with no channel space) is refused the
+                    // park: preserve Unsupported and take the native deadline
+                    // park between retries, whose entry checks cancellation.
                     if kore_futex_wait(WORD.as_ptr(), 0, KORE_FUTEX_INFINITE)
                         == KoreFutexOutcome::Unsupported
                     {

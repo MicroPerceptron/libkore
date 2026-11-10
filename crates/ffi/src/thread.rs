@@ -45,6 +45,10 @@ pub(crate) struct Control {
     outcome: AtomicU32,
     retired: AtomicU32,
     pub(crate) cancel: AtomicBool,
+    /// The native band the thread runs on, plus one; zero until it starts
+    /// (`futex::current_thread`). A canceller reads it after storing
+    /// `cancel`, to wake the thread out of a wait at a cancellation point.
+    band: AtomicU32,
 }
 impl Control {
     pub(crate) fn new() -> Self {
@@ -53,12 +57,31 @@ impl Control {
             outcome: AtomicU32::new(0),
             retired: AtomicU32::new(0),
             cancel: AtomicBool::new(false),
+            band: AtomicU32::new(0),
         }
+    }
+    /// Record the calling thread's band, before its callback can reach a
+    /// cancellation point. `SeqCst`, against the canceller's store of `cancel`
+    /// and then this load: a canceller that reads zero stored `cancel` before
+    /// the thread's first wait reads it.
+    fn start(&self) {
+        let band = kore::futex::current_thread().map_or(0, |band| band as u32 + 1);
+        self.band.store(band, Ordering::SeqCst);
+    }
+    fn band(&self) -> Option<usize> {
+        let band = self.band.load(Ordering::SeqCst);
+        band.checked_sub(1).map(|band| band as usize)
     }
     pub(crate) fn finish(&self, value: *mut c_void, outcome: u32) {
         self.result.store(value, Ordering::Relaxed);
         self.outcome.store(outcome, Ordering::Release);
     }
+}
+/// How long one wait of the calling thread may park ([`Controller::slice`]):
+/// unbounded where the controller can wake it, and therefore where a
+/// cancellation's wake reaches it; one bounded slice where nothing could.
+pub(crate) fn slice() -> Option<core::time::Duration> {
+    THREADS.slice()
 }
 fn status(error: Error) -> i32 {
     match error {
@@ -86,6 +109,7 @@ fn invoke(argument: usize) -> usize {
     call_context(context)
 }
 fn call_context(context: &StartContext) -> usize {
+    context.control.start();
     // SAFETY: forwarded foreign callback and argument lifetime contract.
     crate::thread_local::enter(&context.control);
     let value = unsafe { (context.call)(context.argument) };
@@ -208,12 +232,17 @@ pub unsafe extern "C" fn kore_thread_join(
         if control.retired.load(Ordering::SeqCst) != 0 {
             break;
         }
-        // A cancellation request is a flag, not a wake: a joiner that can be
-        // cancelled parks one slice at a time, as a cancellable futex wait
-        // does. Any other joiner parks until the controller retires the target.
-        let slice = crate::thread_local::cancellable()
-            .then(|| core::time::Duration::from_nanos(crate::thread_local::CANCEL_SLICE_NS));
-        if kore::futex::wait(&control.retired, 0, slice) == kore::futex::WaitOutcome::Unsupported
+        // Park until the controller wakes `retired`, or this joiner's own
+        // cancellation is requested: its canceller stores the request, then
+        // wakes this thread (kore_thread_cancel), and the wait re-reads the
+        // request once it is registered. Only a joiner the controller cannot
+        // wake parks in bounded slices; nothing else would end its park.
+        if kore::futex::wait_unless(
+            &control.retired,
+            0,
+            slice(),
+            crate::thread_local::cancel_pending,
+        ) == kore::futex::WaitOutcome::Unsupported
             // A native worker with no doorbell takes the deadline park, which
             // needs no wake capability at all.
             && !kore::runtime::pace::cede()
@@ -270,7 +299,12 @@ pub unsafe extern "C" fn kore_thread_detach(thread: *mut KoreThread) -> i32 {
 }
 
 /// Request deferred cancellation. The target acts at testcancel, join or foreign
-/// futex wait. A disabled target retains the request. No asynchronous kill occurs.
+/// futex wait; a target waiting at one is woken to act. A disabled target
+/// retains the request. No asynchronous kill occurs. EAGAIN when no wake the
+/// calling thread sends can reach the target, because it neither started the
+/// controller nor was created through it (create refuses it too). Then no
+/// request is recorded, since a target parked at a cancellation point would
+/// never see it.
 /// # Safety
 /// thread is a live handle. Borrowing cancel calls may run concurrently with one
 /// another, but must finish before a consuming join/detach can free the handle.
@@ -279,12 +313,31 @@ pub unsafe extern "C" fn kore_thread_cancel(thread: *mut KoreThread) -> i32 {
     let Some(ticket) = NonNull::new(thread.cast::<Ticket>()) else {
         return KORE_THREAD_EINVAL;
     };
-    let control = unsafe { &ticket.as_ref().control };
+    // SAFETY: the caller supplies a live handle, borrowed for this call.
+    request_cancel(unsafe { &ticket.as_ref().control })
+}
+
+/// kore_thread_cancel's request against the target's shared control.
+fn request_cancel(control: &Control) -> i32 {
     if control.outcome.load(Ordering::Acquire) != 0 || control.retired.load(Ordering::Acquire) != 0
     {
         return KORE_THREAD_ESRCH;
     }
-    control.cancel.store(true, Ordering::Release);
+    // The request is a flag its wake announces: only the controller holds a
+    // send into a managed thread's doorbell, so the wake is relayed through
+    // it, and a thread that cannot relay through it is refused here rather
+    // than leaving a request behind a park nothing ends.
+    if !THREADS.wakes_threads() {
+        return KORE_THREAD_EAGAIN;
+    }
+    // Store, then wake (`futex::wake_thread`'s order). The wake reads the
+    // target's registration, and the target's wait reads the request once it
+    // is registered, so one of the two sees the other. A target that has not
+    // yet recorded its band reads the request at its first cancellation point.
+    control.cancel.store(true, Ordering::SeqCst);
+    if let Some(band) = control.band() {
+        let _ = kore::futex::wake_thread(band);
+    }
     KORE_THREAD_OK
 }
 
@@ -311,6 +364,22 @@ mod tests {
         }
         assert_eq!(value, 23);
         assert_eq!(Arc::strong_count(&control), 1);
+    }
+    #[test]
+    fn a_cancel_no_wake_can_announce_is_refused_and_never_recorded() {
+        // Off metal the controller never starts, so no thread's wake reaches
+        // its threads: the request is refused, and nothing a parked target
+        // would wait on unwoken is left behind. An ended target is gone first.
+        let control = Control::new();
+        control.start();
+        assert_eq!(control.band(), None, "off metal a thread has no band");
+        assert_eq!(request_cancel(&control), KORE_THREAD_EAGAIN);
+        assert!(!control.cancel.load(Ordering::SeqCst));
+        control.finish(ptr::null_mut(), 1);
+        assert_eq!(request_cancel(&control), KORE_THREAD_ESRCH);
+        assert!(!control.cancel.load(Ordering::SeqCst));
+        // Every wait off metal is one the controller cannot end early.
+        assert!(slice().is_some());
     }
     #[test]
     fn host_refusal_preserves_output_and_never_calls_foreign_code() {
