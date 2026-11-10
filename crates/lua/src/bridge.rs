@@ -4,50 +4,42 @@
 //! C frame that called it, and that frame may sit inside a coroutine, a
 //! metamethod, or a `pcall`.  The store, however, is reached only through
 //! the task's async filesystem client on its executor.  So the VM runs on a
-//! kore-rt **worker thread** and the executor stays on thread 0; the two
-//! share one request cell and one word:
+//! kore-rt **worker thread** and the executor stays on thread 0, across
+//! `kore::runtime::bridge`: the `Interpreter` engine, whose work items are
+//! evaluations and whose calls are every verb that needs a service.
 //!
 //! ```text
 //!  thread 0 (executor)                       worker (VM)
 //!  ───────────────────                       ───────────
-//!  write eval → EVAL_POSTED, kick ──────────▶ wait(EVAL_DONE) returns
-//!  park on the wake channel                   runs the chunk …
-//!                                             … C `require` → write op
-//!  ◀──────── CALL_POSTED, kick_parent ─────── wait(CALL_POSTED)
+//!  found the worker: libraries, policy ─────▶ build the VM, finish: ready
+//!  post the eval ───────────────────────────▶ runs the chunk …
+//!                                             … C `require` → call
+//!  ◀──────────────────────────── the call ─── parked on its doorbell
 //!  serve the op (async)
-//!  write reply → CALL_SERVED, kick ─────────▶ returns; EVAL_POSTED
-//!  park on the wake channel
+//!  the answer ──────────────────────────────▶ returns; the chunk resumes
 //!                                             … chunk ends
-//!  ◀──────── EVAL_DONE, kick_parent ────────  wait(EVAL_DONE)
+//!  ◀───────────────────── finish(outcome) ─── waits for the next item
 //!  take stdout/stderr
 //! ```
+//!
+//! The bridge owns the word, the park-and-kick ordering, the cell's
+//! hand-over and the worker's end: a VM thread that panics, cannot park, or
+//! cannot be built is reported gone, never waited for.  This module keeps
+//! what crosses it — an evaluation and its output, a call and its answer —
+//! and the dispatch that answers a call ([`serve_call`]).
 //!
 //! **One transport, many ops.**  `require`, `kore.time.sleep`, and every
 //! later verb that needs a service — this crate's own or an embedder's,
 //! through [`Extension`] — are the same round trip with a different
-//! payload, so they share one word-state pair
-//! (`CALL_POSTED` / `CALL_SERVED`), one worker-side helper ([`host_call`]),
-//! and one thread-0 dispatcher ([`serve_call`]).  Adding a verb is a new op
-//! constant and a new arm — never a new state, and never another copy of
-//! the ordering discipline below.  Verbs that need *no* service do not come
-//! here at all: `kore.time.now` reads the clock page and `kore.random`
-//! draws from the CPU, both directly on the VM thread.
-//!
-//! Every park is a doorbell park; nothing spins.  The worker parks with
-//! `futex::wait` on the word (its own doorbell); thread 0 parks on the
-//! **wake channel** the worker holds a send to (`DoorbellWorker::wake_recv`,
-//! `executor::next_wake_on`) — a launched task has no self-kick for a
-//! worker to inherit, so `futex::wake` could not reach it.  Lost wakeups
-//! are excluded by discipline, not luck: the worker stores the word, then
-//! kicks; thread 0 stands its post, then re-loads the word, then parks.  A
-//! kick that found no standing post was refused, and that ordering means
-//! the store it announced is visible to the re-load.  The
-//! word's holder owns the cell: the worker while it reads `EVAL_POSTED` /
-//! `CALL_SERVED` / `QUIT`, thread 0 while it reads `EVAL_DONE` /
-//! `CALL_POSTED` / `WORKER_GONE`.  Buffers cross the boundary as owned
-//! `Vec`s — the heap frees a block from any thread onto its owning shard's
-//! remote list — or as pointers into a frame the owner keeps alive across
-//! the whole phase (the eval's script).
+//! payload, so they share one call shape ([`kore_lua_host_call`]) and one
+//! thread-0 dispatcher ([`serve_call`]).  Adding a verb is a new op
+//! constant and a new arm — never a new state, and never a copy of the
+//! bridge's ordering.  Verbs that need *no* service do not come here at
+//! all: `kore.time.now` reads the clock page and `kore.random` draws from
+//! the CPU, both directly on the VM thread.  Buffers cross the boundary as
+//! owned `Vec`s — the heap frees a block from any thread onto its owning
+//! shard's remote list — or as borrows the owner keeps alive across the
+//! whole item (the eval's script) or call (a write's bytes).
 //!
 //! Resolution: a source module `<name>.lua` from `SOURCE_SEARCH` — the
 //! task's own tree, then `libs/` — wins over a native `<name>.so`, which
@@ -61,25 +53,21 @@
 //! executable's exported C API.
 
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use core::ffi::{CStr, c_char, c_int};
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use kore::abi::clock::TimerError;
-use kore::abi::session::Status;
 use kore::abi::svc::FS_NAME_BYTES;
 use kore::fs::Fs;
 use kore::runtime::{
-    chan::{NoticeRx, RecvError},
+    bridge::{Bridge, Engine, Gone, Next, Refused, Settled, Work, WorkerHost},
     entry::Rt,
-    futex::{self, WaitOutcome},
-    thread::{self, DoorbellWorker},
+    thread::WorkerStack,
     transport::TrapTransport,
 };
 use kore_late::{LoadError, Loader, Search};
 
 use crate::vm::{EvalResult, ReplResult, Vm};
-use crate::{Answer, Extension, OP_EMBEDDER_BASE, Policy};
+use crate::{Answer, Extension, Library, OP_EMBEDDER_BASE, Policy};
 
 /// The bound on a source module (`<name>.lua`).  Sized like a generous
 /// script, not like a library: the whole buffer is staged in the task's
@@ -94,19 +82,6 @@ const SOURCE_SEARCH: &[&[u8]] = &[b"", kore_late::LIBS_VIEW.as_bytes()];
 
 /// The prefix a native module's opener carries: `luaopen_<name>`.
 const OPENER_PREFIX: &[u8] = b"luaopen_";
-
-// The word's states.  See the module doc for who owns the cell in each.
-const EVAL_DONE: u32 = 0;
-const EVAL_POSTED: u32 = 1;
-/// The worker posted a host call — a `require`, a sleep, an embedder's
-/// library call, any operation that needs thread 0's executor.  Thread 0
-/// owns the cell until it stores [`CALL_SERVED`].  One pair serves every
-/// op: the VM is a synchronous C engine and every service face lives on
-/// thread 0, so the transport is identical and only the payload differs.
-const CALL_POSTED: u32 = 2;
-const CALL_SERVED: u32 = 3;
-const QUIT: u32 = 4;
-const WORKER_GONE: u32 = 5;
 
 /// The host-call op vocabulary, as the C side names them (`kore_lua.c`).
 /// One flat namespace over one transport; a new standard-library verb is a
@@ -210,7 +185,12 @@ pub enum Outcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fatal;
 
-struct Payload {
+/// What crosses the bridge.
+pub struct Payload {
+    // thread 0 → worker, with the founding: what the VM is built with —
+    // the embedder's monomorphized libraries and policy.
+    libraries: &'static [Library],
+    policy: Policy,
     // thread 0 → worker: the evaluation.
     kind: u32,
     script: *const u8,
@@ -251,103 +231,96 @@ struct Payload {
     text: Vec<u8>,
 }
 
-struct Cell {
-    state: AtomicU32,
-    payload: UnsafeCell<Payload>,
-}
+// SAFETY: the pointers cross under the bridge's hand-over and stay alive
+// while the other side reads them: the script and chunk name in thread 0's
+// frame until the evaluation settles, a call's input in the Lua frame of the
+// parked worker until the call is answered, and `error` names a `'static`
+// string.
+unsafe impl Send for Payload {}
 
-// SAFETY: `payload` is touched only by the thread the word's current state
-// hands the cell to (module doc); every hand-over is a Release store on
-// `state` matched by the other side's Acquire load.
-unsafe impl Sync for Cell {}
-
-static CELL: Cell = Cell {
-    state: AtomicU32::new(EVAL_DONE),
-    payload: UnsafeCell::new(Payload {
-        kind: KIND_CHUNK,
-        script: core::ptr::null(),
-        script_len: 0,
-        chunk_name: core::ptr::null(),
-        chunk_name_len: 0,
-        outcome: Outcome::Ok,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        op: 0,
-        args: [0; 3],
-        name: [0; FS_NAME_BYTES],
-        name_len: 0,
-        input: core::ptr::null(),
-        input_len: 0,
-        reply: REPLY_ERROR,
-        source: Vec::new(),
-        opener: None,
-        error: core::ptr::null(),
-        status: STATUS_UNAVAILABLE,
-        results: [0; 2],
-        text: Vec::new(),
-    }),
-};
-
-/// The cell, for the side the word currently hands it to.
-///
-/// # Safety
-/// The caller has observed (Acquire) a state that makes it the owner, and
-/// holds no other reference across the store that hands the cell back.
-unsafe fn payload<'a>() -> &'a mut Payload {
-    unsafe { &mut *CELL.payload.get() }
-}
+static BRIDGE: Bridge<Payload> = Bridge::new(Payload {
+    libraries: &[],
+    policy: Policy::INTERACTIVE,
+    kind: KIND_CHUNK,
+    script: core::ptr::null(),
+    script_len: 0,
+    chunk_name: core::ptr::null(),
+    chunk_name_len: 0,
+    outcome: Outcome::Ok,
+    stdout: Vec::new(),
+    stderr: Vec::new(),
+    op: 0,
+    args: [0; 3],
+    name: [0; FS_NAME_BYTES],
+    name_len: 0,
+    input: core::ptr::null(),
+    input_len: 0,
+    reply: REPLY_ERROR,
+    source: Vec::new(),
+    opener: None,
+    error: core::ptr::null(),
+    status: STATUS_UNAVAILABLE,
+    results: [0; 2],
+    text: Vec::new(),
+});
 
 // ---------------------------------------------------------------- worker
 
-/// The worker's entry: build the VM, then serve evaluations until `QUIT`.
-fn vm_thread<E: Extension>() {
-    let Some(mut vm) = Vm::new_with_policy(E::LIBRARIES, E::POLICY) else {
-        // SAFETY: the worker owns the cell while the word reads EVAL_DONE
-        // and thread 0 has not yet posted (it posts only after spawn).
-        unsafe { payload().outcome = Outcome::Startup };
-        CELL.state.store(WORKER_GONE, Ordering::Release);
-        let _ = thread::kick_parent();
-        return;
-    };
-    loop {
-        match CELL.state.load(Ordering::Acquire) {
-            EVAL_POSTED => {
-                run_eval(&mut vm);
-                CELL.state.store(EVAL_DONE, Ordering::Release);
-                let _ = thread::kick_parent();
-            }
-            QUIT => {
-                drop(vm);
-                CELL.state.store(WORKER_GONE, Ordering::Release);
-                let _ = thread::kick_parent();
-                return;
-            }
-            WORKER_GONE => return,
-            other => {
-                if futex::wait(&CELL.state, other, None) == WaitOutcome::Unsupported {
-                    // No doorbell to park on: a spin would be the only
-                    // alternative, and that is the one thing this bridge
-                    // refuses to be.  Leave; thread 0 reads WORKER_GONE.
-                    drop(vm);
-                    CELL.state.store(WORKER_GONE, Ordering::Release);
-                    let _ = thread::kick_parent();
-                    return;
-                }
-            }
+/// The VM as a bridge engine: build it with the embedder's libraries and
+/// policy, then evaluate each item until thread 0 asks it to quit.
+///
+/// Not generic over the [`Extension`]: the extension may borrow what its
+/// `main` owns, and an engine outlives no such borrow.  What the worker needs
+/// of it is `'static` data, which arrives in the first work item.
+struct Interpreter;
+
+impl Engine for Interpreter {
+    type Payload = Payload;
+
+    fn bridge() -> &'static Bridge<Payload> {
+        &BRIDGE
+    }
+
+    fn run(mut first: Work<Payload>) {
+        let (libraries, policy) = first.with(|cell| (cell.libraries, cell.policy));
+        let Some(mut vm) = Vm::new_with_policy(libraries, policy) else {
+            first.fail(|cell| cell.outcome = Outcome::Startup);
+            return;
+        };
+        // The VM is built: the first item, done.
+        first.finish(|_| ());
+        while let Ok(Next::Work(mut work)) = BRIDGE.next() {
+            let (outcome, stdout, stderr) = run_eval(&mut vm, &mut work);
+            work.finish(|cell| {
+                cell.outcome = outcome;
+                cell.stdout = stdout;
+                cell.stderr = stderr;
+            });
         }
+        // Asked to quit (or unable to wait any longer): the VM is dropped
+        // before the bridge reads the worker gone, on the body's return.
+        drop(vm);
     }
 }
 
-fn run_eval(vm: &mut Vm) {
-    // SAFETY: EVAL_POSTED — the worker owns the cell; thread 0 keeps the
-    // script and chunk name alive until it reads EVAL_DONE.
-    let cell = unsafe { payload() };
-    let script = if cell.script.is_null() {
+fn run_eval(vm: &mut Vm, work: &mut Work<Payload>) -> (Outcome, Vec<u8>, Vec<u8>) {
+    let (kind, script, script_len, chunk_name, chunk_name_len) = work.with(|cell| {
+        (
+            cell.kind,
+            cell.script,
+            cell.script_len,
+            cell.chunk_name,
+            cell.chunk_name_len,
+        )
+    });
+    // SAFETY: thread 0 keeps the script and chunk name alive until the
+    // evaluation settles.
+    let script = if script.is_null() {
         &[][..]
     } else {
-        unsafe { core::slice::from_raw_parts(cell.script, cell.script_len) }
+        unsafe { core::slice::from_raw_parts(script, script_len) }
     };
-    cell.outcome = match cell.kind {
+    let outcome = match kind {
         KIND_REPL => match vm.eval_repl(script) {
             ReplResult::Complete(true) => Outcome::Ok,
             ReplResult::Complete(false) => Outcome::Failed,
@@ -361,7 +334,7 @@ fn run_eval(vm: &mut Vm) {
             // name with every KIND_CHUNK evaluation, so this is never the
             // dangling-null case `from_raw_parts` forbids.
             let name: &'static [u8] =
-                unsafe { core::slice::from_raw_parts(cell.chunk_name, cell.chunk_name_len) };
+                unsafe { core::slice::from_raw_parts(chunk_name, chunk_name_len) };
             match vm.eval(script, name) {
                 EvalResult::Ok => Outcome::Ok,
                 EvalResult::CompileFailed => Outcome::CompileFailed,
@@ -371,57 +344,20 @@ fn run_eval(vm: &mut Vm) {
             }
         }
     };
-    cell.stdout = vm.take_stdout();
-    cell.stderr = vm.take_stderr();
+    (outcome, vm.take_stdout(), vm.take_stderr())
 }
 
-/// The transport every host call shares: write the request, hand the cell
-/// to thread 0, park on the doorbell, read the response back, and resume
-/// the evaluation.  One function owns the whole ordering so no caller can
-/// get it wrong, and a new standard-library verb is a `write`/`read` pair
-/// rather than another copy of this discipline.
-///
-/// `Err` means the bridge is gone and nothing was served; the cell is not
-/// handed back and the evaluation is not resumed.
-///
-/// # Safety
-/// Worker thread only, inside an evaluation (the word reads `EVAL_POSTED`).
-unsafe fn host_call<T>(
-    write: impl FnOnce(&mut Payload),
-    read: impl FnOnce(&Payload) -> T,
-) -> Result<T, &'static CStr> {
-    if CELL.state.load(Ordering::Acquire) != EVAL_POSTED {
-        return Err(c"host call outside an evaluation");
+/// What a refused host call tells the script.
+fn refused(refusal: Refused) -> &'static CStr {
+    match refusal {
+        Refused::NotWorker | Refused::NoWork => c"host call outside an evaluation",
+        Refused::Nested => c"host call made inside another",
     }
-    // SAFETY: EVAL_POSTED — the worker owns the cell.
-    write(unsafe { payload() });
-    CELL.state.store(CALL_POSTED, Ordering::Release);
-    let _ = thread::kick_parent();
-    loop {
-        match CELL.state.load(Ordering::Acquire) {
-            CALL_SERVED => break,
-            WORKER_GONE | QUIT => return Err(c"host is shutting down"),
-            other => {
-                if futex::wait(&CELL.state, other, None) == WaitOutcome::Unsupported {
-                    return Err(c"worker cannot park");
-                }
-            }
-        }
-    }
-    // SAFETY: CALL_SERVED — the worker owns the cell again.
-    let value = read(unsafe { payload() });
-    // Back inside the evaluation.  No kick: thread 0 does not wait on this
-    // word — it parks on its wake doorbell (`park_until_kicked`) and reads
-    // `CALL_SERVED` and `EVAL_POSTED` alike as "the worker is busy".  It
-    // has nothing to do until the worker's next post, and both of those
-    // (`CALL_POSTED`, `EVAL_DONE`) kick.
-    CELL.state.store(EVAL_POSTED, Ordering::Release);
-    Ok(value)
 }
 
 /// C `require`'s half (`kore_lua.c`): post the name, park until served,
 /// hand back what thread 0 stored.  Called on the worker, inside an
-/// evaluation, so the word reads `EVAL_POSTED` on entry.
+/// evaluation.
 ///
 /// # Safety
 /// `name` points at `len` bytes; the out-pointers are valid.
@@ -445,31 +381,29 @@ pub unsafe extern "C" fn kore_lua_host_require(
         return fail(c"module name is not a store name");
     }
     let requested = unsafe { core::slice::from_raw_parts(name.cast::<u8>(), len) };
-    let served = unsafe {
-        host_call(
-            |cell| {
-                cell.op = OP_REQUIRE;
-                cell.name[..len].copy_from_slice(requested);
-                cell.name_len = len;
-                cell.reply = REPLY_ERROR;
-                cell.opener = None;
-                cell.error = core::ptr::null();
-            },
-            |cell| match cell.reply {
-                REPLY_SOURCE => (
-                    REPLY_SOURCE,
-                    cell.source.as_ptr().cast(),
-                    cell.source.len(),
-                    None,
-                ),
-                REPLY_NATIVE => (REPLY_NATIVE, core::ptr::null(), 0, cell.opener),
-                other => (other, cell.error, 0, None),
-            },
-        )
-    };
+    let served = BRIDGE.call(
+        |cell| {
+            cell.op = OP_REQUIRE;
+            cell.name[..len].copy_from_slice(requested);
+            cell.name_len = len;
+            cell.reply = REPLY_ERROR;
+            cell.opener = None;
+            cell.error = core::ptr::null();
+        },
+        |cell| match cell.reply {
+            REPLY_SOURCE => (
+                REPLY_SOURCE,
+                cell.source.as_ptr().cast(),
+                cell.source.len(),
+                None,
+            ),
+            REPLY_NATIVE => (REPLY_NATIVE, core::ptr::null(), 0, cell.opener),
+            other => (other, cell.error, 0, None),
+        },
+    );
     let (reply, reply_bytes, reply_len, reply_opener) = match served {
         Ok(served) => served,
-        Err(message) => return fail(message),
+        Err(refusal) => return fail(refused(refusal)),
     };
     unsafe {
         *bytes = reply_bytes;
@@ -637,11 +571,7 @@ pub fn seed() -> u32 {
 /// is compiled.  Worker-side, inside the evaluation.
 #[unsafe(no_mangle)]
 pub extern "C" fn kore_lua_host_release() {
-    if CELL.state.load(Ordering::Acquire) == EVAL_POSTED {
-        // SAFETY: EVAL_POSTED — the worker owns the cell.
-        let cell = unsafe { payload() };
-        cell.source = Vec::new();
-    }
+    let _ = BRIDGE.with_work(|cell| cell.source = Vec::new());
 }
 
 /// Every value-returning host call's half (`kore_lua.c`): post the op and
@@ -653,7 +583,8 @@ pub extern "C" fn kore_lua_host_release() {
 /// copies it into a Lua string before returning).
 ///
 /// # Safety
-/// The out-pointers are valid for writes.
+/// The out-pointers are valid for writes; `input` points at `input_len`
+/// bytes (or is null), alive until this returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kore_lua_host_call(
     op: u32,
@@ -676,30 +607,30 @@ pub unsafe extern "C" fn kore_lua_host_call(
         }
         STATUS_UNAVAILABLE
     };
-    let served = unsafe {
-        host_call(
-            |cell| {
-                cell.op = op;
-                cell.args = [arg0, arg1, arg2];
-                cell.input = input;
-                cell.input_len = if input.is_null() { 0 } else { input_len };
-                cell.status = STATUS_UNAVAILABLE;
-                cell.results = [0; 2];
-                cell.text = Vec::new();
-            },
-            |cell| {
-                (
-                    cell.status,
-                    cell.results,
-                    cell.text.as_ptr().cast::<c_char>(),
-                    cell.text.len(),
-                )
-            },
-        )
-    };
+    let served = BRIDGE.call(
+        |cell| {
+            cell.op = op;
+            cell.args = [arg0, arg1, arg2];
+            cell.input = input;
+            cell.input_len = if input.is_null() { 0 } else { input_len };
+            cell.status = STATUS_UNAVAILABLE;
+            cell.results = [0; 2];
+            cell.text = Vec::new();
+        },
+        |cell| {
+            cell.input = core::ptr::null();
+            cell.input_len = 0;
+            (
+                cell.status,
+                cell.results,
+                cell.text.as_ptr().cast::<c_char>(),
+                cell.text.len(),
+            )
+        },
+    );
     let (status, results, reply_text, reply_len) = match served {
         Ok(served) => served,
-        Err(message) => return fail(message),
+        Err(refusal) => return fail(refused(refusal)),
     };
     unsafe {
         *result = results[0];
@@ -783,49 +714,26 @@ impl<'r, 't> Services<'r, 't> {
     }
 }
 
-/// The running VM: the worker, its doorbell, and the wake channel thread 0
-/// parks on.
+/// The running VM: its worker, as thread 0 hosts it.
 pub struct Host<'t> {
-    worker: DoorbellWorker,
-    wake: NoticeRx<'t, TrapTransport>,
+    host: WorkerHost<'t, Interpreter>,
 }
 
 impl<'t> Host<'t> {
-    /// Spawn the VM's worker.  `None` when the task holds no channel space
-    /// (its profile lacks `channels`) or the thread cannot be founded.
+    /// Spawn the VM's worker, built with `E`'s libraries and policy.  `None`
+    /// when the task holds no channel space (its profile lacks `channels`)
+    /// or the thread cannot be founded.
     pub fn start<E: Extension>(transport: &'t TrapTransport) -> Option<Self> {
-        let worker = thread::spawn_with_doorbell(vm_thread::<E>, &[])?;
-        let wake = NoticeRx::new(transport, worker.wake_recv());
-        Some(Self { worker, wake })
-    }
-
-    /// Park until the worker kicks (or a spurious executor wake), having
-    /// first stood the wake post and re-read the word — the module doc's
-    /// discipline.  `seen` is the state thread 0 last observed.
-    async fn park_until_kicked(&mut self, seen: u32) -> Result<(), Fatal> {
-        loop {
-            match self.wake.try_recv() {
-                // A kick landed; the caller re-reads the word.
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) => {
-                    if CELL.state.load(Ordering::Acquire) != seen {
-                        return Ok(());
-                    }
-                    let Some(post) = self.wake.standing_post() else {
-                        return Err(Fatal);
-                    };
-                    let _ = kore::runtime::executor::next_wake_on(post).await;
-                }
-                Err(RecvError::Refused(Status::WouldBlock)) => {
-                    let _ = kore::runtime::executor::next_wake().await;
-                }
-                Err(_) => return Err(Fatal),
-            }
-        }
+        let host = WorkerHost::<Interpreter>::spawn(transport, WorkerStack::Band, &[], |cell| {
+            cell.libraries = E::LIBRARIES;
+            cell.policy = E::POLICY;
+            cell.outcome = Outcome::Ok;
+        })?;
+        Some(Self { host })
     }
 
     /// Run `script` on the VM and collect its outcome and output, serving
-    /// every `require` it makes on the way.  `chunk_name` is Lua's chunk
+    /// every call it makes on the way.  `chunk_name` is Lua's chunk
     /// name (NUL-terminated, static); `repl` selects the REPL's
     /// expression-then-statement grammar.
     pub async fn eval<E: Extension>(
@@ -836,108 +744,85 @@ impl<'t> Host<'t> {
         chunk_name: &'static [u8],
         repl: bool,
     ) -> Result<(Outcome, Vec<u8>, Vec<u8>), Fatal> {
-        match CELL.state.load(Ordering::Acquire) {
-            EVAL_DONE => {}
-            WORKER_GONE => {
-                // SAFETY: WORKER_GONE — thread 0 owns the cell.
-                let outcome = unsafe { payload().outcome };
-                return Ok((outcome, Vec::new(), Vec::new()));
-            }
-            _ => return Err(Fatal),
+        // The previous item has settled first — the first time, the VM's
+        // construction, which makes no calls.
+        let settled = self
+            .host
+            .serve(async |cell: &mut Payload| serve_call(services, extension, cell).await)
+            .await
+            .map_err(|_| Fatal)?;
+        if let Settled::Gone(gone) = settled {
+            return self.gone(gone);
         }
-        {
-            // SAFETY: EVAL_DONE — thread 0 owns the cell.
-            let cell = unsafe { payload() };
-            cell.kind = if repl { KIND_REPL } else { KIND_CHUNK };
-            cell.script = script.as_ptr();
-            cell.script_len = script.len();
-            cell.chunk_name = chunk_name.as_ptr();
-            cell.chunk_name_len = chunk_name.len();
-        }
-        CELL.state.store(EVAL_POSTED, Ordering::Release);
-        // A refused kick is not a failure: it means no post stood, and the
-        // worker re-tests the word after it arms one (`futex::wait`'s
-        // contract), so the store above reaches it regardless.
-        let _ = self.worker.kick();
-        loop {
-            match CELL.state.load(Ordering::Acquire) {
-                state @ (EVAL_POSTED | CALL_SERVED) => {
-                    self.park_until_kicked(state).await?;
-                }
-                CALL_POSTED => {
-                    serve_call(services, extension).await;
-                    CELL.state.store(CALL_SERVED, Ordering::Release);
-                    let _ = self.worker.kick();
-                }
-                EVAL_DONE => {
-                    // SAFETY: EVAL_DONE — thread 0 owns the cell; the
-                    // script pointer is dead from here (its frame is ours).
-                    let cell = unsafe { payload() };
-                    cell.script = core::ptr::null();
-                    cell.script_len = 0;
-                    return Ok((
-                        cell.outcome,
-                        core::mem::take(&mut cell.stdout),
-                        core::mem::take(&mut cell.stderr),
-                    ));
-                }
-                _ => return Err(Fatal),
+        self.host
+            .post(|cell| {
+                cell.kind = if repl { KIND_REPL } else { KIND_CHUNK };
+                cell.script = script.as_ptr();
+                cell.script_len = script.len();
+                cell.chunk_name = chunk_name.as_ptr();
+                cell.chunk_name_len = chunk_name.len();
+            })
+            .map_err(|_| Fatal)?;
+        let settled = self
+            .host
+            .serve(async |cell: &mut Payload| serve_call(services, extension, cell).await)
+            .await
+            .map_err(|_| Fatal)?;
+        match settled {
+            Settled::Idle => {
+                let cell = self.host.payload().ok_or(Fatal)?;
+                // The script pointer is dead from here: its frame is ours.
+                cell.script = core::ptr::null();
+                cell.script_len = 0;
+                Ok((
+                    cell.outcome,
+                    core::mem::take(&mut cell.stdout),
+                    core::mem::take(&mut cell.stderr),
+                ))
             }
+            Settled::Gone(gone) => self.gone(gone),
+        }
+    }
+
+    /// What an evaluation answers once the worker is gone: a VM that could
+    /// not be built says so in its outcome ([`Outcome::Startup`]); any other
+    /// loss is the bridge's.
+    fn gone(&mut self, gone: Gone) -> Result<(Outcome, Vec<u8>, Vec<u8>), Fatal> {
+        match (gone, self.host.payload()) {
+            (Gone::Failed, Some(cell)) => Ok((cell.outcome, Vec::new(), Vec::new())),
+            _ => Err(Fatal),
         }
     }
 
     /// Stop the worker and join it, so the task's last thread is thread 0.
-    /// Joins only a worker that acknowledged `QUIT` (or is already gone):
+    /// Joins only a worker that acknowledged the quit (or is already gone):
     /// a worker mid-evaluation is parked on the bridge and would never
     /// return, so it is left to task teardown rather than waited on.
-    pub async fn quit(mut self) {
-        match CELL.state.load(Ordering::Acquire) {
-            EVAL_DONE => {
-                CELL.state.store(QUIT, Ordering::Release);
-                let _ = self.worker.kick();
-                loop {
-                    match CELL.state.load(Ordering::Acquire) {
-                        WORKER_GONE => break,
-                        state => {
-                            if self.park_until_kicked(state).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            WORKER_GONE => {}
-            _ => return,
-        }
-        let _ = self.worker.join();
+    pub async fn quit(self) {
+        let _ = self.host.quit().await;
     }
 }
 
-/// Answer the host call the cell holds.  CALL_POSTED — thread 0 owns the
-/// cell for the whole call.  One dispatcher: a new standard-library verb
-/// is an arm here and nothing about the transport changes.
-async fn serve_call<E: Extension>(services: &mut Services<'_, '_>, extension: &mut E) {
-    // SAFETY: CALL_POSTED.
-    let op = unsafe { payload() }.op;
-    if op == OP_REQUIRE {
-        serve_require(services, E::POLICY).await;
+/// Answer the host call the cell holds; thread 0 holds the cell for the
+/// whole call.  One dispatcher: a new standard-library verb is an arm here
+/// and nothing about the transport changes.
+async fn serve_call<E: Extension>(
+    services: &mut Services<'_, '_>,
+    extension: &mut E,
+    cell: &mut Payload,
+) {
+    if cell.op == OP_REQUIRE {
+        serve_require(services, cell, E::POLICY).await;
     } else {
-        serve_value(services, extension, op, E::POLICY).await;
+        serve_value(services, extension, cell, E::POLICY).await;
     }
 }
 
-/// Answer the `require` the cell holds: read the source, or link the
-/// native module and look its opener up.
-async fn serve_require(services: &mut Services<'_, '_>, policy: Policy) {
-    let (name, len) = {
-        // SAFETY: CALL_POSTED.
-        let cell = unsafe { payload() };
-        (cell.name, cell.name_len)
-    };
-    let reply = resolve(services, &name[..len.min(FS_NAME_BYTES)], policy).await;
-    // SAFETY: CALL_POSTED.
-    let cell = unsafe { payload() };
-    match reply {
+/// Answer a `require`: read the source, or link the native module and
+/// look its opener up.
+async fn serve_require(services: &mut Services<'_, '_>, cell: &mut Payload, policy: Policy) {
+    let len = cell.name_len.min(FS_NAME_BYTES);
+    match resolve(services, &cell.name[..len], policy).await {
         Reply::Source(source) => {
             cell.reply = REPLY_SOURCE;
             cell.source = source;
@@ -964,37 +849,35 @@ async fn serve_require(services: &mut Services<'_, '_>, policy: Policy) {
 async fn serve_value<E: Extension>(
     services: &mut Services<'_, '_>,
     extension: &mut E,
-    op: u32,
+    cell: &mut Payload,
     policy: Policy,
 ) {
+    let op = cell.op;
     if policy.is_restricted()
         && !matches!(
             op,
             OP_FS_READ_FILE | OP_FS_STAT | OP_FS_LIST | OP_FS_ENTRIES | OP_FS_RIGHTS
         )
     {
-        return finish_answer(Answer::Unavailable(alloc::string::String::from(
-            "host operation unavailable to read-only worker",
-        )));
+        return finish_answer(
+            cell,
+            Answer::Unavailable(alloc::string::String::from(
+                "host operation unavailable to read-only worker",
+            )),
+        );
     }
-    let args = {
-        // SAFETY: CALL_POSTED.
-        unsafe { payload() }.args
-    };
+    let args = cell.args;
     // The call's byte argument, borrowed from the Lua frame the parked
     // worker is holding open.  Read here, once, so no arm below repeats
     // the reasoning about why this pointer is live.
     //
-    // SAFETY: CALL_POSTED — thread 0 owns the cell, and the worker set
-    // this window from a Lua value on its own stack before parking.  It
-    // stays parked, and so the value stays rooted, until CALL_SERVED.
-    let input: &[u8] = unsafe {
-        let cell = payload();
-        if cell.input.is_null() || cell.input_len == 0 {
-            &[]
-        } else {
-            core::slice::from_raw_parts(cell.input, cell.input_len)
-        }
+    // SAFETY: the worker set this window from a Lua value on its own stack
+    // before it called, and it stays parked inside the call, so the value
+    // stays rooted, until the call is answered.
+    let input: &[u8] = if cell.input.is_null() || cell.input_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(cell.input, cell.input_len) }
     };
     // The contiguous block, plus the one verb numbered past `os.exit`.
     if (OP_FS_OPEN..=OP_FS_LIST).contains(&op)
@@ -1004,7 +887,7 @@ async fn serve_value<E: Extension>(
         )
     {
         let answer = serve_fs(services, op, args, input, policy).await;
-        return finish_answer(answer);
+        return finish_answer(cell, answer);
     }
     let answer = match op {
         // The executor's own timer — the one verb `kore.time` cannot serve
@@ -1017,7 +900,7 @@ async fn serve_value<E: Extension>(
         // with none, so an empty answer is the honest one, not a refusal.
         OP_PROC_ARGS => {
             let launch = services.args.clone();
-            return finish(STATUS_OK, [0; 2], launch);
+            return finish(cell, STATUS_OK, [0; 2], launch);
         }
         // Recorded, not acted on: the raise that follows this call is what
         // unwinds the evaluation, running every `<close>` on the way out.
@@ -1030,17 +913,17 @@ async fn serve_value<E: Extension>(
         op if op >= OP_EMBEDDER_BASE => extension.serve(op, args).await,
         _ => Answer::Unavailable(alloc::string::String::from("unknown host call")),
     };
-    finish_answer(answer)
+    finish_answer(cell, answer)
 }
 
 /// Write one [`Answer`] back into the cell.  Every op ends here, so the
 /// three shapes a script sees are decided in exactly one place.
-fn finish_answer(answer: Answer) {
+fn finish_answer(cell: &mut Payload, answer: Answer) {
     match answer {
-        Answer::Value(result, result2) => finish(STATUS_OK, [result, result2], Vec::new()),
-        Answer::Bytes(count, bytes) => finish(STATUS_OK, [count, bytes.len() as u64], bytes),
-        Answer::Refused(text) => finish(STATUS_REFUSED, [0; 2], text.into_bytes()),
-        Answer::Unavailable(text) => finish(STATUS_UNAVAILABLE, [0; 2], text.into_bytes()),
+        Answer::Value(result, result2) => finish(cell, STATUS_OK, [result, result2], Vec::new()),
+        Answer::Bytes(count, bytes) => finish(cell, STATUS_OK, [count, bytes.len() as u64], bytes),
+        Answer::Refused(text) => finish(cell, STATUS_REFUSED, [0; 2], text.into_bytes()),
+        Answer::Unavailable(text) => finish(cell, STATUS_UNAVAILABLE, [0; 2], text.into_bytes()),
     }
 }
 
@@ -1104,9 +987,7 @@ async fn serve_fs(
 
 /// Write one value-op outcome back into the cell.  Every op answers the
 /// same three things, so every arm ends here.
-fn finish(status: c_int, results: [u64; 2], text: Vec<u8>) {
-    // SAFETY: CALL_POSTED.
-    let cell = unsafe { payload() };
+fn finish(cell: &mut Payload, status: c_int, results: [u64; 2], text: Vec<u8>) {
     cell.status = status;
     cell.results = results;
     cell.text = text;

@@ -280,8 +280,9 @@ impl Policy {
 /// interfaces.
 ///
 /// Selection is by type instantiation, not runtime dispatch: `Host::start`
-/// is generic over `E`, so `LIBRARIES` reaches the worker thread as
-/// monomorphized static data with no global to publish it.
+/// is generic over `E`, so `LIBRARIES` and `POLICY` are monomorphized static
+/// data the host hands the worker thread in its first work item, with no
+/// global to publish them.
 ///
 /// There is deliberately **no `'static` bound**. The worker thread reads
 /// only [`Extension::LIBRARIES`], which is `&'static` in its own right;
