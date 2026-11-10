@@ -81,11 +81,14 @@ the headers, which `kore-c` publishes to that crate's build script as
 - `kore_fs_run(step, user, &error)` (`kore/program.h`), which runs a
   `KoreFsStep` program as the program's filesystem session.
 
-The host is the shape `kore-lua`'s VM bridge has. `main` runs on a main
-thread, a `DoorbellWorker` with a 1 MiB guarded stack
-(`KORE_MAIN_STACK_BYTES`). Thread 0 is the process owner, and keeps the
-executor and the launch's service faces. The two share one request cell and
-one word. Every park is a doorbell park; nothing spins.
+The host is the shape `kore-lua`'s VM and Kore's `tcc` have, and speaks
+the same seam, kore-rt's `bridge`. `main` runs on a main thread, the
+bridge's worker, with a 1 MiB guarded stack (`KORE_MAIN_STACK_BYTES`).
+Thread 0 is the process owner, and keeps the executor and the launch's
+service faces. The two share one request cell and one word, whose states,
+ordering and hand-over are the bridge's. Every park is a doorbell park;
+nothing spins, and a main thread that panics or cannot park is reported to
+the host rather than waited for.
 
 - **Filesystem.** `kore_fs_run` from the main thread posts the session and
   waits. The host attaches the launch's filesystem face on first use, rooted
