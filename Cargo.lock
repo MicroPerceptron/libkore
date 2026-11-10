@@ -803,6 +803,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-c"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "kore-ffi",
+ "kore-std",
+]
+
+[[package]]
 name = "kore-collections"
 version = "0.1.0"
 

@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Link libkore.so for every Kore ISA and check the image a C program binds.
+
+The library is what an independent C program on Kore links with -lkore, so the
+checks are the ones its loader and its consumers rely on:
+
+- a shared object with no entry point: Kore's image gate classifies a module by
+  its entry, and a library must never register as a program;
+- the soname consumers record, nothing it needs, nothing left undefined;
+- static initial-exec TLS only (Kore's startup linker resolves no dynamic TLS);
+- exactly the declared ABI exported: every function kore.h and kore/program.h
+  declare, the C names kore/stdlib.h and kore/pthread.h alias, and the C
+  library's two lifecycle entry points; no other symbol.
+"""
+import argparse
+import os
+from pathlib import Path
+import re
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[1]
+ARCHES = ('x86_64', 'aarch64', 'riscv64gc')
+HEADERS = ('extern/c/include/kore.h', 'extern/c/include/kore/program.h')
+# kore-ffi's `c-stdlib` names: allocation, the pthread lifecycle, and the
+# compiler ABI's thread-exit destructor hooks.
+C_STDLIB = {'malloc', 'calloc', 'realloc', 'free', 'pthread_create', 'pthread_join',
+            'pthread_detach', 'pthread_cancel', 'pthread_key_create', 'pthread_key_delete',
+            'pthread_setspecific', 'pthread_getspecific', 'pthread_setcancelstate',
+            'pthread_setcanceltype', 'pthread_testcancel', 'pthread_exit',
+            '__cxa_thread_atexit', '__cxa_thread_atexit_impl'}
+# The C library's start and exit call these when a program links libkore.
+LIFECYCLE = {'__kore_program_start', '__kore_program_exit'}
+DYNAMIC_TLS = re.compile(r'TLSDESC|DTPMOD|DTPOFF|TLSGD|TLSLD|TLS_DTP')
+
+
+def readelf(*args):
+    return subprocess.check_output([os.environ.get('LLVM_READELF', 'llvm-readelf'), '-W', *args],
+                                   text=True)
+
+
+def declared():
+    names = set()
+    for header in HEADERS:
+        names |= set(re.findall(r'\b(kore_[a-z][a-z0-9_]*)\s*\(', (ROOT / header).read_text()))
+    if not names:
+        raise SystemExit('no foreign functions found in the generated headers')
+    return names
+
+
+def check(arch, expected):
+    subprocess.run([
+        'cargo', 'build', '--locked', '-p', 'kore-c', '--release',
+        '--target', f'targets/{arch}-unknown-kore-user.json',
+        '-Z', 'build-std=core,alloc,compiler_builtins',
+        '-Z', 'build-std-features=compiler-builtins-mem',
+    ], cwd=ROOT, check=True)
+    image = ROOT / f'target/{arch}-unknown-kore-user/release/libkore.so'
+    header = readelf('--file-header', str(image))
+    if not re.search(r'Type:\s+DYN', header):
+        raise SystemExit(f'{arch}: libkore.so is not a shared object')
+    if not re.search(r'Entry point address:\s+0x0\b', header):
+        raise SystemExit(f'{arch}: libkore.so has an entry point; it would register as a program')
+    dynamic = readelf('--dynamic', str(image))
+    if 'Library soname: [libkore.so]' not in dynamic:
+        raise SystemExit(f'{arch}: libkore.so does not carry its soname')
+    if needed := re.findall(r'\(NEEDED\)\s+Shared library: \[([^\]]+)\]', dynamic):
+        raise SystemExit(f'{arch}: libkore.so needs other libraries: {needed}')
+    exported, undefined = set(), set()
+    for line in readelf('--dyn-syms', str(image)).splitlines():
+        fields = line.split()
+        if len(fields) < 8 or not fields[0].rstrip(':').isdigit():
+            continue
+        kind, binding, section, name = fields[3], fields[4], fields[6], fields[7]
+        if section == 'UND':
+            if name:
+                undefined.add(name)
+        elif binding in ('GLOBAL', 'WEAK') and kind in ('FUNC', 'OBJECT', 'TLS'):
+            exported.add(name.split('@')[0])
+    if undefined:
+        raise SystemExit(f'{arch}: undefined symbols: {sorted(undefined)}')
+    if missing := expected - exported:
+        raise SystemExit(f'{arch}: declared but not exported: {sorted(missing)}')
+    if extra := exported - expected:
+        raise SystemExit(f'{arch}: exported outside the declared ABI: {sorted(extra)}')
+    relocations = readelf('--relocations', str(image))
+    if found := sorted(set(DYNAMIC_TLS.findall(relocations))):
+        raise SystemExit(f'{arch}: dynamic TLS relocations {found}; static initial-exec TLS required')
+    print(f'libkore.so: {arch}: {len(exported)} exported symbols, the declared ABI exactly', flush=True)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--arch', choices=ARCHES)
+    args = parser.parse_args()
+    expected = declared() | C_STDLIB | LIFECYCLE
+    for arch in [args.arch] if args.arch else ARCHES:
+        check(arch, expected)

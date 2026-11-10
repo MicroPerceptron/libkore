@@ -17,7 +17,7 @@ check:
 	python3 tools/check-native.py
 
 fmt:
-	cargo fmt -p kore-std -p libkore-consumer -p kore-ffi -p kore-entry -p kore-wasi -p kore-lua -p kore-host --check
+	cargo fmt -p kore-std -p libkore-consumer -p kore-ffi -p kore-c -p kore-entry -p kore-wasi -p kore-lua -p kore-host --check
 	$(ZIG) fmt --check build.zig build.zig.zon crates/ffi/tests/consumer.zig extern/zig/src/root.zig extern/zig/src/allocator.zig
 
 docs:
@@ -30,7 +30,9 @@ owners:
 	python3 tools/check-owners.py < target/owners.json
 
 # Actual Kore user targets, including its hardware-float x86 ABI. A stock
-# x86_64-unknown-none check alone cannot certify this interface.  `kore-lua`
+# x86_64-unknown-none check alone cannot certify this interface. `kore-c` is
+# linked rather than checked (`tools/check-program.py`): `libkore.so`'s
+# exported ABI, soname and TLS model are properties of the linked image.  `kore-lua`
 # is here because its engine exists only on these targets — its host build
 # carries the logic and none of the C — so a Kore-only regression in the
 # amalgamation would otherwise reach a keytest before it reached a
@@ -46,6 +48,7 @@ cross:
 	    -Z build-std-features=compiler-builtins-mem; \
 	done
 	python3 tools/check-alloc-symbols.py
+	python3 tools/check-program.py
 	python3 tools/check-entry.py
 
 # kore-host drives real image files under POSIX record locks, which Miri does

@@ -487,7 +487,7 @@ pub unsafe extern "C" fn pthread_setcanceltype(kind: i32, old: *mut i32) -> i32 
 /// Same contract as kore_thread_testcancel.
 #[cfg(all(feature = "c-stdlib", target_os = "none"))]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_testcancel() -> () {
+pub unsafe extern "C" fn pthread_testcancel() {
     unsafe { crate::kore_thread_testcancel() }
 }
 

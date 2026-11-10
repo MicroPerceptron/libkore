@@ -1,0 +1,22 @@
+[package]
+name = "kore-c"
+version = "0.1.0-alpha.1"
+edition = "2024"
+publish = false
+description = "libkore.so: the C ABI as a shared object, and the host of an independent C program on Kore"
+build = "build.rs"
+
+# One artifact on a Kore target: `libkore.so` (dll prefix "lib" + lib name
+# "kore"), which a C program links with `-lkore`. Its consumers bind it
+# dynamically, so the system holds one copy however many programs run.
+[lib]
+name = "kore"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Named `kore-std` here: this crate's own artifact is `kore`.
+kore-std = { package = "kore-std", path = "../..", features = ["heap", "fs"] }
+# The C ABI itself, with the standard C allocation and thread names a C
+# program calls (`malloc`, `pthread_create`, ...) exported as real symbols.
+kore-ffi = { path = "../ffi", features = ["c-stdlib"] }

@@ -25,6 +25,21 @@ pub enum RunError {
     Cleanup(Refusal),
 }
 
+impl RunError {
+    /// What a foreign caller reads for a failed run, in the submission-status
+    /// vocabulary: `Quarantined` for an owner that may never run again, and
+    /// `Refused` with the refused close's error, whose view the owner kept.
+    pub fn foreign(&self) -> (KoreStatus, KoreFsError) {
+        match self {
+            Self::Quarantined => (KoreStatus::Quarantined, KoreFsError::None),
+            Self::Cleanup(Refusal::Fs(error)) => (KoreStatus::Refused, classify(*error)),
+            // A close answers in the filesystem's vocabulary or quarantines;
+            // no other refusal reaches cleanup.
+            Self::Cleanup(_) => (KoreStatus::Refused, KoreFsError::Unknown),
+        }
+    }
+}
+
 impl<'w, 't> Session<'w, 't> {
     /// Consume the real native face. Identifier exhaustion returns it unchanged.
     /// Close any previously opened external views before handing off this face:
