@@ -52,10 +52,12 @@ cross:
 	python3 tools/check-entry.py
 
 # kore-host drives real image files under POSIX record locks, which Miri does
-# not model; `make test` exercises its procedure.
+# not model; `make test` exercises its procedure. kore-rt's `bridge` suite runs
+# the worker/host state machine on real threads, so Miri checks every hand-over
+# of the cell the Lua VM and a C program's host share with thread 0.
 miri:
 	cargo miri test --locked --workspace --all-features --exclude kore-wasi --exclude kore-host
-	cargo miri test --locked --manifest-path native/Cargo.toml -p kore-rt erased_poll_and_drop
+	cargo miri test --locked --manifest-path native/Cargo.toml -p kore-rt -- erased_poll_and_drop bridge::
 
 native-check:
 	python3 tools/check-native.py
