@@ -38,8 +38,10 @@
 //! all: `kore.time.now` reads the clock page and `kore.random` draws from
 //! the CPU, both directly on the VM thread.  Buffers cross the boundary as
 //! owned `Vec`s — the heap frees a block from any thread onto its owning
-//! shard's remote list — or as borrows the owner keeps alive across the
-//! whole item (the eval's script) or call (a write's bytes).
+//! shard's remote list — or as a borrow the worker keeps alive across the
+//! whole call (a write's bytes).  The eval's script is the item's own copy,
+//! never a borrow of thread 0's frame: an `eval` future may be dropped
+//! mid-evaluation, and the VM thread would go on reading it.
 //!
 //! Resolution: a source module `<name>.lua` from `SOURCE_SEARCH` — the
 //! task's own tree, then `libs/` — wins over a native `<name>.so`, which
@@ -174,7 +176,8 @@ pub enum Outcome {
     Exited,
     /// REPL only: the chunk needs a continuation line.
     Incomplete,
-    /// REPL only: the expression buffer could not be allocated.
+    /// An evaluation's buffer could not be allocated: the REPL's expression
+    /// buffer, or the copy of the script the evaluation owns.
     ResourceRefused,
     /// The worker could not construct a VM.
     Startup,
@@ -191,10 +194,11 @@ pub struct Payload {
     // the embedder's monomorphized libraries and policy.
     libraries: &'static [Library],
     policy: Policy,
-    // thread 0 → worker: the evaluation.
+    // thread 0 → worker: the evaluation.  `script` is the item's own copy,
+    // in a buffer reused from one evaluation to the next; the worker takes
+    // it for the evaluation and hands it back with the results.
     kind: u32,
-    script: *const u8,
-    script_len: usize,
+    script: Vec<u8>,
     chunk_name: *const u8,
     chunk_name_len: usize,
     // worker → thread 0: its result.
@@ -232,18 +236,16 @@ pub struct Payload {
 }
 
 // SAFETY: the pointers cross under the bridge's hand-over and stay alive
-// while the other side reads them: the script and chunk name in thread 0's
-// frame until the evaluation settles, a call's input in the Lua frame of the
-// parked worker until the call is answered, and `error` names a `'static`
-// string.
+// while the other side reads them: the chunk name is a `'static` literal, a
+// call's input lives in the Lua frame of the parked worker until the call is
+// answered, and `error` names a `'static` string.
 unsafe impl Send for Payload {}
 
 static BRIDGE: Bridge<Payload> = Bridge::new(Payload {
     libraries: &[],
     policy: Policy::INTERACTIVE,
     kind: KIND_CHUNK,
-    script: core::ptr::null(),
-    script_len: 0,
+    script: Vec::new(),
     chunk_name: core::ptr::null(),
     chunk_name_len: 0,
     outcome: Outcome::Ok,
@@ -290,8 +292,10 @@ impl Engine for Interpreter {
         // The VM is built: the first item, done.
         first.finish(|_| ());
         while let Ok(Next::Work(mut work)) = BRIDGE.next() {
-            let (outcome, stdout, stderr) = run_eval(&mut vm, &mut work);
+            let (outcome, script, stdout, stderr) = run_eval(&mut vm, &mut work);
             work.finish(|cell| {
+                // The buffer goes back for the next evaluation to reuse.
+                cell.script = script;
                 cell.outcome = outcome;
                 cell.stdout = stdout;
                 cell.stderr = stderr;
@@ -303,25 +307,21 @@ impl Engine for Interpreter {
     }
 }
 
-fn run_eval(vm: &mut Vm, work: &mut Work<Payload>) -> (Outcome, Vec<u8>, Vec<u8>) {
-    let (kind, script, script_len, chunk_name, chunk_name_len) = work.with(|cell| {
+/// Evaluate the item: the outcome, the script's buffer (to hand back), and
+/// the output.
+fn run_eval(vm: &mut Vm, work: &mut Work<Payload>) -> (Outcome, Vec<u8>, Vec<u8>, Vec<u8>) {
+    // The script is taken, not borrowed: the worker owns it for the whole
+    // evaluation, so nothing thread 0 does with the cell can reach it.
+    let (kind, script, chunk_name, chunk_name_len) = work.with(|cell| {
         (
             cell.kind,
-            cell.script,
-            cell.script_len,
+            core::mem::take(&mut cell.script),
             cell.chunk_name,
             cell.chunk_name_len,
         )
     });
-    // SAFETY: thread 0 keeps the script and chunk name alive until the
-    // evaluation settles.
-    let script = if script.is_null() {
-        &[][..]
-    } else {
-        unsafe { core::slice::from_raw_parts(script, script_len) }
-    };
     let outcome = match kind {
-        KIND_REPL => match vm.eval_repl(script) {
+        KIND_REPL => match vm.eval_repl(&script) {
             ReplResult::Complete(true) => Outcome::Ok,
             ReplResult::Complete(false) => Outcome::Failed,
             ReplResult::CompileFailed => Outcome::CompileFailed,
@@ -335,7 +335,7 @@ fn run_eval(vm: &mut Vm, work: &mut Work<Payload>) -> (Outcome, Vec<u8>, Vec<u8>
             // dangling-null case `from_raw_parts` forbids.
             let name: &'static [u8] =
                 unsafe { core::slice::from_raw_parts(chunk_name, chunk_name_len) };
-            match vm.eval(script, name) {
+            match vm.eval(&script, name) {
                 EvalResult::Ok => Outcome::Ok,
                 EvalResult::CompileFailed => Outcome::CompileFailed,
                 EvalResult::Failed => Outcome::Failed,
@@ -344,7 +344,7 @@ fn run_eval(vm: &mut Vm, work: &mut Work<Payload>) -> (Outcome, Vec<u8>, Vec<u8>
             }
         }
     };
-    (outcome, vm.take_stdout(), vm.take_stderr())
+    (outcome, script, vm.take_stdout(), vm.take_stderr())
 }
 
 /// What a refused host call tells the script.
@@ -736,6 +736,13 @@ impl<'t> Host<'t> {
     /// every call it makes on the way.  `chunk_name` is Lua's chunk
     /// name (NUL-terminated, static); `repl` selects the REPL's
     /// expression-then-statement grammar.
+    ///
+    /// The evaluation runs on a copy of `script`, so this future may be
+    /// dropped at any await: the VM thread is not interrupted, and it reads
+    /// nothing of the caller's.  The next `eval` then first finishes the
+    /// abandoned evaluation, serving its remaining calls and discarding its
+    /// output, before it posts its own.  [`Outcome::ResourceRefused`] when the
+    /// heap cannot hold the copy; nothing is posted then.
     pub async fn eval<E: Extension>(
         &mut self,
         services: &mut Services<'_, '_>,
@@ -754,11 +761,23 @@ impl<'t> Host<'t> {
         if let Settled::Gone(gone) = settled {
             return self.gone(gone);
         }
+        // The evaluation owns its script: it is copied into the cell, never
+        // lent from this frame, because this future may be dropped
+        // mid-evaluation (a `select`, a deadline) while the VM thread goes on
+        // reading it.  One bounded copy into the buffer the previous
+        // evaluation handed back; a script the heap cannot hold a copy of is
+        // refused before anything is posted.
+        {
+            let cell = self.host.payload().ok_or(Fatal)?;
+            cell.script.clear();
+            if cell.script.try_reserve(script.len()).is_err() {
+                return Ok((Outcome::ResourceRefused, Vec::new(), Vec::new()));
+            }
+            cell.script.extend_from_slice(script);
+        }
         self.host
             .post(|cell| {
                 cell.kind = if repl { KIND_REPL } else { KIND_CHUNK };
-                cell.script = script.as_ptr();
-                cell.script_len = script.len();
                 cell.chunk_name = chunk_name.as_ptr();
                 cell.chunk_name_len = chunk_name.len();
             })
@@ -771,9 +790,6 @@ impl<'t> Host<'t> {
         match settled {
             Settled::Idle => {
                 let cell = self.host.payload().ok_or(Fatal)?;
-                // The script pointer is dead from here: its frame is ours.
-                cell.script = core::ptr::null();
-                cell.script_len = 0;
                 Ok((
                     cell.outcome,
                     core::mem::take(&mut cell.stdout),
