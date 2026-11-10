@@ -310,9 +310,14 @@ impl Founded {
         let rt = entry::thread_context()?;
         let doorbell = rt.doorbell()?;
         HOSTED.store(true, Ordering::Release);
+        // A mint grant of its own: the first `pthread_create` on the main
+        // thread starts kore-rt's thread controller there, which mints the
+        // doorbells its threads park on (`thread_controller`). Without one the
+        // controller still runs, taking the deadline park.
+        let grant = thread::channel_space_endowment();
         match thread::spawn_with_doorbell_on(
             main_thread,
-            &[],
+            grant.as_slice(),
             WorkerStack::Bytes(crate::api::KORE_MAIN_STACK_BYTES),
         ) {
             Some(worker) => Some(Self {

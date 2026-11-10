@@ -15,6 +15,12 @@ pub const KORE_THREAD_CANCEL_ENABLE: i32 = 0;
 pub const KORE_THREAD_CANCEL_DISABLE: i32 = 1;
 pub const KORE_THREAD_CANCEL_DEFERRED: i32 = 0;
 pub const KORE_THREAD_CANCEL_ASYNCHRONOUS: i32 = 1;
+/// How long one park lasts at a cancellation point that waits: a request is
+/// a flag no wake carries, so a cancellable wait re-checks it this often.
+/// One millisecond is the cadence the native runtime parks an unreachable
+/// waiter at (`kore-rt`'s `pace::CEDE_NS`): a cancellation is acted on within
+/// one, and an idle cancellable waiter wakes no more often than that.
+pub(crate) const CANCEL_SLICE_NS: u64 = 1_000_000;
 pub type KoreThreadKey = u64;
 pub type KoreThreadDestructor = Option<unsafe extern "C" fn(*mut c_void)>;
 
