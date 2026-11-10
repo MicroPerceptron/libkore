@@ -629,16 +629,11 @@ pub(crate) fn heap_endowment() -> Option<WorkerCap> {
     Some(WorkerCap::heap(rt.bootstrap().handle(role::HEAP, 0)?))
 }
 
-/// Off metal no thread founds another; there is no heap to endow.
-#[cfg(not(target_os = "none"))]
-pub(crate) fn heap_endowment() -> Option<WorkerCap> {
-    None
-}
-
 /// The rights of a wake send a thread may pass on: the notice itself
 /// (`ACCESS`, [`verbs::NOTICE_RIGHTS`](crate::cap::verbs::NOTICE_RIGHTS)) and
 /// `DERIVE`, so the thread can found children holding the same end. A send
 /// into a wake channel conveys nothing but the right to kick it.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
 pub(crate) const WAKE_SEND_RIGHTS: kore_abi::cap::Rights =
     kore_abi::cap::Rights::ACCESS.union(kore_abi::cap::Rights::DERIVE);
 
@@ -674,10 +669,66 @@ pub(crate) fn wake_endowment() -> Option<WorkerCap> {
     })
 }
 
-/// Off metal no thread founds another; there is no wake to inherit.
+impl WorkerCap {
+    /// **Channel space, endowed** — `role::CHANNEL_SPACE@0`: a revocable
+    /// child of the mint grant `space`, so the thread can mint the channels
+    /// that wake the threads *it* founds (a `DoorbellWorker` of its own, or
+    /// the [`thread_controller`](crate::thread_controller) a C program's
+    /// `pthread_create` starts on its main thread). The parent keeps its
+    /// grant; revoking it ends the child's.
+    pub fn channel_space(space: SlotRef) -> Self {
+        use kore_abi::cap::ResourceKind;
+        Self {
+            role: role::CHANNEL_SPACE,
+            index: 0,
+            subject: space,
+            kind: ResourceKind::ChannelSpace as u16 as u8,
+            rights: crate::cap::CHANNEL_SPACE_RIGHTS,
+        }
+    }
+}
+
+/// [`WorkerCap::channel_space`] over this thread's own `role::CHANNEL_SPACE@0`
+/// — `None` when it holds no mint grant.
+#[cfg(target_os = "none")]
+pub fn channel_space_endowment() -> Option<WorkerCap> {
+    let rt = crate::entry::thread_context()?;
+    Some(WorkerCap::channel_space(
+        rt.bootstrap().handle(role::CHANNEL_SPACE, 0)?,
+    ))
+}
+
+/// Off metal no thread founds another.
 #[cfg(not(target_os = "none"))]
-pub(crate) fn wake_endowment() -> Option<WorkerCap> {
+pub fn channel_space_endowment() -> Option<WorkerCap> {
     None
+}
+
+/// This thread's **own kick**: a send into its own doorbell it may derive
+/// from, as a slot — `DOORBELL@`[`OWN_KICK`](crate::futex::OWN_KICK), or for
+/// thread 0 the founder-carved self-kick at `DOORBELL@PEER_BASE`.
+///
+/// `None` when it holds none, or one it may not derive from: the authority a
+/// thread hands a peer so the peer can wake it must itself be derivable. The
+/// arena record decides, as for [`wake_endowment`].
+#[cfg(target_os = "none")]
+pub(crate) fn own_kick() -> Option<SlotRef> {
+    use kore_abi::cap::{CapRecord, ResourceKind};
+    let rt = crate::entry::thread_context()?;
+    let boot = rt.bootstrap();
+    let send = boot
+        .handle(role::DOORBELL, crate::futex::OWN_KICK)
+        .or_else(|| {
+            (crate::entry::geometry::shard_index() == Some(0))
+                .then(|| boot.handle(role::DOORBELL, crate::futex::PEER_BASE))
+                .flatten()
+        })?;
+    let record_va = crate::entry::geometry::slot_record_va(send)?;
+    // SAFETY: the slot alias is this thread's kernel-authored, read-only view
+    // of its own arena record for a slot its boot block names.
+    let record = unsafe { core::ptr::read_volatile(record_va as *const CapRecord) };
+    (record.kind == ResourceKind::ChanSend as u16 && record.rights.contains(WAKE_SEND_RIGHTS))
+        .then_some(send)
 }
 
 /// Build exactly the capability namespace a spawned worker receives.
@@ -787,7 +838,9 @@ pub enum WorkerStack {
 /// doorbell (its recv; the parent keeps the send that kicks it) and a
 /// **wake** channel the other way (the worker holds the send at
 /// `DOORBELL@PEER_BASE`; the parent parks on the recv) — plus a heap
-/// position over the task's supply so it may allocate.
+/// position over the task's supply so it may allocate, and the worker's
+/// own kick, a derivable send into its doorbell it can hand a thread it
+/// founds.
 ///
 /// The wake channel exists because a launched task holds no self-kick:
 /// the founder carves `DOORBELL@2` for service rows that declare workers,
@@ -896,9 +949,9 @@ pub fn kick_parent() -> bool {
 }
 
 /// Spawn `entry` on a worker founded holding its own doorbell, a send
-/// into thread 0's doorbell, a heap position, and `extra`.  `None` when
-/// the task holds no `CHANNEL_SPACE` (its profile lacks `channels`), the
-/// mint or a derive refuses, or [`spawn_with`] does.
+/// into thread 0's doorbell, its own kick ([`own_kick`]), a heap position,
+/// and `extra`.  `None` when the task holds no `CHANNEL_SPACE` (its profile
+/// lacks `channels`), the mint or a derive refuses, or [`spawn_with`] does.
 #[cfg(target_os = "none")]
 pub fn spawn_with_doorbell(entry: fn(), extra: &[WorkerCap]) -> Option<DoorbellWorker> {
     spawn_with_doorbell_on(entry, extra, WorkerStack::Band)
@@ -947,7 +1000,8 @@ pub fn spawn_with_doorbell_on(
         kind: 0,
         rights: Rights::empty(),
     }; MAX_WORKER_CAPS];
-    if 3 + extra.len() > caps.len() {
+    const OWN: usize = 4;
+    if OWN + extra.len() > caps.len() {
         let _ = pair.send.try_retire();
         let _ = pair.root.try_retire();
         let _ = wake.send.try_retire();
@@ -972,9 +1026,19 @@ pub fn spawn_with_doorbell_on(
         kind: ResourceKind::ChanSend as u16 as u8,
         rights: WAKE_SEND_RIGHTS,
     };
-    caps[2] = heap;
-    caps[3..3 + extra.len()].copy_from_slice(extra);
-    let Some(thread) = spawn_entry(ThreadEntry::Plain(entry), &caps[..3 + extra.len()], stack)
+    // The worker's own kick ([`own_kick`]): a derivable send into its own
+    // doorbell, so a thread it founds — the controller its `pthread_create`
+    // starts — can be handed the means to wake it.
+    caps[2] = WorkerCap {
+        role: role::DOORBELL,
+        index: crate::futex::OWN_KICK,
+        subject: pair.root.slot(),
+        kind: ResourceKind::ChanSend as u16 as u8,
+        rights: WAKE_SEND_RIGHTS,
+    };
+    caps[3] = heap;
+    caps[OWN..OWN + extra.len()].copy_from_slice(extra);
+    let Some(thread) = spawn_entry(ThreadEntry::Plain(entry), &caps[..OWN + extra.len()], stack)
     else {
         let _ = pair.send.try_retire();
         let _ = pair.root.try_retire();
@@ -1933,6 +1997,13 @@ pub fn exit(code: ExitCode) -> ! {
     let Some(rt) = crate::entry::thread_context() else {
         crate::entry::refuse();
     };
+    // A thread whose end is awaited announces it first ([`on_exit`]): every
+    // way a thread ends that runs code — its entry returning, a panic, an
+    // explicit exit — comes through here. Taken, so a hook that itself ends
+    // the thread runs once.
+    if let Some((call, argument)) = crate::entry::geometry::take_exit_hook() {
+        call(argument);
+    }
     let Some(slot) = rt.bootstrap().handle(role::SELF, 0) else {
         crate::entry::refuse();
     };
@@ -1956,6 +2027,22 @@ pub fn exit(code: ExitCode) -> ! {
 #[cfg(not(target_os = "none"))]
 pub fn exit(_code: ExitCode) -> ! {
     crate::entry::refuse()
+}
+
+/// Have this thread's [`exit`] run `call(argument)` first, on this thread,
+/// before the exit commits — how the thread that reaps it learns it is
+/// ending without polling for it (the
+/// [`thread_controller`](crate::thread_controller)'s children). The last hook
+/// set stands. `call` runs after the thread's own code, so it must not block,
+/// and must not end the thread itself.
+///
+/// The kernel's exit commits after the hook returns, so a reaper woken by
+/// the hook can still find the thread live for a moment; it parks on the
+/// thread's end for that moment (`futex::wait_or_end`), which no store could
+/// announce.
+#[cfg(target_os = "none")]
+pub(crate) fn on_exit(call: fn(usize), argument: usize) {
+    crate::entry::geometry::set_exit_hook(call, argument);
 }
 
 /// One caller-owned report landing reserved for a complete worker-join fold.
@@ -2291,6 +2378,19 @@ fn join_park(
             TaskWaitStep::Complete(outcome) => return Ok(outcome),
         }
     }
+}
+
+/// [`Thread::poll`] through a landing reserved for it: a repeat observer —
+/// the [`thread_controller`](crate::thread_controller), between a child's
+/// announced end and its reap — probes without spending an arena slot each
+/// time, and so without the one refusal that is about the observer rather
+/// than the thread.
+#[cfg(target_os = "none")]
+pub(crate) fn poll_reserved(
+    thread: &Thread,
+    scratch: &JoinScratch,
+) -> Result<crate::cap::TaskPollOutcome, crate::cap::TaskWaitError> {
+    poll_task_handle_in(&TrapTransport::new(), thread.handle, scratch.report)
 }
 
 /// Issue one unflagged join probe.  `WouldBlock` is the one positive live-task
