@@ -48,7 +48,8 @@ mod recyclable;
 mod serve;
 
 pub use client::{
-    AffineBundleCallError, CallError, CallReply, ClientEndpoints, GrantPin, InvocationAuxiliary,
+    AffineBundleCallError, CallError, CallReply, ClientEndpoints, ContextBundleCallError, GrantPin,
+    InvocationAuxiliary,
     InvocationAuxiliaryCapability, MAX_INVOCATION_AUXILIARIES, Observation, ReplyWaitStats,
     RetainedReturnCallError,
     ReturnCallError, ReturnCapability, ReturnDeriveError, ReturnDeriver, ReturnLeaseSource,

@@ -10,7 +10,43 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // Each owner derives the process heap into its children using its own local
 // slot. No creator's slot number is ever forwarded across the controller seam.
-use super::thread::heap_endowment;
+use super::thread::{WorkerCap, heap_endowment, wake_endowment};
+
+/// What a managed thread is founded holding, re-derived by each founder from
+/// its own holdings: the heap position its callback allocates through, and a
+/// send into the wake channel its founder kicks (`thread::wake_endowment`), so
+/// a managed thread reaches the same host thread 0 a `DoorbellWorker` does —
+/// the host a language runtime keeps there to serve the process and end it.
+/// Either is absent when the founder holds none.
+struct Endowment {
+    caps: [WorkerCap; 2],
+    len: usize,
+}
+
+impl Endowment {
+    fn inherited() -> Self {
+        let vacant = WorkerCap {
+            role: 0,
+            index: 0,
+            subject: kore_abi::session::SlotRef::from_wire(0),
+            kind: 0,
+            rights: kore_abi::cap::Rights::empty(),
+        };
+        let mut endowment = Self {
+            caps: [vacant; 2],
+            len: 0,
+        };
+        for cap in [heap_endowment(), wake_endowment()].into_iter().flatten() {
+            endowment.caps[endowment.len] = cap;
+            endowment.len += 1;
+        }
+        endowment
+    }
+
+    fn as_slice(&self) -> &[WorkerCap] {
+        &self.caps[..self.len]
+    }
+}
 
 const FREE: u64 = 0;
 const BUILD: u64 = 1;
@@ -112,11 +148,11 @@ impl Controller {
         self.started
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::Busy)?;
-        let heap = heap_endowment();
+        let endowment = Endowment::inherited();
         match super::thread::spawn_with_arg(
             controller_entry,
             self as *const Self as usize,
-            heap.as_slice(),
+            endowment.as_slice(),
         ) {
             Some(ticket) => {
                 // This owner deliberately lives until process teardown. Managed
@@ -341,7 +377,7 @@ fn child_entry(argument: usize) {
 fn controller_entry(argument: usize) {
     // SAFETY: start requires static storage.
     let controller = unsafe { &*(argument as *const Controller) };
-    let heap = heap_endowment();
+    let endowment = Endowment::inherited();
     let mut tickets: [Option<super::thread::Thread>; COUNT] = [const { None }; COUNT];
     loop {
         for (record, ticket) in controller.records.iter().zip(tickets.iter_mut()) {
@@ -351,7 +387,7 @@ fn controller_entry(argument: usize) {
                 *ticket = super::thread::spawn_with_arg(
                     child_entry,
                     record as *const Record as usize,
-                    heap.as_slice(),
+                    endowment.as_slice(),
                 );
                 record.state.store(
                     generation | if ticket.is_some() { RUNNING } else { FAILED },

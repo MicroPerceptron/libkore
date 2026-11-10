@@ -1502,6 +1502,31 @@ impl TaskReqWire {
     /// `slot` names the face; no plan, no target, no grants. Seal-exempt,
     /// via==0 only: provisioning is the administrator's, not a task's.
     pub const OP_PROVISION_HOME: u8 = 25;
+    /// Install one file from the caller's own tree as a **private**
+    /// executable generation (`res/EXECUTABLE_CAPABILITY_MIGRATION.md` §7.4):
+    /// exec reads the file through the caller's conveyed view into the
+    /// caller's own memory supply, freezes that supply, registers it, and
+    /// grants an executable capability for it.
+    ///
+    /// The request is a client face's atomic context bundle without an
+    /// executable member: the supply on the ProcessIo lane, the view on the
+    /// filesystem-view lane, and on the first auxiliary lane the receive end
+    /// of a channel whose root the caller keeps — the generation's lifetime:
+    /// revoking that root, or the caller's death, retires it. The proof lane
+    /// and the other auxiliary lanes are vacant. `slot` carries the supply's
+    /// capability tag, so exec selects exactly this request's delivery and
+    /// never a stale one (tags are never reissued). The path rides the
+    /// supply itself ([`InstallPathHeader`]) and is overwritten by the
+    /// file's bytes, so the record keeps its size. Every other field is
+    /// zero. A file longer than the supply is answered
+    /// [`TAG_INSTALL_SUPPLY_SHORT`](TaskRepWire::TAG_INSTALL_SUPPLY_SHORT)
+    /// with the size it needs.
+    ///
+    /// Reading suffices, by the filesystem's own rule: `BIND_EXECUTABLE`
+    /// governs the shared executable namespace, not private code a task
+    /// makes executable from its own lease. The generation binds no global
+    /// name: only the capability's holder reaches it.
+    pub const OP_INSTALL_FILE: u8 = 26;
 
     /// Every retired `TaskReqWire` discriminant, in one definition the
     /// decoder cites (the [`derive_kind_known`](crate::session::derive_kind_known)
@@ -1567,6 +1592,66 @@ impl TaskReqWire {
     /// when this bit is set. Independent of `INSTALL_CONTEXT` (bit 0).
     pub const INSTALL_FROM_TREE: u8 = 1 << 1;
 }
+
+/// The path an [`OP_INSTALL_FILE`](TaskReqWire::OP_INSTALL_FILE) request
+/// installs, which the caller writes at offset 0 of the supply it conveys:
+/// this header, then [`len`](Self::len) UTF-8 bytes. The path is relative
+/// to the conveyed view and `/`-separated. Exec copies it out before the
+/// first file byte lands and the file then overwrites it, so neither the
+/// record nor the frozen image carries it.
+///
+/// A path rides the supply rather than the record because a legal path is
+/// longer than every free field: the record's `target` holds 64 bytes, the
+/// deepest legal path [`FS_SEARCH_PATH_BYTES`], and the pair already uses
+/// all but 128 bytes of its ring (`kore_svc_exec::wire`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct InstallPathHeader {
+    /// Live path bytes after the header (`1..=MAX_PATH`).
+    pub len: U16,
+    /// Reserved; must be zero.
+    pub reserved: [u8; 6],
+}
+
+impl InstallPathHeader {
+    /// Wire size of the header (repr(C), 2 + 6).
+    pub const BYTES: usize = 8;
+    /// The longest path a request carries: the deepest legal filesystem
+    /// path, the bound a search hit spells.
+    pub const MAX_PATH: usize = FS_SEARCH_PATH_BYTES;
+    /// Bytes a request's path occupies at the head of its supply.
+    pub const MAX_BYTES: usize = Self::BYTES + Self::MAX_PATH;
+
+    /// The header for `path`, or `None` for an empty path or one past
+    /// [`MAX_PATH`](Self::MAX_PATH).
+    pub fn for_path(path: &[u8]) -> Option<Self> {
+        if path.is_empty() || path.len() > Self::MAX_PATH {
+            return None;
+        }
+        Some(Self {
+            len: U16::new(path.len() as u16),
+            reserved: [0; 6],
+        })
+    }
+
+    /// The path a supply's head carries: a well-formed header followed by
+    /// that many UTF-8 bytes, or `None`. Component rules (no empty, `.` or
+    /// `..` component; the filesystem's name bound) are the reader's to
+    /// apply, against the filesystem it walks.
+    pub fn path(head: &[u8]) -> Option<&str> {
+        let (header, rest) = Self::read_from_prefix(head).ok()?;
+        let len = usize::from(header.len.get());
+        if header.reserved != [0; 6] || len == 0 || len > Self::MAX_PATH {
+            return None;
+        }
+        core::str::from_utf8(rest.get(..len)?).ok()
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<InstallPathHeader>() == InstallPathHeader::BYTES);
+const _: () = assert!(InstallPathHeader::MAX_PATH <= u16::MAX as usize);
 
 /// The exec reply wire form (`TaskResponse`'s crossing shape). An owned
 /// `Spawned` reply carries exactly one task-handle grant. `id` remains
@@ -1750,6 +1835,20 @@ impl TaskRepWire {
     /// unprovisioned home is a posture (no store, or a stage that failed and
     /// is retried next boot), never a refusal.
     pub const TAG_HOME_PROVISIONED: u8 = 25;
+    /// Reply to [`TaskReqWire::OP_INSTALL_FILE`]: the private generation was
+    /// registered, and the reply grants its executable endpoint. `index`
+    /// carries the segment count and `status` the launch profile word, as
+    /// [`TAG_TREE_ACQUIRED`](Self::TAG_TREE_ACQUIRED) carries them.
+    pub const TAG_FILE_INSTALLED: u8 = 26;
+    /// Reply to [`TaskReqWire::OP_INSTALL_FILE`]: the file is longer than
+    /// the conveyed supply. `id` is the page-rounded size the file needs,
+    /// which a caller may retry with; nothing was registered, and the supply
+    /// was retired, so its memory is the caller's again.
+    pub const TAG_INSTALL_SUPPLY_SHORT: u8 = 27;
+    /// The unit [`TAG_INSTALL_SUPPLY_SHORT`](Self::TAG_INSTALL_SUPPLY_SHORT)
+    /// counts in: mm grants a base-class supply in whole 4 KiB pages, so a
+    /// size the caller can ask for is a multiple of it.
+    pub const INSTALL_SUPPLY_GRANULE: u64 = 4096;
     /// `TAG_HOME_PROVISIONED.index`: the home is recorded at the current
     /// skeleton version.
     pub const HOME_PROVISIONED: u8 = 1 << 0;
@@ -1854,6 +1953,12 @@ impl TaskRepWire {
     pub const REFUSE_PEER_ADMISSION_WEDGED: u8 = 22;
     pub const REFUSE_MODEL_UNAVAILABLE: u8 = 23;
     pub const REFUSE_MODEL_MEMORY_UNAVAILABLE: u8 = 24;
+    /// `TaskRefusal::FileUnavailable` — an install's path named no file the
+    /// presented view could read whole: no such entry, a directory, or a
+    /// read the filesystem refused. Distinct from
+    /// [`REFUSE_IMAGE_UNAVAILABLE`](Self::REFUSE_IMAGE_UNAVAILABLE), which
+    /// says the bytes were read and are not a dynamic executable.
+    pub const REFUSE_FILE_UNAVAILABLE: u8 = 25;
 }
 
 // Live task discriminants stay disjoint from the frozen retired band on
@@ -3962,6 +4067,42 @@ impl InChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An install path round-trips through a supply's head, and every
+    /// malformed head refuses: empty, past the bound, a reserved byte set,
+    /// a length past the bytes present, and bytes that are not UTF-8.
+    #[test]
+    fn install_paths_ride_a_supply_head() {
+        let mut head = [0u8; InstallPathHeader::MAX_BYTES + 1];
+        let path = b"build/hello";
+        let header = InstallPathHeader::for_path(path).unwrap();
+        head[..InstallPathHeader::BYTES].copy_from_slice(header.as_bytes());
+        head[InstallPathHeader::BYTES..][..path.len()].copy_from_slice(path);
+        assert_eq!(InstallPathHeader::path(&head), Some("build/hello"));
+
+        assert_eq!(InstallPathHeader::for_path(b""), None);
+        let longest = [b'a'; InstallPathHeader::MAX_PATH];
+        assert!(InstallPathHeader::for_path(&longest).is_some());
+        let too_long = [b'a'; InstallPathHeader::MAX_PATH + 1];
+        assert_eq!(InstallPathHeader::for_path(&too_long), None);
+
+        let mut reserved = head;
+        reserved[7] = 1;
+        assert_eq!(InstallPathHeader::path(&reserved), None);
+        let mut empty = head;
+        empty[..2].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(InstallPathHeader::path(&empty), None);
+        let mut past = head;
+        past[..2].copy_from_slice(&((InstallPathHeader::MAX_PATH + 1) as u16).to_le_bytes());
+        assert_eq!(InstallPathHeader::path(&past), None);
+        assert_eq!(
+            InstallPathHeader::path(&head[..InstallPathHeader::BYTES + path.len() - 1]),
+            None
+        );
+        let mut invalid = head;
+        invalid[InstallPathHeader::BYTES] = 0xff;
+        assert_eq!(InstallPathHeader::path(&invalid), None);
+    }
 
     /// Every wire form reinterprets in place from arbitrary bytes and
     /// round-trips through its own bytes — the shared-ring contract

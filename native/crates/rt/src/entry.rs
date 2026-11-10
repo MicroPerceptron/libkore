@@ -504,7 +504,7 @@ const fn report_slot_install(current_p1: usize, requested: usize) -> ReportSlotI
 
 #[cfg(target_os = "none")]
 pub(crate) mod geometry {
-    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
     use kore_abi::task::{GeomBlock, geom};
 
@@ -631,6 +631,16 @@ pub(crate) mod geometry {
         finalizer_state: AtomicUsize,
         finalizers: [AtomicUsize; 32],
         exit_started: AtomicUsize,
+        /// This thread's C `errno` ([`c_errno`]): ISO C gives `errno`
+        /// thread storage duration, and this block is the runtime's
+        /// per-thread home, so the word lives here rather than in an ELF
+        /// TLS block — which would give every C-carrying image a TLS
+        /// segment, and with it a TCB migration and a template every spawn
+        /// must place (`kore-late` refuses such a host outright).  Zero on
+        /// a fresh page, as C requires at thread start; deliberately *not*
+        /// inherited by a spawned thread, whose block is its own. Only the
+        /// owning thread reads or writes it.
+        c_errno: AtomicI32,
     }
 
     // The block must fit the founder's one-page window.
@@ -730,6 +740,15 @@ pub(crate) mod geometry {
     /// the first caller on this anchored thread.
     pub(crate) fn begin_panic() -> bool {
         block().panicking.swap(1, Ordering::AcqRel) == 0
+    }
+
+    /// This thread's C `errno` word (the block's `c_errno` field).
+    ///
+    /// Lawful wherever [`block`] is: C code runs only on an anchored
+    /// thread, since anchoring is crt0's first act and a spawned thread's
+    /// trampoline's first act.
+    pub(crate) fn c_errno() -> *mut i32 {
+        block().c_errno.as_ptr()
     }
 
     /// Where this thread's block lives — the value the thread pointer holds,

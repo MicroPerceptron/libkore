@@ -89,6 +89,26 @@ pub enum DeviceSpecies {
 /// its banks.
 pub const MAX_ROOT_COMPLEXES: usize = 8;
 
+/// Claimant faces one device broker can mint: one per driver row, the
+/// founder minting face `n` for driver row `n` (`MintFace`,
+/// `res/DEVICE_SERVICE.md` §10). Five today: input, block, accel, net and
+/// Xe.
+///
+/// The bound is shared, not chosen. The kernel founder seats driver row
+/// `n`'s one executor bell at a fixed slot of its common pin island and
+/// asserts the island holds this many. Exec's manifest gate refuses a
+/// driver row past it. The broker sizes its face table, its claimant band
+/// ([`CLAIMANT_FACE_SUPPLY_BYTES`](crate::task::CLAIMANT_FACE_SUPPLY_BYTES))
+/// and its landing band (two base-arena slots per face, below the
+/// startup-link band, which it asserts) from it. Raising it costs one
+/// ring stride per broker, two broker slots and one founder bell slot per
+/// face; the founder's pins are the first of those to run out.
+///
+/// Deliberately not the image service's face count: that one grows with
+/// the executable catalogue, and a broker band sized by it would grow with
+/// every program the system can run.
+pub const MAX_CLAIMANT_FACES: usize = 5;
+
 impl DeviceSpecies {
     /// Decode the wire byte; `None` for an unknown species (fail-closed —
     /// a broker that cannot name the species must not derive).

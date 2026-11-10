@@ -2588,6 +2588,28 @@ pub const REVOKE_KIND_EXEC_RETURN: u8 = 7;
 /// window survives, the latch re-anchors on it.
 pub const REVOKE_KIND_UNSHARE_IOVA_LIVE: u8 = 8;
 
+/// The [`Invocation::kind`] selector for the consuming **writable lease →
+/// frozen lease** transition through [`OpCode::Revoke`]: the exclusive
+/// intake of a registrar that must validate bytes it did not write
+/// (`res/IMAGE.md` §6b).
+///
+/// The subject is a held or same-session `MemLease` carrying the complete
+/// lifecycle grant `ACCESS|MODIFY|DERIVE|REVOKE`. Commit consumes that
+/// capability and its complete descendant lineage — every view, carve and
+/// route derived from it dies, wherever it travelled — removes every
+/// CPU/DMA/guest alias, and writes a fresh `MemLease` over the same window
+/// into `result`, carrying the same grant. From then on no lessor of the
+/// backing may write the window, the successor and its carves included: the
+/// family's claim table holds it immutable for as long as the successor
+/// lives. A carve whose parent or sibling still holds a writable view of the
+/// window is refused before anything commits, and so is an executable or
+/// swap-sealed lease.
+///
+/// The successor keeps `MODIFY` because a registrar carves the window's text
+/// and finalizes it, which a frozen window admits ([`REVOKE_KIND_EXEC`]
+/// leaves it immutable too); `MODIFY` never again reaches a write.
+pub const REVOKE_KIND_FREEZE: u8 = 9;
+
 /// Argument payload for a **page delegation** derive (`Derive`,
 /// [`kind`](Invocation::kind)` = Region` on a held/staged `Region`
 /// subject; res/IMAGE.md §9a): re-home the subject region

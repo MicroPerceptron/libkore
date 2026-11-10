@@ -635,6 +635,51 @@ pub(crate) fn heap_endowment() -> Option<WorkerCap> {
     None
 }
 
+/// The rights of a wake send a thread may pass on: the notice itself
+/// (`ACCESS`, [`verbs::NOTICE_RIGHTS`](crate::cap::verbs::NOTICE_RIGHTS)) and
+/// `DERIVE`, so the thread can found children holding the same end. A send
+/// into a wake channel conveys nothing but the right to kick it.
+pub(crate) const WAKE_SEND_RIGHTS: kore_abi::cap::Rights =
+    kore_abi::cap::Rights::ACCESS.union(kore_abi::cap::Rights::DERIVE);
+
+/// [`WorkerCap`] re-deriving this thread's own `DOORBELL@PEER_BASE` send for a
+/// child, so the child's [`kick_parent`] reaches the same thread this one's
+/// does: a [`DoorbellWorker`]'s wake end, or one inherited the same way.
+///
+/// `None` when this thread holds no such send, or holds one it may not derive
+/// from (a band peer's notice-only end, [`spmd`](crate::spmd)'s mesh): an
+/// inheritance this thread cannot make is not offered, so it never fails the
+/// spawn it would have rode on. The arena record decides, which is the
+/// kernel's own word for the slot's kind and rights.
+#[cfg(target_os = "none")]
+pub(crate) fn wake_endowment() -> Option<WorkerCap> {
+    use kore_abi::cap::{CapRecord, ResourceKind};
+    let rt = crate::entry::thread_context()?;
+    let send = rt
+        .bootstrap()
+        .handle(role::DOORBELL, crate::futex::PEER_BASE)?;
+    let record_va = crate::entry::geometry::slot_record_va(send)?;
+    // SAFETY: the slot alias is this thread's kernel-authored, read-only view
+    // of its own arena record for a slot its boot block names.
+    let record = unsafe { core::ptr::read_volatile(record_va as *const CapRecord) };
+    if record.kind != ResourceKind::ChanSend as u16 || !record.rights.contains(WAKE_SEND_RIGHTS) {
+        return None;
+    }
+    Some(WorkerCap {
+        role: role::DOORBELL,
+        index: crate::futex::PEER_BASE,
+        subject: send,
+        kind: ResourceKind::ChanSend as u16 as u8,
+        rights: WAKE_SEND_RIGHTS,
+    })
+}
+
+/// Off metal no thread founds another; there is no wake to inherit.
+#[cfg(not(target_os = "none"))]
+pub(crate) fn wake_endowment() -> Option<WorkerCap> {
+    None
+}
+
 /// Build exactly the capability namespace a spawned worker receives.
 ///
 /// This stays target-independent so host tests can pin a subtle shared-space
@@ -694,7 +739,7 @@ fn push_worker_thread_blocks(gblock: &mut GeomBlock, local: Window) -> bool {
 /// view.  [`spawn_with`] when the thread must hold capabilities.
 #[cfg(target_os = "none")]
 pub fn spawn(entry: fn()) -> Option<Thread> {
-    spawn_entry(ThreadEntry::Plain(entry), &[])
+    spawn_entry(ThreadEntry::Plain(entry), &[], WorkerStack::Band)
 }
 
 // (The per-worker `spawn_worker` shim retired with G5: workers found as a
@@ -711,7 +756,30 @@ pub fn spawn(entry: fn()) -> Option<Thread> {
 /// into [`exit`]`(0)`.
 #[cfg(target_os = "none")]
 pub fn spawn_with(entry: fn(), endow: &[WorkerCap]) -> Option<Thread> {
-    spawn_entry(ThreadEntry::Plain(entry), endow)
+    spawn_entry(ThreadEntry::Plain(entry), endow, WorkerStack::Band)
+}
+
+/// Where a spawned worker's stack lives.
+///
+/// A plain thread's stack is its band slot by default: `STACK_BYTES`
+/// (64 KiB) live under a guard page, tiled by [`MAX_THREADS`] — what a
+/// service worker's bounded frames need.  A synchronous engine whose
+/// recursion depth follows its *input* — a C compiler's expression and block
+/// nesting — needs more than a slot holds, so it asks for a **guarded
+/// strip** of the task's stack window instead (`res/SPMD.md` §8's
+/// kernel-thread class, the shape SPMD gang workers already take: usable
+/// pages with one guard granule below, mapped by the founding and given
+/// back by `join`).  Overflow takes a fault either way, never a
+/// neighbour's memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerStack {
+    /// The thread's band slot.
+    Band,
+    /// A guarded strip of at least this many bytes, rounded up to whole
+    /// pages.  The strip comes from the task's one stack window (16 MiB of
+    /// reservation, shared with SPMD gangs); a request the window cannot
+    /// place — or a zero-byte one — refuses the spawn.
+    Bytes(usize),
 }
 
 /// A worker that can **park and be kicked**, and kick back: two channels
@@ -795,6 +863,19 @@ impl DoorbellWorker {
     }
 }
 
+/// The calling thread's C `errno` word — what a C runtime's
+/// `__errno_location` answers.
+///
+/// Per thread, as ISO C requires (C11 7.5p2): the word lives in this
+/// thread's runtime block rather than an ELF TLS block, so an image that
+/// carries C code needs no TLS segment for it. Zero when the thread starts.
+/// The pointer is valid for the calling thread's life, and only that thread
+/// may read or write through it.
+#[cfg(target_os = "none")]
+pub fn c_errno() -> *mut i32 {
+    crate::entry::geometry::c_errno()
+}
+
 /// Worker side of [`DoorbellWorker`]: post one notice into the parent's
 /// wake channel (the send founded at `DOORBELL@PEER_BASE`).  `false` when
 /// this thread holds no such send or the post was refused — the latter
@@ -820,6 +901,18 @@ pub fn kick_parent() -> bool {
 /// mint or a derive refuses, or [`spawn_with`] does.
 #[cfg(target_os = "none")]
 pub fn spawn_with_doorbell(entry: fn(), extra: &[WorkerCap]) -> Option<DoorbellWorker> {
+    spawn_with_doorbell_on(entry, extra, WorkerStack::Band)
+}
+
+/// [`spawn_with_doorbell`] on the stack `stack` names — a guarded strip
+/// for an engine whose depth its input decides ([`WorkerStack`]).  `None`
+/// also when the stack window cannot place the strip.
+#[cfg(target_os = "none")]
+pub fn spawn_with_doorbell_on(
+    entry: fn(),
+    extra: &[WorkerCap],
+    stack: WorkerStack,
+) -> Option<DoorbellWorker> {
     use kore_abi::cap::{ResourceKind, Rights};
 
     use crate::cap::verbs;
@@ -869,16 +962,20 @@ pub fn spawn_with_doorbell(entry: fn(), extra: &[WorkerCap]) -> Option<DoorbellW
         kind: ResourceKind::ChanRecv as u16 as u8,
         rights: crate::cap::CHANNEL_ENDPOINT_RIGHTS,
     };
+    // Derivable, so the threads this worker founds through the
+    // [`thread_controller`](crate::thread_controller) inherit a kick into the
+    // same wake channel ([`wake_endowment`]).
     caps[1] = WorkerCap {
         role: role::DOORBELL,
         index: crate::futex::PEER_BASE,
         subject: wake.send.slot(),
         kind: ResourceKind::ChanSend as u16 as u8,
-        rights: verbs::NOTICE_RIGHTS,
+        rights: WAKE_SEND_RIGHTS,
     };
     caps[2] = heap;
     caps[3..3 + extra.len()].copy_from_slice(extra);
-    let Some(thread) = spawn_with(entry, &caps[..3 + extra.len()]) else {
+    let Some(thread) = spawn_entry(ThreadEntry::Plain(entry), &caps[..3 + extra.len()], stack)
+    else {
         let _ = pair.send.try_retire();
         let _ = pair.root.try_retire();
         let _ = wake.send.try_retire();
@@ -902,7 +999,11 @@ pub fn spawn_with_doorbell(entry: fn(), extra: &[WorkerCap]) -> Option<DoorbellW
 /// caller must remain valid until the returned thread is joined.
 #[cfg(target_os = "none")]
 pub fn spawn_with_arg(entry: fn(usize), argument: usize, endow: &[WorkerCap]) -> Option<Thread> {
-    spawn_entry(ThreadEntry::Argument(entry, argument), endow)
+    spawn_entry(
+        ThreadEntry::Argument(entry, argument),
+        endow,
+        WorkerStack::Band,
+    )
 }
 #[cfg(not(target_os = "none"))]
 pub fn spawn_with_arg(_entry: fn(usize), _argument: usize, _endow: &[WorkerCap]) -> Option<Thread> {
@@ -913,7 +1014,7 @@ pub fn spawn_with_arg(_entry: fn(usize), _argument: usize, _endow: &[WorkerCap])
 /// shape is the only thing the shapes disagree on, and it rides the
 /// start record untouched by everything below.
 #[cfg(target_os = "none")]
-fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap]) -> Option<Thread> {
+fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap], stack: WorkerStack) -> Option<Thread> {
     if endow.len() > MAX_WORKER_CAPS {
         return None;
     }
@@ -952,17 +1053,22 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap]) -> Option<Thread> {
         w.map = p.remaining;
     }
 
-    // ── The stack: an arena strip for SPMD workers (G4b), the band
-    //    slot for plain threads.  Carved here and — exactly like the
+    // ── The stack: an arena strip for SPMD workers (G4b) and for a
+    //    plain thread that asked for one ([`WorkerStack::Bytes`]), the
+    //    band slot otherwise.  Carved here and — exactly like the
     //    band index above — left spent if a later founding step
     //    refuses: the teardown that gives both back is join's, never
     //    spawn's, and the leak-on-refusal is the safe direction for
     //    the same reason the band's is. ──
-    let strip = match &entry {
-        ThreadEntry::Spmd(..) => {
+    let strip = match (&entry, stack) {
+        (ThreadEntry::Spmd(..), _) => {
             Some(crate::spmd::STACKS.carve_guarded(crate::spmd::STACK_GRANULES)?)
         }
-        ThreadEntry::Plain(_) | ThreadEntry::Argument(..) => None,
+        (ThreadEntry::Plain(_) | ThreadEntry::Argument(..), WorkerStack::Band) => None,
+        (ThreadEntry::Plain(_) | ThreadEntry::Argument(..), WorkerStack::Bytes(bytes)) => {
+            let granules = u32::try_from(bytes.div_ceil(crate::stack_arena::GRANULE)).ok()?;
+            Some(crate::spmd::STACKS.carve_guarded(granules)?)
+        }
     };
     let (stack_base, stack_len) = match &strip {
         Some(s) => (s.base(), s.bytes() as u64),
