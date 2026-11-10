@@ -4,6 +4,10 @@ version = "0.1.0-alpha.1"
 edition = "2024"
 publish = false
 description = "The runtime of libkore.so: the C ABI and the host of an independent C program on Kore"
+# No native library is linked: the key carries the headers this runtime
+# implements to dependents' build scripts as `DEP_KORE_INCLUDE` (`build.rs`).
+links = "kore"
+build = "build.rs"
 
 # The runtime `libkore.so` is built from: a distribution's one-line `cdylib`
 # crate names this one and links it under its own `[lib] name = "kore"`, so
