@@ -122,6 +122,30 @@
 //! simply that async code uses the async form, and it is a correctness rule
 //! rather than a stylistic one.
 //!
+//! # Waking a thread out of its wait
+//!
+//! A futex wakes the threads that wait on a word. Some waits must also end
+//! for a reason that is not the word: a C thread's cancellation has to end
+//! the `pthread_join` or `kore_futex_wait` it is parked in. [`wait_unless`]
+//! is that wait — [`wait`] with a caller condition, `stop`, read *after* the
+//! waiter registers, as the word is — and [`wake_thread`] is its wake: a kick
+//! into one thread's doorbell rather than to the waiters of one word.
+//!
+//! The condition's writer stores it (`SeqCst`), then wakes the thread. That
+//! is mechanism 2 again, with the condition in the word's place. The writer
+//! stores, then reads the waiter's registration — [`wake_thread`] reads it
+//! before it kicks or relays, and a hub's sweep reads it again before it
+//! kicks — and the waiter registers, then reads the condition, so one of
+//! the two sees the other. A writer that misses the registration is one whose
+//! store the waiter's read follows: the waiter does not park. A writer that
+//! sees it kicks a post that already stands, since the waiter armed before it
+//! registered, and that kick resolves the park the waiter is in or about to
+//! enter. A wait that can be ended therefore carries no timeout it does not
+//! need: nothing re-reads, on a slice, a condition its writer announces.
+//!
+//! A stoppable wait parks on its doorbell even for a word in a noted window:
+//! the kernel's word wait ends only on its word, and a stop arrives as a kick.
+//!
 //! # What a caller must still do
 //!
 //! **Re-check in a loop.** A return from [`wait`] is never a promise that the
@@ -306,9 +330,9 @@ const NOT_WAITING: usize = 0;
 /// speed while reporting that it was politely waiting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitOutcome {
-    /// The word did not hold `expected` — the caller's condition had already
-    /// changed, and no park was attempted. The common fast path under
-    /// contention, and not a failure.
+    /// The word did not hold `expected`, or a [`wait_unless`] stop held — the
+    /// caller's condition had already changed, and no park was attempted.
+    /// The common fast path under contention, and not a failure.
     Retry,
     /// The thread parked and was woken. **Says nothing about the word**: it
     /// may be a matching [`wake`], an unrelated kick on the shared doorbell,
@@ -399,7 +423,32 @@ pub(crate) const OWN_KICK: u16 = RELAY + 1;
 /// `std`'s locks will be built from, the same disposition
 /// [`block_on`](crate::block::block_on) takes.
 pub fn wait(word: &AtomicU32, expected: u32, timeout: Option<Duration>) -> WaitOutcome {
-    wait_inner(word, expected, timeout, true, LOCK_SPIN)
+    wait_inner(word, expected, timeout, true, LOCK_SPIN, None)
+}
+
+/// [`wait`] that another thread can also end by publishing `stop` and then
+/// waking **this thread** ([`wake_thread`]) — the wait a cancellation point
+/// is, whose request is a flag rather than a word.
+///
+/// `stop` is read after this waiter registers, as the word is, and the park
+/// follows only if the word still holds `expected` and `stop` is still
+/// `false`; otherwise this returns [`Retry`](WaitOutcome::Retry), having
+/// parked nothing. The writer of the condition stores it with `SeqCst` and
+/// then calls [`wake_thread`] with this thread's band, so neither can miss
+/// the other (module docs, *Waking a thread out of its wait*): no timeout is
+/// needed to notice a stop.
+///
+/// The park is always the doorbell's, even for a word in a noted window —
+/// the kernel's word wait cannot be ended by a kick. Everything [`wait`]
+/// says about spurious wakes holds: re-check the word *and* `stop` after any
+/// return. Not from inside a future, for [`wait`]'s reasons.
+pub fn wait_unless(
+    word: &AtomicU32,
+    expected: u32,
+    timeout: Option<Duration>,
+    stop: impl Fn() -> bool,
+) -> WaitOutcome {
+    wait_inner(word, expected, timeout, true, LOCK_SPIN, Some(&stop))
 }
 
 /// [`wait`] with the **barrier's** longer pre-park monitored budget.
@@ -422,7 +471,7 @@ pub(crate) fn wait_barrier(
     expected: u32,
     timeout: Option<Duration>,
 ) -> WaitOutcome {
-    wait_inner(word, expected, timeout, true, BARRIER_SPIN)
+    wait_inner(word, expected, timeout, true, BARRIER_SPIN, None)
 }
 
 /// [`wait_barrier`] with **no** jitter-window spin: straight to the park.
@@ -432,7 +481,7 @@ pub(crate) fn wait_barrier(
 /// Nothing co-resident is about to store the word, so the spin would only
 /// occupy the core; counted like the barrier wait it stands in for.
 pub(crate) fn wait_idle(word: &AtomicU32, expected: u32, timeout: Option<Duration>) -> WaitOutcome {
-    wait_inner(word, expected, timeout, true, NO_SPIN)
+    wait_inner(word, expected, timeout, true, NO_SPIN, None)
 }
 
 /// [`wait`] without the [`stats`] accounting — for the star's hub,
@@ -443,7 +492,7 @@ pub(crate) fn wait_quiet(
     expected: u32,
     timeout: Option<Duration>,
 ) -> WaitOutcome {
-    wait_inner(word, expected, timeout, false, LOCK_SPIN)
+    wait_inner(word, expected, timeout, false, LOCK_SPIN, None)
 }
 
 fn wait_inner(
@@ -452,6 +501,7 @@ fn wait_inner(
     timeout: Option<Duration>,
     counted: bool,
     spin: SpinBudget,
+    stop: Option<&dyn Fn() -> bool>,
 ) -> WaitOutcome {
     let Some(me) = current_thread() else {
         return WaitOutcome::Unsupported;
@@ -463,35 +513,19 @@ fn wait_inner(
     // named to the kernel by that authority and parks on the word itself
     // (the kernel address-wait); every other word keeps the doorbell park.
     // Decided once, before the registry entry, because the entry records
-    // the decision for wakers.
-    let route = crate::cap::mapped::locate(word as *const AtomicU32 as *const u8);
-
-    // ── 1 · Arm ─────────────────────────────────────────────────────────
-    // The standing post must exist before this thread is discoverable as a
-    // waiter, or a notice sent in the window between registering and parking
-    // would find no post and be dropped (`WouldBlock`, on the floor). Arming
-    // first makes "too early" indistinguishable from "on time".  A word park
-    // needs no post: the mapping is its wait authority, which is what lets a
-    // doorbell-less worker wait here at all.
-    if route.is_none() && !imp::arm() {
-        return WaitOutcome::Unsupported;
-    }
-
-    // ── 2 · Register, then check ────────────────────────────────────────
-    // This store must be visible before the load below, and `SeqCst` on both
-    // is what forbids the store-load reordering that would let this thread
-    // and a waker miss each other (module docs, mechanism 2).
-    let slot = match route {
-        Some(_) => claim_wait_on_word(me, addr),
-        None => claim_wait(me, addr),
+    // the decision for wakers. A wait with a `stop` keeps the doorbell
+    // whatever the word: its stop arrives as a kick, which a word park
+    // never sees (`wait_unless`).
+    let route = match stop {
+        Some(_) => None,
+        None => crate::cap::mapped::locate(word as *const AtomicU32 as *const u8),
     };
-    let Some(slot) = slot else {
-        return WaitOutcome::Unsupported;
+
+    // ── 1, 2 · Arm, register, then check ────────────────────────────────
+    let slot = match stand(me, word, expected, route.is_some(), stop, imp::arm) {
+        Ok(slot) => slot,
+        Err(outcome) => return outcome,
     };
-    let _slot = WaitSlot { thread: me, slot };
-    if word.load(Ordering::SeqCst) != expected {
-        return WaitOutcome::Retry;
-    }
 
     // ── 3 · Spin on the line, briefly ───────────────────────────────────
     if let Some(end) = spin_briefly(word, expected, spin) {
@@ -499,7 +533,7 @@ fn wait_inner(
     }
 
     // ── 4 · Park ────────────────────────────────────────────────────────
-    // `_slot` releases on the way out: a waiter that is awake must not stay
+    // `slot` releases on the way out: a waiter that is awake must not stay
     // findable, or the next `wake` spends its kick on nobody and reports
     // having woken someone.
     if counted {
@@ -515,7 +549,7 @@ fn wait_inner(
                 // stored — SeqCst on both sides, one of us sees the other),
                 // then arm the doorbell.  Without the demotion a word-mode
                 // waiter parked on its doorbell is unreachable by any waker.
-                demote_to_bell(me, slot, addr)
+                demote_to_bell(me, slot.slot, addr)
                     && word.load(Ordering::SeqCst) == expected
                     && imp::arm()
             })
@@ -530,6 +564,57 @@ fn wait_inner(
         };
     }
     outcome
+}
+
+/// Steps 1 and 2 of every wait — **arm, register, then check** — with the
+/// arm injected, so the host suite holds the order to account against the
+/// registry the target uses.
+///
+/// `Ok` is a waiter that must park: registered on `word` (in word mode when
+/// `on_word`), its post standing unless it parks on the word, and the word
+/// still `expected` and `stop` still `false`, both read after the
+/// registration. `Err` is what to return instead, having parked nothing; the
+/// registration is released with it.
+fn stand(
+    me: usize,
+    word: &AtomicU32,
+    expected: u32,
+    on_word: bool,
+    stop: Option<&dyn Fn() -> bool>,
+    arm: impl FnOnce() -> bool,
+) -> Result<WaitSlot, WaitOutcome> {
+    let addr = address_of(word);
+
+    // ── 1 · Arm ─────────────────────────────────────────────────────────
+    // The standing post must exist before this thread is discoverable as a
+    // waiter, or a notice sent in the window between registering and parking
+    // would find no post and be dropped (`WouldBlock`, on the floor). Arming
+    // first makes "too early" indistinguishable from "on time".  A word park
+    // needs no post: the mapping is its wait authority, which is what lets a
+    // doorbell-less worker wait here at all.
+    if !on_word && !arm() {
+        return Err(WaitOutcome::Unsupported);
+    }
+
+    // ── 2 · Register, then check ────────────────────────────────────────
+    // This store must be visible before the loads below, and `SeqCst` on all
+    // of them is what forbids the store-load reordering that would let this
+    // thread and a waker miss each other (module docs, mechanism 2). `stop`
+    // is the same argument with the caller's condition in the word's place:
+    // its writer stores, then reads this registration before it kicks.
+    let slot = if on_word {
+        claim_wait_on_word(me, addr)
+    } else {
+        claim_wait(me, addr)
+    };
+    let Some(slot) = slot else {
+        return Err(WaitOutcome::Unsupported);
+    };
+    let slot = WaitSlot { thread: me, slot };
+    if word.load(Ordering::SeqCst) != expected || stop.is_some_and(|stop| stop()) {
+        return Err(WaitOutcome::Retry);
+    }
+    Ok(slot)
 }
 
 /// Cumulative process-wide wait/wake accounting — the terminal's window
@@ -952,6 +1037,52 @@ pub fn wake_all(word: &AtomicU32) -> usize {
     woken
 }
 
+/// Wake **thread `band`** rather than the waiters of a word: kick its
+/// doorbell, so a park it is in or about to enter returns. The wake a
+/// [`wait_unless`] waiter's `stop` is announced by.
+///
+/// Store the condition first, with `SeqCst`. This reads the target's
+/// registration before it kicks, so a target that registers after that read
+/// reads the condition after it (module docs, *Waking a thread out of its
+/// wait*); a target with no doorbell waiter registered is running, and is not
+/// kicked. A thread waking itself kicks nothing either: it is not parked.
+///
+/// The kick goes directly when this thread holds a send into the target's
+/// doorbell, and otherwise through this thread's relay: the hub it adopted
+/// (the [`thread_controller`](crate::thread_controller) of the threads it
+/// founds), whose sweep kicks every thread with a doorbell waiter
+/// registered, or the star's hub. `true` when a kick or a relay went out.
+/// `false` when no kick was needed or this thread has no route to the
+/// target, which a caller that must reach it checks before it publishes.
+pub fn wake_thread(band: usize) -> bool {
+    wake_thread_with(current_thread(), band, imp::kick, relay_missed)
+}
+
+/// [`wake_thread`]'s selection, with the kick and the relay injected so the
+/// host suite can hold it to account.
+fn wake_thread_with(
+    me: Option<usize>,
+    band: usize,
+    kick: impl FnOnce(usize) -> bool,
+    relay: impl FnOnce() -> bool,
+) -> bool {
+    if band >= MAX_THREADS as usize || me == Some(band) || !waits_on_bell(band) {
+        return false;
+    }
+    if kick(band) {
+        STAT_KICKS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    // Refused: no send into that doorbell, or its post already spent — the
+    // relay covers both, as it does for `wake`.
+    STAT_MISSED.fetch_add(1, Ordering::Relaxed);
+    if relay() {
+        STAT_RELAYS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
 /// A **relay hub that is also a waiter**: the thread that founds a group of
 /// threads and holds a send into each of their doorbells — the
 /// [`thread_controller`](crate::thread_controller) — parked on its
@@ -1020,6 +1151,13 @@ pub(crate) fn adopt_hub(hub: &'static Hub) -> bool {
     imp::adopt_hub(hub)
 }
 
+/// Whether the hub this thread relays through is `hub`: a wake it cannot
+/// deliver itself goes there, and from there to every thread `hub`'s thread
+/// can kick.
+pub(crate) fn relays_through(hub: &Hub) -> bool {
+    imp::hub().is_some_and(|adopted| core::ptr::eq(adopted, hub))
+}
+
 /// Record that this thread holds `send`, a send into band `peer`'s
 /// doorbell its founding did not stamp — the channel a controller mints for
 /// each child it founds, or a starter for the controller it founds. From
@@ -1080,7 +1218,6 @@ fn sweep_with(me: usize, mut kick: impl FnMut(usize) -> bool) -> usize {
 }
 
 /// Whether `thread` has any waiter a kick reaches — a doorbell-mode entry.
-#[cfg_attr(not(target_os = "none"), allow(dead_code))]
 fn waits_on_bell(thread: usize) -> bool {
     WAITING_ON[thread].iter().any(|cell| {
         let entry = cell.load(Ordering::SeqCst);
@@ -1114,16 +1251,10 @@ pub(crate) fn wait_or_end(
         return WaitOutcome::Unsupported;
     };
     // Arm, register, check — `wait`'s order and for its reasons.
-    if !imp::arm() {
-        return WaitOutcome::Unsupported;
-    }
-    let Some(slot) = claim_wait(me, address_of(word)) else {
-        return WaitOutcome::Unsupported;
+    let _slot = match stand(me, word, expected, false, None, imp::arm) {
+        Ok(slot) => slot,
+        Err(outcome) => return outcome,
     };
-    let _slot = WaitSlot { thread: me, slot };
-    if word.load(Ordering::SeqCst) != expected {
-        return WaitOutcome::Retry;
-    }
     imp::park_or_end(timeout, task, report)
 }
 
@@ -1158,7 +1289,8 @@ fn address_of(word: &AtomicU32) -> usize {
     word as *const AtomicU32 as usize
 }
 
-/// This thread's band index — its identity in [`WAITING_ON`].
+/// This thread's band index — its identity in the wait registry
+/// (`WAITING_ON`).
 ///
 /// The allocator's shard index, deliberately: it is already stamped at
 /// anchor, already proved injective across live threads (the `MAX_THREADS <=
@@ -1168,7 +1300,12 @@ fn address_of(word: &AtomicU32) -> usize {
 /// The bound is re-checked rather than assumed: an out-of-band index would
 /// index the registry out of range, and a thread that cannot name itself must
 /// refuse to wait rather than borrow a neighbour's entry.
-pub(crate) fn current_thread() -> Option<usize> {
+///
+/// Also the name [`wake_thread`] reaches this thread by, which a thread
+/// records where its wakers can read it. An identity, not an authority: a
+/// waker still needs a send into the band's doorbell, or a relay that holds
+/// one. `None` off metal, and on a thread outside the band.
+pub fn current_thread() -> Option<usize> {
     let index = imp::thread_index()?;
     (index < MAX_THREADS as usize).then_some(index)
 }
@@ -2014,9 +2151,15 @@ mod tests {
         claim_wait(9, address_of(&a)).expect("a doorbell waiter");
         claim_wait_on_word(10, address_of(&b)).expect("a word waiter");
         let mut kicked = std::vec::Vec::new();
+        // The sweep scans every row, and tests in parallel register rows of
+        // their own: only this test's rows are delivered and recorded, and
+        // another's is a refused kick, which is not counted.
         let n = sweep_with(8, |thread| {
-            kicked.push(thread);
-            true
+            let ours = (8..=11).contains(&thread);
+            if ours {
+                kicked.push(thread);
+            }
+            ours
         });
         assert_eq!(kicked, [9], "the sweep kicked a thread no kick can wake");
         assert_eq!(n, 1);
@@ -2025,6 +2168,202 @@ mod tests {
         for row in 8..=11 {
             reset_thread(row);
         }
+    }
+
+    #[test]
+    fn a_stop_is_read_only_once_the_waiter_is_registered() {
+        // The order `wait_unless` rests on: arm, register, and only then read
+        // the stop. Its writer stores the stop and then reads the registry, so
+        // it misses this waiter only when this waiter's read follows its store.
+        // Each step asserts that the one before it already happened.
+        use core::cell::Cell;
+        const ROW: usize = 12;
+        reset_thread(ROW);
+        let word = AtomicU32::new(5);
+        let addr = address_of(&word);
+        let armed = Cell::new(false);
+        let arm = || {
+            assert!(
+                !thread_waits_on(ROW, addr),
+                "registered before the post stood"
+            );
+            armed.set(true);
+            true
+        };
+        let holds = Cell::new(true);
+        let read = Cell::new(0);
+        let stop = || {
+            assert!(
+                armed.get() && thread_waits_on(ROW, addr),
+                "the stop was read before the waiter registered"
+            );
+            read.set(read.get() + 1);
+            holds.get()
+        };
+
+        // A stop that holds: nothing parks, and the registration goes too.
+        let out = stand(ROW, &word, 5, false, Some(&stop), arm);
+        assert_eq!(out.err(), Some(WaitOutcome::Retry));
+        assert_eq!(read.get(), 1);
+        assert!(!thread_waits_on(ROW, addr), "a stopped waiter stayed found");
+
+        // One that does not: the waiter parks registered, and leaves with
+        // its slot.
+        holds.set(false);
+        armed.set(false);
+        let slot = stand(ROW, &word, 5, false, Some(&stop), arm)
+            .expect("a waiter whose stop does not hold parks");
+        assert_eq!(read.get(), 2);
+        assert!(thread_waits_on(ROW, addr), "a parking waiter is not found");
+        drop(slot);
+        assert!(!thread_waits_on(ROW, addr));
+
+        // An arm the kernel refuses registers nothing and reads nothing.
+        let out = stand(ROW, &word, 5, false, Some(&stop), || false);
+        assert_eq!(out.err(), Some(WaitOutcome::Unsupported));
+        assert_eq!(read.get(), 2);
+        assert!(!thread_waits_on(ROW, addr));
+        reset_thread(ROW);
+    }
+
+    #[test]
+    fn a_stop_published_before_its_wake_is_never_missed() {
+        // Every point at which the stop's writer — store, then
+        // `wake_thread` — can run against a waiter's arm, registration, stop
+        // read and park. The waiter either reads the stop and parks nothing,
+        // or parks on a post the writer's kick consumed, which the kernel
+        // resolves at once. The simulated post is the kernel's rule: arming
+        // stands it, a kick consumes a standing one and drops otherwise, and
+        // a park on a consumed post returns.
+        use core::sync::atomic::AtomicBool;
+        const ROW: usize = 13;
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum At {
+            BeforeArm,
+            BeforeRegistering,
+            BeforeStopRead,
+            // Just after the waiter read `false`: the window a stop read
+            // before the registration would leave open.
+            AfterStopRead,
+            BeforePark,
+        }
+        for at in [
+            At::BeforeArm,
+            At::BeforeRegistering,
+            At::BeforeStopRead,
+            At::AfterStopRead,
+            At::BeforePark,
+        ] {
+            reset_thread(ROW);
+            let word = AtomicU32::new(0);
+            let stopped = AtomicBool::new(false);
+            let post = AtomicBool::new(false);
+            let writer = || {
+                stopped.store(true, Ordering::SeqCst);
+                let _ = wake_thread_with(
+                    None,
+                    ROW,
+                    |band| {
+                        assert_eq!(band, ROW);
+                        post.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    },
+                    || false,
+                );
+            };
+            if at == At::BeforeArm {
+                writer();
+            }
+            let arm = || {
+                post.store(true, Ordering::SeqCst);
+                if at == At::BeforeRegistering {
+                    writer();
+                }
+                true
+            };
+            let stop = || {
+                if at == At::BeforeStopRead {
+                    writer();
+                }
+                let stop = stopped.load(Ordering::SeqCst);
+                if at == At::AfterStopRead {
+                    writer();
+                }
+                stop
+            };
+            match stand(ROW, &word, 0, false, Some(&stop), arm) {
+                Err(WaitOutcome::Retry) => {
+                    assert!(
+                        !matches!(at, At::AfterStopRead | At::BeforePark),
+                        "{at:?}: a stop not yet written was read"
+                    );
+                }
+                Ok(slot) => {
+                    assert!(
+                        matches!(at, At::AfterStopRead | At::BeforePark),
+                        "{at:?}: the stop went unread"
+                    );
+                    if at == At::BeforePark {
+                        writer();
+                    }
+                    assert!(
+                        !post.load(Ordering::SeqCst),
+                        "the waiter parks on a post its stop's wake never consumed"
+                    );
+                    drop(slot);
+                }
+                Err(other) => panic!("{at:?}: {other:?}"),
+            }
+        }
+        reset_thread(ROW);
+    }
+
+    #[test]
+    fn a_thread_wake_kicks_only_a_registered_waiter_and_relays_a_refusal() {
+        const ROW: usize = 14;
+        reset_thread(ROW);
+        let word = AtomicU32::new(0);
+        let never = |_: usize| -> bool { panic!("kicked a thread no kick can wake") };
+        let no_relay = || -> bool { panic!("relayed a wake that needed none") };
+        // A running thread (nothing registered), a band past the registry,
+        // and the caller itself are not kicked.
+        let past = MAX_THREADS as usize;
+        assert!(!wake_thread_with(None, ROW, never, no_relay));
+        assert!(!wake_thread_with(None, past, never, no_relay));
+        let slot = claim_wait(ROW, address_of(&word)).expect("a free wait slot");
+        let waiter = WaitSlot { thread: ROW, slot };
+        assert!(!wake_thread_with(Some(ROW), ROW, never, no_relay));
+        // A registered doorbell waiter: kicked directly, relayed when the
+        // kick refuses, and `false` only when neither went out.
+        assert!(wake_thread_with(
+            None,
+            ROW,
+            |band| {
+                assert_eq!(band, ROW);
+                true
+            },
+            no_relay
+        ));
+        assert!(wake_thread_with(None, ROW, |_| false, || true));
+        assert!(!wake_thread_with(None, ROW, |_| false, || false));
+        drop(waiter);
+        // A word-parked waiter is the kernel's address-wait's to end.
+        let slot = claim_wait_on_word(ROW, address_of(&word)).expect("a free wait slot");
+        let waiter = WaitSlot { thread: ROW, slot };
+        assert!(!wake_thread_with(None, ROW, never, no_relay));
+        drop(waiter);
+        reset_thread(ROW);
+    }
+
+    #[test]
+    fn off_metal_a_stoppable_wait_refuses_before_reading_its_stop() {
+        reset_thread(7);
+        let word = AtomicU32::new(1);
+        assert_eq!(
+            wait_unless(&word, 1, None, || panic!("read a stop with no identity")),
+            WaitOutcome::Unsupported
+        );
+        assert!(!wake_thread(0), "off metal no kick reaches a thread");
     }
 
     #[test]

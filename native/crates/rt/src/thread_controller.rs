@@ -36,9 +36,12 @@
 //! A starter with no channel space founds a controller without a doorbell:
 //! neither it nor its children can park, and each of their waits takes the
 //! deadline park every thread can ([`pace::cede`]). A client the controller
-//! cannot kick waits in bounded slices ([`UNREACHED_SLICE`]). A thread that
+//! cannot kick waits in bounded slices ([`Controller::slice`]). A thread that
 //! cannot wake a parking controller is refused a create, which would
-//! otherwise wait on a request nothing announced.
+//! otherwise wait on a request nothing announced; one that cannot relay
+//! through it cannot announce a request to its threads either
+//! ([`Controller::wakes_threads`]), so a parked child is never left waiting
+//! on a request nothing woke it for.
 //!
 //! [`thread::exit`]: crate::thread::exit
 //! [`pace::cede`]: crate::pace::cede
@@ -82,7 +85,8 @@ const POLLING: u32 = 3;
 /// at before the controller parked (`pace::CEDE_NS`): a client the wake
 /// fabric cannot reach is no worse off than it was. Shorter would wake an
 /// unreachable joiner more often for nothing; longer would delay it.
-const UNREACHED_SLICE: Duration = Duration::from_nanos(crate::pace::CEDE_NS);
+/// [`Controller::slice`] says which waits take it.
+pub const UNREACHED_SLICE: Duration = Duration::from_nanos(crate::pace::CEDE_NS);
 
 /// How long the controller rides its doorbell after a reap the kernel did
 /// not complete — a refused lifecycle observation or reclamation, which no
@@ -330,6 +334,35 @@ impl Controller {
             .is_some_and(futex::reaches)
     }
 
+    /// Whether a wake this thread sends reaches the threads the controller
+    /// founded, so a request it announces to them by a wake — a cancellation,
+    /// stored and then [`futex::wake_thread`]ed — ends any park they are in.
+    ///
+    /// True when the controller parks and this thread both holds a send into
+    /// it and relays through its hub — the starter, or a thread it created —
+    /// since every thread the controller can kick is then one relay away. True
+    /// as well when it does not park, since neither do its threads, which need
+    /// no wake. False otherwise, and before the controller starts: a caller
+    /// refuses such a request, rather than leave it behind a park nothing ends.
+    pub fn wakes_threads(&self) -> bool {
+        match self.mode() {
+            None => false,
+            Some(PARKING) => self.wakes_controller() && futex::relays_through(&self.hub),
+            Some(_) => true,
+        }
+    }
+
+    /// How long one wait of the calling thread may park: unbounded (`None`)
+    /// when the controller can kick it — it holds a send into the thread's
+    /// doorbell, so every wake it sends, and every wake relayed through it,
+    /// reaches the thread — and [`UNREACHED_SLICE`] when nothing would end
+    /// that park early.
+    pub fn slice(&self) -> Option<Duration> {
+        let reached = futex::current_thread()
+            .is_some_and(|band| self.reach.load(Ordering::SeqCst) & (1 << band) != 0);
+        (!reached).then_some(UNREACHED_SLICE)
+    }
+
     /// Park until `record`'s state satisfies `done`, and return that state.
     fn settle(&self, record: &Record, done: impl Fn(u64) -> bool) -> u64 {
         loop {
@@ -341,9 +374,7 @@ impl Controller {
             if done(state) {
                 return state;
             }
-            let reached = futex::current_thread()
-                .is_some_and(|band| self.reach.load(Ordering::SeqCst) & (1 << band) != 0);
-            park(&record.event, seen, (!reached).then_some(UNREACHED_SLICE));
+            park(&record.event, seen, self.slice());
         }
     }
 
@@ -1059,6 +1090,16 @@ mod tests {
         assert_eq!(controller.start(), Err(Error::Unavailable));
         assert_eq!(controller.started.load(Ordering::Acquire), IDLE);
         assert_eq!(controller.create(|_| 0, 0), Err(Error::Unavailable));
+    }
+    #[test]
+    fn an_unstarted_controller_wakes_no_thread_and_bounds_every_wait() {
+        // Nothing relays through a controller that was never founded, so no
+        // request to its threads is announced by a wake; and a thread it
+        // cannot kick — off metal, every thread — parks one slice at a time.
+        let controller = Controller::new();
+        assert!(!controller.wakes_threads());
+        assert_eq!(controller.slice(), Some(UNREACHED_SLICE));
+        assert_eq!(controller.started.load(Ordering::Acquire), IDLE);
     }
     #[test]
     fn records_own_their_interference_span() {
