@@ -344,3 +344,49 @@ C program (`docs/languages.md`). It is the first libkore package a C program
 on Kore links without a Rust host. Its shared object is a distribution's
 one-line `cdylib` over it. `tools/check-program.py` links that object for the
 three Kore ISAs and checks its shape and its exact exported ABI.
+
+## One bridge for a synchronous engine on a worker thread
+
+The export records Kore `61ae1aced5113de12aefdcf658bc122b9a46dfbf`, the head of
+Kore's `ft/festive-euler-sghq2d`, stacked on MicroPerceptron/kore#1494's
+branch. The previous export named `eab77f8d`, which never reached GitHub: it
+was #1494's `8bcaa7d3` plus one kore-rt commit, rebuilt from that export byte
+for byte as `ecff66ad`, so its four files are unchanged here. The closure keeps
+its 26 packages and gains one file (383):
+
+- `kore-rt`'s `bridge`: one request cell and one word between a synchronous
+  engine on a worker thread and its async host, with the word's states, the
+  park-and-kick ordering, the cell's hand-over and the worker's end in one
+  place (`Bridge`, `Engine`, `Work`, `WorkerHost`), and a host suite that
+  drives the state machine on real threads;
+- `ThreadBlock`'s `hosted_bridge` tail slot, which names the bridge a worker
+  serves, and with it a bridge-worker notice in `entry::panic_refuse` and
+  `crash::report` once the panic record is published.
+
+`kore-lua`'s VM bridge and `kore-c`'s program host now speak the seam, as Kore's
+`tcc` and its Lua REPL do upstream; each keeps only its payload and dispatch.
+No exported manifest changed, so `native/Cargo.lock` did not. `make miri` also
+runs the `bridge` suite, so Miri checks the cell's every hand-over.
+
+Locally, with the pinned nightly, `make fmt test check docs owners cross miri
+bindings-check` passed on this export. That covers:
+- the native `kore-rt` suite (466, the `bridge` suite's 13 among them) and
+  `kore-dagfs` and `kore-vol` suites;
+- the three Kore user-target checks, which take in `kore-lua`'s bridge;
+- `check-program`, which links `libkore.so` for all three ISAs with exactly its
+  declared 85 exports;
+- Miri over the `bridge` suite.
+
+On Kore's side of the same seam, at the reseal over `61ae1ace` (`0ba5caf4`),
+the production x86 image passed under QEMU 8.2 TCG:
+- `make keytest-tcc-x86`: TCC compiled, linked, installed and ran a program
+  to `exit 42` over the bridge;
+- `make keytest-lua-x86`: the REPL kept multiline state, answered
+  `print(square(9))` with 81 and quit through the bridge, with the default
+  all-architecture `user-verify` ahead of it.
+
+`boot-digest-verify`, `boot-digest-verify-aarch64` and
+`boot-manifest-verify` passed on the resealed artifacts. These are emulator
+results, not physical-hardware acceptance. `kore-c`'s host has no keytest of
+its own yet: no image ships `libkore.so`, so its bridge is proven by the
+Kore-target build and the shared object's link, not by a run.
