@@ -1,8 +1,8 @@
-//! `libkore.so`: libkore's C ABI as a shared object, and the host of an
-//! independent C program on Kore.
+//! The runtime of `libkore.so`: libkore's C ABI as one shared object, and the
+//! host of an independent C program on Kore.
 //!
-//! A C program a compiler wrote on Kore (`tcc` at the shell) links this
-//! library with `-lkore` and includes `kore.h`. From one image the whole
+//! A C program a compiler wrote on Kore (`tcc` at the shell) links
+//! `libkore.so` with `-lkore` and includes `kore.h`. From one image the whole
 //! system shares, it then has:
 //!
 //! - `kore.h`'s functions (`kore-ffi`), and the standard C names that
@@ -13,9 +13,24 @@
 //!   thread 0 serves its filesystem session ([`api::kore_fs_run`], declared
 //!   in `kore/program.h`) and ends the process when any thread exits.
 //!
-//! This is a C program's runtime, never a Rust program's: a Rust executable
-//! links `kore-std` with its own entry, and two runtimes in one process would
-//! grow one heap supply behind two cursors.
+//! # The shared object
+//!
+//! A distribution builds the image from a `cdylib` crate whose `[lib]` is
+//! named `kore` and whose source names this crate (`use kore_c as _;`); Kore's
+//! is `user/runtime/libkore`. Its link carries the contract consumers rely on,
+//! which `tools/check-program.py` checks for every ISA:
+//!
+//! - `--soname=libkore.so`, the name consumers record as `DT_NEEDED`;
+//! - `--no-undefined`: the library binds nothing from the program it links into;
+//! - a shared object with no entry point, so it registers as a library;
+//! - static initial-exec TLS only, which the Kore user targets select;
+//! - exactly the declared ABI exported (`kore.h`, `kore/program.h`, the C names
+//!   `kore/stdlib.h` and `kore/pthread.h` alias, and the C library's two
+//!   lifecycle entry points).
+//!
+//! It is a C program's runtime, never a Rust program's: a Rust executable links
+//! `kore-std` with its own entry, and two runtimes in one process would grow one
+//! heap supply behind two cursors.
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", feature(thread_local))]
 #![deny(unsafe_op_in_unsafe_fn)]

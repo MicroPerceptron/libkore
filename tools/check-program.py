@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Link libkore.so for every Kore ISA and check the image a C program binds.
 
+The image is a distribution's one-line cdylib over kore-c (Kore's is
+user/runtime/libkore), linked with the contract kore-c documents; this builds
+that crate in a temporary workspace, as check-entry.py builds its consumers.
 The library is what an independent C program on Kore links with -lkore, so the
 checks are the ones its loader and its consumers rely on:
 
@@ -13,10 +16,13 @@ checks are the ones its loader and its consumers rely on:
   library's two lifecycle entry points; no other symbol.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 ARCHES = ('x86_64', 'aarch64', 'riscv64gc')
@@ -47,14 +53,39 @@ def declared():
     return names
 
 
+# The shared object as a distribution builds it: a cdylib named `kore` that
+# names kore-c, linked with the soname and no undefined symbol.
+WRAPPER_MANIFEST = ('[package]\nname = "libkore-so"\nversion = "0.0.0"\nedition = "2024"\n'
+                    '[lib]\nname = "kore"\ncrate-type = ["cdylib"]\n[workspace]\n'
+                    '[dependencies]\nkore-c = {{ path = {path} }}\n')
+WRAPPER_SOURCE = '#![no_std]\n// The runtime and its exports come from kore-c.\nuse kore_c as _;\n'
+LINK_CONTRACT = ['-C', 'link-arg=--soname=libkore.so', '-C', 'link-arg=--no-undefined']
+
+
+def build(arch):
+    channel = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+    target_dir = ROOT / 'target/program-consumer'
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=channel, CARGO_TARGET_DIR=str(target_dir),
+               CARGO_INCREMENTAL='0')
+    with tempfile.TemporaryDirectory(prefix='libkore-so-') as temporary:
+        work = Path(temporary)
+        (work / 'src').mkdir()
+        (work / 'Cargo.toml').write_text(
+            WRAPPER_MANIFEST.format(path=json.dumps(str(ROOT / 'crates/c'))))
+        (work / 'src/lib.rs').write_text(WRAPPER_SOURCE)
+        # Reuse the reviewed dependency versions while Cargo adds this fixture.
+        (work / 'Cargo.lock').write_bytes((ROOT / 'Cargo.lock').read_bytes())
+        subprocess.run([
+            'cargo', 'rustc', '--release', '-Zjson-target-spec',
+            '--target', str(ROOT / f'targets/{arch}-unknown-kore-user.json'),
+            '-Zbuild-std=core,alloc,compiler_builtins',
+            '-Zbuild-std-features=compiler-builtins-mem', '--', *LINK_CONTRACT,
+        ], cwd=work, env=env, check=True)
+    return target_dir / f'{arch}-unknown-kore-user/release/libkore.so'
+
+
 def check(arch, expected):
-    subprocess.run([
-        'cargo', 'build', '--locked', '-p', 'kore-c', '--release',
-        '--target', f'targets/{arch}-unknown-kore-user.json',
-        '-Z', 'build-std=core,alloc,compiler_builtins',
-        '-Z', 'build-std-features=compiler-builtins-mem',
-    ], cwd=ROOT, check=True)
-    image = ROOT / f'target/{arch}-unknown-kore-user/release/libkore.so'
+    image = build(arch)
     header = readelf('--file-header', str(image))
     if not re.search(r'Type:\s+DYN', header):
         raise SystemExit(f'{arch}: libkore.so is not a shared object')
