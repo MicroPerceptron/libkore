@@ -84,6 +84,9 @@ that joins `libkore.so` to the program's own `libc.a` — and gets:
   every float digit exact, `stdout` and `stderr`, the `strto*` parsers,
   `qsort`, `strerror`, the string routines and a per-thread `errno`, and
   `kore-c`'s own `abort`;
+- descriptors over the capabilities it holds (`<fcntl.h>`, `<unistd.h>`,
+  `<sys/mman.h>`: `open`, `close`, `mmap`, `munmap`), and
+  `kore_fd_describe` (`kore/program.h`), described below;
 - a host on thread 0, entered from the C library's start;
 - `kore_fs_run(step, user, &error)` (`kore/program.h`), which runs a
   `KoreFsStep` program as the program's filesystem session.
@@ -121,10 +124,10 @@ the host rather than waited for.
   back rather than losing its output — and wakes the writers waiting for
   space, a pass at a time, serving the program's end and its sessions
   between passes and draining beside a session in flight: the ring is the
-  bridge's side source (`WorkerHost::serve_beside`). The host's own writes (a filesystem step's callbacks) are
-  kept in order beside the ring, before any call another thread has in
-  progress. A launch without the stream has no sink, and a
-  write to either stream returns `EOF`.
+  bridge's side source (`WorkerHost::serve_beside`). The host's own writes
+  (a filesystem step's callbacks) are kept in order beside the ring, before
+  any call another thread has in progress. A launch without the stream has
+  no sink, and a write to either stream returns `EOF`.
 - **The end.** The C library's `exit` and `_Exit` call
   `__kore_program_exit(status, finalize)` after their `atexit` handlers, on
   whatever thread called them. The first request wins and reaches the host,
@@ -150,6 +153,71 @@ the host rather than waited for.
 - **Without a host.** A launch that cannot carry one (no channel space or
   heap) runs the program on thread 0, as its C library alone would. Then the
   filesystem session is refused, and only thread 0's exit ends the program.
+
+### Descriptors: C's spelling for a held capability
+
+A program's authority is the capabilities it was founded holding. Each sits
+at a fixed place: the boot block names it by a role and an index, and the
+capability is a slot of the thread's arena. `open` is the readable way to say
+which one is meant, and nothing more:
+
+```c
+int fd = open("/kore/memory", O_RDWR);
+char *region = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+...
+munmap(region, 1 << 20);
+close(fd);
+```
+
+- **The path is not a file.** `open` looks the string up in one static table
+  (`crates/c/src/fd.rs`) whose rows are a name and the bootstrap coordinate it
+  stands for. No filesystem is asked, and no name outside the table exists:
+  `ENOENT`. The first row is `/kore/memory`, `role::HEAP@0`, the memory supply
+  the allocator grows on.
+- **It grants nothing.** `open` succeeds only for a capability the calling
+  thread holds (`ENXIO` otherwise), with access its rights cover (`EACCES`).
+  The only flags are the access modes. `close` forgets the number; the
+  capability stays the program's, and mappings made through it stand.
+- **A descriptor stores the coordinate, never the capability.** Capabilities
+  are per thread on Kore, and `main` and every `pthread` have their own boot
+  block. Each use resolves the coordinate in the *calling* thread's. Numbers
+  are the process's, as C expects, from 3 (0 to 2 are the streams'), and no
+  authority crosses a thread through one.
+- **`kore_fd_describe(fd, &info)`** reads what the calling thread holds
+  there: its kind (`KORE_FD_MEMORY`), what its rights permit, and for a
+  memory supply its whole length.
+
+`mmap` on the memory supply answers fresh, zeroed memory, as mapping
+`/dev/zero` does elsewhere. It is three of kore-rt's verbs, the sequence a
+Wasmtime engine's guest memory takes: a lease carved from the supply's top,
+clear of the allocator, which grows from its bottom; an address from the
+free part of the task's link window (`Rt::link_free_span`); the whole lease
+mapped there. The rules follow from that:
+
+- **The caller never picks the address.** A hint is ignored, and `MAP_FIXED`
+  is `ENOTSUP`.
+- **Read, or read and write.** `PROT_EXEC` is `ENOTSUP`: memory a program
+  wrote is never executable. `MAP_SHARED` and `MAP_PRIVATE` mean the same,
+  since the region is this program's alone. There is no offset, and no
+  `MAP_ANONYMOUS`: memory comes from a capability, so a descriptor names it.
+- **Thread 0 maps, for whichever thread asked.** Every thread that may
+  allocate is founded holding a share of the supply, and `open` and `mmap`
+  hold the caller's access to that share's rights. A share carries no
+  `REVOKE`, though, and a region that can be unmapped again is a carve its
+  holder may revoke, so the caller posts its request to thread 0, which
+  holds the supply's root, and waits as a filesystem session does. A mapping
+  is therefore the process's: any thread may `munmap` it, whole, by its base
+  and its length. Thread 0 answers a request between the main thread's
+  sessions and beside one in flight, as it drains the ring: both are the
+  bridge's side source.
+- **`munmap` parks the region.** The supply's cursors and the window's only
+  advance, so carved bytes and placed addresses never return to them. The
+  mapping is removed and a stale access faults, but the program keeps the
+  lease and its address, and the next `mmap` of the same length takes it,
+  zeroed again, before anything new is carved. One size mapped and unmapped
+  in a loop uses one region. Ever-different sizes spend supply each time and
+  end with `ENOMEM`. A program holds sixteen regions, mapped and parked
+  together.
 
 The C library's half is two weak references. Its start calls
 `__kore_program_start(program, end)` when the program links libkore, and its

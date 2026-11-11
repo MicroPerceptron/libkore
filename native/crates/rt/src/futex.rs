@@ -2013,8 +2013,14 @@ mod tests {
         claim_wait(8, address_of(&a)).expect("the hub's own wait");
         claim_wait(9, address_of(&a)).expect("a doorbell waiter");
         claim_wait_on_word(10, address_of(&b)).expect("a word waiter");
+        // The sweep reads every row, and the suite's other tests hold rows of
+        // their own meanwhile: only these four are this test's to judge. A
+        // kick of any other row is refused, so it is not counted either.
         let mut kicked = std::vec::Vec::new();
         let n = sweep_with(8, |thread| {
+            if !(8..=11).contains(&thread) {
+                return false;
+            }
             kicked.push(thread);
             true
         });

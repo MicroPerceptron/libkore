@@ -17,10 +17,12 @@ use core::ffi::{CStr, c_int};
 pub const EPERM: c_int = 1;
 pub const ENOENT: c_int = 2;
 pub const EIO: c_int = 5;
+pub const ENXIO: c_int = 6;
 pub const EBADF: c_int = 9;
 pub const EAGAIN: c_int = 11;
 pub const ENOMEM: c_int = 12;
 pub const EACCES: c_int = 13;
+pub const EFAULT: c_int = 14;
 pub const EBUSY: c_int = 16;
 pub const EEXIST: c_int = 17;
 pub const ENOTDIR: c_int = 20;
@@ -38,6 +40,7 @@ pub const ENOSYS: c_int = 38;
 pub const ENOTEMPTY: c_int = 39;
 pub const ELOOP: c_int = 40;
 pub const EOVERFLOW: c_int = 75;
+pub const ENOTSUP: c_int = 95;
 
 /// Set this thread's `errno`.
 pub fn set(code: c_int) {
@@ -64,10 +67,12 @@ pub fn describe(code: c_int) -> &'static CStr {
         EPERM => c"Operation not permitted",
         ENOENT => c"No such file or directory",
         EIO => c"I/O error",
+        ENXIO => c"No such device or address",
         EBADF => c"Bad file descriptor",
         EAGAIN => c"Resource temporarily unavailable",
         ENOMEM => c"Out of memory",
         EACCES => c"Permission denied",
+        EFAULT => c"Bad address",
         EBUSY => c"Resource busy",
         EEXIST => c"File exists",
         ENOTDIR => c"Not a directory",
@@ -85,6 +90,7 @@ pub fn describe(code: c_int) -> &'static CStr {
         ENOTEMPTY => c"Directory not empty",
         ELOOP => c"Symbolic link loop",
         EOVERFLOW => c"Value too large for data type",
+        ENOTSUP => c"Not supported",
         _ => c"Unknown error",
     }
 }

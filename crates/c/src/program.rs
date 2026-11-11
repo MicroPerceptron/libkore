@@ -101,6 +101,13 @@ pub(crate) fn on_host() -> bool {
     ROLE.get() == Role::Host
 }
 
+/// Whether a host serves: thread 0 answers what other threads post. The
+/// bridge says so from the founding's claim until the host joins the main
+/// thread at the end.
+pub(crate) fn hosted() -> bool {
+    SESSION.is_hosted()
+}
+
 /// Whether the calling thread is the main thread, the one the host can kick.
 pub(crate) fn on_main() -> bool {
     ROLE.get() == Role::Main
@@ -331,6 +338,9 @@ impl<'t> Founded<'t> {
         // The C streams reach the launcher through this thread: map its
         // stream and install the sink before any thread can write.
         let output = crate::stdio::install(&rt);
+        // Where `mmap` places: this task's free link span, published before
+        // any thread that could map exists.
+        crate::mmap::arm(&rt);
         // A mint grant of its own: the first `pthread_create` on the main
         // thread starts kore-rt's thread controller there, which mints the
         // doorbells its threads park on (`thread_controller`). Without one the
@@ -376,15 +386,18 @@ impl<'t> Founded<'t> {
     }
 }
 
-/// The program's output, the host's side source: every thread writes the
-/// ring (`stdio`), and the host drains it a pass at a time between the main
-/// thread's sessions and beside one in flight. A launch that carried no
-/// stream has none.
-struct Output(Option<&'static crate::stdio::Endpoint>);
+/// What the program's other threads hand thread 0 beside the main thread's
+/// sessions: the bridge's side source.
+/// - The output ring (`stdio`), which every thread writes. It is drained a
+///   pass at a time. A launch that carried no stream has none.
+/// - A thread's `mmap` or `munmap` (`mmap`). Thread 0 carries it out, since
+///   it holds the supply's root. Its caller always kicks, so only the ring
+///   is armed.
+struct Beside(Option<&'static crate::stdio::Endpoint>);
 
-impl Side for Output {
+impl Side for Beside {
     fn pending(&self) -> bool {
-        self.0.is_some() && crate::stdio::pending()
+        crate::mmap::posted() || (self.0.is_some() && crate::stdio::pending())
     }
 
     fn arm(&self) {
@@ -393,10 +406,16 @@ impl Side for Output {
         }
     }
 
-    /// `kick_main` reaches the one writer the host can kick, woken once the
-    /// room it waits for is free. `stdio::drain` is cancellation-safe at
-    /// every wait, as a pass beside a session must be.
+    /// A mapping first: its caller waits on the cell, and serving it runs to
+    /// its answer before the pass's first await, so a pass dropped beside a
+    /// session cannot cut it short. Then one pass of the ring. `kick_main` reaches the one waiter the host can kick: the
+    /// main thread, waiting on the mapping cell or for room in the ring.
+    /// `stdio::drain` is cancellation-safe at every wait, as a pass beside a
+    /// session must be.
     async fn pass(&mut self, kick_main: &dyn Fn()) {
+        if crate::mmap::serve() {
+            kick_main();
+        }
         if let Some(endpoint) = self.0 {
             crate::stdio::drain(endpoint, kick_main).await;
         }
@@ -414,7 +433,7 @@ async fn host(
     output: Option<&'static crate::stdio::Endpoint>,
 ) -> Exit {
     let mut filesystem = Filesystem::new(rt, transport);
-    let mut side = Output(output);
+    let mut side = Beside(output);
     // An end requested mid-session ends the program without waiting for the
     // session: the barrier stops the waiting main thread, and the abandoned
     // session's owner is quarantined, as cancellation leaves it. What the

@@ -22,6 +22,44 @@
  */
 #define KORE_MAIN_STACK_BYTES (1 << 20)
 
+/**
+ * [`KoreFdInfo::kind`]: the memory supply the program's allocator grows
+ * on. `mmap` answers a fresh, zeroed region of it.
+ */
+#define KORE_FD_MEMORY 1
+
+/**
+ * [`KoreFdInfo::access`]: the capability may be read.
+ */
+#define KORE_FD_READ (1 << 0)
+
+/**
+ * [`KoreFdInfo::access`]: the capability may be written.
+ */
+#define KORE_FD_WRITE (1 << 1)
+
+/**
+ * What a descriptor names, as the calling thread holds it
+ * ([`kore_fd_describe`]).
+ */
+typedef struct KoreFdInfo {
+  /**
+   * What kind of capability it is: `KORE_FD_MEMORY`.
+   */
+  uint32_t kind;
+  /**
+   * What the capability's own rights permit this thread, as
+   * `KORE_FD_READ | KORE_FD_WRITE` bits: the rights it was founded with,
+   * which the access `open` asked for can only narrow.
+   */
+  uint32_t access;
+  /**
+   * For `KORE_FD_MEMORY`, the supply's whole length in bytes: what the
+   * allocator and every mapping share, not what is still free.
+   */
+  uint64_t length;
+} KoreFdInfo;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -50,6 +88,26 @@ extern "C" {
  * is null or valid for one aligned write.
  */
 KoreStatus kore_fs_run(KoreFsStep step, void *user, KoreFsError *error);
+
+/**
+ * Describe the capability behind `fd`, a descriptor `open` answered
+ * (`<fcntl.h>`): `open` finds a capability this program was founded holding
+ * by its name, and this reads what was found. Nothing is granted or changed.
+ *
+ * Capabilities are held per thread, so the answer is the calling thread's:
+ * the same descriptor may describe a capability on the thread that opened
+ * it and be refused on one founded without it.
+ *
+ * Returns `KORE_STATUS_OK` with `*out` written.
+ * `KORE_STATUS_INVALID_ARGUMENT`: `out` is null. `KORE_STATUS_STALE_HANDLE`:
+ * `fd` is not an open descriptor. `KORE_STATUS_REFUSED`: the calling thread
+ * holds no such capability, or this is not a Kore program. A refusal leaves
+ * `*out` unchanged.
+ *
+ * # Safety
+ * `out` is null or valid for one aligned write.
+ */
+KoreStatus kore_fd_describe(int fd, struct KoreFdInfo *out);
 
 #ifdef __cplusplus
 }  // extern "C"
