@@ -105,6 +105,11 @@ pub(crate) fn on_host() -> bool {
     ROLE.get() == Role::Host
 }
 
+/// Whether a host serves: thread 0 answers what other threads post.
+pub(crate) fn hosted() -> bool {
+    HOSTED.load(Ordering::Acquire)
+}
+
 /// Whether the calling thread is the main thread, the one the host can kick.
 pub(crate) fn on_main() -> bool {
     ROLE.get() == Role::Main
@@ -160,9 +165,11 @@ impl Request {
     }
 }
 
-/// Anything the host must answer: an end, or a session.
+/// Anything the host must answer: an end, a session, or a mapping.
 fn pending() -> bool {
-    EXIT.posted().is_some() || SESSION.state.load(Ordering::Acquire) == POSTED
+    EXIT.posted().is_some()
+        || SESSION.state.load(Ordering::Acquire) == POSTED
+        || crate::mmap::posted()
 }
 
 // ── Entry points the C library calls ────────────────────────────────────
@@ -363,6 +370,9 @@ impl Founded {
         // The C streams reach the launcher through this thread: map its
         // stream and install the sink before any thread can write.
         let output = crate::stdio::install(&rt);
+        // Where `mmap` places: this task's free link span, published before
+        // any thread that could map exists.
+        crate::mmap::arm(&rt);
         HOSTED.store(true, Ordering::Release);
         // A mint grant of its own: the first `pthread_create` on the main
         // thread starts kore-rt's thread controller there, which mints the
@@ -472,6 +482,11 @@ async fn host(
                 return Ok(exit);
             }
         }
+        // A thread's `mmap` or `munmap`: thread 0 holds the supply's root.
+        if crate::mmap::serve() {
+            wake_main();
+            continue;
+        }
         if SESSION.state.load(Ordering::Acquire) == POSTED {
             // SAFETY: POSTED hands the cell to the host until it stores SERVED.
             let (step, user) = {
@@ -577,10 +592,19 @@ async fn until_exit(
             crate::stdio::drain(output, wake_main).await;
             executor::yield_now().await;
         }
+        // Another thread's mapping does not wait for the session to end,
+        // and the session is polled between two of them.
+        if crate::mmap::serve() {
+            wake_main();
+            executor::yield_now().await;
+            continue;
+        }
         crate::stdio::arm();
-        if park(wake, || ended() || crate::stdio::pending())
-            .await
-            .is_err()
+        if park(wake, || {
+            ended() || crate::stdio::pending() || crate::mmap::posted()
+        })
+        .await
+        .is_err()
         {
             core::future::pending::<()>().await;
         }

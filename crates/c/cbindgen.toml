@@ -15,7 +15,9 @@ parse_deps = false
 # these), not an application API: the C library declares them itself, as
 # its <stdlib.h> declares `abort`. `KoreFsStep` is kore.h's typedef, which
 # this header includes.
-exclude = ["__kore_program_start", "__kore_program_exit", "abort", "KoreFsStep"]
+# `open`, `close`, `mmap` and `munmap` are POSIX's, declared by <fcntl.h>,
+# <unistd.h> and <sys/mman.h>.
+exclude = ["__kore_program_start", "__kore_program_exit", "abort", "open", "close", "mmap", "munmap", "KoreFsStep"]
 [enum]
 prefix_with_name = true
 rename_variants = "ScreamingSnakeCase"

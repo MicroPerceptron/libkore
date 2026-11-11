@@ -419,3 +419,11 @@ only kore-rt's `futex.rs` and `thread_controller.rs` and the record differ.
 The two sides' controller changes compose: the controller and its children
 are founded with `spawn_founder_with_arg`, and a child still waits for its
 founding before its callback runs.
+
+It then moved to Kore `4a56f8279c79fd4d65918e581fe382f0775dfb51`, the merge
+of #1494's next round: kore-rt names the link window's free span once, and C
+programs gain descriptors and mmap. The closure stays at 27 packages and 401
+files. Against that branch's export at `10c7b400`, only kore-rt's `futex.rs`
+and `thread_controller.rs`, the record, and five services' `boot.toml`
+digests differ. The digests come from #1494's own reseal (`f2644e5b`), which
+followed its export.

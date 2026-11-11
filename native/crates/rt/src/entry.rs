@@ -176,6 +176,28 @@ const PROCESS_STDIO_ATTACHMENT: usize = 1 << 1;
 #[cfg(any(test, target_os = "none"))]
 const PROCESS_STDIO_HOST_ATTACHMENT: usize = 1 << 2;
 
+/// The free part of a task's link window ([`Rt::link_free_span`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkSpan {
+    /// The task's whole link window.
+    pub base: u64,
+    /// Its end below the module page.
+    pub limit: u64,
+    /// The first free address: above everything the startup linker placed.
+    pub free: u64,
+}
+
+/// Why a task has no free link span ([`Rt::link_free_span`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkSpanError {
+    /// The task has no `geom::LINK` window.
+    NoWindow,
+    /// The window has no module page.
+    NoModulePage,
+    /// Nothing free above what the startup linker placed.
+    Full,
+}
+
 /// Atomically spend one runtime attachment name.
 ///
 /// This is deliberately a bit in the process-root
@@ -253,6 +275,48 @@ impl Rt {
     #[cfg(not(target_os = "none"))]
     pub fn modules(&self) -> Option<&'static kore_abi::image::ModulePage> {
         None
+    }
+
+    /// **The free part of this task's link window** (`geom::LINK`): where a
+    /// program may place mappings of its own after startup — a Wasmtime
+    /// engine's guest mappings, a C program's `mmap`.
+    ///
+    /// The floor is the larger of the module page's two marks: the recorded
+    /// segments' top ([`ModulePage::high_water`]) and how far the startup
+    /// placement reached ([`ModulePage::placed_high_water`]: the copied
+    /// template views and the TLS block, which no record names). Neither
+    /// alone is the floor. The limit is the module page itself, the
+    /// window's last page.
+    ///
+    /// This names a span and claims nothing. **One placer per window**: a
+    /// program places everything it maps there from one cursor
+    /// (`kore_ld::place::SharedPlacer`), and one that also links native
+    /// modules late (`kore-late`) partitions the span between the two
+    /// itself, since two cursors over one window hand out each other's
+    /// addresses.
+    ///
+    /// [`ModulePage::high_water`]: kore_abi::image::ModulePage::high_water
+    /// [`ModulePage::placed_high_water`]: kore_abi::image::ModulePage::placed_high_water
+    pub fn link_free_span(&self) -> Result<LinkSpan, LinkSpanError> {
+        let (base, len) = self
+            .geom()
+            .and_then(|geom| geom.window(kore_abi::task::geom::LINK))
+            .ok_or(LinkSpanError::NoWindow)?;
+        let limit =
+            kore_abi::image::module_page_va(base, len).ok_or(LinkSpanError::NoModulePage)?;
+        let page = self.modules();
+        let free = page
+            .and_then(|page| page.high_water())
+            .unwrap_or(base)
+            .max(
+                page.and_then(|page| page.placed_high_water(limit))
+                    .unwrap_or(base),
+            )
+            .max(base);
+        if free >= limit {
+            return Err(LinkSpanError::Full);
+        }
+        Ok(LinkSpan { base, limit, free })
     }
 
     /// The `.kore.geom` window table, if the founder stamped it — where the
