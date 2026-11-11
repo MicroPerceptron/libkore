@@ -61,7 +61,7 @@ use kore_ffi::{KoreFsError, KoreFsStep, KoreStatus, Session};
 use crate::exit::{Exit, ExitWord};
 use kore_std::ExitCode;
 use kore_std::fs::Fs;
-use kore_std::runtime::bridge::{Bridge, Engine, Gone, Settled, Work, WorkerHost};
+use kore_std::runtime::bridge::{Bridge, Engine, Gone, Settled, Side, Work, WorkerHost};
 use kore_std::runtime::entry::{self, Rt};
 use kore_std::runtime::executor::{self, Executor};
 use kore_std::runtime::thread::{self, WorkerStack};
@@ -75,6 +75,9 @@ pub type End = unsafe extern "C" fn(c_int) -> !;
 
 /// The program, as [`__kore_program_start`] received it, for the main thread.
 static PROGRAM: AtomicUsize = AtomicUsize::new(0);
+/// The C library's exit, as [`__kore_program_start`] received it, for an
+/// [`abort`] on thread 0.
+static END: AtomicUsize = AtomicUsize::new(0);
 /// Set by the first [`__kore_program_start`]; a second never founds a host.
 static STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -92,6 +95,16 @@ enum Role {
 
 #[thread_local]
 static ROLE: Cell<Role> = Cell::new(Role::Other);
+
+/// Whether the calling thread is the host: thread 0 holding the program.
+pub(crate) fn on_host() -> bool {
+    ROLE.get() == Role::Host
+}
+
+/// Whether the calling thread is the main thread, the one the host can kick.
+pub(crate) fn on_main() -> bool {
+    ROLE.get() == Role::Main
+}
 
 // ── The end ─────────────────────────────────────────────────────────────
 
@@ -174,6 +187,7 @@ pub unsafe extern "C" fn __kore_program_start(program: Option<Program>, end: Opt
     }
     ROLE.set(Role::Host);
     PROGRAM.store(program as usize, Ordering::Release);
+    END.store(end as usize, Ordering::Release);
     // Lives as long as this frame, which never returns.
     let transport = TrapTransport::new();
     match Founded::found(&transport) {
@@ -195,8 +209,13 @@ pub extern "C" fn __kore_program_exit(status: c_int, finalize: c_int) {
     let finalize = finalize != 0;
     match ROLE.get() {
         // Thread 0 itself: the program when there is no host, or a callback
-        // or finalizer the host is running. The barrier is this thread's.
-        Role::Host => startup::barrier(finalize),
+        // or finalizer the host is running. It cannot wait for its own loop,
+        // so it relays what the launcher has room for now; the barrier is
+        // this thread's.
+        Role::Host => {
+            crate::stdio::flush_now();
+            startup::barrier(finalize)
+        }
         role if SESSION.is_hosted() => {
             let _ = EXIT.post(Exit {
                 status,
@@ -215,6 +234,33 @@ pub extern "C" fn __kore_program_exit(status: c_int, finalize: c_int) {
         // No host: only thread 0 owns the process. Anywhere else the barrier
         // refuses and ends this thread alone.
         _ => startup::barrier(finalize),
+    }
+}
+
+/// `abort` (C11 7.22.4.1): the program's abnormal end. It ends with the
+/// aborted status, 134 — what a shell reports for a program `SIGABRT` ended —
+/// and, like `_Exit`, runs no `atexit` handler or finalizer. No stream
+/// buffers, so what the program wrote before has already left it: the host's
+/// loop relays all of it before the end when another thread aborts, and a
+/// callback's `abort` on the host itself relays what the launcher has room
+/// for at once (`stdio::flush_now`).
+///
+/// The C library's `_Exit` lives in the program, so this takes `_Exit`'s
+/// path itself: any other thread hands the status to the host and ends, and
+/// thread 0, the barrier raised, commits the end the C library handed over.
+#[unsafe(no_mangle)]
+pub extern "C" fn abort() -> ! {
+    let status = ExitCode::ABORTED.get();
+    __kore_program_exit(status, 0);
+    match END.load(Ordering::Acquire) {
+        // A program the C library never started: thread 0 ends the task.
+        0 => thread::exit(ExitCode::ABORTED),
+        end => {
+            // SAFETY: `__kore_program_start` stored an `End`, which never
+            // returns; every other thread is stopped.
+            let end: End = unsafe { core::mem::transmute(end) };
+            unsafe { end(status) }
+        }
     }
 }
 
@@ -248,7 +294,10 @@ pub(crate) unsafe fn session(step: KoreFsStep, user: *mut c_void) -> (KoreStatus
 pub(crate) fn panicked(info: &core::panic::PanicInfo<'_>) -> ! {
     crash::report(info);
     match ROLE.get() {
-        Role::Host => startup::barrier(false),
+        Role::Host => {
+            crate::stdio::flush_now();
+            startup::barrier(false)
+        }
         role if SESSION.is_hosted() => {
             let _ = EXIT.post(Exit {
                 status: ExitCode::PANIC.get(),
@@ -265,10 +314,12 @@ pub(crate) fn panicked(info: &core::panic::PanicInfo<'_>) -> ! {
 // ── The host ────────────────────────────────────────────────────────────
 
 /// Thread 0 with its program founded: the runtime context, the executor's
-/// doorbell, and the main thread.
+/// doorbell, the launcher's stream when the launch carried one, and the main
+/// thread.
 struct Founded<'t> {
     rt: Rt,
     doorbell: executor::Doorbell,
+    output: Option<&'static crate::stdio::Endpoint>,
     main: WorkerHost<'t, Main>,
 }
 
@@ -277,6 +328,9 @@ impl<'t> Founded<'t> {
     fn found(transport: &'t TrapTransport) -> Option<Self> {
         let rt = entry::thread_context()?;
         let doorbell = rt.doorbell()?;
+        // The C streams reach the launcher through this thread: map its
+        // stream and install the sink before any thread can write.
+        let output = crate::stdio::install(&rt);
         // A mint grant of its own: the first `pthread_create` on the main
         // thread starts kore-rt's thread controller there, which mints the
         // doorbells its threads park on (`thread_controller`). Without one the
@@ -287,16 +341,34 @@ impl<'t> Founded<'t> {
             WorkerStack::Bytes(crate::api::KORE_MAIN_STACK_BYTES),
             grant.as_slice(),
             |_| {},
-        )?;
-        Some(Self { rt, doorbell, main })
+        );
+        let Some(main) = main else {
+            // No host will drain the stream: writes report `EOF`, as they do
+            // for a launch that carried none.
+            if output.is_some() {
+                crate::stdio::abandon();
+            }
+            return None;
+        };
+        Some(Self {
+            rt,
+            doorbell,
+            output,
+            main,
+        })
     }
 
     /// Serve the program until it ends, then end the process.
     fn serve(self, transport: &TrapTransport, end: End) -> ! {
-        let Self { rt, doorbell, main } = self;
+        let Self {
+            rt,
+            doorbell,
+            output,
+            main,
+        } = self;
         let exit = {
             let mut executor = Executor::new(entry::transport(), doorbell);
-            executor.run(host(&rt, transport, main))
+            executor.run(host(&rt, transport, main, output))
         };
         startup::barrier(exit.finalize);
         // SAFETY: the C library's exit, as `__kore_program_start` received it.
@@ -304,16 +376,52 @@ impl<'t> Founded<'t> {
     }
 }
 
-/// The host's loop: answer each session the main thread asks for, until any
-/// thread asks for the end; then join the main thread if it is ending too, so
-/// the barrier is clean, or leave it to the barrier if it is not.
-async fn host(rt: &Rt, transport: &TrapTransport, mut main: WorkerHost<'_, Main>) -> Exit {
+/// The program's output, the host's side source: every thread writes the
+/// ring (`stdio`), and the host drains it a pass at a time between the main
+/// thread's sessions and beside one in flight. A launch that carried no
+/// stream has none.
+struct Output(Option<&'static crate::stdio::Endpoint>);
+
+impl Side for Output {
+    fn pending(&self) -> bool {
+        self.0.is_some() && crate::stdio::pending()
+    }
+
+    fn arm(&self) {
+        if self.0.is_some() {
+            crate::stdio::arm();
+        }
+    }
+
+    /// `kick_main` reaches the one writer the host can kick, woken once the
+    /// room it waits for is free. `stdio::drain` is cancellation-safe at
+    /// every wait, as a pass beside a session must be.
+    async fn pass(&mut self, kick_main: &dyn Fn()) {
+        if let Some(endpoint) = self.0 {
+            crate::stdio::drain(endpoint, kick_main).await;
+        }
+    }
+}
+
+/// The host's loop: answer each session the main thread asks for, and relay
+/// what every thread writes, until any thread asks for the end. Then relay
+/// the rest and close the stream, and join the main thread if it is ending
+/// too, so the barrier is clean, or leave it to the barrier if it is not.
+async fn host(
+    rt: &Rt,
+    transport: &TrapTransport,
+    mut main: WorkerHost<'_, Main>,
+    output: Option<&'static crate::stdio::Endpoint>,
+) -> Exit {
     let mut filesystem = Filesystem::new(rt, transport);
+    let mut side = Output(output);
     // An end requested mid-session ends the program without waiting for the
     // session: the barrier stops the waiting main thread, and the abandoned
-    // session's owner is quarantined, as cancellation leaves it.
+    // session's owner is quarantined, as cancellation leaves it. What the
+    // program writes is relayed meanwhile, beside the session, so a program
+    // that never stops printing still ends when it asks to.
     let served = main
-        .serve_until(
+        .serve_beside(
             async |cell: &mut Payload| {
                 let (status, error) = match cell.step {
                     Some(step) => filesystem.run(step, cell.user).await,
@@ -324,6 +432,7 @@ async fn host(rt: &Rt, transport: &TrapTransport, mut main: WorkerHost<'_, Main>
                 cell.error = error;
             },
             || EXIT.posted().is_some(),
+            &mut side,
         )
         .await;
     let (exit, joined) = match served {
@@ -351,6 +460,16 @@ async fn host(rt: &Rt, transport: &TrapTransport, mut main: WorkerHost<'_, Main>
         // the main thread cannot tell whether it is ending.
         Ok(Some(Settled::Idle)) | Err(_) => (INTERNAL, false),
     };
+    // Whatever ended the program, what it wrote reaches the launcher, and
+    // then the stream's close, before the process ends: the launcher shows
+    // all of it before the status. The main thread may still be waiting for
+    // room, so it is finished before the main thread is retired.
+    if let Some(output) = output {
+        crate::stdio::finish(output, &|| {
+            let _ = main.kick();
+        })
+        .await;
+    }
     if joined {
         // The main thread asked and is ending itself: wait for it, so a
         // program that ran on it alone is stopped cleanly.

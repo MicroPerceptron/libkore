@@ -86,6 +86,16 @@
 //!   post was refused before the post stood, so the re-read sees its store; a
 //!   kick into a standing post resolves the park at once.
 //!
+//! - **A side source** (`Side`, metal only) is work other
+//!   threads hand the host through the same wake channel: a C program's
+//!   output, which any of its threads may write. Its producers kick only
+//!   while the host is armed, and the host arms after its post stands and
+//!   then re-reads the source beside the word, so the same argument holds:
+//!   a kick that found no post was refused before the arm, and the re-read
+//!   sees what the producer published first. The host drains the source a
+//!   bounded pass at a time, between the worker's calls and beside one in
+//!   flight, so neither waits for the other.
+//!
 //! A refused kick is therefore never an error on either side, and a wake is
 //! never a promise: both sides re-read the word after every return.
 //!
@@ -850,7 +860,7 @@ fn last_word(reason: Gone) {
 // ─── The host ──────────────────────────────────────────────────────────
 
 #[cfg(target_os = "none")]
-pub use host::WorkerHost;
+pub use host::{Side, WorkerHost};
 
 #[cfg(target_os = "none")]
 mod host {
@@ -872,6 +882,47 @@ mod host {
     /// The worker's entry, as the founding calls it.
     fn trampoline<E: Engine>() {
         enter::<E>(&super::Native);
+    }
+
+    /// How soon a park whose receive was refused for want of a standing post
+    /// looks again. A rotating receiver's handoff is in flight, and nothing
+    /// is armed to wake the host when it lands. This is the figure the
+    /// tree's other notice receivers retry a handoff at (`chan`, `process`).
+    const HANDOFF_RETRY_NS: u64 = 100_000;
+
+    /// A **side source** the host serves beside the worker's calls, kicked
+    /// through the same wake channel: work other threads hand thread 0, such
+    /// as a C program's output, which any of its threads may write.
+    ///
+    /// The host runs the source's passes between the worker's calls and
+    /// beside one in flight, so neither waits for the other. A pass never
+    /// ends a serve: only the serve's stop does. Producers kick the host only
+    /// while it is armed, so a run of work costs no trap per item.
+    pub trait Side {
+        /// Whether the source has work for the host now.
+        fn pending(&self) -> bool;
+        /// Have the source's producers kick the wake channel from now on.
+        /// The host arms after its wake post stands and before it re-reads
+        /// [`pending`](Self::pending). Work published after the arm kicks a
+        /// standing post, and work published before it is seen (module doc).
+        fn arm(&self);
+        /// One bounded pass over the source's work. `kick_worker` wakes the
+        /// worker, for work it waits on beside the bridge (room it needs).
+        /// A pass beside a call is dropped mid-way when the call completes
+        /// first, so it must be cancellation-safe.
+        fn pass(&mut self, kick_worker: &dyn Fn()) -> impl Future<Output = ()>;
+    }
+
+    /// No side source: [`WorkerHost::serve`] and
+    /// [`serve_until`](WorkerHost::serve_until).
+    impl Side for () {
+        fn pending(&self) -> bool {
+            false
+        }
+
+        fn arm(&self) {}
+
+        async fn pass(&mut self, _: &dyn Fn()) {}
     }
 
     /// **The host's half of a bridge**: the worker it founded over
@@ -945,6 +996,15 @@ mod host {
             Ok(())
         }
 
+        /// **Kick the worker's doorbell**, for an engine whose worker also
+        /// waits on words of its own beside the bridge (a C program's main
+        /// thread, waiting for room for its output). A kick is a hint: the
+        /// worker re-reads whatever it waits on, so a spurious one costs a
+        /// re-read. `false` when the kernel refused it.
+        pub fn kick(&self) -> bool {
+            self.worker.kick()
+        }
+
         /// **Serve the worker's calls until it yields the cell**: `answer`
         /// dispatches each call, holding the payload for the whole call.
         /// Returns at once if the worker is already idle or gone.
@@ -952,7 +1012,7 @@ mod host {
             &mut self,
             answer: impl AsyncFnMut(&mut E::Payload),
         ) -> Result<Settled, Fatal> {
-            match self.drive(answer, None::<fn() -> bool>).await? {
+            match self.drive(answer, None::<fn() -> bool>, &mut ()).await? {
                 Some(settled) => Ok(settled),
                 // `drive` stops only for a stop condition, and there is none.
                 None => Err(Fatal),
@@ -973,26 +1033,57 @@ mod host {
             answer: impl AsyncFnMut(&mut E::Payload),
             stop: impl Fn() -> bool,
         ) -> Result<Option<Settled>, Fatal> {
-            self.drive(answer, Some(stop)).await
+            self.drive(answer, Some(stop), &mut ()).await
+        }
+
+        /// [`serve_until`](Self::serve_until) with a [`Side`] source served
+        /// beside the worker: a pass whenever the source has work, between
+        /// the worker's calls and beside a call in flight. The stop and the
+        /// worker's next call are read between passes, so a source whose
+        /// producers never pause still lets the serve stop.
+        ///
+        /// For a C program's host, whose every thread writes the output the
+        /// host relays.
+        pub async fn serve_beside(
+            &mut self,
+            answer: impl AsyncFnMut(&mut E::Payload),
+            stop: impl Fn() -> bool,
+            side: &mut impl Side,
+        ) -> Result<Option<Settled>, Fatal> {
+            self.drive(answer, Some(stop), side).await
         }
 
         async fn drive<S: Fn() -> bool>(
             &mut self,
             mut answer: impl AsyncFnMut(&mut E::Payload),
             stop: Option<S>,
+            side: &mut impl Side,
         ) -> Result<Option<Settled>, Fatal> {
             let bridge = E::bridge();
+            let Self { worker, wake, .. } = self;
+            let worker = &*worker;
             let stopped = || stop.as_ref().is_some_and(|stop| stop());
+            let kick_worker = || {
+                let _ = worker.kick();
+            };
             loop {
                 if stopped() {
                     return Ok(None);
+                }
+                // One pass, then the worker: the stop and its next call are
+                // read between passes, however fast the side's producers are.
+                if side.pending() {
+                    side.pass(&kick_worker).await;
+                    if stopped() {
+                        return Ok(None);
+                    }
                 }
                 match bridge.host_step() {
                     HostStep::Settled(settled) => return Ok(Some(settled)),
                     HostStep::Wait(seen) => {
                         let moved =
                             || bridge.word().load(core::sync::atomic::Ordering::Acquire) != seen;
-                        park(&mut self.wake, || moved() || stopped()).await?;
+                        park(wake, || moved() || stopped() || armed(side)).await?;
                     }
                     HostStep::Serve => {
                         // SAFETY: `CALL` hands the host the cell until it
@@ -1005,14 +1096,14 @@ mod host {
                             answer(payload).await;
                         } else {
                             let call = pin!(answer(payload));
-                            let ended = pin!(until(&mut self.wake, &stopped));
+                            let ended = pin!(until(wake, &stopped, side, &kick_worker));
                             if race(call, ended).await.is_none() {
                                 return Ok(None);
                             }
                         }
                         // A worker that gave the call up already said so.
                         if bridge.answer() {
-                            let _ = self.worker.kick();
+                            let _ = worker.kick();
                         }
                     }
                 }
@@ -1098,20 +1189,43 @@ mod host {
                     let _ = executor::next_wake_on(post).await;
                 }
                 Err(RecvError::Refused(Status::WouldBlock)) => {
-                    let _ = executor::next_wake().await;
+                    // No post stands to wake on while a rotating receiver's
+                    // handoff is in flight, and nothing is armed to say when
+                    // it lands: look again shortly rather than wait for a wake
+                    // nothing will make.
+                    let _ = executor::next_wake_for(HANDOFF_RETRY_NS).await;
                 }
                 Err(_) => return Err(Fatal),
             }
         }
     }
 
-    /// Resolve once `stopped` holds, parking on the wake channel meanwhile:
-    /// the call being served is not a reason to wake, only a stop is. On a
-    /// broken channel it never resolves — the host can no longer hear a stop
-    /// — and the call it races runs to its own end.
-    async fn until(wake: &mut NoticeRx<'_, TrapTransport>, stopped: &impl Fn() -> bool) {
+    /// The side source's part of a park's re-read: arm it, then read it.
+    fn armed(side: &impl Side) -> bool {
+        side.arm();
+        side.pending()
+    }
+
+    /// Resolve once `stopped` holds, parking on the wake channel meanwhile
+    /// and running the side's passes: the call being served is not a reason
+    /// to wake, only a stop or side work is. On a broken channel it never
+    /// resolves, since the host can no longer hear a stop, and the call it
+    /// races runs to its own end. Each pass yields, so the call is polled
+    /// however fast the side's producers are; a pass in flight is dropped
+    /// when the call completes first ([`Side::pass`]).
+    async fn until(
+        wake: &mut NoticeRx<'_, TrapTransport>,
+        stopped: &impl Fn() -> bool,
+        side: &mut impl Side,
+        kick_worker: &dyn Fn(),
+    ) {
         while !stopped() {
-            if park(wake, stopped).await.is_err() {
+            if side.pending() {
+                side.pass(kick_worker).await;
+                executor::yield_now().await;
+                continue;
+            }
+            if park(wake, || stopped() || armed(side)).await.is_err() {
                 core::future::pending::<()>().await;
             }
         }

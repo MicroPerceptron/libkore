@@ -12,9 +12,10 @@ header = "/* libkore.so: what an independent C program on Kore adds to kore.h. L
 parse_deps = false
 [export]
 # The C library's half of the program lifecycle (its start and exit call
-# these), not an application API: the C library declares them itself.
-# `KoreFsStep` is kore.h's typedef, which this header includes.
-exclude = ["__kore_program_start", "__kore_program_exit", "KoreFsStep"]
+# these), not an application API: the C library declares them itself, as
+# its <stdlib.h> declares `abort`. `KoreFsStep` is kore.h's typedef, which
+# this header includes.
+exclude = ["__kore_program_start", "__kore_program_exit", "abort", "KoreFsStep"]
 [enum]
 prefix_with_name = true
 rename_variants = "ScreamingSnakeCase"

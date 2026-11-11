@@ -38,12 +38,17 @@
 // The C ABI's exports are this image's reason to exist; naming the crate keeps
 // them in the link.
 use kore_ffi as _;
+// Kore's C library, exported whole from this image.
+#[cfg(target_os = "none")]
+use kore_c_shim as _;
 
 pub mod api;
 #[cfg(any(test, target_os = "none"))]
 mod exit;
 #[cfg(target_os = "none")]
 mod program;
+#[cfg(any(test, target_os = "none"))]
+mod stdio;
 
 /// The process heap over the founder's `role::HEAP` supply, grown on demand.
 /// The program's allocations (`malloc`, `kore_alloc_*`) and this library's
