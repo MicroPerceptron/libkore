@@ -435,8 +435,16 @@ controller's relay as before and reach fewer threads; `docs/runtime.md` now
 says so. The metal evidence is Kore's `keytest-tcc-x86`. The libkore tour has
 two threads take 400 turns through a mutex and a condition variable on the
 futex while `main` waits parked on a word nobody stores. The controller admits
-two managed threads at once today, so `main` is the only parked thread. On
-the image built from `4f913c4`, the relay before the founding wait was merged,
-no wake reached it. On the same image with kore-rt's futex and controller from
-`a4ab7234`, which count and sweep, it was woken 208 times and the tour failed
-that step.
+two managed threads at once on this stack, so `main` is the only parked
+thread; Kore #1494's later `2a0730d`, which gives the controller's children
+their founder's arena, lifts that bound, and the step then parks up to eight
+more. On the image built from `4f913c4`, the relay before the founding wait
+was merged, no wake reached it. On the same image with kore-rt's futex and
+controller from `a4ab7234`, which count and sweep, it was woken 208 times and
+the tour failed that step.
+
+Kore's reseal over this export repeats that measurement on the merged tree
+(`e0717eb`, built from `d64b7a5`, which pins it): every step ran to `exit 42`
+and no wake reached the parked thread. The same tree with the futex and
+controller of `36b99426`, the founding wait's own, which count and sweep, woke
+it 206 times, and the tour failed that step.
