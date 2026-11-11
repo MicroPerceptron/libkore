@@ -390,3 +390,37 @@ controller's threads is refused with EAGAIN, as create refuses it, and records
 nothing. A host test drives `request_cancel` to that refusal. The metal
 evidence is Kore's `keytest-tcc-x86`, whose libkore tour cancels a thread
 parked in `pthread_join` and one parked in `kore_futex_wait` with no timeout.
+
+## A relayed wake reaches its waiter alone
+
+The export records Kore `920526a62ee585740537a2d1de74e3a265420377`, on
+`ft/admiring-lovelace-69eiok`, which is stacked on `ft/brave-heisenberg-zgoaux`
+(`dea991f0`). Two changes since `a4ab7234` reach the closure, which keeps its
+26 packages and 382 files:
+
+- `kore-rt`'s thread controller relays a wake to the threads it was for and no
+  others (Kore `b67f198`). Managed threads hold no send into each other's
+  doorbells, so a wake between two of them goes through the controller's hub.
+  The hub used to count relays, and the controller swept: it kicked every
+  thread with a doorbell waiter, whatever word that thread waited on, so every
+  relayed wake woke every parked thread in the program. Now a waker owes the
+  hub the bands of the waiters it found and could not kick before it moves the
+  hub's word: `wake` owes its first, `wake_all` all of them and `wake_thread`
+  its target. The controller takes the owed bands after it reads that word and
+  kicks each band that still waits. The registry's Dekker argument makes this
+  lossless: a waiter that registers after the waker's scan reads the new word
+  and never parks.
+- The services' `boot.toml` digests are the reseal over that change
+  (`920526a`), after `ft/brave-heisenberg-zgoaux`'s own (`bfecfd1`).
+
+No exported manifest changed, so `native/Cargo.lock` did not.
+
+Nothing in `kore-ffi` or `kore-c` changes. A C program's futex wakes take the
+controller's relay as before and reach fewer threads; `docs/runtime.md` now
+says so. The metal evidence is Kore's `keytest-tcc-x86`. The libkore tour has
+two threads take 400 turns through a mutex and a condition variable on the
+futex while `main` waits parked on a word nobody stores. The controller admits
+two managed threads at once today, so `main` is the only parked thread. On
+the image built from `920526a`'s source, no wake reached it. On the same image
+with kore-rt's futex and controller from `a4ab7234`, which count and sweep, it
+was woken 208 times and the tour failed that step.
