@@ -806,8 +806,16 @@ dependencies = [
 name = "kore-c"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "kore-c-shim",
  "kore-ffi",
  "kore-std",
+]
+
+[[package]]
+name = "kore-c-shim"
+version = "0.1.0"
+dependencies = [
+ "kore-rt",
 ]
 
 [[package]]
