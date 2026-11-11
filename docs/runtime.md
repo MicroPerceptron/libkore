@@ -205,7 +205,9 @@ a send into each managed thread's doorbell. The target's wait reads the request
 again once it is registered (`futex::wait_unless`), and the wake reads that
 registration, so one of the two always sees the other. Only a target the
 controller cannot wake waits in bounded 1 ms slices against one monotonic
-deadline. A thread whose wake cannot reach the controller's threads, because
+deadline. A thread the controller founds with a doorbell is never one: it
+runs its callback only once its founding is published, after the controller
+can kick it. A thread whose wake cannot reach the controller's threads, because
 it neither started the controller nor was created through it, is refused with
 EAGAIN and records no request, as create refuses it: Kore's capability model
 grants no wake without a send, and a request a parked target never sees would

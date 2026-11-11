@@ -390,3 +390,17 @@ controller's threads is refused with EAGAIN, as create refuses it, and records
 nothing. A host test drives `request_cancel` to that refusal. The metal
 evidence is Kore's `keytest-tcc-x86`, whose libkore tour cancels a thread
 parked in `pthread_join` and one parked in `kore_futex_wait` with no timeout.
+
+The export then moved to Kore `40de25825eb1ea7816f7e7df86e116b3ad20d1fc`,
+which closes a child's founding window. The controller sets a child's reach
+bit only after `spawn_with_arg` returns, and the child ran its callback at
+once. Its first wait could therefore start before the controller had
+recorded that it can kick the child. A cancellable `kore_futex_wait` in that
+window took the unreached slice and kept it until its first real wake.
+`child_entry` now settles on its record until the founding is published,
+which follows the reach bit, so a thread the controller founds with a
+doorbell is reached from its first wait. A host test holds a founding back
+and checks that the callback waits for it. The closure keeps its 26 packages
+and 382 files. Besides `thread_controller.rs`, it carries the
+`services/swap/boot.toml` digest of Kore's reseal over the cancellation wake
+(`bfecfd17`).

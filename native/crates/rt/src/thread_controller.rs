@@ -27,6 +27,8 @@
 //! the controller mints a doorbell, keeps the send (an adopted peer, withdrawn
 //! before the child's band can be reused), and founds the child holding it, a
 //! send into the controller, the starter's kick, the host's wake and the heap.
+//! The child runs its callback once its founding is published, which follows
+//! the adopted send, so the controller reaches every wait the callback makes.
 //! Children and the starter relay through the controller's hub, so a wake
 //! between two threads neither can kick directly still arrives: the controller
 //! sweeps ([`futex::sweep`]).
@@ -140,7 +142,8 @@ fn empty(_: usize) -> usize {
 struct Record {
     state: AtomicU64,
     /// Bumped by the controller after each transition a client can wait
-    /// for; clients park on it. An event count: the state is the truth.
+    /// for; clients park on it, the child too until it is founded. An event
+    /// count: the state is the truth.
     event: AtomicU32,
     /// Set by the child's exit hook: it has stopped running its own code
     /// and is committing its end.
@@ -201,7 +204,8 @@ pub struct Controller {
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
     starter: AtomicU32,
     /// The bands whose doorbells the controller can kick, a bit each: the
-    /// clients its wakes reach. A child's bit is set once it is founded and
+    /// clients its wakes reach. A child's bit is set before its founding is
+    /// published, which the child waits for before its callback runs, and
     /// cleared before its band can be reused.
     reach: AtomicU32,
     records: [Record; COUNT],
@@ -356,7 +360,9 @@ impl Controller {
     /// when the controller can kick it — it holds a send into the thread's
     /// doorbell, so every wake it sends, and every wake relayed through it,
     /// reaches the thread — and [`UNREACHED_SLICE`] when nothing would end
-    /// that park early.
+    /// that park early. A thread the controller founds with a doorbell is
+    /// reached before its callback runs, so every wait of that callback is
+    /// unbounded from the first.
     pub fn slice(&self) -> Option<Duration> {
         let reached = futex::current_thread()
             .is_some_and(|band| self.reach.load(Ordering::SeqCst) & (1 << band) != 0);
@@ -511,7 +517,7 @@ fn pause() {
 }
 
 /// The managed thread's entry: announce its end however it comes, relay
-/// through the controller, run the callback.
+/// through the controller, wait to be founded, run the callback.
 fn child_entry(argument: usize) {
     // SAFETY: controller storage is static; record cannot be reused until join.
     let record = unsafe { &*(argument as *const Record) };
@@ -528,7 +534,14 @@ fn child_entry(argument: usize) {
     let _ = record.state.load(Ordering::Acquire);
     let start = unsafe { *record.start.get() };
     // SAFETY: `home` names the static controller whose record this is.
-    let _ = futex::adopt_hub(&unsafe { &*(start.home as *const Controller) }.hub);
+    let home = unsafe { &*(start.home as *const Controller) };
+    let _ = futex::adopt_hub(&home.hub);
+    // The callback runs once the founding is published, as `create` returns
+    // once it is. The controller publishes it only after it can kick this
+    // thread (`reach`), so no wait in the callback rides the unreached slice
+    // for want of a bit the controller had yet to set. A child that outran
+    // its founding parks here as its creator does, until the announcement.
+    home.settle(record, |state| state & MASK != REQUEST);
     record
         .value
         .store((start.call)(start.argument), Ordering::Release);
@@ -1079,6 +1092,45 @@ mod tests {
             assert_eq!(joiner.join().unwrap(), Ok(5));
         });
         assert_eq!(record.state.load(Ordering::Acquire), 16);
+    }
+    #[test]
+    fn a_child_runs_its_callback_only_once_its_founding_is_published() {
+        // The child's half of its founding, with a host thread for the child
+        // and this one for the controller. The controller sets the child's
+        // reach bit before it publishes the founding, so a callback that ran
+        // first could find its own waits unreached, and bounded.
+        static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+        fn callback(record: usize) -> usize {
+            // SAFETY: the record is leaked below, so it outlives this child.
+            let record = unsafe { &*(record as *const Record) };
+            SEEN.store(record.state.load(Ordering::Acquire), Ordering::Release);
+            7
+        }
+        let controller: &'static Controller =
+            std::boxed::Box::leak(std::boxed::Box::new(Controller::new()));
+        let record = &controller.records[0];
+        // SAFETY: no child runs yet; this thread is the BUILD claimant.
+        unsafe {
+            *record.start.get() = Start {
+                call: callback,
+                argument: record as *const Record as usize,
+                retire: None,
+                home: controller as *const Controller as usize,
+            };
+        }
+        record.state.store(REQUEST, Ordering::Release);
+        std::thread::scope(|scope| {
+            let child = scope.spawn(|| child_entry(record as *const Record as usize));
+            // Every chance for a child that does not wait to run first.
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(record.returned.load(Ordering::Acquire), 0);
+            record.state.store(RUNNING, Ordering::Release);
+            record.announce();
+            child.join().unwrap();
+        });
+        assert_eq!(SEEN.load(Ordering::Acquire), RUNNING);
+        assert_eq!(record.value.load(Ordering::Acquire), 7);
+        assert_eq!(record.returned.load(Ordering::Acquire), 1);
     }
     #[test]
     fn an_unstarted_controller_refuses_and_never_waits() {
