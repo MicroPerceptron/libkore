@@ -55,4 +55,4 @@ endows    = ["MEM_SUPPLY@0", "MEM_REGION@0", "SYSTEM_OBSERVE@0"]  # review mirro
 shell_client = true
 exec_client = true
 digest_x86_64  = "blake3:d1ce3128c73f02293e323f87d79850b8558dfd82d882b65169767febb7baf6e4"  # res/x86_64/; make boot-digests
-digest_aarch64 = "blake3:a03d13d5caf95b15a82902ed087c816af46f74aa305ca47d01681b039e9d55fe"  # res/aarch64/; make boot-digests-aarch64
+digest_aarch64 = "blake3:901b68a3acc55e7424ee98c90758fa17d5675f50292a1bc8e277591b2f0f5803"  # res/aarch64/; make boot-digests-aarch64
