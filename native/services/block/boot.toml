@@ -12,5 +12,5 @@ chain     = true
 endowment = "kore_svc_block::BlockEndowment"
 protocol  = "kore_svc_block::BlockService"
 endows    = ["DMA_POOL@1"]
-digest_x86_64  = "blake3:c55dc025414bbcd3a511a3072095c412aedfee76d69f22bedeb51859bc30ec6b"
-digest_aarch64 = "blake3:807f59729471b0b98d09a5b8c8e1d1931986475835c116aaee136fbe5843fdc4"
+digest_x86_64  = "blake3:a22f3a5b08f35a278ebf663d557e0b1ec490c8e732cdee0fa68151e349ddbc57"
+digest_aarch64 = "blake3:2855f4168dcfe5b78dca4c508bc6f3120af84412c74498f2cf6475b01508c8e2"

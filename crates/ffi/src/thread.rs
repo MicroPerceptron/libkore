@@ -98,7 +98,11 @@ fn retire(argument: usize) {
     // SAFETY: called exactly once by native owner after successful reclamation.
     unsafe {
         let context = NonNull::new_unchecked(argument as *mut StartContext);
-        context.as_ref().control.retired.store(1, Ordering::Release);
+        let control = &context.as_ref().control;
+        // Store, then wake (the futex's order): a joiner parked on the word
+        // re-reads it once it is registered, so neither can miss the other.
+        control.retired.store(1, Ordering::SeqCst);
+        kore::futex::wake_all(&control.retired);
         release(context);
     }
 }
@@ -196,16 +200,24 @@ pub unsafe extern "C" fn kore_thread_join(
         return KORE_THREAD_EDEADLK;
     }
     // Wait without claiming the native join record: cancellation must leave the
-    // target joinable. Only the controller can retire native capabilities.
+    // target joinable. Only the controller can retire native capabilities, and
+    // it wakes `retired` when it does.
     loop {
         unsafe { crate::kore_thread_testcancel() };
         let control = unsafe { &ticket.as_ref().control };
-        if control.retired.load(Ordering::Acquire) != 0 {
+        if control.retired.load(Ordering::SeqCst) != 0 {
             break;
         }
-        // Independent native workers need not own a doorbell. Use the
-        // controller's deadline park, which requires no peer wake capability.
-        if !kore::runtime::pace::cede() {
+        // A cancellation request is a flag, not a wake: a joiner that can be
+        // cancelled parks one slice at a time, as a cancellable futex wait
+        // does. Any other joiner parks until the controller retires the target.
+        let slice = crate::thread_local::cancellable()
+            .then(|| core::time::Duration::from_nanos(crate::thread_local::CANCEL_SLICE_NS));
+        if kore::futex::wait(&control.retired, 0, slice) == kore::futex::WaitOutcome::Unsupported
+            // A native worker with no doorbell takes the deadline park, which
+            // needs no wake capability at all.
+            && !kore::runtime::pace::cede()
+        {
             return KORE_THREAD_EAGAIN;
         }
     }

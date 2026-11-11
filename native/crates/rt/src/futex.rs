@@ -70,15 +70,26 @@
 //! `i`'s send end is looked up at `role::DOORBELL@(2 + i)`, and index 2 is
 //! the self-kick a founder already carves — so a thread endowed with it can
 //! wake **thread 0** with nothing added, which is the endowment the input
-//! service's relay thread already takes. Higher indices are the peer mesh,
-//! and `thread::spawn_with` does not provision one yet: [`wake`] returns
-//! `false` for a peer this thread holds no send end for, rather than
-//! reporting a kick it did not deliver.
+//! service's relay thread already takes. Higher indices are the peer mesh;
+//! [`wake`] returns `false` for a peer this thread holds no send end for,
+//! rather than reporting a kick it did not deliver.
 //!
-//! That asymmetry is a provisioning gap, not a design one — filling it is
-//! minting `MAX_THREADS` doorbell pairs in the spawning thread and endowing
-//! each child with the ends, which needs a `role::CHANNEL_SPACE` grant in the
-//! task that spawns. Nothing in the API changes when it lands.
+//! The mesh is provisioned by whoever founds the threads, from a
+//! `role::CHANNEL_SPACE` grant: the star (`res/SPMD.md` §3) for an SPMD
+//! region, and the [`thread_controller`](crate::thread_controller) for the
+//! threads it owns. A founding stamps the sends it can name in advance; a
+//! send a thread comes to hold *after* its founding — the channel a
+//! controller mints for each child it founds, or the one a starter mints for
+//! the controller it founds — is **adopted** ([`adopt_peer`]) into the
+//! thread's own runtime block, and [`wake`] finds it there exactly as it
+//! finds a stamped one.
+//!
+//! A waiter that no send this thread holds can reach is handed to a
+//! **relay**: the star's hub (one notice on `DOORBELL@`[`RELAY`], answered by
+//! a kick to every peer), or a [`Hub`] this thread adopted — a hub that is
+//! itself a waiter, woken through its own word, which kicks only the threads
+//! with waiters registered ([`sweep`]). Nothing in the wait/wake API changes
+//! with either.
 //!
 //! **For a word in a shared window the gap is closed** by the kernel
 //! address-wait (`res/EVENT.md` §6).  A word that
@@ -348,6 +359,15 @@ pub(crate) const PEER_BASE: u16 = 2;
 /// here instead; the hub kicks everyone it holds.  Numbered one past the
 /// band peers so it can never collide with one.
 pub(crate) const RELAY: u16 = PEER_BASE + MAX_THREADS as u16;
+
+/// A thread's **own kick**: a send into its own doorbell that it may derive
+/// from — the authority it hands a thread it founds so that thread can wake
+/// it ([`thread::own_kick`](crate::thread)).  One past [`RELAY`], so neither
+/// the peer arithmetic nor the relay can name it: a thread never kicks itself
+/// through the mesh.  Thread 0's own kick predates this index — it is the
+/// founder-carved self-kick at [`PEER_BASE`], its own peer-0 entry.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) const OWN_KICK: u16 = RELAY + 1;
 
 /// Wait until another thread wakes this one, or `timeout` elapses.
 ///
@@ -825,6 +845,13 @@ pub(crate) fn notify_resident_completion() -> bool {
 /// parked is still woken correctly — its post already stands, so the notice
 /// resolves the park it is about to enter.
 pub fn wake(word: &AtomicU32) -> bool {
+    wake_one(word, true)
+}
+
+/// [`wake`]'s body. `relay` says whether a waiter this thread cannot reach
+/// is handed on ([`relay_missed`]); a [`Hub`]'s own signal is not, since the
+/// hub is the relay.
+fn wake_one(word: &AtomicU32, relay: bool) -> bool {
     let addr = address_of(word);
     let route = crate::cap::mapped::locate(word as *const AtomicU32 as *const u8);
     let mut unreachable_waiter = false;
@@ -852,17 +879,27 @@ pub fn wake(word: &AtomicU32) -> bool {
         }
     }
     // A registered waiter this caller holds no peer send for is the
-    // hub's to reach (`res/SPMD.md` §3 — the star): one relay notice,
-    // counted as a wake because a notice is now in flight toward the
-    // waiter.  No hub wired → today's honest miss.
+    // hub's to reach (`res/SPMD.md` §3 — the star, or this thread's own
+    // `Hub`): one relay, counted as a wake because a wake is now in
+    // flight toward the waiter.  No hub wired → today's honest miss.
     if unreachable_waiter {
         STAT_MISSED.fetch_add(1, Ordering::Relaxed);
-        if imp::relay() {
+        if relay && relay_missed() {
             STAT_RELAYS.fetch_add(1, Ordering::Relaxed);
             return true;
         }
     }
     false
+}
+
+/// Hand the waiters this thread could not reach to the thread that can:
+/// its adopted [`Hub`], through the hub's own word, or else the star's hub
+/// through one raw notice on `DOORBELL@`[`RELAY`]. `true` when either went.
+fn relay_missed() -> bool {
+    match imp::hub() {
+        Some(hub) => hub.relay(),
+        None => imp::relay(),
+    }
 }
 
 /// Wake **every** thread waiting on `word`; returns how many were kicked.
@@ -904,16 +941,203 @@ pub fn wake_all(word: &AtomicU32) -> usize {
             missed = true;
         }
     }
-    // The relay hop (the star, `res/SPMD.md` §3): every waiter this
-    // caller could not kick is the hub's job — one notice covers them
-    // all, counted once.  With the intra-chunk kick mesh this is the
-    // exception path (cross-chunk waiters), not the release path.
-    if missed && imp::relay() {
+    // The relay hop (the star, `res/SPMD.md` §3, or this thread's `Hub`):
+    // every waiter this caller could not kick is the hub's job — one relay
+    // covers them all, counted once.  With the intra-chunk kick mesh this
+    // is the exception path (cross-chunk waiters), not the release path.
+    if missed && relay_missed() {
         STAT_RELAYS.fetch_add(1, Ordering::Relaxed);
         woken += 1;
     }
     woken
 }
+
+/// A **relay hub that is also a waiter**: the thread that founds a group of
+/// threads and holds a send into each of their doorbells — the
+/// [`thread_controller`](crate::thread_controller) — parked on its
+/// [`word`](Self::word) like any other waiter.
+///
+/// A thread that adopted the hub ([`adopt_hub`]) relays a wake it cannot
+/// deliver by counting it in [`relays`](Self::relays), then [`signal`]ing
+/// the hub: an ordinary store-then-wake of the hub's word, with every
+/// property [`wake`] has. The hub reads `relays` after each wake and, when
+/// it moved, [`sweep`]s.
+///
+/// Why a count and not the star's raw notice: this hub is woken for work of
+/// its own, and a notice says nothing about why it came. A hub that took
+/// every notice for a relay would kick every parked thread on every
+/// unrelated event; one that took none would lose a relay whose notice
+/// coalesced with another on its doorbell. The count is bumped before the
+/// word, so a hub that sees the word move sees the relay behind it.
+///
+/// [`signal`]: Self::signal
+#[repr(align(128))]
+pub(crate) struct Hub {
+    word: AtomicU32,
+    relays: AtomicU32,
+}
+
+impl Hub {
+    pub(crate) const fn new() -> Self {
+        Self {
+            word: AtomicU32::new(0),
+            relays: AtomicU32::new(0),
+        }
+    }
+
+    /// The word the hub thread waits on.
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+    pub(crate) fn word(&self) -> &AtomicU32 {
+        &self.word
+    }
+
+    /// Relays owed so far, wrapping: the hub sweeps whenever this moved
+    /// since its last sweep.
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+    pub(crate) fn relays(&self) -> u32 {
+        self.relays.load(Ordering::SeqCst)
+    }
+
+    /// Tell the hub something changed — store, then wake, the order this
+    /// module requires. Delivered directly or not at all: the hub has no
+    /// relay but itself. `true` when a kick reached it.
+    pub(crate) fn signal(&self) -> bool {
+        self.word.fetch_add(1, Ordering::SeqCst);
+        wake_one(&self.word, false)
+    }
+
+    /// One relay: counted before the word moves.
+    fn relay(&self) -> bool {
+        self.relays.fetch_add(1, Ordering::SeqCst);
+        self.signal()
+    }
+}
+
+/// Relay through `hub` from now on: a wake this thread cannot deliver goes
+/// to it ([`Hub`]). The first adoption stands — `false` when this thread
+/// already relays through a hub, or has no runtime block to record it in.
+pub(crate) fn adopt_hub(hub: &'static Hub) -> bool {
+    imp::adopt_hub(hub)
+}
+
+/// Record that this thread holds `send`, a send into band `peer`'s
+/// doorbell its founding did not stamp — the channel a controller mints for
+/// each child it founds, or a starter for the controller it founds. From
+/// here on [`wake`] reaches `peer` directly. `false` when `peer` is outside
+/// the band or this thread has no runtime block.
+///
+/// The record is this thread's alone — it names a slot in its own arena — so
+/// it lives in its runtime block, not beside [`WAITING_ON`]: a band reused
+/// by a later thread starts from a zeroed block and inherits nothing.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) fn adopt_peer(peer: u32, send: kore_abi::session::SlotRef) -> bool {
+    imp::adopt_peer(peer as usize, send)
+}
+
+/// Withdraw `peer`'s adopted send. Called before the send is retired, so no
+/// wake presents a name the arena is about to reissue.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) fn forget_peer(peer: u32) {
+    imp::forget_peer(peer as usize);
+}
+
+/// Whether this thread holds a send into band `peer`'s doorbell — stamped
+/// at its founding or adopted since.
+pub(crate) fn reaches(peer: u32) -> bool {
+    imp::reaches(peer as usize)
+}
+
+/// The hub's answer to a relay ([`Hub`]): kick every thread this one can
+/// reach that has a doorbell waiter registered, itself excepted, and return
+/// how many were kicked.
+///
+/// A relay does not say which word it was for, so every such thread is a
+/// candidate and each kick is a wake its target re-checks — spurious for one
+/// whose word did not move, which every waiter tolerates by contract, and
+/// paid only when a relay was owed. A word-parked waiter is not kicked: the
+/// kernel's address-wait, not its doorbell, holds it, and its slice bounds
+/// a relay it misses.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) fn sweep() -> usize {
+    let Some(me) = current_thread() else {
+        return 0;
+    };
+    imp::sweep(me)
+}
+
+/// [`sweep`]'s selection over the registry, with the kick injected so the
+/// host suite can hold it to account.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+fn sweep_with(me: usize, mut kick: impl FnMut(usize) -> bool) -> usize {
+    let mut kicked = 0;
+    for thread in 0..MAX_THREADS as usize {
+        if thread != me && waits_on_bell(thread) && kick(thread) {
+            STAT_KICKS.fetch_add(1, Ordering::Relaxed);
+            kicked += 1;
+        }
+    }
+    kicked
+}
+
+/// Whether `thread` has any waiter a kick reaches — a doorbell-mode entry.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+fn waits_on_bell(thread: usize) -> bool {
+    WAITING_ON[thread].iter().any(|cell| {
+        let entry = cell.load(Ordering::SeqCst);
+        entry != NOT_WAITING && entry & WORD_MODE == 0
+    })
+}
+
+/// [`wait`] that also ends when the task `task` ends: one doorbell park
+/// whose join arm (`SessionFlags::WAIT_TASK`) watches that task beside the
+/// word, for a thread that must see both a futex wake and a sibling's end
+/// without polling either — the [`thread_controller`](crate::thread_controller)
+/// reaping a child that has announced its exit. `report` is a landing the
+/// caller owns (a `thread::JoinScratch`); an exit leaves its report there.
+///
+/// [`Woken`](WaitOutcome::Woken) covers the task's end too: the caller
+/// re-checks its word *and* the task. There is no monitored spin, because
+/// the edge waited for is a kernel event no store announces, and the park
+/// stays on the doorbell even for a word in a noted window — the kernel's
+/// word wait does not compose with a join arm. Uncounted in [`stats`], like
+/// the star hub's housekeeping wait: the threads that use it are not the
+/// ones a bench measures.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+pub(crate) fn wait_or_end(
+    word: &AtomicU32,
+    expected: u32,
+    timeout: Option<Duration>,
+    task: kore_abi::session::SlotRef,
+    report: kore_abi::session::SlotRef,
+) -> WaitOutcome {
+    let Some(me) = current_thread() else {
+        return WaitOutcome::Unsupported;
+    };
+    // Arm, register, check — `wait`'s order and for its reasons.
+    if !imp::arm() {
+        return WaitOutcome::Unsupported;
+    }
+    let Some(slot) = claim_wait(me, address_of(word)) else {
+        return WaitOutcome::Unsupported;
+    };
+    let _slot = WaitSlot { thread: me, slot };
+    if word.load(Ordering::SeqCst) != expected {
+        return WaitOutcome::Retry;
+    }
+    imp::park_or_end(timeout, task, report)
+}
+
+/// How long a park that could not raise its join arm rides the doorbell
+/// alone. A join arm the kernel did not install answers `WouldBlock` at
+/// once, with nothing parked; riding the doorbell for this long instead
+/// keeps a caller that loops on [`wait_or_end`] from trapping in a ring.
+/// The joiner's own pacing for an unestablished park
+/// (`thread::join_park`, two milliseconds), so the two degrade alike.
+#[cfg_attr(
+    not(target_os = "none"),
+    expect(dead_code, reason = "the join arm is a metal-only trap")
+)]
+const END_SLICE: Duration = Duration::from_millis(2);
 
 /// Whether this thread can [`wait`] at all — a doorbell to park on and an
 /// identity in the thread band.
@@ -1182,13 +1406,113 @@ mod imp {
         let Some(rt) = crate::entry::thread_context() else {
             return false;
         };
-        let Ok(peer) = u16::try_from(index) else {
-            return false;
-        };
-        let Some(send) = rt.bootstrap().handle(role::DOORBELL, PEER_BASE + peer) else {
+        kick_with(&rt, index)
+    }
+
+    /// [`kick`] against a context the caller already resolved — the sweep
+    /// kicks many peers off one boot-page parse.
+    fn kick_with(rt: &crate::entry::Rt, index: usize) -> bool {
+        let Some(send) = send_for(rt, index) else {
             return false;
         };
         verbs::post_notice(send, COOKIE_FUTEX, index as u64)
+    }
+
+    /// The send this thread holds into band `index`'s doorbell: the one its
+    /// founding stamped at `DOORBELL@(PEER_BASE + index)`, else the one it
+    /// adopted since ([`super::adopt_peer`]).
+    fn send_for(rt: &crate::entry::Rt, index: usize) -> Option<kore_abi::session::SlotRef> {
+        let peer = u16::try_from(index).ok()?;
+        rt.bootstrap()
+            .handle(role::DOORBELL, PEER_BASE + peer)
+            .or_else(|| crate::entry::geometry::late_kick(index))
+    }
+
+    pub(super) fn reaches(index: usize) -> bool {
+        crate::entry::thread_context().is_some_and(|rt| send_for(&rt, index).is_some())
+    }
+
+    pub(super) fn adopt_peer(index: usize, send: kore_abi::session::SlotRef) -> bool {
+        crate::entry::geometry::set_late_kick(index, Some(send))
+    }
+
+    pub(super) fn forget_peer(index: usize) {
+        let _ = crate::entry::geometry::set_late_kick(index, None);
+    }
+
+    pub(super) fn sweep(me: usize) -> usize {
+        let Some(rt) = crate::entry::thread_context() else {
+            return 0;
+        };
+        super::sweep_with(me, |thread| kick_with(&rt, thread))
+    }
+
+    /// The hub this thread relays through, if it adopted one.
+    pub(super) fn hub() -> Option<&'static super::Hub> {
+        let addr = crate::entry::geometry::futex_hub();
+        // SAFETY: `adopt_hub` records only the address of a `&'static Hub`,
+        // and nothing ever clears or rewrites it to another value.
+        (addr != 0).then(|| unsafe { &*(addr as *const super::Hub) })
+    }
+
+    pub(super) fn adopt_hub(hub: &'static super::Hub) -> bool {
+        crate::entry::geometry::set_futex_hub(hub as *const super::Hub as usize)
+    }
+
+    /// Park on the standing post with the join arm watching `task` beside
+    /// it — the composite `WAIT_DELIVERY | WAIT_TASK` (± `WAIT_SLEEP`)
+    /// shape the kernel resolves first-wins (`SessionFlags::WAIT_TASK`).
+    pub(super) fn park_or_end(
+        timeout: Option<Duration>,
+        task: kore_abi::session::SlotRef,
+        report: kore_abi::session::SlotRef,
+    ) -> WaitOutcome {
+        let Some(db) = doorbell() else {
+            return WaitOutcome::Unsupported;
+        };
+        let deadline = match timeout {
+            Some(d) => match crate::clock::uptime() {
+                Ok(now) => Some((now + d).as_nanos()),
+                Err(_) => return WaitOutcome::Unsupported,
+            },
+            None => None,
+        };
+        let mut p = SessionBuilder::new();
+        p.park_standing(db.chan, db.land.index() as u16, db.recv_tag);
+        if let Some(at) = deadline {
+            p.wait_sleep(at);
+        }
+        if p.join(task, report).is_err() {
+            return WaitOutcome::Unsupported;
+        }
+        p.wait_task();
+        let Ok(committed) = TrapTransport::new().commit_join_park(&p) else {
+            return WaitOutcome::Unsupported;
+        };
+        match committed.status() {
+            // The doorbell won: consume and re-stand, as `park` does.
+            Status::Ok => {
+                let _ = verbs::take_notice(db.land);
+                post(&db);
+                WaitOutcome::Woken
+            }
+            // The task ended (`Exited`), or the post or the task was reaped
+            // (`Revoked`) — the caller's re-check reads which; a reaped
+            // doorbell refuses its next arm.  An OCC loss parked nothing and
+            // is retried by the caller's loop.
+            Status::Exited | Status::Revoked | Status::Conflict => WaitOutcome::Woken,
+            Status::Deadline => WaitOutcome::TimedOut,
+            // Nobody won, or the join arm could not be raised and nothing
+            // parked: ride the doorbell alone, bounded (`END_SLICE`).
+            Status::WouldBlock => {
+                let slice = timeout.map_or(super::END_SLICE, |t| t.min(super::END_SLICE));
+                match park(Some(slice)) {
+                    WaitOutcome::TimedOut if timeout.is_none() => WaitOutcome::Woken,
+                    outcome => outcome,
+                }
+            }
+            _ => WaitOutcome::Unsupported,
+        }
     }
 
     // The relay slot sits exactly one past the last band peer — the
@@ -1259,6 +1583,37 @@ mod imp {
 
     pub(super) fn kick(_index: usize) -> bool {
         false
+    }
+
+    pub(super) fn reaches(_index: usize) -> bool {
+        false
+    }
+
+    pub(super) fn adopt_peer(_index: usize, _send: kore_abi::session::SlotRef) -> bool {
+        false
+    }
+
+    pub(super) fn forget_peer(_index: usize) {}
+
+    pub(super) fn sweep(_me: usize) -> usize {
+        0
+    }
+
+    /// No runtime block off metal: no hub was ever adopted.
+    pub(super) fn hub() -> Option<&'static super::Hub> {
+        None
+    }
+
+    pub(super) fn adopt_hub(_hub: &'static super::Hub) -> bool {
+        false
+    }
+
+    pub(super) fn park_or_end(
+        _timeout: Option<core::time::Duration>,
+        _task: kore_abi::session::SlotRef,
+        _report: kore_abi::session::SlotRef,
+    ) -> super::WaitOutcome {
+        super::WaitOutcome::Unsupported
     }
 
     pub(super) fn relay() -> bool {
@@ -1620,5 +1975,63 @@ mod tests {
         let word = AtomicU32::new(0);
         assert!(!wake(&word));
         assert_eq!(wake_all(&word), 0);
+    }
+
+    #[test]
+    fn a_relay_is_counted_before_the_hub_word_moves() {
+        // The hub's lost-relay argument: it reads `relays` after it sees its
+        // word move, so the count must already have moved by then. Off metal
+        // the kick refuses, but the two stores are the shared half.
+        static HUB: Hub = Hub::new();
+        let (word, relays) = (HUB.word().load(Ordering::SeqCst), HUB.relays());
+        assert!(!HUB.relay(), "off metal no kick reaches the hub");
+        assert_eq!(HUB.relays(), relays.wrapping_add(1));
+        assert_eq!(HUB.word().load(Ordering::SeqCst), word.wrapping_add(1));
+        // A plain signal moves the word and owes no relay.
+        assert!(!HUB.signal());
+        assert_eq!(HUB.relays(), relays.wrapping_add(1));
+        assert_eq!(HUB.word().load(Ordering::SeqCst), word.wrapping_add(2));
+    }
+
+    #[test]
+    fn a_hub_word_owns_its_interference_span() {
+        // The hub thread's monitored spin watches its word's line; every
+        // client of the hub stores to it.  Sharing the line with neighbours
+        // would end that spin on their traffic.
+        assert_eq!(core::mem::align_of::<Hub>(), 128);
+    }
+
+    #[test]
+    fn a_sweep_kicks_only_doorbell_waiters_other_than_itself() {
+        // Rows 8..=11: the hub (8), a doorbell waiter (9), a word-parked
+        // waiter (10), and a thread waiting on nothing (11).
+        for row in 8..=11 {
+            reset_thread(row);
+        }
+        let a = AtomicU32::new(0);
+        let b = AtomicU32::new(0);
+        claim_wait(8, address_of(&a)).expect("the hub's own wait");
+        claim_wait(9, address_of(&a)).expect("a doorbell waiter");
+        claim_wait_on_word(10, address_of(&b)).expect("a word waiter");
+        let mut kicked = std::vec::Vec::new();
+        let n = sweep_with(8, |thread| {
+            kicked.push(thread);
+            true
+        });
+        assert_eq!(kicked, [9], "the sweep kicked a thread no kick can wake");
+        assert_eq!(n, 1);
+        // A kick that refuses is not counted as a wake.
+        assert_eq!(sweep_with(8, |_| false), 0);
+        for row in 8..=11 {
+            reset_thread(row);
+        }
+    }
+
+    #[test]
+    fn the_own_kick_is_named_past_every_peer_and_the_relay() {
+        // No peer arithmetic (`PEER_BASE + band`) and no relay lookup may
+        // ever resolve a thread's own kick.
+        assert_eq!(OWN_KICK, RELAY + 1);
+        assert!(OWN_KICK > PEER_BASE + MAX_THREADS as u16 - 1);
     }
 }

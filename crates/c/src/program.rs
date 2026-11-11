@@ -277,10 +277,15 @@ impl<'t> Founded<'t> {
     fn found(transport: &'t TrapTransport) -> Option<Self> {
         let rt = entry::thread_context()?;
         let doorbell = rt.doorbell()?;
+        // A mint grant of its own: the first `pthread_create` on the main
+        // thread starts kore-rt's thread controller there, which mints the
+        // doorbells its threads park on (`thread_controller`). Without one the
+        // controller still runs, taking the deadline park.
+        let grant = thread::channel_space_endowment();
         let main = WorkerHost::<Main>::spawn(
             transport,
             WorkerStack::Bytes(crate::api::KORE_MAIN_STACK_BYTES),
-            &[],
+            grant.as_slice(),
             |_| {},
         )?;
         Some(Self { rt, doorbell, main })

@@ -504,7 +504,7 @@ const fn report_slot_install(current_p1: usize, requested: usize) -> ReportSlotI
 
 #[cfg(target_os = "none")]
 pub(crate) mod geometry {
-    use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
     use kore_abi::task::{GeomBlock, geom};
 
@@ -641,6 +641,21 @@ pub(crate) mod geometry {
         /// inherited by a spawned thread, whose block is its own. Only the
         /// owning thread reads or writes it.
         c_errno: AtomicI32,
+        /// Sends into peers' doorbells this thread came to hold after its
+        /// founding ([`futex::adopt_peer`](crate::futex)), indexed by the
+        /// peer's band, each its arena slot plus one (`0` = none). Arena
+        /// names are this thread's alone, so they live here and a band a
+        /// later thread reuses starts with none. Only the owning thread
+        /// reads or writes them.
+        late_kicks: [AtomicU32; crate::thread::MAX_THREADS as usize],
+        /// The [`futex::Hub`](crate::futex) this thread relays an
+        /// undeliverable wake through, as an address (`0` = none). Set once.
+        futex_hub: AtomicUsize,
+        /// What [`thread::exit`](crate::thread::exit) runs before it commits
+        /// ([`set_exit_hook`]): a `fn(usize)` as an address (`0` = none),
+        /// and its argument. Taken by the exit, so it runs once.
+        exit_call: AtomicUsize,
+        exit_argument: AtomicUsize,
         /// The [`bridge`](crate::bridge) this thread is the worker of — the
         /// address of its word — or `0` for every other thread.  Written by
         /// the worker's own entry before anything else runs on it, so a worker
@@ -751,6 +766,11 @@ pub(crate) mod geometry {
         block().panicking.swap(1, Ordering::AcqRel) == 0
     }
 
+    /// This thread has begun a panic ([`begin_panic`]).
+    pub(crate) fn panicking() -> bool {
+        block().panicking.load(Ordering::Acquire) != 0
+    }
+
     /// This thread's C `errno` word (the block's `c_errno` field).
     ///
     /// Lawful wherever [`block`] is: C code runs only on an anchored
@@ -758,6 +778,66 @@ pub(crate) mod geometry {
     /// trampoline's first act.
     pub(crate) fn c_errno() -> *mut i32 {
         block().c_errno.as_ptr()
+    }
+
+    /// The send this thread adopted into band `peer`'s doorbell, if any.
+    pub(crate) fn late_kick(peer: usize) -> Option<kore_abi::session::SlotRef> {
+        let slot = block().late_kicks.get(peer)?.load(Ordering::Relaxed);
+        let index = slot.checked_sub(1)?;
+        Some(kore_abi::session::SlotRef::from_wire(index))
+    }
+
+    /// Record (`Some`) or withdraw (`None`) this thread's adopted send into
+    /// band `peer`'s doorbell. `false` when `peer` is outside the band.
+    pub(crate) fn set_late_kick(peer: usize, send: Option<kore_abi::session::SlotRef>) -> bool {
+        let Some(cell) = block().late_kicks.get(peer) else {
+            return false;
+        };
+        let word = match send {
+            Some(slot) => match slot.index().checked_add(1) {
+                Some(word) => word,
+                None => return false,
+            },
+            None => 0,
+        };
+        cell.store(word, Ordering::Relaxed);
+        true
+    }
+
+    /// The futex hub this thread relays through, as an address (`0` = none).
+    pub(crate) fn futex_hub() -> usize {
+        block().futex_hub.load(Ordering::Relaxed)
+    }
+
+    /// Adopt the futex hub at `addr`; the first adoption stands.
+    pub(crate) fn set_futex_hub(addr: usize) -> bool {
+        addr != 0
+            && block()
+                .futex_hub
+                .compare_exchange(0, addr, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
+
+    /// Have [`thread::exit`](crate::thread::exit) run `call(argument)` on
+    /// this thread before it commits, replacing any hook set before.
+    pub(crate) fn set_exit_hook(call: fn(usize), argument: usize) {
+        let b = block();
+        b.exit_argument.store(argument, Ordering::Relaxed);
+        b.exit_call.store(call as usize, Ordering::Relaxed);
+    }
+
+    /// Take this thread's exit hook, leaving none: a hook that itself ends
+    /// the thread runs once.
+    pub(crate) fn take_exit_hook() -> Option<(fn(usize), usize)> {
+        let b = block();
+        let call = b.exit_call.swap(0, Ordering::Relaxed);
+        if call == 0 {
+            return None;
+        }
+        // SAFETY: only `set_exit_hook` stores a nonzero `exit_call`, and it
+        // stores a `fn(usize)` cast to its address.
+        let call = unsafe { core::mem::transmute::<usize, fn(usize)>(call) };
+        Some((call, b.exit_argument.load(Ordering::Relaxed)))
     }
 
     /// The bridge this thread is the worker of, by its word's address (the

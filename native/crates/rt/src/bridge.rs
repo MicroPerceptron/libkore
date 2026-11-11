@@ -105,12 +105,16 @@
 //! `GONE` is the worker's last word on the bridge, and it always says it,
 //! whichever way it leaves ([`Gone`]): its body returns; it answers a quit; it
 //! fails a work item; its probe at entry finds it cannot park, or a park is
-//! refused mid-call or between items; or it panics. The last needs no help
-//! from the engine: the worker's runtime block names its bridge from its first
-//! instruction, and every kore-rt panic path — `entry::panic_refuse`,
+//! refused mid-call or between items; it ends its thread itself; or it panics.
+//! The last two need no help from the engine. The worker's runtime block names
+//! its bridge from its first instruction, and the worker's entry registers the
+//! thread's exit hook (`thread::on_exit`), which `thread::exit` runs before
+//! it commits: a worker that ends its thread without having said its last
+//! word has it said for it. Every kore-rt panic path — `entry::panic_refuse`,
 //! `crash::panic`, `crash::report` — publishes `GONE`·[`Panicked`](Gone::Panicked)
 //! and kicks the host *after* the panic record is published, so a host that
-//! ends the process on it cannot cut the report short. That slot is also how a
+//! ends the process on it cannot cut the report short; the exit hook names a
+//! panic too, for an exit taken while one is in flight. That slot is also how a
 //! worker-side call proves its caller is the worker: holdings are per thread,
 //! and so is the right to touch a worker's cell.
 //!
@@ -158,8 +162,9 @@ const NEVER: u32 = u32::MAX;
 /// Why a worker is gone: the reason its last word on the bridge carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gone {
-    /// The worker's body returned, or the worker ended itself
-    /// ([`Bridge::leave`]). Results it finished before are in the payload.
+    /// The worker's body returned, or the worker ended itself: through
+    /// [`Bridge::leave`], or by ending its thread (`thread::exit`, whose exit
+    /// hook says it). Results it finished before are in the payload.
     Ended,
     /// The worker answered the host's `WorkerHost::quit`.
     Quit,
@@ -525,8 +530,10 @@ impl<P> Bridge<P> {
     /// **End this worker**: publish `GONE`·[`Ended`](Gone::Ended) — or
     /// [`Quit`](Gone::Quit), when the host had asked — and kick the host.
     /// For a worker that ends its thread itself instead of returning from
-    /// [`Engine::run`] (a C program's main thread, ending the process); the
-    /// trampoline does the same for a body that returns. `false` when the
+    /// [`Engine::run`], at a point of its choosing: a C program's main thread
+    /// leaves once its exit status is posted, so the host reads both. A
+    /// `thread::exit` that comes first says the same through the exit hook,
+    /// and the trampoline says it for a body that returns. `false` when the
     /// caller is not the worker or the worker is already gone.
     pub fn leave(&self) -> bool {
         self.leave_with(&Native, Gone::Ended)
@@ -818,14 +825,23 @@ fn enter<E: Engine>(ends: &impl Ends) {
 /// A panicking thread's last word on its bridge, if it is a worker — called by
 /// kore-rt's panic paths once the panic record is published (module doc).
 pub(crate) fn panicked() {
+    last_word(Gone::Panicked);
+}
+
+/// Say `reason` as this thread's last word on its bridge, if it is a worker
+/// still on one: for the panic paths and the exit hook, which end a worker
+/// that never said its own. A worker that did is released, and this is
+/// nothing.
+fn last_word(reason: Gone) {
     let address = imp::hosted();
     if address == 0 {
         return;
     }
     // SAFETY: a worker's runtime block names its bridge's word from the
-    // worker's first instruction, and an `Engine`'s bridge is `'static`.
+    // worker's first instruction until its last word, and an `Engine`'s
+    // bridge is `'static`.
     let word = unsafe { &*(address as *const AtomicU32) };
-    if settle(word, Gone::Panicked) {
+    if settle(word, reason) {
         imp::release(address);
         let _ = imp::kick_host();
     }
@@ -1122,13 +1138,31 @@ mod host {
 
 // ─── The metal half ────────────────────────────────────────────────────
 
-/// The worker's runtime block names its bridge (by its word's address), and
-/// its wake send reaches the host.
+/// The worker's runtime block names its bridge (by its word's address), its
+/// exit hook says its last word, and its wake send reaches the host.
 #[cfg(target_os = "none")]
 mod imp {
+    use super::Gone;
+
     pub(super) fn adopt(word: usize) -> bool {
         crate::entry::geometry::set_hosted_bridge(word);
+        // However the thread ends from here, `thread::exit` runs this first.
+        // The hook is the entry's to set, as the thread controller sets its
+        // children's: this entry is the worker's, so no one else sets it.
+        crate::thread::on_exit(exiting, 0);
         true
+    }
+
+    /// The worker's exit hook: a worker still on its bridge as its thread
+    /// ends has not said its last word, so its end says it. It runs after
+    /// the thread's own code, and neither blocks nor ends the thread.
+    fn exiting(_: usize) {
+        let reason = if crate::entry::geometry::panicking() {
+            Gone::Panicked
+        } else {
+            Gone::Ended
+        };
+        super::last_word(reason);
     }
 
     pub(super) fn hosted() -> usize {
