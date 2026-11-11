@@ -123,10 +123,14 @@ pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 /// end — a host that ends the whole process on a worker's panic tells the
 /// host only once the record is published, so the host's barrier cannot cut
 /// the report short. `true` when this call published the record.
+///
+/// A [`bridge`](crate::bridge) worker's host is told here, after the record:
+/// the worker's bridge reads `GONE`·`Panicked` and the host is kicked.
 pub fn report(info: &core::panic::PanicInfo<'_>) -> bool {
     let first = crate::entry::begin_panic();
     if first {
         report_panic_info(info);
+        crate::bridge::panicked();
     }
     first
 }

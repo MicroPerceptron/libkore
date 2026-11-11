@@ -351,3 +351,57 @@ C program (`docs/languages.md`). It is the first libkore package a C program
 on Kore links without a Rust host. Its shared object is a distribution's
 one-line `cdylib` over it. `tools/check-program.py` links that object for the
 three Kore ISAs and checks its shape and its exact exported ABI.
+
+## One bridge for a synchronous engine on a worker thread
+
+The export records Kore `6a8c754bc959e9489a6fb18be642fcc881a65c48`, a commit
+on Kore's `ft/festive-euler-sghq2d`, which carries the bridge and merges
+MicroPerceptron/kore#1494's branch at `f2644e5b` (`eca08c04`). Since the last
+export recorded here (`0018956a`), that branch's exports moved through four
+Kore commits, and this export carries all four:
+- `2a0730dd`, where threads that found take a founder's arena;
+- `6c57f344`, where a founding's staged space waits for the reap;
+- `2d4998ba`, which brings Kore's C library, `kore-c-shim`;
+- `10c7b400`, where `kore-rt` names a task's link window and its free span
+  once (`738c3591`), and `kore-c-shim` gains `ENXIO`, `EFAULT` and `ENOTSUP`.
+
+Against the export at `10c7b400`, the closure keeps its 27 packages and gains
+one file (402):
+
+- `kore-rt`'s `bridge`: one request cell and one word between a synchronous
+  engine on a worker thread and its async host. The word's states, the
+  park-and-kick ordering, the cell's hand-over and the worker's end live in one
+  place (`Bridge`, `Engine`, `Work`, `WorkerHost`), with a host suite that
+  drives the state machine on real threads. The host can also serve a side
+  source beside the worker (`Side`, `serve_beside`): work other threads hand it
+  through the same wake channel, armed and re-read with the word.
+- `ThreadBlock`'s `hosted_bridge` tail slot, which names the bridge a worker
+  serves. With it come a bridge-worker notice in `entry::panic_refuse` and
+  `crash::report`, once the panic record is published, and the worker's exit
+  hook: a worker that ends its thread through `thread::exit` without saying
+  its last word has it said for it.
+- `futex`'s sweep test judges only the rows it claims (`6a8c754b`). The sweep
+  reads every row, and the suite's other tests hold rows of their own
+  meanwhile, so it failed whenever one overlapped it: 8 runs in 300 of
+  `futex::tests`.
+- The services' `boot.toml` digests are the base's seal at `f2644e5b`. Kore's
+  half reseals over its pin of this branch, so that seal follows this export
+  and cannot be in it.
+
+`kore-lua`'s VM bridge and `kore-c`'s program host now speak the seam, as Kore's
+`tcc` and its Lua REPL do upstream. Each keeps only its payload and its
+dispatch. `kore-c` founds its main thread through `WorkerHost::spawn`, holding
+the channel-space grant `b9eb3c2` gave it. What the program's other threads
+hand thread 0 is the bridge's side source: the output ring `0460f5c` brought,
+and the `mmap` cell `c876e43` brought. No exported manifest changed, so
+`native/Cargo.lock` did not. `make miri` also runs the `bridge` suite, so Miri
+checks every hand-over of the cell.
+
+Locally, with the pinned nightly, `make fmt test check docs owners cross miri
+bindings-check` passed on this export. That covers:
+- the native `kore-rt` suite (477, the `bridge` suite's 13 among them) and the
+  `kore-dagfs` and `kore-vol` suites;
+- the three Kore user-target checks, which take in `kore-lua`'s bridge;
+- `check-program`, which links `libkore.so` for all three ISAs with exactly its
+  declared 129 exports, the five `c876e43` brought among them;
+- Miri over the `bridge` suite (14 tests with `erased_poll_and_drop`).

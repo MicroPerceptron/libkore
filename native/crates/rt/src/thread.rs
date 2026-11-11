@@ -1001,13 +1001,16 @@ pub(crate) const fn gang_founding_slots(workers: usize, tls: bool, endowments: u
 /// Minting one is the star's rule (`res/SPMD.md` §3) applied to a single
 /// peer.
 ///
-/// This is the shape a synchronous engine on a worker thread needs — a
+/// This is the transport a synchronous engine on a worker thread needs — a
 /// C interpreter whose `require` must hand a request to the executor
 /// and wait for the answer without spinning (`res/DAGFS.md` §4): the
 /// worker `futex::wait`s on a word and parks on its doorbell; the
 /// executor answers, stores, and [`kick`](Self::kick)s; the worker
 /// stores and [`kick_parent`]s; the executor parks on
-/// [`wake_recv`](Self::wake_recv) through `next_wake_on`.
+/// [`wake_recv`](Self::wake_recv) through `next_wake_on`.  An engine does
+/// not speak that protocol itself: [`bridge::WorkerHost`](crate::bridge)
+/// founds the worker on this and owns the word, its ordering and the
+/// worker's end, so every engine shares one copy of it.
 #[cfg(target_os = "none")]
 #[must_use]
 pub struct DoorbellWorker {
@@ -2269,8 +2272,9 @@ pub fn exit(_code: ExitCode) -> ! {
 /// Have this thread's [`exit`] run `call(argument)` first, on this thread,
 /// before the exit commits — how the thread that reaps it learns it is
 /// ending without polling for it (the
-/// [`thread_controller`](crate::thread_controller)'s children). The last hook
-/// set stands. `call` runs after the thread's own code, so it must not block,
+/// [`thread_controller`](crate::thread_controller)'s children; a
+/// [`bridge`](crate::bridge) worker's host). The last hook set stands, so the
+/// hook is the thread's entry's to set. `call` runs after the thread's own code, so it must not block,
 /// and must not end the thread itself.
 ///
 /// The kernel's exit commits after the hook returns, so a reaper woken by

@@ -48,6 +48,11 @@
 //!   [`MemSource`](heap::MemSource) backing.  kore-rt ships the engine,
 //!   the seam, and the metal source (`heap::HeapSupplySource` — the
 //!   founder-provisioned grow window every founded binary links).
+//! - [`bridge`] — **a synchronous engine on a worker thread**, served by its
+//!   async host: one request cell and one word, whose states, park and kick
+//!   ordering, cell hand-over and worker-gone handling live here once.  Lua,
+//!   TinyCC and an independent C program's `main` are the same exchange with
+//!   different payloads ([`bridge::Engine`], [`bridge::Bridge`]).
 //! - [`service::SystemService`] — the unified shape of a bootstrapped
 //!   service (KRAPH §5.2's role bundle + a serve step): the endowment is a
 //!   typed [`Bundle`](service::Bundle) resolved fail-closed from the
@@ -84,6 +89,7 @@ extern crate std;
 
 pub mod barrier;
 pub mod block;
+pub mod bridge;
 pub mod cap;
 pub mod chan;
 pub mod clock;

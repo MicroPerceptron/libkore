@@ -91,11 +91,14 @@ that joins `libkore.so` to the program's own `libc.a` — and gets:
 - `kore_fs_run(step, user, &error)` (`kore/program.h`), which runs a
   `KoreFsStep` program as the program's filesystem session.
 
-The host is the shape `kore-lua`'s VM bridge has. `main` runs on a main
-thread, a `DoorbellWorker` with a 1 MiB guarded stack
-(`KORE_MAIN_STACK_BYTES`). Thread 0 is the process owner, and keeps the
-executor and the launch's service faces. The two share one request cell and
-one word. Every park is a doorbell park; nothing spins.
+The host is the shape `kore-lua`'s VM and Kore's `tcc` have, and speaks
+the same seam, kore-rt's `bridge`. `main` runs on a main thread, the
+bridge's worker, with a 1 MiB guarded stack (`KORE_MAIN_STACK_BYTES`).
+Thread 0 is the process owner, and keeps the executor and the launch's
+service faces. The two share one request cell and one word, whose states,
+ordering and hand-over are the bridge's. Every park is a doorbell park;
+nothing spins, and a main thread that panics or cannot park is reported to
+the host rather than waited for.
 
 - **Filesystem.** `kore_fs_run` from the main thread posts the session and
   waits. The host attaches the launch's filesystem face on first use, rooted
@@ -120,10 +123,11 @@ one word. Every park is a doorbell park; nothing spins.
   stream's capacity when it has none — a slow terminal holds the program
   back rather than losing its output — and wakes the writers waiting for
   space, a pass at a time, serving the program's end and its sessions
-  between passes. The host's own writes (a filesystem step's callbacks) are
-  kept in order beside the ring, before any call another thread has in
-  progress. A launch without the stream has no sink, and a
-  write to either stream returns `EOF`.
+  between passes and draining beside a session in flight: the ring is the
+  bridge's side source (`WorkerHost::serve_beside`). The host's own writes
+  (a filesystem step's callbacks) are kept in order beside the ring, before
+  any call another thread has in progress. A launch without the stream has
+  no sink, and a write to either stream returns `EOF`.
 - **The end.** The C library's `exit` and `_Exit` call
   `__kore_program_exit(status, finalize)` after their `atexit` handlers, on
   whatever thread called them. The first request wins and reaches the host,
@@ -203,7 +207,9 @@ mapped there. The rules follow from that:
   holder may revoke, so the caller posts its request to thread 0, which
   holds the supply's root, and waits as a filesystem session does. A mapping
   is therefore the process's: any thread may `munmap` it, whole, by its base
-  and its length.
+  and its length. Thread 0 answers a request between the main thread's
+  sessions and beside one in flight, as it drains the ring: both are the
+  bridge's side source.
 - **`munmap` parks the region.** The supply's cursors and the window's only
   advance, so carved bytes and placed addresses never return to them. The
   mapping is removed and a stale access faults, but the program keeps the

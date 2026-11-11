@@ -720,6 +720,15 @@ pub(crate) mod geometry {
         /// and its argument. Taken by the exit, so it runs once.
         exit_call: AtomicUsize,
         exit_argument: AtomicUsize,
+        /// The [`bridge`](crate::bridge) this thread is the worker of — the
+        /// address of its word — or `0` for every other thread.  Written by
+        /// the worker's own entry before anything else runs on it, so a worker
+        /// panic from its first instruction reaches the host; read by the
+        /// worker's bridge calls as the proof that their caller is the worker,
+        /// and by the panic paths, which give the host the worker's last word.
+        /// Not inherited: a spawned thread's block is its own, and zero.  Only
+        /// the owning thread reads or writes it.
+        hosted_bridge: AtomicUsize,
     }
 
     // The block must fit the founder's one-page window.
@@ -821,6 +830,11 @@ pub(crate) mod geometry {
         block().panicking.swap(1, Ordering::AcqRel) == 0
     }
 
+    /// This thread has begun a panic ([`begin_panic`]).
+    pub(crate) fn panicking() -> bool {
+        block().panicking.load(Ordering::Acquire) != 0
+    }
+
     /// This thread's C `errno` word (the block's `c_errno` field).
     ///
     /// Lawful wherever [`block`] is: C code runs only on an anchored
@@ -888,6 +902,17 @@ pub(crate) mod geometry {
         // stores a `fn(usize)` cast to its address.
         let call = unsafe { core::mem::transmute::<usize, fn(usize)>(call) };
         Some((call, b.exit_argument.load(Ordering::Relaxed)))
+    }
+
+    /// The bridge this thread is the worker of, by its word's address (the
+    /// block's `hosted_bridge` field); `0` when it is no bridge's worker.
+    pub(crate) fn hosted_bridge() -> usize {
+        block().hosted_bridge.load(Ordering::Relaxed)
+    }
+
+    /// Name (or, with `0`, unname) the bridge this thread is the worker of.
+    pub(crate) fn set_hosted_bridge(word: usize) {
+        block().hosted_bridge.store(word, Ordering::Relaxed);
     }
 
     /// Where this thread's block lives — the value the thread pointer holds,
@@ -2123,6 +2148,8 @@ pub fn panic_refuse(info: &core::panic::PanicInfo<'_>) -> ! {
         refuse();
     }
     crate::crash::report_panic_info(info);
+    // A bridge worker's host hears it is gone, now the record is published.
+    crate::bridge::panicked();
     let payload = info
         .location()
         .map_or(RUNG_PANIC, |at| panic_payload(at.file(), at.line()));
