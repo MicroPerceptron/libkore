@@ -28,3 +28,6 @@ kore-ffi = { path = "../ffi", features = ["c-stdlib"] }
 # `malloc` and `abort`: kore-ffi's allocator is this image's `malloc`, and the
 # host ends a whole program.
 kore-c-shim = { path = "../../native/crates/c-shim", default-features = false, features = ["runtime"] }
+# The link window's placer: one cursor every `mmap` of the process takes its
+# address from, as a Wasmtime engine's guest mappings do.
+kore-ld = { path = "../../native/crates/ld", default-features = false }

@@ -371,13 +371,10 @@ mod metal {
 
     // ── The streams' lock ───────────────────────────────────────────────
 
-    /// The classic three-state futex mutex, reentrant per thread: a stream
-    /// call holds it across all its writes, and the sink each write reaches
-    /// takes it again.
-    static LOCK: AtomicU32 = AtomicU32::new(FREE);
-    const FREE: u32 = 0;
-    const HELD: u32 = 1;
-    const CONTENDED: u32 = 2;
+    /// The streams' lock, reentrant per thread ([`DEPTH`]): a stream call
+    /// holds it across all its writes, and the sink each write reaches takes
+    /// it again.
+    static LOCK: crate::lock::Lock = crate::lock::Lock::new();
 
     /// How many times this thread holds [`LOCK`].
     #[thread_local]
@@ -398,7 +395,7 @@ mod metal {
         }
         let depth = DEPTH.get();
         if depth == 0 {
-            acquire();
+            LOCK.acquire();
             // The holder is the ring's one producer: `tail` is exact here.
             CALL.store(IN_CALL | u64::from(RING.tail()), Ordering::SeqCst);
         }
@@ -416,32 +413,9 @@ mod metal {
             1 => {
                 DEPTH.set(0);
                 CALL.store(0, Ordering::SeqCst);
-                release();
+                LOCK.release();
             }
             depth => DEPTH.set(depth - 1),
-        }
-    }
-
-    fn acquire() {
-        if LOCK
-            .compare_exchange(FREE, HELD, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
-        }
-        while LOCK.swap(CONTENDED, Ordering::Acquire) != FREE {
-            // Bounded: the holder's wake may not reach this thread.
-            if futex::wait(&LOCK, CONTENDED, Some(SLICE)) == WaitOutcome::Unsupported {
-                // No doorbell to park on: the deadline park any thread can.
-                let _ = pace::cede();
-            }
-        }
-    }
-
-    fn release() {
-        // SeqCst, as the futex contract asks of the store before a wake.
-        if LOCK.swap(FREE, Ordering::SeqCst) == CONTENDED {
-            futex::wake(&LOCK);
         }
     }
 

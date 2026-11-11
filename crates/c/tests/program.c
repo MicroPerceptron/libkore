@@ -1,5 +1,6 @@
 /* kore/program.h as an independent C program uses it: a session whose
- * callbacks are kore.h's own KoreFsStep, run through kore_fs_run. Compiled
+ * callbacks are kore.h's own KoreFsStep, run through kore_fs_run, and a
+ * descriptor described through kore_fd_describe. Compiled
  * freestanding for every Kore ISA by tools/check-bindings.py. */
 #include <kore/program.h>
 
@@ -27,4 +28,17 @@ int program_session(void)
     KoreFsError error = KORE_FS_ERROR_NONE;
     KoreStatus status = run(open_root, &reader, &error);
     return status == KORE_STATUS_OK && error == KORE_FS_ERROR_NONE && reader.done;
+}
+
+/* A descriptor's description: the exact entry type, its fields and the
+ * constants its fields take. */
+static KoreStatus (*const describe)(int, KoreFdInfo *) = kore_fd_describe;
+
+int program_memory(int fd)
+{
+    KoreFdInfo info = {0};
+    if (describe(fd, &info) != KORE_STATUS_OK)
+        return 0;
+    return info.kind == KORE_FD_MEMORY && (info.access & (KORE_FD_READ | KORE_FD_WRITE)) != 0 &&
+           info.length != 0;
 }

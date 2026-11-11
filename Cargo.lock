@@ -808,6 +808,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "kore-c-shim",
  "kore-ffi",
+ "kore-ld",
  "kore-std",
 ]
 
