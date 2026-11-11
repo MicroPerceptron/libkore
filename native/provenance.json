@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/MicroPerceptron/kore",
-  "revision": "920526a62ee585740537a2d1de74e3a265420377",
+  "revision": "7b9bd960374649a731132b3047e6e84190653b6f",
   "packages": {
     "crates/abi": "kore-abi",
     "crates/app": "kore-app",
@@ -245,7 +245,7 @@
     "crates/rt/src/task_watch.rs": "96b646f8785e427640519191cbf1f294c6908e5062a8082db271364048aa5b9a",
     "crates/rt/src/termination.rs": "920685ebb2071db58ae667e57bd02a6127166e8224ed13ec81216465ca315a55",
     "crates/rt/src/thread.rs": "3b6b1087a4c20bb592331ae4c48692d8f93056afc98be9708ae32236f494980e",
-    "crates/rt/src/thread_controller.rs": "9d27172248eebdeb2b8dd0b491b723ff6293189e19c1351bfb8a844360a4e4c5",
+    "crates/rt/src/thread_controller.rs": "97dcc83f5d8b6922ea9092bedd4be0a59ebb84071506452721809ff99bb22451",
     "crates/rt/src/tls.rs": "85bd95bafb3de73d249d7a2eb8779b5afc929077e27b4baa5f7c7428063063ab",
     "crates/rt/src/transport/mod.rs": "d5af890c800dd53abdbea8329383068cf43f0bf294ccb6b46dd7d8592ae5f321",
     "crates/rt/src/upcall.rs": "c0cbd2a59479dfba006850bb1bc5dd4f20f59317d178af776ba678f0e6404f02",

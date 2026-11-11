@@ -391,12 +391,26 @@ nothing. A host test drives `request_cancel` to that refusal. The metal
 evidence is Kore's `keytest-tcc-x86`, whose libkore tour cancels a thread
 parked in `pthread_join` and one parked in `kore_futex_wait` with no timeout.
 
+The export then moved to Kore `40de25825eb1ea7816f7e7df86e116b3ad20d1fc`,
+which closes a child's founding window. The controller sets a child's reach
+bit only after `spawn_with_arg` returns, and the child ran its callback at
+once. Its first wait could therefore start before the controller had
+recorded that it can kick the child. A cancellable `kore_futex_wait` in that
+window took the unreached slice and kept it until its first real wake.
+`child_entry` now settles on its record until the founding is published,
+which follows the reach bit, so a thread the controller founds with a
+doorbell is reached from its first wait. A host test holds a founding back
+and checks that the callback waits for it. The closure keeps its 26 packages
+and 382 files. Besides `thread_controller.rs`, it carries the
+`services/swap/boot.toml` digest of Kore's reseal over the cancellation wake
+(`bfecfd17`).
+
 ## A relayed wake reaches its waiter alone
 
-The export records Kore `920526a62ee585740537a2d1de74e3a265420377`, on
+The export records Kore `7b9bd960374649a731132b3047e6e84190653b6f`, on
 `ft/admiring-lovelace-69eiok`, which is stacked on `ft/brave-heisenberg-zgoaux`
-(`dea991f0`). Two changes since `a4ab7234` reach the closure, which keeps its
-26 packages and 382 files:
+and merges its head (`36b99426`). Two changes since `40de2582` reach the
+closure, which keeps its 26 packages and 382 files:
 
 - `kore-rt`'s thread controller relays a wake to the threads it was for and no
   others (Kore `b67f198`). Managed threads hold no send into each other's
@@ -411,7 +425,8 @@ The export records Kore `920526a62ee585740537a2d1de74e3a265420377`, on
   lossless: a waiter that registers after the waker's scan reads the new word
   and never parks.
 - The services' `boot.toml` digests are the reseal over that change
-  (`920526a`), after `ft/brave-heisenberg-zgoaux`'s own (`bfecfd1`).
+  (`920526a`). The founding wait leaves every service's image as it was: its
+  own reseal (`36b99426`) rebuilt only the shell and the image archive.
 
 No exported manifest changed, so `native/Cargo.lock` did not.
 
@@ -421,6 +436,7 @@ says so. The metal evidence is Kore's `keytest-tcc-x86`. The libkore tour has
 two threads take 400 turns through a mutex and a condition variable on the
 futex while `main` waits parked on a word nobody stores. The controller admits
 two managed threads at once today, so `main` is the only parked thread. On
-the image built from `920526a`'s source, no wake reached it. On the same image
-with kore-rt's futex and controller from `a4ab7234`, which count and sweep, it
-was woken 208 times and the tour failed that step.
+the image built from `4f913c4`, the relay before the founding wait was merged,
+no wake reached it. On the same image with kore-rt's futex and controller from
+`a4ab7234`, which count and sweep, it was woken 208 times and the tour failed
+that step.
