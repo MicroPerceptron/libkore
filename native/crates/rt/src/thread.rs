@@ -496,19 +496,21 @@ pub struct Thread {
     /// The parent-arena slot holding the child's task handle: the join
     /// subject, and (revoked) the reap.
     handle: SlotRef,
-    /// The parent-held `Region`s the provisioning session produced —
-    /// stack, runtime block, boot staging page.  Revoking them is what
-    /// actually unmaps the band; the parent holds them precisely so that
-    /// a dead thread cannot keep its own stack alive.
-    provisioned: [SlotRef; PROVISIONED_REGIONS],
+    /// The parent-held `Region`s the provisioning session produced that
+    /// outlive the founding: the stack and the runtime block.  Revoking them
+    /// is what actually unmaps the band; the parent holds them precisely so
+    /// that a dead thread cannot keep its own stack alive.  The third, the
+    /// boot staging page, is the founding's delegation source, which its
+    /// commit consumes ([`HELD_REGIONS`]).
+    regions: [SlotRef; HELD_REGIONS],
     tls_region: Option<SlotRef>,
-    /// Founding result slots whose return waits for [`join`]: the staged
-    /// space, the delivered view, the boot delegation and one per endowment
-    /// of a gang founding that did not commit whole, whose outcome only the
-    /// join learns.  A founding that commits returns them at once
-    /// ([`release_scrubbed`]), so a founder holds per live child only what
-    /// `join` revokes; this list is then empty.
-    spent: [SlotRef; SCRUBBED_RESULTS + MAX_WORKER_CAPS],
+    /// Founding names whose return waits for [`join`]: always the staged
+    /// space, whose founder record the `Found` leaves standing until the reap
+    /// ([`STAGED_SPACE`]); and, for a gang founding that did not commit whole,
+    /// whose outcome only the join learns, what a whole commit returns at
+    /// once ([`release_committed`]: [`RELEASED_AT_COMMIT`] names and one per
+    /// endowment).
+    spent: [SlotRef; SPENT_CAPACITY],
     /// Live entries in [`spent`](Self::spent).
     spent_len: u8,
     /// The arena strip this stack was carved from — `Some` for SPMD
@@ -924,27 +926,56 @@ impl WorkerArena {
     }
 }
 
-/// The regions a founder provisions for each thread and holds until
-/// [`join`] revokes them: the stack, the runtime block and the boot staging
-/// page ([`Thread`]'s `provisioned`; a TLS block is one more, apart).
+/// The regions a founder provisions for each thread: the stack, the runtime
+/// block and the boot staging page (a TLS block is one more, apart).
 const PROVISIONED_REGIONS: usize = 3;
 
+/// The provisioned regions a founder holds until [`join`] revokes them: the
+/// stack and the runtime block ([`Thread`]'s `regions`).  The boot staging
+/// page is the founding's delegation source: the commit moves its page into
+/// the child and retires its founder record, so its name is free from then
+/// on, a dead record any later landing or result replaces.
+const HELD_REGIONS: usize = 2;
+
+/// The staged space a thread's `Found` consumes, whose founder name stays
+/// spent until [`join`]'s reap.  The commit moves the space into the child but
+/// scrubs from the founder only what it delivers and delegates, so the
+/// founder's record of the space stands — an `AddrSpace` with every right,
+/// bound to nothing the founder holds — until the reap retires it.  A name
+/// returned before that is not vacant: the next post landing there is refused
+/// as occupied, and the next result written there overwrites a live record.
+const STAGED_SPACE: usize = 1;
+
 /// The founding results a committed `Found` scrubs from the founder, beside
-/// one per endowment: the staged space, the child's view and the boot
-/// delegation ([`release_scrubbed`]; [`Thread`]'s `spent`).
-const SCRUBBED_RESULTS: usize = 3;
+/// one per endowment: the child's delivered view and the boot delegation's.
+const SCRUBBED_RESULTS: usize = 2;
+
+/// The founding names a committed `Found` leaves without a live record,
+/// beside one per endowment: the consumed staging page and the scrubbed
+/// results ([`release_committed`]).
+const RELEASED_AT_COMMIT: usize = PROVISIONED_REGIONS - HELD_REGIONS + SCRUBBED_RESULTS;
+
+/// [`Thread`]'s `spent`: the staged space, and what a gang founding that did
+/// not commit whole could not return.
+const SPENT_CAPACITY: usize = STAGED_SPACE + RELEASED_AT_COMMIT + MAX_WORKER_CAPS;
 
 /// Arena names one thread's founding holds in its founder while it is in
-/// flight, beside one per endowment: its provisioned regions, the results the
-/// commit scrubs, and the handle.  One more with a TLS block.
+/// flight, beside one per endowment: its provisioned regions, the staged
+/// space, the results the commit scrubs, and the handle.  One more with a TLS
+/// block.
 #[cfg_attr(all(not(target_os = "none"), not(test)), allow(dead_code))]
-pub(crate) const FOUNDING_SLOTS: usize = PROVISIONED_REGIONS + SCRUBBED_RESULTS + 1;
+pub(crate) const FOUNDING_SLOTS: usize = PROVISIONED_REGIONS + STAGED_SPACE + SCRUBBED_RESULTS + 1;
 
 /// Arena names a founded thread keeps in its founder until [`join`]: its
-/// handle and its provisioned regions (one more with a TLS block).  The rest
-/// of the founding's plan returns at commit ([`release_scrubbed`]).
+/// handle, its held regions and its staged space (one more with a TLS block).
+/// The rest of the founding's plan returns at commit ([`release_committed`]).
 #[cfg_attr(all(not(target_os = "none"), not(test)), allow(dead_code))]
-pub(crate) const RETAINED_SLOTS: usize = 1 + PROVISIONED_REGIONS;
+pub(crate) const RETAINED_SLOTS: usize = 1 + HELD_REGIONS + STAGED_SPACE;
+
+// Every founding name is kept until the reap or returned at commit, never
+// both and never neither: the launch budgets ([`crate::spmd`]) count the two
+// halves apart.
+const _: () = assert!(FOUNDING_SLOTS == RETAINED_SLOTS + RELEASED_AT_COMMIT);
 
 /// The arena names a gang session founding `workers` threads holds at its
 /// peak, just before its founding commits: every worker's claims and every
@@ -1225,19 +1256,22 @@ pub fn spawn_with_arg(_entry: fn(usize), _argument: usize, _endow: &[WorkerCap])
     None
 }
 
-/// Return a committed founding's result names to the slot ledger.
+/// Return to the slot ledger the founding names a committed `Found` left
+/// without a live record.
 ///
-/// A `Found` that commits moves the staged space, the child's view and every
-/// endowment out of the founder (the delivery map scrubs each one's founder
-/// slot) and clears the founder's delegated `Region` results, the boot page's
-/// among them. No capability is left under these names, and none can have
-/// been copied: the founder was inside its own trap from apply to scrub. They
-/// are free the moment the commit reports `Ok`, and only that proves it: a
-/// refused or unreadable commit keeps its names (the founding's
-/// leak-on-refusal rule), as a gang founding that did not commit whole keeps
-/// them in its tickets for `join`.
+/// A `Found` that commits delivers the child's view and every endowment out
+/// of the founder (the delivery map scrubs each one's founder slot), clears
+/// the founder's delegated `Region` results, the boot page's among them, and
+/// retires the tag of the staging page its delegation consumed. No live
+/// record is left under these names, and none can have been copied: the
+/// founder was inside its own trap from apply to scrub. They are free the
+/// moment the commit reports `Ok`, and only that proves it: a refused or
+/// unreadable commit keeps its names (the founding's leak-on-refusal rule),
+/// as a gang founding that did not commit whole keeps them in its tickets for
+/// `join`. The staged space is not among them: the commit consumes it without
+/// scrubbing its founder record ([`STAGED_SPACE`]).
 #[cfg(target_os = "none")]
-fn release_scrubbed(slots: impl IntoIterator<Item = SlotRef>) {
+fn release_committed(slots: impl IntoIterator<Item = SlotRef>) {
     for slot in slots {
         crate::entry::geometry::release_cap_slot(slot);
     }
@@ -1442,13 +1476,14 @@ fn spawn_entry(
     if committed.status() != kore_abi::session::Status::Ok {
         return None;
     }
-    // The founding's result plan is spent and its names come back now: the
-    // commit moved the staged space, the view and every endowment into the
-    // child and scrubbed their founder slots, and cleared the boot
-    // delegation's (`release_scrubbed`).  The join ticket keeps only what
-    // `join` must revoke.
-    release_scrubbed(
-        [space_res, view_res, boot_res]
+    // The founding's plan is spent, and the names it left without a live
+    // record come back now: the commit moved the view and every endowment
+    // into the child, scrubbing their founder slots, cleared the boot
+    // delegation's, and consumed the staging page (`release_committed`).  The
+    // staged space's record stands until the reap ([`STAGED_SPACE`]), so its
+    // name rides the join ticket beside what `join` revokes.
+    release_committed(
+        [stage_res, view_res, boot_res]
             .into_iter()
             .chain(staged[..endow.len()].iter().map(|e| e.result)),
     );
@@ -1456,10 +1491,10 @@ fn spawn_entry(
         owner,
         index,
         handle: handle_res,
-        provisioned: [stack_res, tblock_res, stage_res],
+        regions: [stack_res, tblock_res],
         tls_region,
-        spent: [handle_res; SCRUBBED_RESULTS + MAX_WORKER_CAPS],
-        spent_len: 0,
+        spent: [space_res; SPENT_CAPACITY],
+        spent_len: STAGED_SPACE as u8,
         strip,
     })
 }
@@ -1970,33 +2005,31 @@ pub(crate) fn spawn_gang_workers(
     // Mint every ticket now that the founding committed: whichever
     // workers exist are joinable, and a vacant handle's join refuses in
     // the caller's abort arm rather than orphaning anyone.  A whole commit
-    // returns each worker's founding plan now (`release_scrubbed`); a
-    // partial one leaves it to the tickets, for the join that learns which
-    // workers exist.
+    // returns what it left of each worker's founding without a live record
+    // now (`release_committed`); a partial one leaves those names to the
+    // tickets, for the join that learns which workers exist.  Either way the
+    // staged space's name waits for the reap ([`STAGED_SPACE`]).
     for (k, claim) in claims.iter_mut().take(n).enumerate() {
         let Some(c) = claim.take() else { return false };
         let endowed = &endow_store[k][..endow_lens[k]];
-        let mut spent = [c.space_res; SCRUBBED_RESULTS + MAX_WORKER_CAPS];
+        let committed = [c.stage_res, c.view_res, c.boot_res]
+            .into_iter()
+            .chain(endowed.iter().map(|e| e.result));
+        let mut spent = [c.space_res; SPENT_CAPACITY];
         let spent_len = if founded_all {
-            release_scrubbed(
-                [c.space_res, c.view_res, c.boot_res]
-                    .into_iter()
-                    .chain(endowed.iter().map(|e| e.result)),
-            );
-            0
+            release_committed(committed);
+            STAGED_SPACE
         } else {
-            spent[1] = c.view_res;
-            spent[2] = c.boot_res;
-            for (i, e) in endowed.iter().enumerate() {
-                spent[3 + i] = e.result;
+            for (name, slot) in spent[STAGED_SPACE..].iter_mut().zip(committed) {
+                *name = slot;
             }
-            SCRUBBED_RESULTS + endowed.len()
+            STAGED_SPACE + RELEASED_AT_COMMIT + endowed.len()
         };
         out[k] = Some(Thread {
             owner,
             index: c.index,
             handle: c.handle_res,
-            provisioned: [c.stack_res, c.tblock_res, c.stage_res],
+            regions: [c.stack_res, c.tblock_res],
             tls_region: c.tls_region,
             spent,
             spent_len: spent_len as u8,
@@ -2305,8 +2338,9 @@ impl Drop for JoinScratch {
 /// 2. **the parent-held regions** — stack, runtime block, boot staging.
 ///    These are the parent's precisely so a dead thread cannot keep its
 ///    own stack alive;
-/// 3. **the arena slots** — the founding results the kernel scrubbed, plus
-///    the handle;
+/// 3. **the arena slots** — the held regions, the staged space, whose
+///    founder record the reap has just retired, whatever a partial gang
+///    commit left in the ticket, and the handle;
 /// 4. **the band index — last.**  Every window in that band is now
 ///    unmapped, so the next [`spawn`] can be handed it.  Released any
 ///    earlier and a new thread would map its stack over a corpse's: the
@@ -2375,21 +2409,21 @@ pub(crate) fn join_reserved_at(
         });
     }
     // The stack and runtime-block regions are parent-held and die here.
-    // The STAGE region is deliberately NOT presented: the founding's
+    // The STAGE region is deliberately not among them: the founding's
     // delegate consumed it (the boot page re-rooted under the child, its
     // parent record retired with the move), so revoking it refuses the
     // WHOLE session as `Revoked` — which un-revokes the handle too and
     // silently leaves `torn_down` false.  That exact shape leaked every
     // joined thread's strip and band index since #407 (bounded, and
-    // invisible until the G7 retirement witness demanded a real reap);
-    // the slot itself is still released below, corpse and all.
-    for slot in [
-        Some(thread.provisioned[0]),
-        Some(thread.provisioned[1]),
-        thread.tls_region,
-    ]
-    .into_iter()
-    .flatten()
+    // invisible until the G7 retirement witness demanded a real reap).
+    // Its name came back when the founding committed, or rides `spent`
+    // from a gang founding that did not commit whole.
+    for slot in thread
+        .regions
+        .into_iter()
+        .map(Some)
+        .chain([thread.tls_region])
+        .flatten()
     {
         if b.revoke(slot).is_err() {
             return Err(ThreadJoinError {
@@ -2416,7 +2450,7 @@ pub(crate) fn join_reserved_at(
     if let Some(slot) = thread.tls_region {
         crate::entry::geometry::release_cap_slot(slot);
     }
-    for slot in thread.provisioned {
+    for slot in thread.regions {
         crate::entry::geometry::release_cap_slot(slot);
     }
     for slot in &thread.spent[..thread.spent_len as usize] {

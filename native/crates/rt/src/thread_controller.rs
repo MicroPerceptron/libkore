@@ -33,9 +33,9 @@
 //!
 //! Both the controller and every child take a founder's arena (the
 //! founding granule of capability slots): the controller holds each live child's handle,
-//! its provisioned regions and the root and send of its doorbell until the
-//! reap, a whole process's worth of them, and a child may found an SPMD gang
-//! of its own.
+//! its stack and runtime-block regions, its staged space and the root and send
+//! of its doorbell until the reap, a whole process's worth of them, and a
+//! child may found an SPMD gang of its own.
 //!
 //! # Degrade, never wedge
 //!
