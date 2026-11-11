@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/abi",
     "crates/app",
+    "crates/c-shim",
     "crates/collections",
     "crates/dagfs",
     "crates/driver",

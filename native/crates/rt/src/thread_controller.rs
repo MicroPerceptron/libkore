@@ -33,6 +33,12 @@
 //! between two threads neither can kick directly still arrives: the controller
 //! sweeps ([`futex::sweep`]).
 //!
+//! Both the controller and every child take a founder's arena (the
+//! founding granule of capability slots): the controller holds each live child's handle,
+//! its stack and runtime-block regions, its staged space and the root and send
+//! of its doorbell until the reap, a whole process's worth of them, and a
+//! child may found an SPMD gang of its own.
+//!
 //! # Degrade, never wedge
 //!
 //! A starter with no channel space founds a controller without a doorbell:
@@ -707,7 +713,7 @@ mod owner {
                     own_kick.map(|kick| send(PEER_BASE + starter as u16, kick, WAKE_SEND_RIGHTS)),
                 )
             };
-            let Some(ticket) = thread::spawn_with_arg(
+            let Some(ticket) = thread::spawn_founder_with_arg(
                 super::controller_entry,
                 self as *const Self as usize,
                 endowment.as_slice(),
@@ -882,8 +888,8 @@ mod owner {
             if let Some(wires) = &wires {
                 endowment.push(Some(doorbell(&wires.root)));
             }
-            // A child neither founds threads nor hands these on: notice
-            // rights only.
+            // A child hands these on to no one (the threads it asks for are
+            // founded here, not by it): notice rights only.
             endowment.push(
                 self.kick
                     .map(|kick| send(PEER_BASE + self.band as u16, kick, verbs::NOTICE_RIGHTS)),
@@ -893,7 +899,7 @@ mod owner {
             }));
             endowment.push(thread::heap_endowment());
             endowment.push(thread::wake_endowment());
-            let Some(thread) = thread::spawn_with_arg(
+            let Some(thread) = thread::spawn_founder_with_arg(
                 child_entry,
                 record as *const Record as usize,
                 endowment.as_slice(),

@@ -72,11 +72,18 @@ one-line `cdylib` named `kore` over it, linked with `--soname=libkore.so
 --no-undefined` (Kore's `user/runtime/libkore`). It ships the library beside
 the headers, which `kore-c` publishes to that crate's build script as
 `DEP_KORE_INCLUDE`, so they come from the same revision. A program links it with
-`-lkore` and gets:
+`-lkore` — Kore's TCC links it into every program, its `-lc` reading a script
+that joins `libkore.so` to the program's own `libc.a` — and gets:
 
 - every `kore.h` function, and the C names `kore/stdlib.h` and
   `kore/pthread.h` alias as real symbols (`c-stdlib`), over the process heap
   `kore-c` installs on the launch's `HEAP` supply;
+- the rest of the C library the program's headers declare (Kore's hosted
+  `<stdio.h>`, `<stdlib.h>`, `<string.h>` and `<errno.h>`, beside TCC):
+  `kore-c-shim`'s `printf` family, every conversion C has but the wide ones and
+  every float digit exact, `stdout` and `stderr`, the `strto*` parsers,
+  `qsort`, `strerror`, the string routines and a per-thread `errno`, and
+  `kore-c`'s own `abort`;
 - a host on thread 0, entered from the C library's start;
 - `kore_fs_run(step, user, &error)` (`kore/program.h`), which runs a
   `KoreFsStep` program as the program's filesystem session.
@@ -92,9 +99,28 @@ one word. Every park is a doorbell park; nothing spins.
   at the directory the program was launched in, and runs `kore-ffi`'s
   `Session` on its executor. The callbacks run there, as on any native
   executor, while the caller waits: they must not depend on its
-  thread-local state. A thread that cannot park (any but the main thread)
+  thread-local state, nor wait for another program thread — while one runs
+  the host serves nothing else, the streams included. A thread that cannot park (any but the main thread)
   is refused, as is a launch with no face. A quarantined session can never
   run again.
+- **The streams.** `stdout` and `stderr` reach the launch's interactive
+  stream (`PROFILE_INTERACTIVE`), the terminal the program was run from,
+  which only thread 0 may publish into. Any thread's write goes whole into
+  one in-process ring under a futex lock, which a stream call holds across
+  all its writes (POSIX's `flockfile`): the holder is the ring's one
+  producer, so one call's output is never split by another thread's, and it
+  kicks the host only if the host armed itself before parking. Every wait
+  for room is bounded by the runtime's slice: the host kicks the main thread
+  when its room is free, and a pthread, which the host cannot reach,
+  re-reads the ring each slice. The host drains the
+  ring into the stream's records as the launcher has room, parks on the
+  stream's capacity when it has none — a slow terminal holds the program
+  back rather than losing its output — and wakes the writers waiting for
+  space, a pass at a time, serving the program's end and its sessions
+  between passes. The host's own writes (a filesystem step's callbacks) are
+  kept in order beside the ring, before any call another thread has in
+  progress. A launch without the stream has no sink, and a
+  write to either stream returns `EOF`.
 - **The end.** The C library's `exit` and `_Exit` call
   `__kore_program_exit(status, finalize)` after their `atexit` handlers, on
   whatever thread called them. The first request wins and reaches the host,
@@ -110,6 +136,13 @@ one word. Every park is a doorbell park; nothing spins.
   - An end requested mid-session does not wait for the session.
   - A panic in the library ends the program the same way, its record
     published first.
+  - `abort` takes `_Exit`'s path with the aborted status, 134, what a shell
+    reports for a program `SIGABRT` ended: no `atexit` handler runs.
+  - An end the host's loop serves drains the ring and closes the stream
+    before the status, so the launcher shows all of the program's output
+    first. An end committed on the host itself (a callback's `exit` or
+    `abort`, a panic there) cannot wait: it relays what the launcher has room
+    for, and closes the stream if that was all of it.
 - **Without a host.** A launch that cannot carry one (no channel space or
   heap) runs the program on thread 0, as its C library alone would. Then the
   filesystem session is refused, and only thread 0's exit ends the program.
@@ -125,10 +158,13 @@ and checks it:
 - its soname, nothing needed or undefined;
 - static initial-exec TLS only;
 - exactly the declared ABI exported: `kore.h`, `kore/program.h`, the
-  `c-stdlib` names and the two lifecycle entry points.
+  `c-stdlib` names, the two lifecycle entry points, and the C library names
+  Kore's hosted headers declare (`C_LIBRARY`).
 
 Kore's `make keytest-tcc-x86` compiles a C program against these headers at
-Kore's shell, links `libkore.so`, and runs it through every surface above
+Kore's shell, links `libkore.so`, and runs it through every surface above. It
+also compiles Kore's `hello.c`, written against the standard headers alone,
+reads every line it prints off the terminal, and ends a program by `abort`
 (Kore `res/TCC.md` §10). That is boot evidence; this repository's checks are
 compiler and link evidence. Task preparation (`kore_task_*`) still needs a
 Rust host to admit its batch: the independent host does not admit one.

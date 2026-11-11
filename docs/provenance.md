@@ -404,3 +404,18 @@ and checks that the callback waits for it. The closure keeps its 26 packages
 and 382 files. Besides `thread_controller.rs`, it carries the
 `services/swap/boot.toml` digest of Kore's reseal over the cancellation wake
 (`bfecfd17`).
+
+The export then moved to Kore `618772900e088b8b45ebafa8101d066edf4ffb3b`,
+the merge of MicroPerceptron/kore#1494's newer branch into this change. That
+branch brings three changes, which its own exports carried here up to Kore
+`2d4998ba`:
+
+- threads that found take a founder's arena;
+- a founding's staged space waits for the reap;
+- Kore's C library (`kore-c-shim`).
+
+The closure is now 27 packages and 401 files. Against that branch's export,
+only kore-rt's `futex.rs` and `thread_controller.rs` and the record differ.
+The two sides' controller changes compose: the controller and its children
+are founded with `spawn_founder_with_arg`, and a child still waits for its
+founding before its callback runs.
