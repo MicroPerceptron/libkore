@@ -415,6 +415,22 @@ fn release_thread_index(n: u32) {
     }
 }
 
+/// **How many thread bands are free now**: how many more threads this task
+/// could found before its band plan is full.  An upper bound — a founding also
+/// needs its founder's arena names and, for a strip stack, room in the stack
+/// window — and a snapshot, which a concurrent founding or join moves.
+#[cfg(target_os = "none")]
+pub fn free_bands() -> u32 {
+    let used = THREAD_SLOTS.load(Ordering::Acquire);
+    (!used & (((1u64 << MAX_THREADS) - 1) as u32)).count_ones()
+}
+
+/// Off the metal no thread founds another: no band is free.
+#[cfg(not(target_os = "none"))]
+pub fn free_bands() -> u32 {
+    0
+}
+
 /// How a spawned thread enters Rust: the plain `fn()` every service
 /// worker uses, or an **spmd entry** carrying a region launch's context
 /// and the index it assigned (`res/SPMD.md` §2) — the CUDA
@@ -484,14 +500,15 @@ pub struct Thread {
     /// stack, runtime block, boot staging page.  Revoking them is what
     /// actually unmaps the band; the parent holds them precisely so that
     /// a dead thread cannot keep its own stack alive.
-    provisioned: [SlotRef; 3],
+    provisioned: [SlotRef; PROVISIONED_REGIONS],
     tls_region: Option<SlotRef>,
-    /// Founding result slots the kernel already scrubbed (the staged
-    /// space, the delivered view, the boot delegation, one per
-    /// endowment): no capability is left in them, but the *userland* slot
-    /// reservation is, and a task that never returned it would run out of
-    /// arena long before it ran out of bands.
-    spent: [SlotRef; 3 + MAX_WORKER_CAPS],
+    /// Founding result slots whose return waits for [`join`]: the staged
+    /// space, the delivered view, the boot delegation and one per endowment
+    /// of a gang founding that did not commit whole, whose outcome only the
+    /// join learns.  A founding that commits returns them at once
+    /// ([`release_scrubbed`]), so a founder holds per live child only what
+    /// `join` revokes; this list is then empty.
+    spent: [SlotRef; SCRUBBED_RESULTS + MAX_WORKER_CAPS],
     /// Live entries in [`spent`](Self::spent).
     spent_len: u8,
     /// The arena strip this stack was carved from — `Some` for SPMD
@@ -790,7 +807,12 @@ fn push_worker_thread_blocks(gblock: &mut GeomBlock, local: Window) -> bool {
 /// view.  [`spawn_with`] when the thread must hold capabilities.
 #[cfg(target_os = "none")]
 pub fn spawn(entry: fn()) -> Option<Thread> {
-    spawn_entry(ThreadEntry::Plain(entry), &[], WorkerStack::Band)
+    spawn_entry(
+        ThreadEntry::Plain(entry),
+        &[],
+        WorkerStack::Band,
+        WorkerArena::Task,
+    )
 }
 
 // (The per-worker `spawn_worker` shim retired with G5: workers found as a
@@ -807,7 +829,12 @@ pub fn spawn(entry: fn()) -> Option<Thread> {
 /// into [`exit`]`(0)`.
 #[cfg(target_os = "none")]
 pub fn spawn_with(entry: fn(), endow: &[WorkerCap]) -> Option<Thread> {
-    spawn_entry(ThreadEntry::Plain(entry), endow, WorkerStack::Band)
+    spawn_entry(
+        ThreadEntry::Plain(entry),
+        endow,
+        WorkerStack::Band,
+        WorkerArena::Task,
+    )
 }
 
 /// Where a spawned worker's stack lives.
@@ -831,6 +858,100 @@ pub enum WorkerStack {
     /// reservation, shared with SPMD gangs); a request the window cannot
     /// place — or a zero-byte one — refuses the spawn.
     Bytes(usize),
+}
+
+/// How many capability slots a spawned thread's arena holds: the one sizing
+/// question a founding leaves to its founder (`FoundReq.arena_slots`, which
+/// the kernel accepts in `1..=ARENA_SLOTS`).
+///
+/// Every thread's arena holds its boot names, the runtime's serve scratch,
+/// report and carve slots, and whatever it reserves while it runs. A thread
+/// that **founds** holds more, for as long as each child lives: the child's
+/// handle and the regions its stack, runtime block and boot page live in
+/// (what [`join`] revokes), and, while a founding is in flight, that
+/// founding's whole result plan.  A thread that founds a gang, or a thread
+/// controller that founds a process's threads, therefore needs an arena that
+/// scales with its children, the case the kernel's founding granule is sized
+/// for ("founders are the arena's real sizing case", `ARENA_SLOTS`). A thread
+/// controller founded with a task's 64 slots held two live threads; with the
+/// founding granule it holds over two dozen, within a couple of the band
+/// plan's own limit ([`MAX_THREADS`]).
+///
+/// Spawned arenas cannot grow: only thread 0 carries the extension window, so
+/// the size is chosen once, here.
+#[cfg(any(test, target_os = "none"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerArena {
+    /// A thread that founds nothing: [`TASK_ARENA_SLOTS`].
+    Task,
+    /// A thread that founds others: the founding granule,
+    /// [`ARENA_SLOT_CEILING`](crate::entry::ARENA_SLOT_CEILING).
+    Founder,
+}
+
+/// A task's arena: one word of the runtime's slot ledger.
+///
+/// It holds the widest endowment a worker can take, the serve scratch, the
+/// report and carve slots behind it, and the short-lived reservations of a
+/// thread that founds nothing (a channel mint, a join landing). The assert
+/// below proves the first three fit; a widening of [`MAX_WORKER_CAPS`] or of
+/// the serve scratch that broke that would fail the build here, not a
+/// founding at run time.
+#[cfg(any(test, target_os = "none"))]
+pub(crate) const TASK_ARENA_SLOTS: u32 = u64::BITS;
+
+#[cfg(any(test, target_os = "none"))]
+const _: () = {
+    // The highest boot name a worker can carry, then the runtime layout the
+    // entry derives after it: serve scratch, the report slot, the carve slot.
+    let top = child_slot::ENDOW_BASE as usize + MAX_WORKER_CAPS;
+    let carve = top + crate::entry::SERVE_SCRATCH_SLOTS + 2;
+    assert!(carve < TASK_ARENA_SLOTS as usize);
+    assert!(TASK_ARENA_SLOTS <= crate::entry::ARENA_SLOT_CEILING);
+    // Both sizes fit the per-thread slot alias band: the slot alias of a
+    // founder's arena is the band's whole width.
+    assert!(kore_abi::execution::alias_bytes(crate::entry::ARENA_SLOT_CEILING) <= SLOTS_BYTES);
+};
+
+#[cfg(any(test, target_os = "none"))]
+impl WorkerArena {
+    /// The `FoundReq.arena_slots` this arena is founded with.
+    pub(crate) const fn slots(self) -> u32 {
+        match self {
+            Self::Task => TASK_ARENA_SLOTS,
+            Self::Founder => crate::entry::ARENA_SLOT_CEILING,
+        }
+    }
+}
+
+/// The regions a founder provisions for each thread and holds until
+/// [`join`] revokes them: the stack, the runtime block and the boot staging
+/// page ([`Thread`]'s `provisioned`; a TLS block is one more, apart).
+const PROVISIONED_REGIONS: usize = 3;
+
+/// The founding results a committed `Found` scrubs from the founder, beside
+/// one per endowment: the staged space, the child's view and the boot
+/// delegation ([`release_scrubbed`]; [`Thread`]'s `spent`).
+const SCRUBBED_RESULTS: usize = 3;
+
+/// Arena names one thread's founding holds in its founder while it is in
+/// flight, beside one per endowment: its provisioned regions, the results the
+/// commit scrubs, and the handle.  One more with a TLS block.
+#[cfg_attr(all(not(target_os = "none"), not(test)), allow(dead_code))]
+pub(crate) const FOUNDING_SLOTS: usize = PROVISIONED_REGIONS + SCRUBBED_RESULTS + 1;
+
+/// Arena names a founded thread keeps in its founder until [`join`]: its
+/// handle and its provisioned regions (one more with a TLS block).  The rest
+/// of the founding's plan returns at commit ([`release_scrubbed`]).
+#[cfg_attr(all(not(target_os = "none"), not(test)), allow(dead_code))]
+pub(crate) const RETAINED_SLOTS: usize = 1 + PROVISIONED_REGIONS;
+
+/// The arena names a gang session founding `workers` threads holds at its
+/// peak, just before its founding commits: every worker's claims and every
+/// endowment result.
+#[cfg_attr(all(not(target_os = "none"), not(test)), allow(dead_code))]
+pub(crate) const fn gang_founding_slots(workers: usize, tls: bool, endowments: usize) -> usize {
+    workers * (FOUNDING_SLOTS + tls as usize) + endowments
 }
 
 /// A worker that can **park and be kicked**, and kick back: two channels
@@ -952,6 +1073,14 @@ pub fn kick_parent() -> bool {
 /// into thread 0's doorbell, its own kick ([`own_kick`]), a heap position,
 /// and `extra`.  `None` when the task holds no `CHANNEL_SPACE` (its profile
 /// lacks `channels`), the mint or a derive refuses, or [`spawn_with`] does.
+///
+/// The worker takes a founder's arena, the founding granule of capability
+/// slots rather than a task's 64: a doorbell worker is where a host runs a
+/// program's own code (libkore's C `main`, a
+/// language engine), and that code founds threads of its own — its first
+/// `pthread_create` starts the [thread controller](crate::thread_controller)
+/// and an SPMD dispatch founds a gang, each holding the founder's arena for
+/// as long as its children live.
 #[cfg(target_os = "none")]
 pub fn spawn_with_doorbell(entry: fn(), extra: &[WorkerCap]) -> Option<DoorbellWorker> {
     spawn_with_doorbell_on(entry, extra, WorkerStack::Band)
@@ -1038,8 +1167,12 @@ pub fn spawn_with_doorbell_on(
     };
     caps[3] = heap;
     caps[OWN..OWN + extra.len()].copy_from_slice(extra);
-    let Some(thread) = spawn_entry(ThreadEntry::Plain(entry), &caps[..OWN + extra.len()], stack)
-    else {
+    let Some(thread) = spawn_entry(
+        ThreadEntry::Plain(entry),
+        &caps[..OWN + extra.len()],
+        stack,
+        WorkerArena::Founder,
+    ) else {
         let _ = pair.send.try_retire();
         let _ = pair.root.try_retire();
         let _ = wake.send.try_retire();
@@ -1067,6 +1200,24 @@ pub fn spawn_with_arg(entry: fn(usize), argument: usize, endow: &[WorkerCap]) ->
         ThreadEntry::Argument(entry, argument),
         endow,
         WorkerStack::Band,
+        WorkerArena::Task,
+    )
+}
+
+/// [`spawn_with_arg`] founding a thread that founds others, with a founder's
+/// arena ([`WorkerArena::Founder`]): the thread controller, and the threads
+/// it founds, any of which may found a gang or ask for more threads.
+#[cfg(target_os = "none")]
+pub(crate) fn spawn_founder_with_arg(
+    entry: fn(usize),
+    argument: usize,
+    endow: &[WorkerCap],
+) -> Option<Thread> {
+    spawn_entry(
+        ThreadEntry::Argument(entry, argument),
+        endow,
+        WorkerStack::Band,
+        WorkerArena::Founder,
     )
 }
 #[cfg(not(target_os = "none"))]
@@ -1074,11 +1225,34 @@ pub fn spawn_with_arg(_entry: fn(usize), _argument: usize, _endow: &[WorkerCap])
     None
 }
 
+/// Return a committed founding's result names to the slot ledger.
+///
+/// A `Found` that commits moves the staged space, the child's view and every
+/// endowment out of the founder (the delivery map scrubs each one's founder
+/// slot) and clears the founder's delegated `Region` results, the boot page's
+/// among them. No capability is left under these names, and none can have
+/// been copied: the founder was inside its own trap from apply to scrub. They
+/// are free the moment the commit reports `Ok`, and only that proves it: a
+/// refused or unreadable commit keeps its names (the founding's
+/// leak-on-refusal rule), as a gang founding that did not commit whole keeps
+/// them in its tickets for `join`.
+#[cfg(target_os = "none")]
+fn release_scrubbed(slots: impl IntoIterator<Item = SlotRef>) {
+    for slot in slots {
+        crate::entry::geometry::release_cap_slot(slot);
+    }
+}
+
 /// The one founding every public spawn shape resolves to — the entry
 /// shape is the only thing the shapes disagree on, and it rides the
 /// start record untouched by everything below.
 #[cfg(target_os = "none")]
-fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap], stack: WorkerStack) -> Option<Thread> {
+fn spawn_entry(
+    entry: ThreadEntry,
+    endow: &[WorkerCap],
+    stack: WorkerStack,
+    arena: WorkerArena,
+) -> Option<Thread> {
     if endow.len() > MAX_WORKER_CAPS {
         return None;
     }
@@ -1092,7 +1266,7 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap], stack: WorkerStack) -> O
     // ordinary slot exhaustion before spending a band or provisioning memory,
     // and leave a report slot available to poll/join existing children.
     // Session A owns three regions (+ TLS); B owns four results + endowments.
-    let slots_needed = 3 + usize::from(template.is_some()) + 4 + endow.len() + 1;
+    let slots_needed = FOUNDING_SLOTS + usize::from(template.is_some()) + endow.len() + 1;
     if crate::entry::geometry::available_cap_slots() < slots_needed {
         return None;
     }
@@ -1204,7 +1378,7 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap], stack: WorkerStack) -> O
 
     // ── Stamp the boot page (at its staging VA — the delegation moves
     //    it to `boot_va`, which is what the child receives as `arg`). ──
-    let arena_slots: u32 = 64;
+    let arena_slots = arena.slots();
     if let (Some(t), Some(p)) = (template, tls) {
         unsafe { t.initialize(p.mapping.base()) };
     }
@@ -1268,22 +1442,24 @@ fn spawn_entry(entry: ThreadEntry, endow: &[WorkerCap], stack: WorkerStack) -> O
     if committed.status() != kore_abi::session::Status::Ok {
         return None;
     }
-    // The join ticket: what the thread cost, in the order `join` must
-    // give it back.
-    let mut spent = [space_res; 3 + MAX_WORKER_CAPS];
-    spent[1] = view_res;
-    spent[2] = boot_res;
-    for (i, e) in staged[..endow.len()].iter().enumerate() {
-        spent[3 + i] = e.result;
-    }
+    // The founding's result plan is spent and its names come back now: the
+    // commit moved the staged space, the view and every endowment into the
+    // child and scrubbed their founder slots, and cleared the boot
+    // delegation's (`release_scrubbed`).  The join ticket keeps only what
+    // `join` must revoke.
+    release_scrubbed(
+        [space_res, view_res, boot_res]
+            .into_iter()
+            .chain(staged[..endow.len()].iter().map(|e| e.result)),
+    );
     Some(Thread {
         owner,
         index,
         handle: handle_res,
         provisioned: [stack_res, tblock_res, stage_res],
         tls_region,
-        spent,
-        spent_len: (3 + endow.len()) as u8,
+        spent: [handle_res; SCRUBBED_RESULTS + MAX_WORKER_CAPS],
+        spent_len: 0,
         strip,
     })
 }
@@ -1487,6 +1663,19 @@ pub(crate) fn spawn_gang_workers(
     if star.is_some() && n > crate::star::MESH_CEILING {
         return false;
     }
+    // Refuse a session this arena cannot finish before claiming anything:
+    // past here a refusal leaks what it claimed.  A planned endowment is the
+    // star's mesh closed with the heap; an explicit one is as given.
+    let endowments = if endows.is_empty() {
+        n * (star.map_or(0, |plan| plan.mesh_caps(n)) + usize::from(heap.is_some()))
+    } else {
+        endows.iter().map(|caps| caps.len()).sum()
+    };
+    if crate::entry::geometry::available_cap_slots()
+        < gang_founding_slots(n, template.is_some(), endowments)
+    {
+        return false;
+    }
     let Some(self_space) = crate::entry::geometry::self_space_slot() else {
         return false;
     };
@@ -1509,7 +1698,8 @@ pub(crate) fn spawn_gang_workers(
         tls_region: Option<SlotRef>,
     }
     let mut claims: [Option<Claim>; MAX_SESSION_FOUNDS] = [const { None }; MAX_SESSION_FOUNDS];
-    let arena_slots: u32 = 64;
+    // A gang worker runs a region's body and founds nothing.
+    let arena_slots = WorkerArena::Task.slots();
     let transport = TrapTransport::new();
     // ── Session A′: provision every worker's three pages, one commit. ──
     let mut a = SessionBuilder::new();
@@ -1779,15 +1969,29 @@ pub(crate) fn spawn_gang_workers(
     let founded_all = committed.status() == kore_abi::session::Status::Ok;
     // Mint every ticket now that the founding committed: whichever
     // workers exist are joinable, and a vacant handle's join refuses in
-    // the caller's abort arm rather than orphaning anyone.
+    // the caller's abort arm rather than orphaning anyone.  A whole commit
+    // returns each worker's founding plan now (`release_scrubbed`); a
+    // partial one leaves it to the tickets, for the join that learns which
+    // workers exist.
     for (k, claim) in claims.iter_mut().take(n).enumerate() {
         let Some(c) = claim.take() else { return false };
-        let mut spent = [c.space_res; 3 + MAX_WORKER_CAPS];
-        spent[1] = c.view_res;
-        spent[2] = c.boot_res;
-        for (i, e) in endow_store[k][..endow_lens[k]].iter().enumerate() {
-            spent[3 + i] = e.result;
-        }
+        let endowed = &endow_store[k][..endow_lens[k]];
+        let mut spent = [c.space_res; SCRUBBED_RESULTS + MAX_WORKER_CAPS];
+        let spent_len = if founded_all {
+            release_scrubbed(
+                [c.space_res, c.view_res, c.boot_res]
+                    .into_iter()
+                    .chain(endowed.iter().map(|e| e.result)),
+            );
+            0
+        } else {
+            spent[1] = c.view_res;
+            spent[2] = c.boot_res;
+            for (i, e) in endowed.iter().enumerate() {
+                spent[3 + i] = e.result;
+            }
+            SCRUBBED_RESULTS + endowed.len()
+        };
         out[k] = Some(Thread {
             owner,
             index: c.index,
@@ -1795,7 +1999,7 @@ pub(crate) fn spawn_gang_workers(
             provisioned: [c.stack_res, c.tblock_res, c.stage_res],
             tls_region: c.tls_region,
             spent,
-            spent_len: (3 + endow_lens[k]) as u8,
+            spent_len: spent_len as u8,
             strip: Some(c.strip),
         });
     }
