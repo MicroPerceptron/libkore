@@ -205,6 +205,13 @@ impl MonitorReqWire {
     /// records.  The monitor assembles the census from its own
     /// `SystemObserve` capability; the request carries no authority.
     pub const OP_DEVICE_CENSUS: u8 = 2;
+    /// One page of the census functions' live state
+    /// (`crate::device::state`): `reserved[0]` is the page ordinal.  Sampled
+    /// when asked, never cached; the request carries no authority.
+    pub const OP_DEVICE_STATES: u8 = 5;
+    /// One function's BAR shapes: `reserved[0..2]` is its catalog index,
+    /// little-endian.  Lengths only.
+    pub const OP_DEVICE_BARS: u8 = 6;
 }
 
 /// Monitor reply: a complete bounded snapshot or a closed refusal. The
@@ -222,9 +229,11 @@ pub struct MonitorRepWire {
     /// Tagged observation payload: ProcessorPage for processor replies, or
     /// iommu_status::Snapshot encoded by its wire-page methods for IOMMU replies.
     pub processor: crate::processor_status::ProcessorPage,
-    /// [`TAG_DEVICE_CENSUS`](Self::TAG_DEVICE_CENSUS) only; the zero page
-    /// on every other tag (the codec refuses a stray one).
-    pub census: crate::device::DeviceCensusPage,
+    /// The device record of [`TAG_DEVICE_CENSUS`](Self::TAG_DEVICE_CENSUS),
+    /// [`TAG_DEVICE_STATES`](Self::TAG_DEVICE_STATES) or
+    /// [`TAG_DEVICE_BARS`](Self::TAG_DEVICE_BARS); the zero slot on every
+    /// other tag (the codec refuses a stray one).
+    pub device: crate::device::DevicePage,
 }
 
 impl MonitorRepWire {
@@ -233,6 +242,8 @@ impl MonitorRepWire {
     pub const TAG_SNAPSHOT: u8 = 1;
     pub const TAG_REFUSED: u8 = 2;
     pub const TAG_DEVICE_CENSUS: u8 = 3;
+    pub const TAG_DEVICE_STATES: u8 = 6;
+    pub const TAG_DEVICE_BARS: u8 = 7;
     pub const REFUSE_DENIED: u8 = 1;
 }
 
@@ -1527,6 +1538,15 @@ impl TaskReqWire {
     /// makes executable from its own lease. The generation binds no global
     /// name: only the capability's holder reaches it.
     pub const OP_INSTALL_FILE: u8 = 26;
+    /// One page of the census functions' live state
+    /// (`crate::device::state`), relayed from the monitor as
+    /// [`OP_DEVICE_CENSUS`](Self::OP_DEVICE_CENSUS)'s pages are, but never
+    /// cached: `slot` is the page ordinal.  Bind-inert data, no grants,
+    /// answered on any launcher pair.
+    pub const OP_DEVICE_STATES: u8 = 27;
+    /// One function's BAR shapes, relayed from the monitor: `slot` is the
+    /// function's catalog index.  Lengths only; no grants.
+    pub const OP_DEVICE_BARS: u8 = 28;
 
     /// Every retired `TaskReqWire` discriminant, in one definition the
     /// decoder cites (the [`derive_kind_known`](crate::session::derive_kind_known)
@@ -1700,9 +1720,11 @@ pub struct TaskRepWire {
     /// Tagged observation payload: ProcessorPage for processor replies, or
     /// iommu_status::Snapshot encoded by its wire-page methods for IOMMU replies.
     pub processor: crate::processor_status::ProcessorPage,
-    /// [`TAG_DEVICE_CENSUS`](Self::TAG_DEVICE_CENSUS)'s page; the zero
-    /// page on every other tag.
-    pub census: crate::device::DeviceCensusPage,
+    /// The device record of [`TAG_DEVICE_CENSUS`](Self::TAG_DEVICE_CENSUS),
+    /// [`TAG_DEVICE_STATES`](Self::TAG_DEVICE_STATES) or
+    /// [`TAG_DEVICE_BARS`](Self::TAG_DEVICE_BARS); the zero slot on every
+    /// other tag.
+    pub device: crate::device::DevicePage,
     /// Only `REFUSE_LEDGER_FULL` with `index == 1` may carry this bounded
     /// failure snapshot. Every other reply requires the all-zero form.
     pub cleanup: CleanupRowDiagnosticWire,
@@ -1845,6 +1867,10 @@ impl TaskRepWire {
     /// which a caller may retry with; nothing was registered, and the supply
     /// was retired, so its memory is the caller's again.
     pub const TAG_INSTALL_SUPPLY_SHORT: u8 = 27;
+    /// Reply to [`TaskReqWire::OP_DEVICE_STATES`]: `device` is the page.
+    pub const TAG_DEVICE_STATES: u8 = 28;
+    /// Reply to [`TaskReqWire::OP_DEVICE_BARS`]: `device` is the table.
+    pub const TAG_DEVICE_BARS: u8 = 29;
     /// The unit [`TAG_INSTALL_SUPPLY_SHORT`](Self::TAG_INSTALL_SUPPLY_SHORT)
     /// counts in: mm grants a base-class supply in whole 4 KiB pages, so a
     /// size the caller can ask for is a multiple of it.

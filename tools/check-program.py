@@ -36,7 +36,7 @@ C_STDLIB = {'malloc', 'calloc', 'realloc', 'free', 'pthread_create', 'pthread_jo
             'pthread_setcanceltype', 'pthread_testcancel', 'pthread_exit',
             '__cxa_thread_atexit', '__cxa_thread_atexit_impl'}
 # The C library's start and exit call these when a program links libkore.
-LIFECYCLE = {'__kore_program_start', '__kore_program_exit'}
+LIFECYCLE = {'__kore_program_start', '__kore_program_exit', '__kore_program_arguments'}
 # The rest of the C library a program's headers declare (Kore's TCC
 # `include/`: <stdio.h>, <stdlib.h>, <string.h>, <errno.h>), which libkore.so
 # implements: kore-c-shim's printf family, streams, parsers, string routines

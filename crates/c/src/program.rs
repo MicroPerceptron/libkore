@@ -48,6 +48,8 @@
 //! the C library alone would: allocation, threads, time and random work, a
 //! filesystem session is refused, and only thread 0's exit ends the program.
 
+extern crate alloc;
+
 use core::cell::{Cell, UnsafeCell};
 use core::ffi::{c_int, c_void};
 use core::future::poll_fn;
@@ -370,6 +372,18 @@ impl Founded {
         // The C streams reach the launcher through this thread: map its
         // stream and install the sink before any thread can write.
         let output = crate::stdio::install(&rt);
+        // `main`'s arguments, read from the launcher's page while this is
+        // still the only thread. A line that is no argument vector cannot
+        // be handed to `main`: say why on `stderr` and end here, before the
+        // program runs.
+        if let Err(malformed) = crate::args::capture(&rt) {
+            crate::stdio::report(alloc::format!("kore: {malformed}\n").as_bytes());
+            crate::stdio::flush_now();
+            // SAFETY: the C library's exit, which `__kore_program_start`
+            // stored before it called this.
+            let end: End = unsafe { core::mem::transmute(END.load(Ordering::Acquire)) };
+            unsafe { end(ExitCode::USAGE.get()) }
+        }
         // Where `mmap` places: this task's free link span, published before
         // any thread that could map exists.
         crate::mmap::arm(&rt);

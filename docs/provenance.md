@@ -447,3 +447,13 @@ places:
 The closure is now 27 packages and 406 files. Against Kore `e6b108d1`, only
 kore-rt's `futex.rs` and `thread_controller.rs` differ. No exported manifest
 changed, so `native/Cargo.lock` did not.
+
+It then moved to Kore `5c09f155b03682e95f24f924cdd65188fc9ebc60`, the merge
+of #1494's next round into this change. That round lets the kernel observe a
+PCI function's live state and its BARs' shapes, and puts the name a program
+was run by in its process page. libkore#32 exported it first, at Kore
+`dfece644`. The closure is now 27 packages and 407 files. Against Kore
+`4b236fbe`, only kore-rt's `futex.rs` and `thread_controller.rs` differ.
+Against libkore#32's export, five services' `boot.toml` digests differ as
+well, from #1494's reseals that followed it. No exported manifest changed,
+so `native/Cargo.lock` did not.
