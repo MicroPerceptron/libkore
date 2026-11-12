@@ -465,3 +465,9 @@ kore-rt's futex and controller from `a4ab7234`, which count and sweep, it was
 woken 208 times and the tour failed that step. Kore `e0717eb` repeated that
 over the founding wait: no wake, against 206 with the founding wait's own
 futex and controller (`36b99426`).
+
+Kore's reseal over this export measures it with all nine parked (`09a98a0`,
+built from `8b617ee`, which pins it): every step ran to `exit 42` and no wake
+reached any of them. The same tree with the futex and controller of that
+branch's head (`83861dc9`), which count and sweep, delivered 1466 wakes to
+them over the 400 turns, and the tour failed that step.
