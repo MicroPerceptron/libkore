@@ -72,11 +72,21 @@ one-line `cdylib` named `kore` over it, linked with `--soname=libkore.so
 --no-undefined` (Kore's `user/runtime/libkore`). It ships the library beside
 the headers, which `kore-c` publishes to that crate's build script as
 `DEP_KORE_INCLUDE`, so they come from the same revision. A program links it with
-`-lkore` and gets:
+`-lkore` — Kore's TCC links it into every program, its `-lc` reading a script
+that joins `libkore.so` to the program's own `libc.a` — and gets:
 
 - every `kore.h` function, and the C names `kore/stdlib.h` and
   `kore/pthread.h` alias as real symbols (`c-stdlib`), over the process heap
   `kore-c` installs on the launch's `HEAP` supply;
+- the rest of the C library the program's headers declare (Kore's hosted
+  `<stdio.h>`, `<stdlib.h>`, `<string.h>` and `<errno.h>`, beside TCC):
+  `kore-c-shim`'s `printf` family, every conversion C has but the wide ones and
+  every float digit exact, `stdout` and `stderr`, the `strto*` parsers,
+  `qsort`, `strerror`, the string routines and a per-thread `errno`, and
+  `kore-c`'s own `abort`;
+- descriptors over the capabilities it holds (`<fcntl.h>`, `<unistd.h>`,
+  `<sys/mman.h>`: `open`, `close`, `mmap`, `munmap`), and
+  `kore_fd_describe` (`kore/program.h`), described below;
 - a host on thread 0, entered from the C library's start;
 - `kore_fs_run(step, user, &error)` (`kore/program.h`), which runs a
   `KoreFsStep` program as the program's filesystem session.
@@ -92,9 +102,28 @@ one word. Every park is a doorbell park; nothing spins.
   at the directory the program was launched in, and runs `kore-ffi`'s
   `Session` on its executor. The callbacks run there, as on any native
   executor, while the caller waits: they must not depend on its
-  thread-local state. A thread that cannot park (any but the main thread)
+  thread-local state, nor wait for another program thread — while one runs
+  the host serves nothing else, the streams included. A thread that cannot park (any but the main thread)
   is refused, as is a launch with no face. A quarantined session can never
   run again.
+- **The streams.** `stdout` and `stderr` reach the launch's interactive
+  stream (`PROFILE_INTERACTIVE`), the terminal the program was run from,
+  which only thread 0 may publish into. Any thread's write goes whole into
+  one in-process ring under a futex lock, which a stream call holds across
+  all its writes (POSIX's `flockfile`): the holder is the ring's one
+  producer, so one call's output is never split by another thread's, and it
+  kicks the host only if the host armed itself before parking. Every wait
+  for room is bounded by the runtime's slice: the host kicks the main thread
+  when its room is free, and a pthread, which the host cannot reach,
+  re-reads the ring each slice. The host drains the
+  ring into the stream's records as the launcher has room, parks on the
+  stream's capacity when it has none — a slow terminal holds the program
+  back rather than losing its output — and wakes the writers waiting for
+  space, a pass at a time, serving the program's end and its sessions
+  between passes. The host's own writes (a filesystem step's callbacks) are
+  kept in order beside the ring, before any call another thread has in
+  progress. A launch without the stream has no sink, and a
+  write to either stream returns `EOF`.
 - **The end.** The C library's `exit` and `_Exit` call
   `__kore_program_exit(status, finalize)` after their `atexit` handlers, on
   whatever thread called them. The first request wins and reaches the host,
@@ -110,9 +139,79 @@ one word. Every park is a doorbell park; nothing spins.
   - An end requested mid-session does not wait for the session.
   - A panic in the library ends the program the same way, its record
     published first.
+  - `abort` takes `_Exit`'s path with the aborted status, 134, what a shell
+    reports for a program `SIGABRT` ended: no `atexit` handler runs.
+  - An end the host's loop serves drains the ring and closes the stream
+    before the status, so the launcher shows all of the program's output
+    first. An end committed on the host itself (a callback's `exit` or
+    `abort`, a panic there) cannot wait: it relays what the launcher has room
+    for, and closes the stream if that was all of it.
 - **Without a host.** A launch that cannot carry one (no channel space or
   heap) runs the program on thread 0, as its C library alone would. Then the
   filesystem session is refused, and only thread 0's exit ends the program.
+
+### Descriptors: C's spelling for a held capability
+
+A program's authority is the capabilities it was founded holding. Each sits
+at a fixed place: the boot block names it by a role and an index, and the
+capability is a slot of the thread's arena. `open` is the readable way to say
+which one is meant, and nothing more:
+
+```c
+int fd = open("/kore/memory", O_RDWR);
+char *region = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+...
+munmap(region, 1 << 20);
+close(fd);
+```
+
+- **The path is not a file.** `open` looks the string up in one static table
+  (`crates/c/src/fd.rs`) whose rows are a name and the bootstrap coordinate it
+  stands for. No filesystem is asked, and no name outside the table exists:
+  `ENOENT`. The first row is `/kore/memory`, `role::HEAP@0`, the memory supply
+  the allocator grows on.
+- **It grants nothing.** `open` succeeds only for a capability the calling
+  thread holds (`ENXIO` otherwise), with access its rights cover (`EACCES`).
+  The only flags are the access modes. `close` forgets the number; the
+  capability stays the program's, and mappings made through it stand.
+- **A descriptor stores the coordinate, never the capability.** Capabilities
+  are per thread on Kore, and `main` and every `pthread` have their own boot
+  block. Each use resolves the coordinate in the *calling* thread's. Numbers
+  are the process's, as C expects, from 3 (0 to 2 are the streams'), and no
+  authority crosses a thread through one.
+- **`kore_fd_describe(fd, &info)`** reads what the calling thread holds
+  there: its kind (`KORE_FD_MEMORY`), what its rights permit, and for a
+  memory supply its whole length.
+
+`mmap` on the memory supply answers fresh, zeroed memory, as mapping
+`/dev/zero` does elsewhere. It is three of kore-rt's verbs, the sequence a
+Wasmtime engine's guest memory takes: a lease carved from the supply's top,
+clear of the allocator, which grows from its bottom; an address from the
+free part of the task's link window (`Rt::link_free_span`); the whole lease
+mapped there. The rules follow from that:
+
+- **The caller never picks the address.** A hint is ignored, and `MAP_FIXED`
+  is `ENOTSUP`.
+- **Read, or read and write.** `PROT_EXEC` is `ENOTSUP`: memory a program
+  wrote is never executable. `MAP_SHARED` and `MAP_PRIVATE` mean the same,
+  since the region is this program's alone. There is no offset, and no
+  `MAP_ANONYMOUS`: memory comes from a capability, so a descriptor names it.
+- **Thread 0 maps, for whichever thread asked.** Every thread that may
+  allocate is founded holding a share of the supply, and `open` and `mmap`
+  hold the caller's access to that share's rights. A share carries no
+  `REVOKE`, though, and a region that can be unmapped again is a carve its
+  holder may revoke, so the caller posts its request to thread 0, which
+  holds the supply's root, and waits as a filesystem session does. A mapping
+  is therefore the process's: any thread may `munmap` it, whole, by its base
+  and its length.
+- **`munmap` parks the region.** The supply's cursors and the window's only
+  advance, so carved bytes and placed addresses never return to them. The
+  mapping is removed and a stale access faults, but the program keeps the
+  lease and its address, and the next `mmap` of the same length takes it,
+  zeroed again, before anything new is carved. One size mapped and unmapped
+  in a loop uses one region. Ever-different sizes spend supply each time and
+  end with `ENOMEM`. A program holds sixteen regions, mapped and parked
+  together.
 
 The C library's half is two weak references. Its start calls
 `__kore_program_start(program, end)` when the program links libkore, and its
@@ -125,10 +224,13 @@ and checks it:
 - its soname, nothing needed or undefined;
 - static initial-exec TLS only;
 - exactly the declared ABI exported: `kore.h`, `kore/program.h`, the
-  `c-stdlib` names and the two lifecycle entry points.
+  `c-stdlib` names, the two lifecycle entry points, and the C library names
+  Kore's hosted headers declare (`C_LIBRARY`).
 
 Kore's `make keytest-tcc-x86` compiles a C program against these headers at
-Kore's shell, links `libkore.so`, and runs it through every surface above
+Kore's shell, links `libkore.so`, and runs it through every surface above. It
+also compiles Kore's `hello.c`, written against the standard headers alone,
+reads every line it prints off the terminal, and ends a program by `abort`
 (Kore `res/TCC.md` §10). That is boot evidence; this repository's checks are
 compiler and link evidence. Task preparation (`kore_task_*`) still needs a
 Rust host to admit its batch: the independent host does not admit one.

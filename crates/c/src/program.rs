@@ -76,6 +76,9 @@ pub type End = unsafe extern "C" fn(c_int) -> !;
 
 /// The program, as [`__kore_program_start`] received it, for the main thread.
 static PROGRAM: AtomicUsize = AtomicUsize::new(0);
+/// The C library's exit, as [`__kore_program_start`] received it, for an
+/// [`abort`] on thread 0.
+static END: AtomicUsize = AtomicUsize::new(0);
 /// Set by the first [`__kore_program_start`]; a second never founds a host.
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// The host serves: the main thread exists and thread 0 parks for it. Set
@@ -96,6 +99,21 @@ enum Role {
 
 #[thread_local]
 static ROLE: Cell<Role> = Cell::new(Role::Other);
+
+/// Whether the calling thread is the host: thread 0 holding the program.
+pub(crate) fn on_host() -> bool {
+    ROLE.get() == Role::Host
+}
+
+/// Whether a host serves: thread 0 answers what other threads post.
+pub(crate) fn hosted() -> bool {
+    HOSTED.load(Ordering::Acquire)
+}
+
+/// Whether the calling thread is the main thread, the one the host can kick.
+pub(crate) fn on_main() -> bool {
+    ROLE.get() == Role::Main
+}
 
 // ── The end ─────────────────────────────────────────────────────────────
 
@@ -147,9 +165,11 @@ impl Request {
     }
 }
 
-/// Anything the host must answer: an end, or a session.
+/// Anything the host must answer: an end, a session, or a mapping.
 fn pending() -> bool {
-    EXIT.posted().is_some() || SESSION.state.load(Ordering::Acquire) == POSTED
+    EXIT.posted().is_some()
+        || SESSION.state.load(Ordering::Acquire) == POSTED
+        || crate::mmap::posted()
 }
 
 // ── Entry points the C library calls ────────────────────────────────────
@@ -175,6 +195,7 @@ pub unsafe extern "C" fn __kore_program_start(program: Option<Program>, end: Opt
     }
     ROLE.set(Role::Host);
     PROGRAM.store(program as usize, Ordering::Release);
+    END.store(end as usize, Ordering::Release);
     match Founded::found() {
         Some(host) => host.serve(end),
         None => unsafe { program() },
@@ -194,8 +215,13 @@ pub extern "C" fn __kore_program_exit(status: c_int, finalize: c_int) {
     let finalize = finalize != 0;
     match ROLE.get() {
         // Thread 0 itself: the program when there is no host, or a callback
-        // or finalizer the host is running. The barrier is this thread's.
-        Role::Host => startup::barrier(finalize),
+        // or finalizer the host is running. It cannot wait for its own loop,
+        // so it relays what the launcher has room for now; the barrier is
+        // this thread's.
+        Role::Host => {
+            crate::stdio::flush_now();
+            startup::barrier(finalize)
+        }
         role if HOSTED.load(Ordering::Acquire) => {
             let _ = EXIT.post(Exit {
                 status,
@@ -210,6 +236,33 @@ pub extern "C" fn __kore_program_exit(status: c_int, finalize: c_int) {
         // No host: only thread 0 owns the process. Anywhere else the barrier
         // refuses and ends this thread alone.
         _ => startup::barrier(finalize),
+    }
+}
+
+/// `abort` (C11 7.22.4.1): the program's abnormal end. It ends with the
+/// aborted status, 134 — what a shell reports for a program `SIGABRT` ended —
+/// and, like `_Exit`, runs no `atexit` handler or finalizer. No stream
+/// buffers, so what the program wrote before has already left it: the host's
+/// loop relays all of it before the end when another thread aborts, and a
+/// callback's `abort` on the host itself relays what the launcher has room
+/// for at once (`stdio::flush_now`).
+///
+/// The C library's `_Exit` lives in the program, so this takes `_Exit`'s
+/// path itself: any other thread hands the status to the host and ends, and
+/// thread 0, the barrier raised, commits the end the C library handed over.
+#[unsafe(no_mangle)]
+pub extern "C" fn abort() -> ! {
+    let status = ExitCode::ABORTED.get();
+    __kore_program_exit(status, 0);
+    match END.load(Ordering::Acquire) {
+        // A program the C library never started: thread 0 ends the task.
+        0 => thread::exit(ExitCode::ABORTED),
+        end => {
+            // SAFETY: `__kore_program_start` stored an `End`, which never
+            // returns; every other thread is stopped.
+            let end: End = unsafe { core::mem::transmute(end) };
+            unsafe { end(status) }
+        }
     }
 }
 
@@ -264,7 +317,10 @@ pub(crate) unsafe fn session(step: KoreFsStep, user: *mut c_void) -> (KoreStatus
 pub(crate) fn panicked(info: &core::panic::PanicInfo<'_>) -> ! {
     crash::report(info);
     match ROLE.get() {
-        Role::Host => startup::barrier(false),
+        Role::Host => {
+            crate::stdio::flush_now();
+            startup::barrier(false)
+        }
         role if HOSTED.load(Ordering::Acquire) => {
             let _ = EXIT.post(Exit {
                 status: ExitCode::PANIC.get(),
@@ -297,10 +353,12 @@ fn fatal() -> ! {
 struct Fatal;
 
 /// Thread 0 with its program founded: the runtime context, the executor's
-/// doorbell, and the main thread.
+/// doorbell, the launcher's stream when the launch carried one, and the main
+/// thread.
 struct Founded {
     rt: Rt,
     doorbell: executor::Doorbell,
+    output: Option<&'static crate::stdio::Endpoint>,
     worker: DoorbellWorker,
 }
 
@@ -309,6 +367,12 @@ impl Founded {
     fn found() -> Option<Self> {
         let rt = entry::thread_context()?;
         let doorbell = rt.doorbell()?;
+        // The C streams reach the launcher through this thread: map its
+        // stream and install the sink before any thread can write.
+        let output = crate::stdio::install(&rt);
+        // Where `mmap` places: this task's free link span, published before
+        // any thread that could map exists.
+        crate::mmap::arm(&rt);
         HOSTED.store(true, Ordering::Release);
         // A mint grant of its own: the first `pthread_create` on the main
         // thread starts kore-rt's thread controller there, which mints the
@@ -323,10 +387,16 @@ impl Founded {
             Some(worker) => Some(Self {
                 rt,
                 doorbell,
+                output,
                 worker,
             }),
             None => {
                 HOSTED.store(false, Ordering::Release);
+                // No host will drain the stream: writes report `EOF`, as
+                // they do for a launch that carried none.
+                if output.is_some() {
+                    crate::stdio::abandon();
+                }
                 None
             }
         }
@@ -337,12 +407,25 @@ impl Founded {
         let Self {
             rt,
             doorbell,
+            output,
             worker,
         } = self;
         let transport = TrapTransport::new();
         let exit = {
             let mut executor = Executor::new(entry::transport(), doorbell);
-            executor.run(host(&rt, &transport, &worker))
+            executor.run(async {
+                let exit = host(&rt, &transport, &worker, output).await;
+                // Whatever ended the program, what it wrote reaches the
+                // launcher, and then the stream's close, before the process
+                // ends: the launcher shows all of it before the status.
+                if let Some(output) = output {
+                    crate::stdio::finish(output, &|| {
+                        let _ = worker.kick();
+                    })
+                    .await;
+                }
+                exit
+            })
         };
         let exit = exit.unwrap_or(Exit {
             status: ExitCode::INTERNAL.get(),
@@ -375,12 +458,34 @@ fn main_thread() {
 
 /// The host's loop: answer each session the main thread posts, until any
 /// thread asks for the end.
-async fn host(rt: &Rt, transport: &TrapTransport, worker: &DoorbellWorker) -> Result<Exit, Fatal> {
+async fn host(
+    rt: &Rt,
+    transport: &TrapTransport,
+    worker: &DoorbellWorker,
+    output: Option<&'static crate::stdio::Endpoint>,
+) -> Result<Exit, Fatal> {
     let mut wake = NoticeRx::new(transport, worker.wake_recv());
     let mut filesystem = Filesystem::new(rt, transport);
+    // The one writer the host can kick, woken when its room is made.
+    let wake_main = || {
+        let _ = worker.kick();
+    };
     loop {
         if let Some(exit) = EXIT.posted() {
             return Ok(exit);
+        }
+        if let Some(output) = output {
+            // One bounded pass: the end and the next session are served
+            // between passes, however fast the program writes.
+            crate::stdio::drain(output, &wake_main).await;
+            if let Some(exit) = EXIT.posted() {
+                return Ok(exit);
+            }
+        }
+        // A thread's `mmap` or `munmap`: thread 0 holds the supply's root.
+        if crate::mmap::serve() {
+            wake_main();
+            continue;
         }
         if SESSION.state.load(Ordering::Acquire) == POSTED {
             // SAFETY: POSTED hands the cell to the host until it stores SERVED.
@@ -396,7 +501,7 @@ async fn host(rt: &Rt, transport: &TrapTransport, worker: &DoorbellWorker) -> Re
             // the abandoned session's owner is quarantined, as cancellation
             // leaves it.
             let session = pin!(filesystem.run(step, user));
-            let ended = pin!(until_exit(&mut wake));
+            let ended = pin!(until_exit(&mut wake, output, &wake_main));
             let outcome = race(session, ended).await;
             let Some((status, error)) = outcome else {
                 continue;
@@ -411,7 +516,10 @@ async fn host(rt: &Rt, transport: &TrapTransport, worker: &DoorbellWorker) -> Re
             let _ = worker.kick();
             continue;
         }
-        park(&mut wake, pending).await?;
+        // Armed before the recheck `park` makes, so a writer that published
+        // meanwhile either kicks or is seen.
+        crate::stdio::arm();
+        park(&mut wake, || pending() || crate::stdio::pending()).await?;
     }
 }
 
@@ -433,6 +541,10 @@ async fn race<A: Future, B: Future>(
     .await
 }
 
+/// How soon a receive refused for want of a standing post looks again: the
+/// tree's figure for a rotating notice receiver (the WASI host's handoff).
+const WOULD_BLOCK_RETRY_NS: u64 = 100_000;
+
 /// Park until a kick, a spurious wake, or `ready` holds, having stood the
 /// wake post before re-reading what `ready` reads.
 async fn park(
@@ -452,21 +564,48 @@ async fn park(
                 let _ = executor::next_wake_on(post).await;
             }
             Err(RecvError::Refused(Status::WouldBlock)) => {
-                let _ = executor::next_wake().await;
+                // No post stands to wake on: look again shortly, as the
+                // tree's other receivers do, rather than wait for a wake
+                // nothing armed.
+                let _ = executor::next_wake_for(WOULD_BLOCK_RETRY_NS).await;
             }
             Err(_) => return Err(Fatal),
         }
     }
 }
 
-/// Resolve once an end is posted, parking on the wake channel meanwhile: the
-/// session being served is not a reason to wake, only an end is. On a broken
-/// channel it never resolves, since the host can no longer hear an end; the
-/// session it races then runs to its own completion.
-async fn until_exit(wake: &mut NoticeRx<'_, TrapTransport>) {
+/// Resolve once an end is posted, parking on the wake channel meanwhile and
+/// draining what the program writes: the session being served is not a
+/// reason to wake, only an end or output is. On a broken channel it never
+/// resolves, since the host can no longer hear an end; the session it races
+/// then runs to its own completion. Dropped when the session ends first,
+/// which the drain survives (`stdio::drain`). Each pass yields, so the
+/// session it races is polled however fast the program writes.
+async fn until_exit(
+    wake: &mut NoticeRx<'_, TrapTransport>,
+    output: Option<&'static crate::stdio::Endpoint>,
+    wake_main: &dyn Fn(),
+) {
     let ended = || EXIT.posted().is_some();
     while !ended() {
-        if park(wake, ended).await.is_err() {
+        if let Some(output) = output {
+            crate::stdio::drain(output, wake_main).await;
+            executor::yield_now().await;
+        }
+        // Another thread's mapping does not wait for the session to end,
+        // and the session is polled between two of them.
+        if crate::mmap::serve() {
+            wake_main();
+            executor::yield_now().await;
+            continue;
+        }
+        crate::stdio::arm();
+        if park(wake, || {
+            ended() || crate::stdio::pending() || crate::mmap::posted()
+        })
+        .await
+        .is_err()
+        {
             core::future::pending::<()>().await;
         }
     }

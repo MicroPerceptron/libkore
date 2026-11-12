@@ -405,12 +405,35 @@ and 382 files. Besides `thread_controller.rs`, it carries the
 `services/swap/boot.toml` digest of Kore's reseal over the cancellation wake
 (`bfecfd17`).
 
+The export then moved to Kore `618772900e088b8b45ebafa8101d066edf4ffb3b`,
+the merge of MicroPerceptron/kore#1494's newer branch into this change. That
+branch brings three changes, which its own exports carried here up to Kore
+`2d4998ba`:
+
+- threads that found take a founder's arena;
+- a founding's staged space waits for the reap;
+- Kore's C library (`kore-c-shim`).
+
+The closure is now 27 packages and 401 files. Against that branch's export,
+only kore-rt's `futex.rs` and `thread_controller.rs` and the record differ.
+The two sides' controller changes compose: the controller and its children
+are founded with `spawn_founder_with_arg`, and a child still waits for its
+founding before its callback runs.
+
+It then moved to Kore `4a56f8279c79fd4d65918e581fe382f0775dfb51`, the merge
+of #1494's next round: kore-rt names the link window's free span once, and C
+programs gain descriptors and mmap. The closure stays at 27 packages and 401
+files. Against that branch's export at `10c7b400`, only kore-rt's `futex.rs`
+and `thread_controller.rs`, the record, and five services' `boot.toml`
+digests differ. The digests come from #1494's own reseal (`f2644e5b`), which
+followed its export.
+
 ## A relayed wake reaches its waiter alone
 
-The export records Kore `7b9bd960374649a731132b3047e6e84190653b6f`, on
+The export records Kore `fba0662d3485d065ef85ffd400acd4643e73460f`, on
 `ft/admiring-lovelace-69eiok`, which is stacked on `ft/brave-heisenberg-zgoaux`
-and merges its head (`36b99426`). Two changes since `40de2582` reach the
-closure, which keeps its 26 packages and 382 files:
+and merges its head (`83861dc9`). Against that branch's export at `4a56f827`,
+the closure keeps its 27 packages and 401 files, and two things differ:
 
 - `kore-rt`'s thread controller relays a wake to the threads it was for and no
   others (Kore `b67f198`). Managed threads hold no send into each other's
@@ -424,9 +447,9 @@ closure, which keeps its 26 packages and 382 files:
   kicks each band that still waits. The registry's Dekker argument makes this
   lossless: a waiter that registers after the waker's scan reads the new word
   and never parks.
-- The services' `boot.toml` digests are the reseal over that change
-  (`920526a`). The founding wait leaves every service's image as it was: its
-  own reseal (`36b99426`) rebuilt only the shell and the image archive.
+- `services/swap/boot.toml`'s digests, from that branch's reseal (`83861dc9`),
+  which followed its export. This branch's reseal over the relay follows this
+  export in turn.
 
 No exported manifest changed, so `native/Cargo.lock` did not.
 
@@ -434,17 +457,11 @@ Nothing in `kore-ffi` or `kore-c` changes. A C program's futex wakes take the
 controller's relay as before and reach fewer threads; `docs/runtime.md` now
 says so. The metal evidence is Kore's `keytest-tcc-x86`. The libkore tour has
 two threads take 400 turns through a mutex and a condition variable on the
-futex while `main` waits parked on a word nobody stores. The controller admits
-two managed threads at once on this stack, so `main` is the only parked
-thread; Kore #1494's later `2a0730d`, which gives the controller's children
-their founder's arena, lifts that bound, and the step then parks up to eight
-more. On the image built from `4f913c4`, the relay before the founding wait
-was merged, no wake reached it. On the same image with kore-rt's futex and
-controller from `a4ab7234`, which count and sweep, it was woken 208 times and
-the tour failed that step.
-
-Kore's reseal over this export repeats that measurement on the merged tree
-(`e0717eb`, built from `d64b7a5`, which pins it): every step ran to `exit 42`
-and no wake reached the parked thread. The same tree with the futex and
-controller of `36b99426`, the founding wait's own, which count and sweep, woke
-it 206 times, and the tour failed that step.
+futex while `main` and as many more threads as the controller admits, up to
+eight, wait parked on words nobody stores. Before the founder's arena, the
+controller admitted two managed threads at once, so `main` was the only
+parked thread. On the image built from `4f913c4` no wake reached it; with
+kore-rt's futex and controller from `a4ab7234`, which count and sweep, it was
+woken 208 times and the tour failed that step. Kore `e0717eb` repeated that
+over the founding wait: no wake, against 206 with the founding wait's own
+futex and controller (`36b99426`).

@@ -23,3 +23,11 @@ kore-std = { package = "kore-std", path = "../..", features = ["heap", "fs"] }
 # The C ABI itself, with the standard C allocation and thread names a C
 # program calls (`malloc`, `pthread_create`, ...) exported as real symbols.
 kore-ffi = { path = "../ffi", features = ["c-stdlib"] }
+# Kore's C library: the `printf` family and the standard streams, `<string.h>`
+# and `<stdlib.h>`'s parsers, `errno`. Its process half without its own
+# `malloc` and `abort`: kore-ffi's allocator is this image's `malloc`, and the
+# host ends a whole program.
+kore-c-shim = { path = "../../native/crates/c-shim", default-features = false, features = ["runtime"] }
+# The link window's placer: one cursor every `mmap` of the process takes its
+# address from, as a Wasmtime engine's guest mappings do.
+kore-ld = { path = "../../native/crates/ld", default-features = false }

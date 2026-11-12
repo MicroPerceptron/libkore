@@ -1,0 +1,44 @@
+[package]
+name = "kore-c-shim"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The C symbols a vendored C library imports on a kore user target"
+
+[features]
+default = ["runtime", "malloc", "abort", "wide-classes"]
+# The process half: the `<stdio.h>` writes over the standard sink the process
+# installs, `errno` and the parsers that set it. An executable takes it; a
+# shared library leaves it out and imports those symbols from the executable
+# it links into, so one process never holds two heaps.
+runtime = ["dep:kore-rt"]
+# `malloc`, `calloc`, `realloc` and `free` over the task's global heap. A C
+# runtime that exports its own allocator under those names (libkore.so)
+# leaves this out, so one process never holds two `malloc`s whose blocks
+# the other's `free` would misread.
+malloc = ["runtime"]
+# `abort`, ending the calling task with the aborted status. A C runtime that
+# ends a whole program its own way (libkore.so's host) leaves this out and
+# exports its own.
+abort = ["runtime"]
+# The wide character classes (`iswalnum` … `iswxdigit`, `towlower`,
+# `towupper`) a vendored C library calls: tree-sitter's scanners. Pure, so a
+# shared library may carry its own. A C runtime whose headers declare no
+# `<wctype.h>` (libkore.so) leaves them out, so it exports exactly the ABI
+# its headers declare.
+wide-classes = []
+# `strtold` and `ldexpl` as byte-level helpers a consumer's C layer wraps
+# (`long_double`): C's `long double` has no Rust spelling, so the C side owns
+# the type and this crate the arithmetic. Off unless a consumer compiles C
+# that converts `long double` (TCC does: its float literals).
+long-double = ["runtime", "dep:rustc_apfloat"]
+
+[dependencies]
+kore-rt = { path = "../rt", optional = true }
+# LLVM's APFloat (the code clang folds float literals with): correctly
+# rounded decimal conversion and scaling for x87 double-extended and IEEE
+# quad. `no_std`, `forbid(unsafe_code)`; it allocates only to convert decimal.
+rustc_apfloat = { version = "=0.2.3", optional = true }
+
+[dev-dependencies]
+rustc_apfloat = "=0.2.3"

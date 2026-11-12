@@ -12,8 +12,9 @@ checks are the ones its loader and its consumers rely on:
 - the soname consumers record, nothing it needs, nothing left undefined;
 - static initial-exec TLS only (Kore's startup linker resolves no dynamic TLS);
 - exactly the declared ABI exported: every function kore.h and kore/program.h
-  declare, the C names kore/stdlib.h and kore/pthread.h alias, and the C
-  library's two lifecycle entry points; no other symbol.
+  declare, the C names kore/stdlib.h and kore/pthread.h alias, the C
+  library's two lifecycle entry points, and the C library names Kore's
+  hosted headers declare and libkore.so implements; no other symbol.
 """
 import argparse
 import json
@@ -36,6 +37,22 @@ C_STDLIB = {'malloc', 'calloc', 'realloc', 'free', 'pthread_create', 'pthread_jo
             '__cxa_thread_atexit', '__cxa_thread_atexit_impl'}
 # The C library's start and exit call these when a program links libkore.
 LIFECYCLE = {'__kore_program_start', '__kore_program_exit'}
+# The rest of the C library a program's headers declare (Kore's TCC
+# `include/`: <stdio.h>, <stdlib.h>, <string.h>, <errno.h>), which libkore.so
+# implements: kore-c-shim's printf family, streams, parsers, string routines
+# and per-thread errno, and kore-c's own abort; and <fcntl.h>, <unistd.h> and
+# <sys/mman.h>'s open, close, mmap and munmap over the capabilities the
+# program holds. The program's libc.a holds the rest: exit, atexit and the
+# routines a compiler assumes.
+C_LIBRARY = {'printf', 'fprintf', 'sprintf', 'snprintf', 'vprintf', 'vfprintf', 'vsprintf',
+             'vsnprintf', 'fputc', 'putc', 'putchar', 'fputs', 'puts', 'fwrite', 'fflush',
+             'fclose', 'stdout', 'stderr',
+             'strtol', 'strtoll', 'strtoul', 'strtoull', 'atoi', 'atol', 'strtod', 'strtof',
+             'qsort', 'strerror', 'abort',
+             'memchr', 'strchr', 'strrchr', 'strcmp', 'strncmp', 'strcpy', 'strncpy', 'strncat',
+             'strstr',
+             '__errno_location',
+             'open', 'close', 'mmap', 'munmap'}
 DYNAMIC_TLS = re.compile(r'TLSDESC|DTPMOD|DTPOFF|TLSGD|TLSLD|TLS_DTP')
 
 
@@ -123,6 +140,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--arch', choices=ARCHES)
     args = parser.parse_args()
-    expected = declared() | C_STDLIB | LIFECYCLE
+    expected = declared() | C_STDLIB | LIFECYCLE | C_LIBRARY
     for arch in [args.arch] if args.arch else ARCHES:
         check(arch, expected)

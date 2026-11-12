@@ -32,18 +32,34 @@
 //! `kore-std` with its own entry, and two runtimes in one process would grow one
 //! heap supply behind two cursors.
 #![cfg_attr(target_os = "none", no_std)]
-#![cfg_attr(target_os = "none", feature(thread_local))]
+#![cfg_attr(target_os = "none", feature(thread_local, c_variadic))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 // The C ABI's exports are this image's reason to exist; naming the crate keeps
 // them in the link.
 use kore_ffi as _;
+// Kore's C library, exported whole from this image.
+#[cfg(target_os = "none")]
+use kore_c_shim as _;
 
 pub mod api;
 #[cfg(any(test, target_os = "none"))]
 mod exit;
+// Off Kore only `kore_fd_describe` and the host suite read these two: the
+// names, the verbs and most refusals are the Kore program's alone.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+mod fd;
+#[cfg(target_os = "none")]
+mod lock;
+#[cfg(any(test, target_os = "none"))]
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+mod mmap;
+#[cfg(target_os = "none")]
+mod posix;
 #[cfg(target_os = "none")]
 mod program;
+#[cfg(any(test, target_os = "none"))]
+mod stdio;
 
 /// The process heap over the founder's `role::HEAP` supply, grown on demand.
 /// The program's allocations (`malloc`, `kore_alloc_*`) and this library's
