@@ -762,6 +762,33 @@ impl<P: StorageProvider> Engine<P> {
         })
     }
 
+    /// What a watch on `handle` follows: the directory it names, and that
+    /// directory's change epoch now. Watching is observing what a listing
+    /// shows, so it takes exactly a listing's authority — `READ` on a live
+    /// route to a directory.
+    pub(crate) fn watch_target(&self, session: SessionId, handle: Handle) -> FsResult<(ObjectId, u64)> {
+        let route = self.route(session, handle)?;
+        route.rights.require(Rights::READ)?;
+        if !self.ns.kind(route.object)?.is_dir() {
+            return Err(FsError::NotDirectory);
+        }
+        Ok((route.object, self.ns.change_epoch(route.object)?))
+    }
+
+    /// The change epoch of the directory a watch armed on `handle` follows,
+    /// read only through a route that still proves to that same directory:
+    /// a retired edge, a closed handle or a reclaimed directory is
+    /// `AccessLost`, and the watch ends instead of counting for a client
+    /// that could no longer list what it counts.
+    pub(crate) fn watch_epoch(&self, session: SessionId, handle: Handle, dir: ObjectId) -> FsResult<u64> {
+        let route = self.route(session, handle)?;
+        route.rights.require(Rights::READ)?;
+        if route.object != dir {
+            return Err(FsError::AccessLost);
+        }
+        self.ns.change_epoch(dir)
+    }
+
     /// One page of a directory's entries.
     pub fn list(&self, session: SessionId, handle: Handle, cursor: u32) -> FsResult<ListPage> {
         let route = self.route(session, handle)?;

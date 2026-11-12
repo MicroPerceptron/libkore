@@ -158,6 +158,7 @@ mod router;
 pub mod search;
 pub mod service;
 pub mod slot;
+mod watches;
 pub mod window;
 pub mod wire;
 
@@ -185,6 +186,9 @@ pub use kore_dagfs::DagfsProtocol;
 /// The storage-ring client (`res/STORAGE_TRANSPORT.md` §4), for rows that
 /// read through the filesystem's transport — exec's image loads.
 pub use kore_dagfs::stor;
+/// The watch plane every filesystem pair carries after its rings
+/// (`kore_dagfs::watch`), for the founders that format pair windows.
+pub use kore_dagfs::watch;
 pub use namespace::{EdgeId, ListEntry, Name};
 pub use object::{ANY_REVISION, ObjectId, ObjectKind, ObjectSubtype, Revision, StableObjectId};
 pub use provider::{

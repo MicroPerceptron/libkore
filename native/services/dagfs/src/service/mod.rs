@@ -65,7 +65,7 @@ use kore_rt::{
 use kore_svc_extract::schema::InputIdentity;
 
 use crate::{
-    ServiceAlloc,
+    ObjectId, ServiceAlloc,
     authority::{GrantId, Handle, Retired, Rights, SessionId},
     block_on,
     bounds::{FIRST_TASK_VIEW_SESSION, MAX_SESSIONS},
@@ -369,6 +369,9 @@ pub struct FsService<P: StorageProvider> {
     /// immediately before delegating a status request; the default zeros
     /// honestly describe the bare volatile posture every other harness runs.
     backend: FsBackendStatus,
+    /// Which slots' watch planes have a watch armed or owe a wake
+    /// ([`crate::watches`]); the planes live in the slots' own records.
+    watches: crate::watches::WatchIndex,
 }
 
 /// What the mounted backend reports about itself for `SystemStatus` — set
@@ -484,6 +487,11 @@ struct SessionSlot<K> {
     /// The session's one private provider placement. The service already
     /// serializes dispatch; no additional lock or namespace object.
     replacement: Option<crate::engine::Replacement<K>>,
+    /// The recyclable peer's watch plane and its armed watches
+    /// ([`crate::watches`]), adopted from the pair window's tail at admission
+    /// and dropped before the host unmaps it. Only the primary frontend's
+    /// slots carry one: a secondary engine's watches are recorded here too.
+    watch: Option<crate::watches::Plane>,
 }
 
 impl<K> SessionSlot<K> {
@@ -495,6 +503,7 @@ impl<K> SessionSlot<K> {
             task_view: None,
             deferring: false,
             replacement: None,
+            watch: None,
         }
     }
 }
@@ -601,7 +610,149 @@ impl<P: StorageProvider> FsService<P> {
             pending_reclaims: Vec::new_in(crate::service_alloc()),
             pending_aborts: Vec::new_in(crate::service_alloc()),
             backend: FsBackendStatus::default(),
+            watches: crate::watches::WatchIndex::new(),
         }
+    }
+
+    /// Adopt `peer`'s watch plane from its pair window's tail into the slot's
+    /// record, claiming the record as admission does. Refused for a fixed
+    /// pair, a heap that cannot hold the record, or a slot whose previous
+    /// plane never detached — a host/service desync admission must not paper
+    /// over. A tail without a formatted plane admits the peer with none: the
+    /// plane is what watches publish into, not what the pair needs to serve,
+    /// so such a client's `Watch` answers `Unsupported`.
+    pub(crate) fn attach_watch_plane(&mut self, peer: PeerId, aux: &'static mut [u8]) -> bool {
+        let slot = peer.slot();
+        if slot == 0 {
+            return false;
+        }
+        let Ok(state) = self.slots.claim(slot) else {
+            return false;
+        };
+        if state.watch.is_some() {
+            return false;
+        }
+        state.watch = crate::watches::Plane::adopt(peer, aux);
+        true
+    }
+
+    /// Drop `peer`'s watch plane before its window is unmapped. A late call
+    /// for an earlier occupant is inert.
+    pub(crate) fn detach_watch_plane(&mut self, peer: PeerId) {
+        let slot = peer.slot();
+        if let Some(state) = self.slots.get_mut(slot)
+            && state.watch.as_ref().is_some_and(|plane| plane.peer() == peer)
+        {
+            state.watch = None;
+            self.watches.forget(slot);
+        }
+    }
+
+    /// The plane of the pair that delivered a request (`via`) for `session`;
+    /// `Unsupported` for a fixed pair or a peer admitted without one.
+    fn watch_plane_mut(&mut self, via: u16, session: SessionId) -> FsResult<&mut crate::watches::Plane> {
+        self.slots
+            .get_mut(usize::from(session.index()))
+            .and_then(|state| state.watch.as_mut())
+            .filter(|plane| plane.peer().arrival() == via)
+            .ok_or(FsError::Unsupported)
+    }
+
+    /// Arm a watch on a directory of `store`, resolved by that store's engine
+    /// (`target`), into the plane of the pair that asked.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arm_watch(
+        &mut self,
+        via: u16,
+        session: SessionId,
+        slot: u8,
+        tag: u32,
+        store: crate::router::Store,
+        handle: Handle,
+        target: FsResult<(ObjectId, u64)>,
+    ) -> FsResponse {
+        let armed = self
+            .watch_plane_mut(via, session)
+            .and_then(|plane| {
+                let owed = plane.arm(slot, tag, store, handle, target?)?;
+                Ok((plane.armed(), owed))
+            });
+        match armed {
+            Ok((armed, owed)) => {
+                self.watches.note(usize::from(session.index()), armed, owed);
+                FsResponse::Done
+            }
+            Err(error) => FsResponse::Refused(error),
+        }
+    }
+
+    pub(crate) fn disarm_watch(&mut self, via: u16, session: SessionId, slot: u8) -> FsResponse {
+        let disarmed = self.watch_plane_mut(via, session).and_then(|plane| {
+            let owed = plane.disarm(slot)?;
+            Ok((plane.armed(), owed))
+        });
+        match disarmed {
+            Ok((armed, owed)) => {
+                self.watches.note(usize::from(session.index()), armed, owed);
+                FsResponse::Done
+            }
+            Err(error) => FsResponse::Refused(error),
+        }
+    }
+
+    /// The change epoch a watch on `handle` follows, read through this
+    /// engine — the secondary half of a dual-router settle.
+    pub(crate) fn watch_epoch(&self, session: SessionId, handle: Handle, dir: ObjectId) -> FsResult<u64> {
+        self.engine.watch_epoch(session, handle, dir)
+    }
+
+    /// What a watch on `handle` would follow in this engine.
+    pub(crate) fn watch_target(&self, session: SessionId, handle: Handle) -> FsResult<(ObjectId, u64)> {
+        self.engine.watch_target(session, handle)
+    }
+
+    /// Publish every armed watch whose directory changed. This engine answers
+    /// for the user store; `system` for the dual router's system volume (a
+    /// lone engine passes one that refuses, which ends any such watch).
+    pub(crate) fn settle_watches(
+        &mut self,
+        mut system: impl FnMut(SessionId, Handle, ObjectId) -> FsResult<u64>,
+    ) {
+        if self.watches.idle() {
+            return;
+        }
+        let engine = &self.engine;
+        for slot in self.watches.armed() {
+            let Some(plane) = self.slots.get_mut(slot).and_then(|state| state.watch.as_mut()) else {
+                self.watches.forget(slot);
+                continue;
+            };
+            let owed = plane.settle(SessionId::new(slot as u16), |store, session, handle, dir| {
+                match store {
+                    crate::router::Store::User => engine.watch_epoch(session, handle, dir),
+                    crate::router::Store::System => system(session, handle, dir),
+                }
+            });
+            self.watches.note(slot, plane.armed(), owed);
+        }
+    }
+
+    /// Peers owed a watch-plane wake, for the serving host: up to
+    /// `out.len()`, each handed over once.
+    pub(crate) fn owed_watch_wakes(&mut self, out: &mut [Option<PeerId>]) -> usize {
+        let slots = &self.slots;
+        let mut taken = 0;
+        self.watches.take_owed(|slot| {
+            if taken == out.len() {
+                return false;
+            }
+            if let Some(plane) = slots.get(slot).and_then(|state| state.watch.as_ref()) {
+                out[taken] = Some(plane.peer());
+                taken += 1;
+            }
+            true
+        });
+        taken
     }
 
     /// Replace the backend posture snapshot folded into `SystemStatus`
@@ -1140,6 +1291,7 @@ impl<P: StorageProvider> FsService<P> {
         if let Some(state) = self.slots.get_mut(slot) {
             *state = SessionSlot::vacant();
         }
+        self.watches.forget(slot);
         true
     }
 
@@ -2466,6 +2618,13 @@ impl<P: StorageProvider> FsService<P> {
                 self.engine.sync(session, handle).await?;
                 FsResponse::Done
             }
+            // A watch publishes into the asking pair's plane, which only the
+            // pair-aware layer above names (`serve_request_async`, or the dual
+            // router); reaching the session-only dispatch is a composition
+            // that forwarded the verb past its owner.
+            FsRequest::Watch { .. } | FsRequest::Unwatch { .. } => {
+                return Err(FsError::Unsupported);
+            }
             FsRequest::LendVersion {
                 handle,
                 window_offset,
@@ -3657,6 +3816,233 @@ mod recyclable_session_tests {
             .expect("POSIX projection is visible");
         assert_eq!(native.stable_object, posix.stable_object);
         assert_eq!(native.stable_object, ls.stable_object);
+    }
+
+    /// A recyclable peer's watch plane as exec formats it after the rings,
+    /// leaked like the host's mapping of it, with the client's half beside
+    /// the service's.
+    fn watch_plane() -> (
+        &'static mut [u8],
+        kore_dagfs::watch::WatchSink<'static>,
+    ) {
+        #[repr(align(64))]
+        struct Plane([u8; kore_dagfs::watch::PLANE_BYTES]);
+        let plane = &mut alloc::boxed::Box::leak(alloc::boxed::Box::new(Plane(
+            [0; kore_dagfs::watch::PLANE_BYTES],
+        )))
+        .0;
+        kore_ring::event::init::<kore_abi::svc::FsWatchState, kore_abi::svc::FsWatchRecord>(
+            plane,
+            kore_abi::svc::FS_WATCH_RECORDS,
+        )
+        .unwrap();
+        let (base, len) = (plane.as_mut_ptr(), plane.len());
+        // SAFETY: the two halves alias the plane only through the channel
+        // protocol, as the client's and the service's mappings do on metal.
+        let client = unsafe { core::slice::from_raw_parts_mut(base, len) };
+        (plane, kore_dagfs::watch::sink(client).unwrap())
+    }
+
+    /// Two peers of one task view: a watcher holding its root, and a writer
+    /// that changes it.
+    fn watched_view() -> (RamService, SessionId, SessionId) {
+        let mut service = RamService::default();
+        assert!(service.establish_admin_source());
+        service
+            .register_private_invocation_view(
+                0xD0,
+                &Name::new("terminal-0").unwrap(),
+                Rights::ALL,
+                None,
+            )
+            .unwrap();
+        let watcher = admit_view(&mut service, 0x106, 0xD0, Rights::ALL);
+        let writer = admit_view(&mut service, 0x105, 0xD0, Rights::ALL);
+        (service, watcher, writer)
+    }
+
+    fn settle(service: &mut RamService, owed: &mut [Option<PeerId>]) -> usize {
+        <RamService as kore_rt::service::SystemService>::take_owed_wakes(service, owed)
+    }
+
+    #[test]
+    fn a_watch_counts_another_peer_s_change_and_owes_a_parked_client_one_wake() {
+        use kore_dagfs::watch::{Cursor, Seen};
+        let (mut service, watcher, writer) = watched_view();
+        let peer = PeerId::from_arrival(0x106).unwrap();
+        let (plane, sink) = watch_plane();
+        assert!(service.attach_watch_plane(peer, plane));
+        let root = service.engine.open_root(watcher, Rights::READ).unwrap();
+        let target = service.watch_target(watcher, root.handle);
+        assert_eq!(
+            service.arm_watch(0x106, watcher, 0, 7, crate::router::Store::User, root.handle, target),
+            FsResponse::Done
+        );
+        let mut cursor = Cursor::new(0, 7).unwrap();
+        assert_eq!(cursor.observe(&sink.state().unwrap()), Seen::Same);
+
+        // Nothing changed: nothing published, nobody owed.
+        let mut owed = [None; 4];
+        assert_eq!(settle(&mut service, &mut owed), 0);
+
+        // The client parks; the other peer makes a file in the shared view.
+        let seen = sink.seq();
+        assert!(sink.park(seen));
+        let writer_root = service.engine.open_root(writer, Rights::ALL).unwrap();
+        crate::block_on(service.engine.create(
+            writer,
+            writer_root.handle,
+            &Name::new("new.txt").unwrap(),
+            ObjectKind::File,
+        ))
+        .unwrap();
+        assert_eq!(settle(&mut service, &mut owed), 1);
+        assert_eq!(owed[0], Some(peer));
+        assert_eq!(settle(&mut service, &mut owed), 0, "one change, one wake");
+        assert_ne!(sink.seq(), seen);
+        assert_eq!(cursor.observe(&sink.state().unwrap()), Seen::Changed);
+
+        // A running client is owed nothing for the next change; it reads it.
+        let created = crate::block_on(service.engine.create(
+            writer,
+            writer_root.handle,
+            &Name::new("more.txt").unwrap(),
+            ObjectKind::File,
+        ))
+        .unwrap();
+        assert_eq!(settle(&mut service, &mut owed), 0);
+        assert_eq!(cursor.observe(&sink.state().unwrap()), Seen::Changed);
+
+        // A child's bytes changing is a change to what the folder shows.
+        crate::block_on(service.engine.write_at(
+            writer,
+            created.handle,
+            0,
+            b"bytes",
+            crate::ANY_REVISION,
+        ))
+        .unwrap();
+        assert_eq!(settle(&mut service, &mut owed), 0);
+        assert_eq!(cursor.observe(&sink.state().unwrap()), Seen::Changed);
+
+        // Closing the watched handle ends the watch: the plane stops
+        // counting for a route the client let go of.
+        service.engine.close(watcher, root.handle).unwrap();
+        assert_eq!(settle(&mut service, &mut owed), 0);
+        assert_eq!(cursor.observe(&sink.state().unwrap()), Seen::Ended);
+        assert_eq!(service.watches.armed_count(), 0);
+    }
+
+    /// A plane lives in its serving slot's own record, so a peer far past
+    /// the host's bootstrap table — the seventh program reading files, and
+    /// the two-hundredth — watches as the first does.
+    #[test]
+    fn a_peer_in_a_high_slot_has_its_own_plane() {
+        use kore_dagfs::watch::{Cursor, Seen};
+        let (mut service, _, writer) = watched_view();
+        let high = admit_view(&mut service, 0x1C8, 0xD0, Rights::ALL);
+        assert_eq!(high, SessionId::new(0xC8));
+        let peer = PeerId::from_arrival(0x1C8).unwrap();
+        let (plane, sink) = watch_plane();
+        assert!(service.attach_watch_plane(peer, plane));
+        let root = service.engine.open_root(high, Rights::READ).unwrap();
+        let target = service.watch_target(high, root.handle);
+        assert_eq!(
+            service.arm_watch(0x1C8, high, 3, 11, crate::router::Store::User, root.handle, target),
+            FsResponse::Done
+        );
+        let mut cursor = Cursor::new(3, 11).unwrap();
+        let writer_root = service.engine.open_root(writer, Rights::ALL).unwrap();
+        crate::block_on(service.engine.create(
+            writer,
+            writer_root.handle,
+            &Name::new("far.txt").unwrap(),
+            ObjectKind::File,
+        ))
+        .unwrap();
+        let mut owed = [None; 4];
+        settle(&mut service, &mut owed);
+        assert_eq!(cursor.observe(&sink.state().unwrap()), Seen::Changed);
+        // Closing the peer wipes the slot, plane and index together.
+        service.detach_watch_plane(peer);
+        assert!(service.peer_closed(0x1C8, PeerClose::Orderly));
+        assert_eq!(service.watches.armed_count(), 0);
+    }
+
+    #[test]
+    fn a_watch_takes_a_listing_s_authority_and_a_plane_of_the_asking_pair() {
+        let (mut service, watcher, _) = watched_view();
+        let peer = PeerId::from_arrival(0x106).unwrap();
+        let root = service.engine.open_root(watcher, Rights::ALL).unwrap();
+        let file = crate::block_on(service.engine.create(
+            watcher,
+            root.handle,
+            &Name::new("f").unwrap(),
+            ObjectKind::File,
+        ))
+        .unwrap();
+        let user = crate::router::Store::User;
+
+        // No plane attached yet: nothing to publish into.
+        let target = service.watch_target(watcher, root.handle);
+        assert_eq!(
+            service.arm_watch(0x106, watcher, 0, 1, user, root.handle, target),
+            FsResponse::Refused(FsError::Unsupported)
+        );
+        let (plane, sink) = watch_plane();
+        assert!(service.attach_watch_plane(peer, plane));
+        // A second plane for the occupied slot is refused.
+        let (again, _) = watch_plane();
+        assert!(!service.attach_watch_plane(peer, again));
+        // A tail that carries no plane admits its peer without one.
+        let bare: &'static mut [u8] = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; 64]));
+        assert!(service.attach_watch_plane(PeerId::from_arrival(0x105).unwrap(), bare));
+        // Another generation of the slot names no plane of its own.
+        let target = service.watch_target(watcher, root.handle);
+        assert_eq!(
+            service.arm_watch(0x206, watcher, 0, 1, user, root.handle, target),
+            FsResponse::Refused(FsError::Unsupported)
+        );
+        // A file is not watched: a listing is what a watch follows.
+        let target = service.watch_target(watcher, file.handle);
+        assert_eq!(
+            service.arm_watch(0x106, watcher, 0, 1, user, file.handle, target),
+            FsResponse::Refused(FsError::NotDirectory)
+        );
+        // A slot past the plane, or the zero tag, is out of range.
+        for (slot, tag) in [(kore_abi::svc::FS_WATCH_SLOTS as u8, 1), (0, 0)] {
+            let target = service.watch_target(watcher, root.handle);
+            assert_eq!(
+                service.arm_watch(0x106, watcher, slot, tag, user, root.handle, target),
+                FsResponse::Refused(FsError::Range)
+            );
+        }
+        assert_eq!(service.watches.armed_count(), 0);
+
+        // Re-arming a slot replaces its watch; disarming clears its tag.
+        for tag in [3, 4] {
+            let target = service.watch_target(watcher, root.handle);
+            assert_eq!(
+                service.arm_watch(0x106, watcher, 1, tag, user, root.handle, target),
+                FsResponse::Done
+            );
+        }
+        assert_eq!(service.watches.armed_count(), 1);
+        assert_eq!(sink.state().unwrap().tag[1], 4);
+        assert_eq!(service.disarm_watch(0x106, watcher, 1), FsResponse::Done);
+        assert_eq!(sink.state().unwrap().tag[1], 0);
+        assert_eq!(service.watches.armed_count(), 0);
+
+        // Detaching the plane before the window goes drops its watches.
+        let target = service.watch_target(watcher, root.handle);
+        assert_eq!(
+            service.arm_watch(0x106, watcher, 2, 9, user, root.handle, target),
+            FsResponse::Done
+        );
+        service.detach_watch_plane(PeerId::from_arrival(0x206).unwrap());
+        assert_eq!(service.watches.armed_count(), 1, "a late detach for another generation is inert");
+        service.detach_watch_plane(peer);
+        assert_eq!(service.watches.armed_count(), 0);
     }
 
     /// A dead writer's staged replacement is released on the service's next

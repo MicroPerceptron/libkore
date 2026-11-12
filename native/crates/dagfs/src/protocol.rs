@@ -193,6 +193,22 @@ pub enum FsRequest {
     Sync {
         handle: Handle,
     },
+    /// Arm watch `slot` (below [`FS_WATCH_SLOTS`](kore_abi::svc::FS_WATCH_SLOTS))
+    /// on the directory `handle` names, tagged `tag` (non-zero): the pair's
+    /// watch plane ([`crate::watch`]) counts every change to what a listing
+    /// of that directory shows, under `tag`, until the slot is re-armed or
+    /// disarmed or the watch ends. The handle stays the client's; its route
+    /// is revalidated before every count, and one that stops proving ends the
+    /// watch rather than reporting through a route the client lost.
+    Watch {
+        handle: Handle,
+        slot: u8,
+        tag: u32,
+    },
+    /// Disarm watch `slot`, armed or not.
+    Unwatch {
+        slot: u8,
+    },
     /// Hold this session's whole-tree commits until the window closes.
     ///
     /// The durable contract serializes session zero's entire tree after every
@@ -630,6 +646,17 @@ impl SvcProtocol for DagfsProtocol {
     /// recyclable-session seam; fixed per-command pairs were a parallel
     /// execution pipeline and made boot topology scale with the command set.
     const SERVE_PAIRS: usize = 2;
+
+    /// The rings, then the watch plane ([`crate::watch`]) in the same window:
+    /// every filesystem pair carries its change channel, so a client never
+    /// needs a capability beyond the pair to learn that a directory changed.
+    fn init_pair_window(
+        window: &mut [u8],
+        req_cap: u32,
+        rep_cap: u32,
+    ) -> Result<(), kore_ring::spsc::RingError> {
+        crate::watch::init_pair_window(window, req_cap, rep_cap)
+    }
 
     fn reply_matches(request: &FsReqWire, response: &FsResponse, grants: u8) -> bool {
         if grants != 0 {

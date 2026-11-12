@@ -3939,6 +3939,16 @@ impl InReqWire {
     /// `InputStreamRequest::Reprint` — echo the line being edited, cursor
     /// in place, then apply every key queued since `Hold`.
     pub const OP_REPRINT: u8 = 6;
+    /// `InputStreamRequest::Insert` — type text into the **held** line at
+    /// its cursor, as if typed, without echo (the `Reprint` shows it):
+    /// `reserved0` = the byte count (1 to [`INSERT_BYTES`](Self::INSERT_BYTES)),
+    /// `reserved2..reserved4` = the bytes, little-endian, the words past the
+    /// count zero. Printable ASCII only: the line takes bytes up to the first
+    /// it cannot hold — any other byte, or one past a full line — so no
+    /// insert can ever complete a line.
+    pub const OP_INSERT: u8 = 7;
+    /// The most one `Insert` carries: its three data words.
+    pub const INSERT_BYTES: usize = 24;
 }
 
 /// The stream-input-service reply wire form. The legacy stream counters are
@@ -4031,6 +4041,9 @@ impl InRepWire {
     /// `InputStreamResponse::Reprinted` — the line is echoed again and the
     /// held keys applied.
     pub const TAG_REPRINTED: u8 = 7;
+    /// `InputStreamResponse::Inserted` — `produced` = how many of the
+    /// insert's bytes the line took (zero to its count).
+    pub const TAG_INSERTED: u8 = 8;
 
     /// `InputStreamRefusal::Busy` — a queue is already attached (the v1
     /// single-peer bound, `res/USERLAND.md` §5.9).
@@ -4040,6 +4053,9 @@ impl InRepWire {
     /// `InputStreamRefusal::BadQueue` — the delivered slot was absent or
     /// not a well-formed queue window.
     pub const REFUSE_BAD_QUEUE: u8 = 3;
+    /// `InputStreamRefusal::NotHeld` — an insert into a line that is not
+    /// held, or not being edited (a completed line still in flight).
+    pub const REFUSE_NOT_HELD: u8 = 4;
 }
 
 /// One data-plane chunk — the `ring::spsc<InChunk>` record the backend
@@ -4476,6 +4492,32 @@ impl SurReqWire {
     /// compositor snapshots the name and ends the pick. No subject
     /// ([`SurRepWire::TAG_PICK_ANSWERED`]).
     pub const OP_PICKED: u8 = 13;
+    /// `SurfaceRequest::CopyChunk` — one piece of the text this window puts
+    /// on its seat's clipboard (`res/CLIPBOARD.md`), written at the head of
+    /// its pair lease's request plane (`kore_window::menu`'s page): `a` =
+    /// the piece's offset in the text `| len << 32` (1 to the plane's size),
+    /// `b` = the whole text's byte length (1 to
+    /// `kore_window::clipboard::CLIPBOARD_BYTES`). The piece at offset zero
+    /// begins a copy, and only the seat's focused window may begin one, on
+    /// a gesture of the user's it has not spent; later pieces continue it
+    /// in order, and the piece that reaches the length ends it. The
+    /// compositor copies each piece out before replying, so the plane may be
+    /// reused once answered. No subject ([`SurRepWire::TAG_COPIED`]).
+    pub const OP_COPY_CHUNK: u8 = 14;
+    /// `SurfaceRequest::Paste` — read the seat's clipboard into this
+    /// window's request plane: `a` = the offset to read from. Offset zero
+    /// begins a read, and only the seat's focused window may begin one, on
+    /// a gesture of the user's it has not spent; later offsets continue it
+    /// until it reaches the end or the clipboard changes. No subject
+    /// ([`SurRepWire::TAG_CLIPBOARD`], [`SurRepWire::TAG_CLIPBOARD_EMPTY`]).
+    pub const OP_PASTE: u8 = 15;
+    /// `SurfaceRequest::PasteToShell` — the seat's terminal window asks for
+    /// the clipboard to be typed into its shell's line: queued as an inert
+    /// `ShellAction::Paste` for its controller, which reads the text and
+    /// edits the line itself. Only the seat's focused terminal window may
+    /// ask, on a gesture it has not spent. No words, no subject
+    /// ([`SurRepWire::TAG_PASTE_QUEUED`], [`SurRepWire::TAG_CLIPBOARD_EMPTY`]).
+    pub const OP_PASTE_TO_SHELL: u8 = 16;
 
     /// [`OP_SET_CURSOR`](Self::OP_SET_CURSOR) `a`: the standard arrow.
     pub const CURSOR_DEFAULT: u64 = 0;
@@ -4597,6 +4639,20 @@ impl SurRepWire {
     /// `SurfaceResponse::PickAnswered` — `a` echoes the token answered; the
     /// pick has ended and the plane may be reused.
     pub const TAG_PICK_ANSWERED: u8 = 14;
+    /// `SurfaceResponse::Copied` — `a` = the text copied so far (the
+    /// piece's offset plus its length, echoed); when it is the whole
+    /// length, the text is the seat's clipboard.
+    pub const TAG_COPIED: u8 = 15;
+    /// `SurfaceResponse::Clipboard` — `a` = the offset read from (echoed)
+    /// `| len << 32`, the bytes now at the head of the request plane (1 to
+    /// the plane's size), `b` = the clipboard text's whole byte length.
+    pub const TAG_CLIPBOARD: u8 = 16;
+    /// `SurfaceResponse::ClipboardEmpty` — the seat's clipboard holds no
+    /// text. No words.
+    pub const TAG_CLIPBOARD_EMPTY: u8 = 17;
+    /// `SurfaceResponse::PasteQueued` — `a` = the byte length of the text
+    /// the controller was asked to type.
+    pub const TAG_PASTE_QUEUED: u8 = 18;
 
     /// A v1 vocabulary gate: an unknown op, a non-XRGB8888 format, a
     /// non-CPU reach, a non-LINEAR modifier, a non-empty flag set.
@@ -4613,6 +4669,10 @@ impl SurRepWire {
     /// A capability transfer or teardown did not settle. A retiring surface
     /// keeps its backing reserved until revocation succeeds; retry is safe.
     pub const REFUSE_BUSY: u8 = 6;
+    /// The user did not ask: a clipboard verb from a window that is not its
+    /// seat's focused window, or with no unspent gesture of the user's
+    /// behind it.
+    pub const REFUSE_DENIED: u8 = 7;
 }
 
 /// One damage rectangle of a [`CommitWire`] record — pixel-addressed,
@@ -4956,7 +5016,17 @@ impl FsReqWire {
     /// route no longer validates. The view must belong to the caller's task.
     /// `window_offset` is return-post correlation.
     pub const OP_MATCH_VIEW: u8 = 65;
-    pub const OP_MAX: u8 = Self::OP_MATCH_VIEW;
+    /// Arm watch slot `kind` on the directory `handle`, tagged `length`
+    /// (non-zero, the client's own name for this arming): from now on the
+    /// pair's watch plane — the event channel after the rings in this pair's
+    /// own window — counts every change to what a listing of that directory
+    /// shows. Re-arming a slot replaces its watch. Observation, not
+    /// authority: the handle's route is revalidated before every count, and
+    /// a route that stops proving ends the watch. Answered `Done`.
+    pub const OP_WATCH: u8 = 66;
+    /// Disarm watch slot `kind`. Answered `Done`, armed or not.
+    pub const OP_UNWATCH: u8 = 67;
+    pub const OP_MAX: u8 = Self::OP_UNWATCH;
 
     /// [`OP_STOR_MAINTAIN`](Self::OP_STOR_MAINTAIN): report only.
     pub const MAINTAIN_STATUS: u8 = 0;
@@ -5118,6 +5188,59 @@ impl FsDirEntryWire {
     /// Bytes one entry occupies in the data window.
     pub const BYTES: usize = 48;
 }
+
+/// Watch slots one filesystem pair may arm ([`FsReqWire::OP_WATCH`]).
+///
+/// Sized by the client that follows the most folders at once: the Files
+/// explorer watches the folder it shows and the sidebar's live folders (its
+/// root and the expanded folders whose lines are on screen), fifteen of them
+/// at most. Every armed watch holds a handle, so this stays under half the
+/// service's per-session handle bound (32, `kore_dagfs::bounds`) — a client
+/// watching every slot keeps the handles a listing needs. The plane's
+/// `ended` word is one bit per slot, so 32 is the layout's own ceiling.
+pub const FS_WATCH_SLOTS: usize = 16;
+const _: () = assert!(FS_WATCH_SLOTS <= u32::BITS as usize);
+
+/// The level state of a filesystem pair's **watch plane**: the event channel
+/// (`res/EVENT.md`) the service formats after the request/reply rings in the
+/// pair's own window and republishes whole whenever a watched directory
+/// changes. Slot `k` belongs to the watch [`FsReqWire::OP_WATCH`] armed with
+/// slot `k`. 136 bytes.
+///
+/// Counts, not contents: a change is "what a listing of this directory, or
+/// of one of its child folders, shows may differ" — an entry made, removed
+/// or renamed in it, a child's length, revision or folder count moved, or an
+/// entry made or removed in a child folder (its line's count and whether it
+/// holds folders) — and the client lists again through its own handle, whose
+/// route the service revalidates. Nothing here names an entry, so the plane
+/// carries no observation the handle could not make itself.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
+)]
+pub struct FsWatchState {
+    /// Per slot: the tag the slot was armed with; zero while disarmed. A
+    /// client reads a slot's counts only under the tag it armed, so a count
+    /// left by the slot's previous watch is never mistaken for its own.
+    pub tag: [u32; FS_WATCH_SLOTS],
+    /// Per slot: changes seen since the slot was armed, wrapping. Coalesced:
+    /// several changes between two service passes advance it once.
+    pub changes: [u32; FS_WATCH_SLOTS],
+    /// Bit `k`: slot `k`'s watch ended — its handle closed, its route stopped
+    /// proving, or its directory was reclaimed. Cleared by re-arming.
+    pub ended: u32,
+    /// Reserved; zero.
+    pub reserved: u32,
+}
+
+/// The watch plane's record ring: one slot of a reserved edge kind, never
+/// pushed. A later per-entry change record lands in it without moving the
+/// plane's state or its offset.
+pub type FsWatchRecord = u64;
+/// Records the watch plane's ring holds.
+pub const FS_WATCH_RECORDS: u32 = 1;
+
+const _: () = assert!(core::mem::size_of::<FsWatchState>() == 136);
 
 /// Maximum bytes in one view-relative search path.
 ///

@@ -23,6 +23,8 @@
 //! | `OpenAt` | parent | — | — | — | `name` |
 //! | `OpenGrant` | — | grant id | — | — | — |
 //! | `Close`/`Stat`/`Sync` | object | — | — | — | — |
+//! | `Watch` | directory | — | — | tag (slot in `kind`) | — |
+//! | `Unwatch` | — | — | — | — (slot in `kind`) | — |
 //! | `List` | directory | — | — | cursor | — |
 //! | `Parents` | object | — | — | cursor | — |
 //! | `Locate` | anchor | stable identity | — | — | — |
@@ -448,6 +450,16 @@ pub fn encode_req(req: &FsRequest) -> FsReqWire {
             w.op = FsReqWire::OP_SYNC;
             w.handle = U64::new(handle.to_bits());
         }
+        FsRequest::Watch { handle, slot, tag } => {
+            w.op = FsReqWire::OP_WATCH;
+            w.handle = U64::new(handle.to_bits());
+            w.kind = slot;
+            w.length = U32::new(tag);
+        }
+        FsRequest::Unwatch { slot } => {
+            w.op = FsReqWire::OP_UNWATCH;
+            w.kind = slot;
+        }
         FsRequest::DeferCommits { hold } => {
             w.op = FsReqWire::OP_DEFER_COMMITS;
             w.kind = u8::from(hold);
@@ -713,6 +725,8 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
             | FsReqWire::OP_DEFER_COMMITS
             | FsReqWire::OP_SET_SYSTEM_SEED
             | FsReqWire::OP_STOR_MAINTAIN
+            | FsReqWire::OP_WATCH
+            | FsReqWire::OP_UNWATCH
     ) && w.kind != 0
     {
         return None;
@@ -914,6 +928,35 @@ pub fn decode_req(w: &FsReqWire) -> Option<FsRequest> {
         }
         FsReqWire::OP_REVOKE => FsRequest::Revoke { grant },
         FsReqWire::OP_SYNC => FsRequest::Sync { handle },
+        FsReqWire::OP_WATCH => {
+            // `kind` is the slot and `length` the tag; nothing else rides. A
+            // slot past the plane or a zero tag (the plane's "disarmed") is a
+            // framing mismatch, not a request to guess at.
+            if usize::from(w.kind) >= kore_abi::svc::FS_WATCH_SLOTS
+                || w.length.get() == 0
+                || w.window_offset.get() != 0
+                || w.handle2.get() != 0
+                || w.offset.get() != 0
+                || w.expected_revision.get() != 0
+                || !names_are_empty(w)
+            {
+                return None;
+            }
+            FsRequest::Watch {
+                handle,
+                slot: w.kind,
+                tag: w.length.get(),
+            }
+        }
+        FsReqWire::OP_UNWATCH => {
+            if usize::from(w.kind) >= kore_abi::svc::FS_WATCH_SLOTS
+                || !control_payload_is_empty(w)
+                || w.window_offset.get() != 0
+            {
+                return None;
+            }
+            FsRequest::Unwatch { slot: w.kind }
+        }
         FsReqWire::OP_DEFER_COMMITS => {
             // `kind` is the whole payload: a deferral names no object, and a
             // value outside the two-state vocabulary is a framing mismatch.
@@ -1737,6 +1780,8 @@ pub fn decode_rep_for(request: &FsRequest, w: &FsRepWire) -> Option<(FsResponse,
         | FsRequest::DetachEdge { .. }
         | FsRequest::Revoke { .. }
         | FsRequest::Sync { .. }
+        | FsRequest::Watch { .. }
+        | FsRequest::Unwatch { .. }
         | FsRequest::BeginReplace { .. }
         | FsRequest::WriteReplacement { .. }
         | FsRequest::AbortReplace { .. }
@@ -1876,6 +1921,8 @@ pub fn reply_matches(request: &FsRequest, response: &FsResponse) -> bool {
         | FsRequest::DetachEdge { .. }
         | FsRequest::Revoke { .. }
         | FsRequest::Sync { .. }
+        | FsRequest::Watch { .. }
+        | FsRequest::Unwatch { .. }
         | FsRequest::BeginReplace { .. }
         | FsRequest::WriteReplacement { .. }
         | FsRequest::AbortReplace { .. }
@@ -2018,6 +2065,66 @@ mod tests {
         let mut stray = wire;
         stray.offset = U64::new(1);
         assert_eq!(decode_req(&stray), None);
+    }
+
+    /// A watch carries its directory, its slot and its tag and nothing else;
+    /// an unwatch carries its slot alone. Both answer `Done`, and a slot past
+    /// the plane, the zero tag, or any stray operand is refused.
+    #[test]
+    fn watch_verbs_round_trip_and_refuse_stray_operands() {
+        let slots = kore_abi::svc::FS_WATCH_SLOTS as u8;
+        for (slot, tag) in [(0, 1), (slots - 1, u32::MAX)] {
+            let watch = FsRequest::Watch {
+                handle: Handle::from_bits(0x1_0000_0003),
+                slot,
+                tag,
+            };
+            let unwatch = FsRequest::Unwatch { slot };
+            for request in [watch, unwatch] {
+                assert!(!request.needs_window());
+                assert_eq!(decode_req(&encode_req(&request)), Some(request));
+                assert!(reply_matches(&request, &FsResponse::Done));
+                assert_eq!(
+                    decode_rep_for(&request, &encode_rep(&FsResponse::Done, 0)),
+                    Some((FsResponse::Done, 0))
+                );
+            }
+        }
+        let wire = encode_req(&FsRequest::Watch {
+            handle: Handle::from_bits(9),
+            slot: 1,
+            tag: 5,
+        });
+        let strays: [fn(&mut FsReqWire); 8] = [
+            |w| w.kind = kore_abi::svc::FS_WATCH_SLOTS as u8,
+            |w| w.length = U32::new(0),
+            |w| w.window_offset = U32::new(4),
+            |w| w.handle2 = U64::new(1),
+            |w| w.offset = U64::new(1),
+            |w| w.expected_revision = U64::new(1),
+            |w| w.rights = 1,
+            |w| {
+                w.name[0] = b'x';
+                w.name_len = 1;
+            },
+        ];
+        for stray in strays {
+            let mut bad = wire;
+            stray(&mut bad);
+            assert_eq!(decode_req(&bad), None);
+        }
+        let wire = encode_req(&FsRequest::Unwatch { slot: 2 });
+        let strays: [fn(&mut FsReqWire); 4] = [
+            |w| w.kind = kore_abi::svc::FS_WATCH_SLOTS as u8,
+            |w| w.handle = U64::new(1),
+            |w| w.length = U32::new(1),
+            |w| w.window_offset = U32::new(1),
+        ];
+        for stray in strays {
+            let mut bad = wire;
+            stray(&mut bad);
+            assert_eq!(decode_req(&bad), None);
+        }
     }
 
     /// Every maintenance action survives the wire; only a forced refresh

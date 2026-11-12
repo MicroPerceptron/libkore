@@ -427,3 +427,23 @@ files. Against that branch's export at `10c7b400`, only kore-rt's `futex.rs`
 and `thread_controller.rs`, the record, and five services' `boot.toml`
 digests differ. The digests come from #1494's own reseal (`f2644e5b`), which
 followed its export.
+
+It then moved to Kore `eb59823a29cc9b0cfe0ea27a386c3fac266534ef`, the merge
+of #1494's merge of Kore main `f2dc8309`. Main reaches the closure in four
+places:
+
+- the seat clipboard and Cmd chords (#1469): kore-abi's insert into a held
+  input line and a window's clipboard chunks, and kore-window's clipboard,
+  key split and shortcuts;
+- Files' live folder and sidebar (#1450, #1456): a DagFS watch plane in the
+  `dagfs` crate and service, and kore-rt's owed service wakes
+  (`SystemService::take_owed_wakes`), which the serve host delivers after
+  each unit of work;
+- DagFS's cwd anchor and `MatchView`, `.` and `..` in `resolve`, and a dead
+  view reaped by asking the kernel;
+- five services' `boot.toml` digests, from #1494's reseal over the merge
+  (`e6b108d1`).
+
+The closure is now 27 packages and 406 files. Against Kore `e6b108d1`, only
+kore-rt's `futex.rs` and `thread_controller.rs` differ. No exported manifest
+changed, so `native/Cargo.lock` did not.

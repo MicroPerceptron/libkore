@@ -16,6 +16,7 @@ use kore_abi::session::DISPLAY_FORMAT_XRGB8888;
 use kore_abi::svc::{CommitWire, MAX_COMMIT_RECTS, SurRectWire, SurRepWire, SurReqWire};
 
 use crate::capture::{CaptureFrame, CaptureMode};
+use crate::clipboard::{CHUNK_BYTES, CLIPBOARD_BYTES};
 use crate::cursor::Cursor;
 use crate::document::DocumentKind;
 use crate::menu::MENU_PLANE_BYTES;
@@ -210,6 +211,21 @@ pub enum SurfaceRequest {
     /// stable identity, or zero if the user cancelled; its name is the
     /// first `len` bytes of this window's menu plane (none when cancelled).
     Picked { token: u64, object: u64, len: u8 },
+    /// Put text on this window's seat's clipboard ([`crate::clipboard`]), a
+    /// piece at a time: bytes `offset..offset + len` of a `total`-byte text
+    /// are at the head of this window's request plane. Offset zero begins the
+    /// copy (focused window, unspent gesture); the piece that reaches `total`
+    /// ends it, and the text then replaces the clipboard's.
+    CopyChunk { offset: u32, len: u16, total: u32 },
+    /// Read the seat's clipboard from `offset` into this window's request
+    /// plane. Offset zero begins the read (focused window, unspent gesture);
+    /// later offsets continue it until it reaches the end.
+    Paste { offset: u32 },
+    /// The seat's terminal window asks for the clipboard to be typed into its
+    /// shell's line: queued as an inert
+    /// [`ShellAction::Paste`](crate::control::ShellAction::Paste) for its
+    /// controller (focused window, unspent gesture).
+    PasteToShell,
 }
 
 /// The surface-class reply vocabulary.
@@ -263,6 +279,17 @@ pub enum SurfaceResponse {
     /// The answer is delivered and the pick has ended; the plane may be
     /// reused. The token, echoed.
     PickAnswered { token: u64 },
+    /// The copy has taken the text through `through`; when that is the whole
+    /// text, the text is the seat's clipboard.
+    Copied { through: u32 },
+    /// Bytes `offset..offset + len` of the clipboard's `total`-byte text are
+    /// at the head of the request plane.
+    Clipboard { offset: u32, len: u16, total: u32 },
+    /// The seat's clipboard holds no text.
+    ClipboardEmpty,
+    /// The shell paste is queued for this window's controller; the text is
+    /// `total` bytes.
+    PasteQueued { total: u32 },
     /// The refusal, echoing the subject the verb named (zero if none).
     Refused {
         refusal: SurfaceRefusal,
@@ -288,6 +315,9 @@ pub enum SurfaceRefusal {
     Unknown,
     /// Authority delivery or revocation has not settled; retry is safe.
     Busy,
+    /// The user did not ask: a clipboard verb from a window that is not its
+    /// seat's focused window, or with no unspent gesture behind it.
+    Denied,
 }
 
 impl SurfaceRefusal {
@@ -299,6 +329,7 @@ impl SurfaceRefusal {
             Self::OutOfMemory => SurRepWire::REFUSE_OUT_OF_MEMORY,
             Self::Unknown => SurRepWire::REFUSE_UNKNOWN,
             Self::Busy => SurRepWire::REFUSE_BUSY,
+            Self::Denied => SurRepWire::REFUSE_DENIED,
         }
     }
 
@@ -310,6 +341,7 @@ impl SurfaceRefusal {
             SurRepWire::REFUSE_OUT_OF_MEMORY => Self::OutOfMemory,
             SurRepWire::REFUSE_UNKNOWN => Self::Unknown,
             SurRepWire::REFUSE_BUSY => Self::Busy,
+            SurRepWire::REFUSE_DENIED => Self::Denied,
             _ => return None,
         })
     }
@@ -457,8 +489,47 @@ pub fn encode_req(req: &SurfaceRequest) -> SurReqWire {
             w.b = U64::new(object);
             w.c = U64::new(u64::from(len));
         }
+        SurfaceRequest::CopyChunk { offset, len, total } => {
+            w.op = SurReqWire::OP_COPY_CHUNK;
+            w.a = U64::new(piece_word(offset, len));
+            w.b = U64::new(u64::from(total));
+        }
+        SurfaceRequest::Paste { offset } => {
+            w.op = SurReqWire::OP_PASTE;
+            w.a = U64::new(u64::from(offset));
+        }
+        SurfaceRequest::PasteToShell => {
+            w.op = SurReqWire::OP_PASTE_TO_SHELL;
+        }
     }
     w
+}
+
+/// The piece word a copy and a paste share: `offset | len << 32`.
+const fn piece_word(offset: u32, len: u16) -> u64 {
+    offset as u64 | (len as u64) << 32
+}
+
+/// A clipboard text's length: 1 to [`CLIPBOARD_BYTES`].
+fn text_length(word: u64) -> Option<u32> {
+    u32::try_from(word)
+        .ok()
+        .filter(|&len| len != 0 && len as usize <= CLIPBOARD_BYTES)
+}
+
+/// A piece of a clipboard text, lifted: `offset..offset + len` of `total`
+/// bytes, `len` 1 to [`CHUNK_BYTES`] and `total` 1 to [`CLIPBOARD_BYTES`].
+fn piece(word: u64, total: u64) -> Option<(u32, u16, u32)> {
+    let (offset, len) = (word as u32, (word >> 32) as u16);
+    let total = u32::try_from(total).ok()?;
+    let fits = u64::from(offset) + u64::from(len) <= u64::from(total);
+    (word >> 48 == 0
+        && len != 0
+        && usize::from(len) <= CHUNK_BYTES
+        && total != 0
+        && total as usize <= CLIPBOARD_BYTES
+        && fits)
+        .then_some((offset, len, total))
 }
 
 /// Structural lift; stray bits are the re-encode comparison's to catch.
@@ -532,6 +603,18 @@ fn raw_decode_req(w: &SurReqWire) -> Option<SurfaceRequest> {
             }
             SurfaceRequest::Picked { token, object, len }
         }
+        SurReqWire::OP_COPY_CHUNK => {
+            let (offset, len, total) = piece(w.a.get(), w.b.get())?;
+            SurfaceRequest::CopyChunk { offset, len, total }
+        }
+        SurReqWire::OP_PASTE => {
+            let offset = u32::try_from(w.a.get()).ok()?;
+            if offset as usize >= CLIPBOARD_BYTES {
+                return None;
+            }
+            SurfaceRequest::Paste { offset }
+        }
+        SurReqWire::OP_PASTE_TO_SHELL => SurfaceRequest::PasteToShell,
         _ => return None,
     })
 }
@@ -674,6 +757,22 @@ pub fn encode_rep(rep: &SurfaceResponse, grants: u8) -> SurRepWire {
             w.tag = SurRepWire::TAG_PICK_ANSWERED;
             w.a = U64::new(token);
         }
+        SurfaceResponse::Copied { through } => {
+            w.tag = SurRepWire::TAG_COPIED;
+            w.a = U64::new(u64::from(through));
+        }
+        SurfaceResponse::Clipboard { offset, len, total } => {
+            w.tag = SurRepWire::TAG_CLIPBOARD;
+            w.a = U64::new(piece_word(offset, len));
+            w.b = U64::new(u64::from(total));
+        }
+        SurfaceResponse::ClipboardEmpty => {
+            w.tag = SurRepWire::TAG_CLIPBOARD_EMPTY;
+        }
+        SurfaceResponse::PasteQueued { total } => {
+            w.tag = SurRepWire::TAG_PASTE_QUEUED;
+            w.a = U64::new(u64::from(total));
+        }
         SurfaceResponse::Refused { refusal, subject } => {
             w.tag = SurRepWire::TAG_REFUSED;
             w.refusal = refusal.code();
@@ -751,6 +850,17 @@ fn raw_decode_rep(w: &SurRepWire) -> Option<SurfaceResponse> {
         },
         SurRepWire::TAG_PICK_CLAIMED => SurfaceResponse::PickClaimed { token: w.a.get() },
         SurRepWire::TAG_PICK_ANSWERED => SurfaceResponse::PickAnswered { token: w.a.get() },
+        SurRepWire::TAG_COPIED => SurfaceResponse::Copied {
+            through: text_length(w.a.get())?,
+        },
+        SurRepWire::TAG_CLIPBOARD => {
+            let (offset, len, total) = piece(w.a.get(), w.b.get())?;
+            SurfaceResponse::Clipboard { offset, len, total }
+        }
+        SurRepWire::TAG_CLIPBOARD_EMPTY => SurfaceResponse::ClipboardEmpty,
+        SurRepWire::TAG_PASTE_QUEUED => SurfaceResponse::PasteQueued {
+            total: text_length(w.a.get())?,
+        },
         SurRepWire::TAG_REFUSED => SurfaceResponse::Refused {
             refusal: SurfaceRefusal::from_code(w.refusal)?,
             subject: w.id.get(),
@@ -867,6 +977,20 @@ pub fn reply_matches(request: &SurReqWire, response: &SurfaceResponse, grants: u
         | (SurfaceRequest::Picked { token, .. }, SurfaceResponse::PickAnswered { token: got }) => {
             token == got
         }
+        // The copy echoes how far it has taken the text: exactly to the end
+        // of the piece just sent.
+        (SurfaceRequest::CopyChunk { offset, len, .. }, SurfaceResponse::Copied { through }) => {
+            u64::from(through) == u64::from(offset) + u64::from(len)
+        }
+        // A read answers from the offset asked, and an empty clipboard
+        // answers only the read's first piece: a read under way that finds
+        // the clipboard changed is refused instead.
+        (SurfaceRequest::Paste { offset }, SurfaceResponse::Clipboard { offset: got, .. }) => {
+            offset == got
+        }
+        (SurfaceRequest::Paste { offset }, SurfaceResponse::ClipboardEmpty) => offset == 0,
+        (SurfaceRequest::PasteToShell, SurfaceResponse::PasteQueued { .. }) => true,
+        (SurfaceRequest::PasteToShell, SurfaceResponse::ClipboardEmpty) => true,
         _ => false,
     }
 }
@@ -1167,7 +1291,7 @@ mod tests {
         }
     }
 
-    fn every_request() -> [SurfaceRequest; 14] {
+    fn every_request() -> [SurfaceRequest; 19] {
         [
             SurfaceRequest::Query,
             SurfaceRequest::CreateSurface {
@@ -1217,10 +1341,25 @@ mod tests {
                 object: u64::MAX,
                 len: PICK_NAME_BYTES as u8,
             },
+            SurfaceRequest::CopyChunk {
+                offset: 0,
+                len: 1,
+                total: 1,
+            },
+            SurfaceRequest::CopyChunk {
+                offset: (CLIPBOARD_BYTES - CHUNK_BYTES) as u32,
+                len: CHUNK_BYTES as u16,
+                total: CLIPBOARD_BYTES as u32,
+            },
+            SurfaceRequest::Paste { offset: 0 },
+            SurfaceRequest::Paste {
+                offset: CLIPBOARD_BYTES as u32 - 1,
+            },
+            SurfaceRequest::PasteToShell,
         ]
     }
 
-    fn every_response() -> [SurfaceResponse; 13] {
+    fn every_response() -> [SurfaceResponse; 19] {
         [
             SurfaceResponse::Info {
                 width: 1920,
@@ -1260,7 +1399,102 @@ mod tests {
             SurfaceResponse::PickQueued { serial: 3 },
             SurfaceResponse::PickClaimed { token: 0x7071_ce4e },
             SurfaceResponse::PickAnswered { token: 0x7071_ce4e },
+            SurfaceResponse::Copied { through: 1 },
+            SurfaceResponse::Copied {
+                through: CLIPBOARD_BYTES as u32,
+            },
+            SurfaceResponse::Clipboard {
+                offset: 4096,
+                len: 17,
+                total: 4113,
+            },
+            SurfaceResponse::ClipboardEmpty,
+            SurfaceResponse::PasteQueued { total: 9 },
+            SurfaceResponse::Refused {
+                refusal: SurfaceRefusal::Denied,
+                subject: 0,
+            },
         ]
+    }
+
+    /// A clipboard piece names a span inside its text, the text inside the
+    /// clipboard's bound and the piece inside the plane; nothing crosses
+    /// with a grant; and each reply answers only the verb and offset asked.
+    #[test]
+    fn clipboard_pieces_stay_inside_their_text_and_answer_their_own_offset() {
+        let copy = SurfaceRequest::CopyChunk {
+            offset: 4096,
+            len: 100,
+            total: 4196,
+        };
+        let wire = encode_req(&copy);
+        assert_eq!(SurfaceWire::request_grants(&wire), 0);
+        assert_eq!(decode_req(&wire), Some(copy));
+        assert!(reply_matches(&wire, &SurfaceResponse::Copied { through: 4196 }, 0));
+        assert!(!reply_matches(&wire, &SurfaceResponse::Copied { through: 4096 }, 0));
+        assert!(!reply_matches(&wire, &SurfaceResponse::Copied { through: 4196 }, 1));
+        for (offset, len, total) in [
+            (0, 0, 1),
+            (0, 1, 0),
+            (1, 1, 1),
+            (0, CHUNK_BYTES as u16 + 1, CLIPBOARD_BYTES as u32),
+            (0, 1, CLIPBOARD_BYTES as u32 + 1),
+            (u32::MAX, 1, CLIPBOARD_BYTES as u32),
+        ] {
+            let wire = encode_req(&SurfaceRequest::CopyChunk { offset, len, total });
+            assert_eq!(decode_req(&wire), None, "{offset} {len} {total}");
+        }
+        let mut stray = encode_req(&copy);
+        stray.a = (stray.a.get() | 1 << 50).into();
+        assert_eq!(decode_req(&stray), None);
+
+        let read = encode_req(&SurfaceRequest::Paste { offset: 0 });
+        let piece = SurfaceResponse::Clipboard {
+            offset: 0,
+            len: 12,
+            total: 12,
+        };
+        assert!(reply_matches(&read, &piece, 0));
+        assert!(reply_matches(&read, &SurfaceResponse::ClipboardEmpty, 0));
+        let later = encode_req(&SurfaceRequest::Paste { offset: 12 });
+        assert!(!reply_matches(&later, &piece, 0));
+        assert!(
+            !reply_matches(&later, &SurfaceResponse::ClipboardEmpty, 0),
+            "a read under way never learns the clipboard emptied: it is refused"
+        );
+        let past = encode_req(&SurfaceRequest::Paste {
+            offset: CLIPBOARD_BYTES as u32,
+        });
+        assert_eq!(decode_req(&past), None);
+        for piece in [
+            (0, 13, 12),
+            (0, 0, 12),
+            (0, CHUNK_BYTES as u16 + 1, CLIPBOARD_BYTES as u32),
+        ] {
+            let mut w = encode_rep(&SurfaceResponse::ClipboardEmpty, 0);
+            w.tag = SurRepWire::TAG_CLIPBOARD;
+            w.a = piece_word(piece.0, piece.1).into();
+            w.b = u64::from(piece.2).into();
+            assert_eq!(decode_rep(&w), None, "{piece:?}");
+        }
+
+        let shell = encode_req(&SurfaceRequest::PasteToShell);
+        assert!(reply_matches(&shell, &SurfaceResponse::PasteQueued { total: 5 }, 0));
+        assert!(reply_matches(&shell, &SurfaceResponse::ClipboardEmpty, 0));
+        assert!(!reply_matches(&shell, &SurfaceResponse::Copied { through: 5 }, 0));
+        let denied = SurfaceResponse::Refused {
+            refusal: SurfaceRefusal::Denied,
+            subject: 0,
+        };
+        for request in [copy, SurfaceRequest::Paste { offset: 0 }, SurfaceRequest::PasteToShell] {
+            assert!(reply_matches(&encode_req(&request), &denied, 0));
+        }
+        for zero in [
+            SurfaceResponse::Copied { through: 0 },
+            SurfaceResponse::PasteQueued { total: 0 },
+        ] {
+            assert_eq!(decode_rep(&encode_rep(&zero, 0)), None);
+        }
     }
 
     /// A pick is answered only by its own serial's echo, a claim and an
