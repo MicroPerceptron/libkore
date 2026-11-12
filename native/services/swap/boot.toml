@@ -9,5 +9,5 @@ image     = "kore-svc-swap"
 endowment = "kore_svc_swap::ZramEndowment"
 protocol  = "kore_svc_swap::ZramSwap"
 endows    = ["MEM_SUPPLY@0"]
-digest_x86_64  = "blake3:aa0fa749d355437dbd3a239e58b299cd9ff7d33854f60e15905b1b6bc7aabd30"  # res/x86_64/; make boot-digests
-digest_aarch64 = "blake3:efaa5dddb597e5abadc3b71bf4a45af9f63264aab7c9772ce1574b62ef14cb85"  # res/aarch64/; make boot-digests-aarch64
+digest_x86_64  = "blake3:c64857d1f04b3d2fcf5fcb547fc4a64eddd367df7e326341adb64e7798488dce"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:bfdbd6b573e15ad82edb567ef3cfab5112e298fbdccd284418b9c29809bdf4de"  # res/aarch64/; make boot-digests-aarch64

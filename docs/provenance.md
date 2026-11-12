@@ -457,3 +457,13 @@ was run by in its process page. libkore#32 exported it first, at Kore
 Against libkore#32's export, five services' `boot.toml` digests differ as
 well, from #1494's reseals that followed it. No exported manifest changed,
 so `native/Cargo.lock` did not.
+
+It then moved to Kore `7c0be6e84ac2e8ee67591b44c0f42d46ab596f83`, the merge
+of #1494's next round into this change. That round has the kernel offer a
+function to drivers only on positive evidence and name each claim's holder,
+which kore-abi's device state and its new device classes carry. The closure
+is now 27 packages and 408 files. Against Kore `fe9603e3`, only kore-rt's
+`futex.rs` and `thread_controller.rs` differ, and `services/swap/boot.toml`:
+swap links kore-rt's futex, so its digests are this change's reseal over
+the ioctl round (`b04325e9`). No exported manifest changed, so
+`native/Cargo.lock` did not.
