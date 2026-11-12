@@ -3,7 +3,7 @@
 //!
 //! The census is boot-frozen identity. This is what changes after boot, and
 //! what a driver writer asks before touching a device: whether a driver
-//! claimed the function, which founded row drives its DMA, which BARs exist,
+//! claimed the function, which founded row holds that claim, which BARs exist,
 //! which of them a driver may map and which are mapped now, and how the
 //! function can interrupt. A BAR is its index, its size and the length a
 //! driver may map; **no address crosses** (res/DEVICE_SERVICE.md §1.1), so
@@ -33,7 +33,7 @@ use super::census::{DeviceCensus, DeviceCensusPage, MAX_DEVICE_CENSUS_ROWS};
 pub const DEVICE_BARS: usize = 6;
 /// Every BAR's bit, for the three per-BAR bitmaps of a [`DeviceState`].
 pub const DEVICE_BAR_MASK: u8 = (1 << DEVICE_BARS) - 1;
-/// `DeviceState::driver` when no founded row drives the function's DMA.
+/// `DeviceState::driver` when no running founded row holds the function.
 pub const DEVICE_ROW_NONE: u8 = 0xFF;
 /// States per vended page: 8 header bytes + 128 = 136 bytes, the census
 /// page's size, so a page rides the monitor and exec reply wires as one.
@@ -77,11 +77,12 @@ pub const fn device_bar_of(operand: u16) -> Option<(u16, u8)> {
 pub struct DeviceState {
     /// [`Self::PRESENT`] and the bits below it.
     pub flags: u8,
-    /// The founded row (the founding record's index) whose task activated
-    /// DMA on this function, or [`DEVICE_ROW_NONE`]. The kernel's own
-    /// shutdown ledger, so it names who drives the device rather than who
-    /// claimed it: a function a row claimed and delegated reads the row it
-    /// was delegated to, and a driver that never activates DMA reads none.
+    /// The founded row (the founding record's index) whose task holds this
+    /// function's claim, or [`DEVICE_ROW_NONE`]. The kernel records whom a
+    /// claim's grant is sealed for when the claim commits, and follows that
+    /// exact grant if it is carried on, so this names the claimant whether
+    /// or not it does DMA. A claim whose task is not a running founded row
+    /// (it ended, or it is a program) reads none: the claim still stands.
     pub driver: u8,
     /// Bit `n`: BAR `n` exists as memory the kernel resolved. An I/O BAR is
     /// not one: no driver may reach port space through a BAR.

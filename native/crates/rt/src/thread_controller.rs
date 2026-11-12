@@ -27,6 +27,8 @@
 //! the controller mints a doorbell, keeps the send (an adopted peer, withdrawn
 //! before the child's band can be reused), and founds the child holding it, a
 //! send into the controller, the starter's kick, the host's wake and the heap.
+//! The child runs its callback once its founding is published, which follows
+//! the adopted send, so the controller reaches every wait the callback makes.
 //! Children and the starter relay through the controller's hub, so a wake
 //! between two threads neither can kick directly still arrives: the controller
 //! sweeps ([`futex::sweep`]).
@@ -42,9 +44,12 @@
 //! A starter with no channel space founds a controller without a doorbell:
 //! neither it nor its children can park, and each of their waits takes the
 //! deadline park every thread can ([`pace::cede`]). A client the controller
-//! cannot kick waits in bounded slices ([`UNREACHED_SLICE`]). A thread that
+//! cannot kick waits in bounded slices ([`Controller::slice`]). A thread that
 //! cannot wake a parking controller is refused a create, which would
-//! otherwise wait on a request nothing announced.
+//! otherwise wait on a request nothing announced; one that cannot relay
+//! through it cannot announce a request to its threads either
+//! ([`Controller::wakes_threads`]), so a parked child is never left waiting
+//! on a request nothing woke it for.
 //!
 //! [`thread::exit`]: crate::thread::exit
 //! [`pace::cede`]: crate::pace::cede
@@ -88,7 +93,8 @@ const POLLING: u32 = 3;
 /// at before the controller parked (`pace::CEDE_NS`): a client the wake
 /// fabric cannot reach is no worse off than it was. Shorter would wake an
 /// unreachable joiner more often for nothing; longer would delay it.
-const UNREACHED_SLICE: Duration = Duration::from_nanos(crate::pace::CEDE_NS);
+/// [`Controller::slice`] says which waits take it.
+pub const UNREACHED_SLICE: Duration = Duration::from_nanos(crate::pace::CEDE_NS);
 
 /// How long the controller rides its doorbell after a reap the kernel did
 /// not complete — a refused lifecycle observation or reclamation, which no
@@ -142,7 +148,8 @@ fn empty(_: usize) -> usize {
 struct Record {
     state: AtomicU64,
     /// Bumped by the controller after each transition a client can wait
-    /// for; clients park on it. An event count: the state is the truth.
+    /// for; clients park on it, the child too until it is founded. An event
+    /// count: the state is the truth.
     event: AtomicU32,
     /// Set by the child's exit hook: it has stopped running its own code
     /// and is committing its end.
@@ -203,7 +210,8 @@ pub struct Controller {
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
     starter: AtomicU32,
     /// The bands whose doorbells the controller can kick, a bit each: the
-    /// clients its wakes reach. A child's bit is set once it is founded and
+    /// clients its wakes reach. A child's bit is set before its founding is
+    /// published, which the child waits for before its callback runs, and
     /// cleared before its band can be reused.
     reach: AtomicU32,
     records: [Record; COUNT],
@@ -336,6 +344,37 @@ impl Controller {
             .is_some_and(futex::reaches)
     }
 
+    /// Whether a wake this thread sends reaches the threads the controller
+    /// founded, so a request it announces to them by a wake — a cancellation,
+    /// stored and then [`futex::wake_thread`]ed — ends any park they are in.
+    ///
+    /// True when the controller parks and this thread both holds a send into
+    /// it and relays through its hub — the starter, or a thread it created —
+    /// since every thread the controller can kick is then one relay away. True
+    /// as well when it does not park, since neither do its threads, which need
+    /// no wake. False otherwise, and before the controller starts: a caller
+    /// refuses such a request, rather than leave it behind a park nothing ends.
+    pub fn wakes_threads(&self) -> bool {
+        match self.mode() {
+            None => false,
+            Some(PARKING) => self.wakes_controller() && futex::relays_through(&self.hub),
+            Some(_) => true,
+        }
+    }
+
+    /// How long one wait of the calling thread may park: unbounded (`None`)
+    /// when the controller can kick it — it holds a send into the thread's
+    /// doorbell, so every wake it sends, and every wake relayed through it,
+    /// reaches the thread — and [`UNREACHED_SLICE`] when nothing would end
+    /// that park early. A thread the controller founds with a doorbell is
+    /// reached before its callback runs, so every wait of that callback is
+    /// unbounded from the first.
+    pub fn slice(&self) -> Option<Duration> {
+        let reached = futex::current_thread()
+            .is_some_and(|band| self.reach.load(Ordering::SeqCst) & (1 << band) != 0);
+        (!reached).then_some(UNREACHED_SLICE)
+    }
+
     /// Park until `record`'s state satisfies `done`, and return that state.
     fn settle(&self, record: &Record, done: impl Fn(u64) -> bool) -> u64 {
         loop {
@@ -347,9 +386,7 @@ impl Controller {
             if done(state) {
                 return state;
             }
-            let reached = futex::current_thread()
-                .is_some_and(|band| self.reach.load(Ordering::SeqCst) & (1 << band) != 0);
-            park(&record.event, seen, (!reached).then_some(UNREACHED_SLICE));
+            park(&record.event, seen, self.slice());
         }
     }
 
@@ -486,7 +523,7 @@ fn pause() {
 }
 
 /// The managed thread's entry: announce its end however it comes, relay
-/// through the controller, run the callback.
+/// through the controller, wait to be founded, run the callback.
 fn child_entry(argument: usize) {
     // SAFETY: controller storage is static; record cannot be reused until join.
     let record = unsafe { &*(argument as *const Record) };
@@ -503,7 +540,14 @@ fn child_entry(argument: usize) {
     let _ = record.state.load(Ordering::Acquire);
     let start = unsafe { *record.start.get() };
     // SAFETY: `home` names the static controller whose record this is.
-    let _ = futex::adopt_hub(&unsafe { &*(start.home as *const Controller) }.hub);
+    let home = unsafe { &*(start.home as *const Controller) };
+    let _ = futex::adopt_hub(&home.hub);
+    // The callback runs once the founding is published, as `create` returns
+    // once it is. The controller publishes it only after it can kick this
+    // thread (`reach`), so no wait in the callback rides the unreached slice
+    // for want of a bit the controller had yet to set. A child that outran
+    // its founding parks here as its creator does, until the announcement.
+    home.settle(record, |state| state & MASK != REQUEST);
     record
         .value
         .store((start.call)(start.argument), Ordering::Release);
@@ -1056,6 +1100,45 @@ mod tests {
         assert_eq!(record.state.load(Ordering::Acquire), 16);
     }
     #[test]
+    fn a_child_runs_its_callback_only_once_its_founding_is_published() {
+        // The child's half of its founding, with a host thread for the child
+        // and this one for the controller. The controller sets the child's
+        // reach bit before it publishes the founding, so a callback that ran
+        // first could find its own waits unreached, and bounded.
+        static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+        fn callback(record: usize) -> usize {
+            // SAFETY: the record is leaked below, so it outlives this child.
+            let record = unsafe { &*(record as *const Record) };
+            SEEN.store(record.state.load(Ordering::Acquire), Ordering::Release);
+            7
+        }
+        let controller: &'static Controller =
+            std::boxed::Box::leak(std::boxed::Box::new(Controller::new()));
+        let record = &controller.records[0];
+        // SAFETY: no child runs yet; this thread is the BUILD claimant.
+        unsafe {
+            *record.start.get() = Start {
+                call: callback,
+                argument: record as *const Record as usize,
+                retire: None,
+                home: controller as *const Controller as usize,
+            };
+        }
+        record.state.store(REQUEST, Ordering::Release);
+        std::thread::scope(|scope| {
+            let child = scope.spawn(|| child_entry(record as *const Record as usize));
+            // Every chance for a child that does not wait to run first.
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(record.returned.load(Ordering::Acquire), 0);
+            record.state.store(RUNNING, Ordering::Release);
+            record.announce();
+            child.join().unwrap();
+        });
+        assert_eq!(SEEN.load(Ordering::Acquire), RUNNING);
+        assert_eq!(record.value.load(Ordering::Acquire), 7);
+        assert_eq!(record.returned.load(Ordering::Acquire), 1);
+    }
+    #[test]
     fn an_unstarted_controller_refuses_and_never_waits() {
         let controller: &'static Controller =
             std::boxed::Box::leak(std::boxed::Box::new(Controller::new()));
@@ -1065,6 +1148,16 @@ mod tests {
         assert_eq!(controller.start(), Err(Error::Unavailable));
         assert_eq!(controller.started.load(Ordering::Acquire), IDLE);
         assert_eq!(controller.create(|_| 0, 0), Err(Error::Unavailable));
+    }
+    #[test]
+    fn an_unstarted_controller_wakes_no_thread_and_bounds_every_wait() {
+        // Nothing relays through a controller that was never founded, so no
+        // request to its threads is announced by a wake; and a thread it
+        // cannot kick — off metal, every thread — parks one slice at a time.
+        let controller = Controller::new();
+        assert!(!controller.wakes_threads());
+        assert_eq!(controller.slice(), Some(UNREACHED_SLICE));
+        assert_eq!(controller.started.load(Ordering::Acquire), IDLE);
     }
     #[test]
     fn records_own_their_interference_span() {

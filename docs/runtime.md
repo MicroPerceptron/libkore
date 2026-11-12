@@ -131,10 +131,13 @@ names on Kore targets; it never interposes host pthreads.
 
 The first create starts one process-lifetime controller. It owns all native join
 capabilities; portable handles contain identifiers, never arena slot authority.
-Calls use bounded shared records and paced parks, including a 1 ms controller
-scan while idle. They must run on native threads, not executor callbacks that
-owe other futures progress. Capacity depends on native bands and the controller's
-capability arena; ordinary slot exhaustion is refused before spending a band.
+Calls use bounded shared records and futex parks: the controller parks until a
+request, a thread's end or a relayed wake moves its word, and a waiting caller
+parks until the controller wakes it. Only a thread the controller cannot wake
+parks in bounded 1 ms slices. Calls must run on native threads, not executor
+callbacks that owe other futures progress. Capacity depends on native bands and
+the controller's capability arena; ordinary slot exhaustion is refused before
+spending a band.
 
 Create uses the installed process allocator for its handle and callback context.
 On error the output is unchanged and the argument is not retained. On success,
@@ -193,8 +196,22 @@ this does not implement dynamic DSO unloading or Rust/C++ stack unwinding.
 `kore_thread_testcancel`, foreign join and foreign futex waits. Disabled targets
 retain pending requests. `setcancelstate` enables/disables delivery;
 `setcanceltype` accepts deferred and refuses asynchronous with ENOTSUP, preserving
-output on failure. Cancellation-aware waits use bounded 1 ms native parks and
-one monotonic deadline. A canceled joiner leaves its target joinable.
+output on failure. A canceled joiner leaves its target joinable.
+
+A request wakes a target parked at a cancellation point; no cancellation-aware
+wait polls for one. The canceller stores the request, then wakes the target's
+thread (`futex::wake_thread`), relayed through the controller, the one owner of
+a send into each managed thread's doorbell. The target's wait reads the request
+again once it is registered (`futex::wait_unless`), and the wake reads that
+registration, so one of the two always sees the other. Only a target the
+controller cannot wake waits in bounded 1 ms slices against one monotonic
+deadline. A thread the controller founds with a doorbell is never one: it
+runs its callback only once its founding is published, after the controller
+can kick it. A thread whose wake cannot reach the controller's threads, because
+it neither started the controller nor was created through it, is refused with
+EAGAIN and records no request, as create refuses it: Kore's capability model
+grants no wake without a send, and a request a parked target never sees would
+be a silent loss.
 
 On explicit `kore_thread_exit` or cancellation, caller-owned cleanup nodes run
 LIFO, then compiler TLS destructors, then pthread key destructors. Normal callback
@@ -237,11 +254,14 @@ there is no second wait registry. Use `wait_async` in Rust executor tasks.
 C exposes `kore_futex_available`, `kore_futex_wait`, `kore_futex_wake` and
 `kore_futex_wake_all` in `<kore.h>`; Zig exposes `kore.futex.*`. The foreign
 wait blocks a native thread and must not run inside an executor callback.
-For managed threads it is also a deferred cancellation point. Independent
-controller-created threads are not endowed with doorbells, so their native futex
-waits report `Unsupported`; this adapter does not create a peer wake mesh.
-Foreign join uses the controller's deadline-park helper and works on these
-threads. Cancellation is checked even when a foreign futex wait is unsupported.
+For managed threads it is also a deferred cancellation point, which a
+cancellation request wakes. Controller-created threads are founded with
+doorbells when the thread that started the controller holds a channel-space
+grant, and park; a wake one of them cannot deliver directly is relayed through
+the controller, which holds a send into each. Without the grant they have none:
+their native futex waits report `Unsupported`, and foreign join takes the
+deadline park, which needs no wake. Cancellation is checked even when a foreign
+futex wait is unsupported.
 Timeouts are relative nanoseconds; zero is a deadline of zero and
 `KORE_FUTEX_INFINITE` requests an unbounded wait. Retry, spurious wake, timeout,
 unsupported context and invalid pointer shape remain distinct outcomes.

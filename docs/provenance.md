@@ -351,3 +351,119 @@ C program (`docs/languages.md`). It is the first libkore package a C program
 on Kore links without a Rust host. Its shared object is a distribution's
 one-line `cdylib` over it. `tools/check-program.py` links that object for the
 three Kore ISAs and checks its shape and its exact exported ABI.
+
+## A cancellation is a wake
+
+The export records Kore `a4ab7234e2fe60b43a1df42f12be8f636255fc7a`, one commit
+past MicroPerceptron/kore#1494's branch head `76fddb9f`. Two of the six
+commits since `0018956a` reach the closure, which keeps its 26 packages and
+382 files:
+
+- `kore-rt`'s futex gains a wait another thread can end, and the wake that
+  ends it (Kore `a4ab7234`). `futex::wait_unless` is `wait` with a caller
+  condition read once the waiter is registered, as the word is, and always
+  parks on the doorbell. `futex::wake_thread` kicks one thread's doorbell
+  rather than a word's waiters, directly or relayed through the caller's hub,
+  and reads the target's registration before it kicks. A condition stored
+  with `SeqCst` before that wake is therefore never missed, and no slice is
+  needed to notice it. Arm, register and check are one function that every
+  doorbell wait shares, and the host suite drives it with the arm injected to
+  pin that order. `futex::current_thread` is public: the band a thread
+  records for its wakers.
+- Its thread controller exposes the rule its own joins used:
+  `Controller::slice` is unbounded where the controller can wake the calling
+  thread, and `UNREACHED_SLICE` where nothing could. `Controller::wakes_threads`
+  says whether a wake the calling thread sends reaches the threads it founded.
+- The services' `boot.toml` digests are #1494's reseal over the parking
+  controller (`76fddb9f`).
+
+No exported manifest changed, so `native/Cargo.lock` did not.
+
+`kore-ffi`'s cancellation points no longer poll. A managed thread records its
+band when it starts; `kore_thread_cancel` stores the request and wakes that
+band; `kore_thread_join` and a managed thread's `kore_futex_wait` wait with
+`wait_unless`, with no timeout of their own. An idle cancellable waiter now
+sleeps until something happens rather than waking every millisecond. Only a
+thread the controller cannot wake keeps the bounded slice, now the
+controller's `UNREACHED_SLICE`. A canceller whose wake cannot reach the
+controller's threads is refused with EAGAIN, as create refuses it, and records
+nothing. A host test drives `request_cancel` to that refusal. The metal
+evidence is Kore's `keytest-tcc-x86`, whose libkore tour cancels a thread
+parked in `pthread_join` and one parked in `kore_futex_wait` with no timeout.
+
+The export then moved to Kore `40de25825eb1ea7816f7e7df86e116b3ad20d1fc`,
+which closes a child's founding window. The controller sets a child's reach
+bit only after `spawn_with_arg` returns, and the child ran its callback at
+once. Its first wait could therefore start before the controller had
+recorded that it can kick the child. A cancellable `kore_futex_wait` in that
+window took the unreached slice and kept it until its first real wake.
+`child_entry` now settles on its record until the founding is published,
+which follows the reach bit, so a thread the controller founds with a
+doorbell is reached from its first wait. A host test holds a founding back
+and checks that the callback waits for it. The closure keeps its 26 packages
+and 382 files. Besides `thread_controller.rs`, it carries the
+`services/swap/boot.toml` digest of Kore's reseal over the cancellation wake
+(`bfecfd17`).
+
+The export then moved to Kore `618772900e088b8b45ebafa8101d066edf4ffb3b`,
+the merge of MicroPerceptron/kore#1494's newer branch into this change. That
+branch brings three changes, which its own exports carried here up to Kore
+`2d4998ba`:
+
+- threads that found take a founder's arena;
+- a founding's staged space waits for the reap;
+- Kore's C library (`kore-c-shim`).
+
+The closure is now 27 packages and 401 files. Against that branch's export,
+only kore-rt's `futex.rs` and `thread_controller.rs` and the record differ.
+The two sides' controller changes compose: the controller and its children
+are founded with `spawn_founder_with_arg`, and a child still waits for its
+founding before its callback runs.
+
+It then moved to Kore `4a56f8279c79fd4d65918e581fe382f0775dfb51`, the merge
+of #1494's next round: kore-rt names the link window's free span once, and C
+programs gain descriptors and mmap. The closure stays at 27 packages and 401
+files. Against that branch's export at `10c7b400`, only kore-rt's `futex.rs`
+and `thread_controller.rs`, the record, and five services' `boot.toml`
+digests differ. The digests come from #1494's own reseal (`f2644e5b`), which
+followed its export.
+
+It then moved to Kore `eb59823a29cc9b0cfe0ea27a386c3fac266534ef`, the merge
+of #1494's merge of Kore main `f2dc8309`. Main reaches the closure in four
+places:
+
+- the seat clipboard and Cmd chords (#1469): kore-abi's insert into a held
+  input line and a window's clipboard chunks, and kore-window's clipboard,
+  key split and shortcuts;
+- Files' live folder and sidebar (#1450, #1456): a DagFS watch plane in the
+  `dagfs` crate and service, and kore-rt's owed service wakes
+  (`SystemService::take_owed_wakes`), which the serve host delivers after
+  each unit of work;
+- DagFS's cwd anchor and `MatchView`, `.` and `..` in `resolve`, and a dead
+  view reaped by asking the kernel;
+- five services' `boot.toml` digests, from #1494's reseal over the merge
+  (`e6b108d1`).
+
+The closure is now 27 packages and 406 files. Against Kore `e6b108d1`, only
+kore-rt's `futex.rs` and `thread_controller.rs` differ. No exported manifest
+changed, so `native/Cargo.lock` did not.
+
+It then moved to Kore `5c09f155b03682e95f24f924cdd65188fc9ebc60`, the merge
+of #1494's next round into this change. That round lets the kernel observe a
+PCI function's live state and its BARs' shapes, and puts the name a program
+was run by in its process page. libkore#32 exported it first, at Kore
+`dfece644`. The closure is now 27 packages and 407 files. Against Kore
+`4b236fbe`, only kore-rt's `futex.rs` and `thread_controller.rs` differ.
+Against libkore#32's export, five services' `boot.toml` digests differ as
+well, from #1494's reseals that followed it. No exported manifest changed,
+so `native/Cargo.lock` did not.
+
+It then moved to Kore `7c0be6e84ac2e8ee67591b44c0f42d46ab596f83`, the merge
+of #1494's next round into this change. That round has the kernel offer a
+function to drivers only on positive evidence and name each claim's holder,
+which kore-abi's device state and its new device classes carry. The closure
+is now 27 packages and 408 files. Against Kore `fe9603e3`, only kore-rt's
+`futex.rs` and `thread_controller.rs` differ, and `services/swap/boot.toml`:
+swap links kore-rt's futex, so its digests are this change's reseal over
+the ioctl round (`b04325e9`). No exported manifest changed, so
+`native/Cargo.lock` did not.
