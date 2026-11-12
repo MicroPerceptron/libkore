@@ -21,8 +21,10 @@
 
 mod census;
 mod i2c_admission;
+mod state;
 pub use census::*;
 pub use i2c_admission::*;
+pub use state::*;
 
 /// An I/O virtual address — a device-domain address translated by the
 /// IOMMU. **Never** a physical address: userland holds only this, so it can

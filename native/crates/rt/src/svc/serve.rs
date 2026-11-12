@@ -2358,6 +2358,39 @@ impl<'w, 't, T: Transport, S: SystemService> ServeHost<'w, 't, T, S> {
             // work: a pair a serve step just minted is attached before
             // the next wake, and a retired one stops now.
             self.settle_minted();
+            self.deliver_owed_wakes().await;
+        }
+    }
+
+    /// Send each peer the service owes a wake its one notice
+    /// ([`SystemService::take_owed_wakes`]), through the endpoint this host
+    /// owns. A service names a peer once per owed wake, so the batches end
+    /// within the peer table; the bound only keeps a service that kept
+    /// answering full batches from holding the loop.
+    async fn deliver_owed_wakes(&mut self) {
+        // Peers asked for per call: a stack array, so the ask allocates
+        // nothing; its size only trades calls for stack, and the founder
+        // roster's whole recyclable band fits one batch.
+        const BATCH: usize = 8;
+        for _ in 0..=self.pairs.len().div_ceil(BATCH) {
+            let mut owed = [None; BATCH];
+            let count = self.svc.take_owed_wakes(&mut owed).min(BATCH);
+            for peer in owed[..count].iter().flatten() {
+                // A peer retired since its batch was published has no one
+                // left to wake; `notify_peer` refuses it by generation.
+                let _ = self
+                    .notify_peer(
+                        *peer,
+                        Notice {
+                            cookie: crate::event::COOKIE_EVENT,
+                            payload: 0,
+                        },
+                    )
+                    .await;
+            }
+            if count < BATCH {
+                break;
+            }
         }
     }
 
@@ -2406,6 +2439,7 @@ impl<'w, 't, T: Transport, S: SystemService> ServeHost<'w, 't, T, S> {
         // The handshake drains even on an idle pass, so a host test can
         // attach a freshly minted pair without a request in flight.
         self.settle_minted();
+        self.deliver_owed_wakes().await;
         served
     }
 }
@@ -2818,6 +2852,116 @@ mod tests {
             AsyncAware::decode_rep(&client.rep.pop().expect("reply")),
             Some((Reply::Granted, 0))
         );
+    }
+
+    /// A service that publishes into its peers' auxiliary planes and owes
+    /// some of them a wake (`SystemService::take_owed_wakes`).
+    struct Owing {
+        /// Peers still owed, or `None` for a service that answers full
+        /// batches forever.
+        owed: Option<usize>,
+        asks: u32,
+    }
+
+    impl SystemService for Owing {
+        const NAME: &'static str = "owing-test";
+        type Endowment = NoCaps;
+
+        fn bind(_: NoCaps) -> Self {
+            Self { owed: Some(0), asks: 0 }
+        }
+
+        fn serve(&mut self, _: u64, sv: &mut Serve<'_, Reply>) {
+            sv.reply(Reply::Granted);
+        }
+
+        fn take_owed_wakes(&mut self, owed: &mut [Option<PeerId>]) -> usize {
+            self.asks += 1;
+            let count = match self.owed.as_mut() {
+                Some(left) => {
+                    let count = (*left).min(owed.len());
+                    *left -= count;
+                    count
+                }
+                None => owed.len(),
+            };
+            for peer in &mut owed[..count] {
+                *peer = PeerId::from_arrival(0x102);
+            }
+            count
+        }
+    }
+
+    impl SvcProtocol for Owing {
+        type Request = u64;
+        type Response = Reply;
+        type ReqWire = u64;
+        type RepWire = u64;
+
+        const REPLY_GRANTS: usize = 0;
+
+        fn encode_req(req: &u64) -> u64 {
+            *req
+        }
+
+        fn decode_req(wire: &u64) -> Option<u64> {
+            Some(*wire)
+        }
+
+        fn encode_rep(rep: &Reply, grants: u8) -> u64 {
+            DropAware::encode_rep(rep, grants)
+        }
+
+        fn decode_rep(wire: &u64) -> Option<(Reply, u8)> {
+            DropAware::decode_rep(wire)
+        }
+    }
+
+    /// The host asks for owed wakes after every pass — a served request and
+    /// an idle one alike — asks again while batches come back full, and stops
+    /// within the peer table even for a service that never stops owing. (A
+    /// notice to a peer that is not a live recyclable generation is refused
+    /// by generation, which is what a peer retired since its batch gets.)
+    #[test]
+    fn the_host_drains_owed_wakes_after_every_pass_and_bounds_the_batches() {
+        let window = {
+            let bytes = window_bytes::<Owing>(REQ_CAP, REP_CAP);
+            let layout = std::alloc::Layout::from_size_align(bytes, 64).expect("window layout");
+            // SAFETY: as `window()` above — one leaked aligned allocation.
+            unsafe {
+                let ptr = std::alloc::alloc_zeroed(layout);
+                assert!(!ptr.is_null());
+                core::slice::from_raw_parts_mut(ptr, bytes)
+            }
+        };
+        let (mut client, rings) = split_window::<Owing>(window, REQ_CAP, REP_CAP).expect("rings");
+        let endpoints = ServeEndpoints {
+            kick: SlotRef::from_wire(60),
+            grant_tx: [None; MAX_GRANTS],
+            scratch: [None; MAX_GRANTS],
+            return_post: None,
+        };
+        let transport = OkTransport::new();
+        let mut host = ServeHost::new(Owing::bind(NoCaps), &transport, rings, endpoints);
+
+        client.req.push(1).expect("request fits");
+        assert!(drive(host.serve_next()));
+        assert_eq!(host.service().asks, 1, "a pass that owes nothing asks once");
+
+        // Every peer the table holds owed at once: full batches, then the
+        // short ask that ends them.
+        let peers = host.pairs.len();
+        host.service_mut().owed = Some(peers);
+        assert!(!drive(host.serve_next()));
+        assert_eq!(host.service().asks, 1 + peers as u32 / 8 + 1);
+        assert_eq!(host.service().owed, Some(0));
+
+        // A service that never stops owing is bounded by the peer table.
+        host.service_mut().owed = None;
+        host.service_mut().asks = 0;
+        assert!(!drive(host.serve_next()));
+        let bound = host.pairs.len().div_ceil(8) as u32 + 1;
+        assert_eq!(host.service().asks, bound);
     }
 
     /// Walking return posts are host-owned reply-and-wait state: the first
