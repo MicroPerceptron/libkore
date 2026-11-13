@@ -656,36 +656,83 @@ pub(crate) fn heap_endowment() -> Option<WorkerCap> {
 pub(crate) const WAKE_SEND_RIGHTS: kore_abi::cap::Rights =
     kore_abi::cap::Rights::ACCESS.union(kore_abi::cap::Rights::DERIVE);
 
+/// [`WorkerCap`] handing a child this thread's own capability at
+/// `(role, index)`: a derive of it, of the same `kind`, holding `rights`,
+/// which the child finds under the same coordinate.
+///
+/// `None` when this thread holds nothing there, something of another kind,
+/// or a capability that cannot give `rights` to a child: its own must cover
+/// them and `DERIVE`. A share this thread cannot make is not offered, so it
+/// never fails the spawn it would have rode on. The arena record decides,
+/// which is the kernel's own word for the slot's kind and rights.
+///
+/// This is how a capability reaches every thread of a process without any
+/// thread inheriting another's holdings: each founder names what it hands on
+/// and re-derives it. Ask for `DERIVE` in `rights` when the child founds
+/// threads that are to hold it too.
+pub fn share_endowment(
+    role: u16,
+    index: u16,
+    kind: kore_abi::cap::ResourceKind,
+    rights: kore_abi::cap::Rights,
+) -> Option<WorkerCap> {
+    share_endowment_of_kind(role, index, kind as u16, rights)
+}
+
+/// [`share_endowment`] with the kind as its wire discriminant, for a caller
+/// that stored it.
+#[cfg(target_os = "none")]
+pub(crate) fn share_endowment_of_kind(
+    role: u16,
+    index: u16,
+    kind: u16,
+    rights: kore_abi::cap::Rights,
+) -> Option<WorkerCap> {
+    use kore_abi::cap::{CapRecord, Rights};
+    let rt = crate::entry::thread_context()?;
+    let subject = rt.bootstrap().handle(role, index)?;
+    let record_va = crate::entry::geometry::slot_record_va(subject)?;
+    // SAFETY: the slot alias is this thread's kernel-authored, read-only view
+    // of its own arena record for a slot its boot block names.
+    let record = unsafe { core::ptr::read_volatile(record_va as *const CapRecord) };
+    if record.kind != kind || !record.rights.contains(rights | Rights::DERIVE) {
+        return None;
+    }
+    Some(WorkerCap {
+        role,
+        index,
+        subject,
+        kind: u8::try_from(kind).ok()?,
+        rights,
+    })
+}
+
+/// Off metal no thread founds another.
+#[cfg(not(target_os = "none"))]
+pub(crate) fn share_endowment_of_kind(
+    _role: u16,
+    _index: u16,
+    _kind: u16,
+    _rights: kore_abi::cap::Rights,
+) -> Option<WorkerCap> {
+    None
+}
+
 /// [`WorkerCap`] re-deriving this thread's own `DOORBELL@PEER_BASE` send for a
 /// child, so the child's [`kick_parent`] reaches the same thread this one's
 /// does: a [`DoorbellWorker`]'s wake end, or one inherited the same way.
 ///
 /// `None` when this thread holds no such send, or holds one it may not derive
-/// from (a band peer's notice-only end, [`spmd`](crate::spmd)'s mesh): an
-/// inheritance this thread cannot make is not offered, so it never fails the
-/// spawn it would have rode on. The arena record decides, which is the
-/// kernel's own word for the slot's kind and rights.
+/// from (a band peer's notice-only end, [`spmd`](crate::spmd)'s mesh): see
+/// [`share_endowment`].
 #[cfg(target_os = "none")]
 pub(crate) fn wake_endowment() -> Option<WorkerCap> {
-    use kore_abi::cap::{CapRecord, ResourceKind};
-    let rt = crate::entry::thread_context()?;
-    let send = rt
-        .bootstrap()
-        .handle(role::DOORBELL, crate::futex::PEER_BASE)?;
-    let record_va = crate::entry::geometry::slot_record_va(send)?;
-    // SAFETY: the slot alias is this thread's kernel-authored, read-only view
-    // of its own arena record for a slot its boot block names.
-    let record = unsafe { core::ptr::read_volatile(record_va as *const CapRecord) };
-    if record.kind != ResourceKind::ChanSend as u16 || !record.rights.contains(WAKE_SEND_RIGHTS) {
-        return None;
-    }
-    Some(WorkerCap {
-        role: role::DOORBELL,
-        index: crate::futex::PEER_BASE,
-        subject: send,
-        kind: ResourceKind::ChanSend as u16 as u8,
-        rights: WAKE_SEND_RIGHTS,
-    })
+    share_endowment(
+        role::DOORBELL,
+        crate::futex::PEER_BASE,
+        kore_abi::cap::ResourceKind::ChanSend,
+        WAKE_SEND_RIGHTS,
+    )
 }
 
 impl WorkerCap {

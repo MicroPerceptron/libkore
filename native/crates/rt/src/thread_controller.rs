@@ -187,6 +187,70 @@ impl Record {
     }
 }
 
+/// A capability every thread a controller founds is founded holding, beyond
+/// the runtime's own: a share of the one its founder holds at the same
+/// boot-block coordinate ([`thread::share_endowment`]).
+///
+/// Capabilities are per thread, so a program whose threads must all act on
+/// one (park on a word of a shared window, ring a peer's doorbell) says so
+/// here, once, and each founding hands it on: the starter to the controller,
+/// the controller to each thread. A thread whose founder does not hold it is
+/// founded without it.
+///
+/// [`thread::share_endowment`]: crate::thread::share_endowment
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Handed {
+    /// The boot-block role every holder finds it under.
+    pub role: u16,
+    /// The instance within that role.
+    pub index: u16,
+    /// The kind of capability there.
+    pub kind: kore_abi::cap::ResourceKind,
+    /// The rights a thread holds it with. The controller holds `DERIVE` as
+    /// well, which is what lets it hand the share on.
+    pub rights: kore_abi::cap::Rights,
+}
+
+/// How many capabilities a controller hands on. Each costs a derive at
+/// every founding, and what a program's threads share is a face or two, not
+/// a namespace: two is a device's interrupt word and its doorbell.
+pub const MAX_HANDED: usize = 2;
+
+impl Handed {
+    /// Marks a taken entry: a vacant one is zero.
+    const TAKEN: u64 = 1 << 63;
+
+    fn pack(self) -> Option<u64> {
+        let kind = u8::try_from(self.kind as u16).ok()?;
+        Some(
+            Self::TAKEN
+                | u64::from(self.role) << 32
+                | u64::from(self.index) << 16
+                | u64::from(kind) << 8
+                | u64::from(self.rights.bits()),
+        )
+    }
+
+    /// `(role, index, kind, rights)` of a taken entry.
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+    fn unpack(word: u64) -> Option<(u16, u16, u16, kore_abi::cap::Rights)> {
+        (word & Self::TAKEN != 0).then(|| {
+            (
+                (word >> 32) as u16,
+                (word >> 16) as u16,
+                u16::from((word >> 8) as u8),
+                kore_abi::cap::Rights::from_bits_truncate(word as u8),
+            )
+        })
+    }
+
+    /// The coordinate alone: two entries for one coordinate would stamp it
+    /// twice in a thread's boot block.
+    const fn coordinate(word: u64) -> u64 {
+        word & (0xffff_ffff << 16)
+    }
+}
+
 /// Named process-owned storage. Start once during application startup and
 /// share its static reference with workers. This consumes one native thread
 /// for the process lifetime. No native ticket escapes its owner.
@@ -206,6 +270,9 @@ pub struct Controller {
     /// clients its wakes reach. A child's bit is set once it is founded and
     /// cleared before its band can be reused.
     reach: AtomicU32,
+    /// What every founding here hands on ([`Handed`], packed; zero is
+    /// vacant).
+    handed: [AtomicU64; MAX_HANDED],
     records: [Record; COUNT],
 }
 impl Default for Controller {
@@ -224,8 +291,37 @@ impl Controller {
             band: AtomicU32::new(0),
             starter: AtomicU32::new(0),
             reach: AtomicU32::new(0),
+            handed: [const { AtomicU64::new(0) }; MAX_HANDED],
             records: [const { Record::new() }; COUNT],
         }
+    }
+
+    /// Have every thread this controller founds hold `share`.
+    ///
+    /// Call before [`start`](Self::start), from any thread: the controller
+    /// thread is founded holding what was named by then, and can hand on
+    /// nothing it was not founded with. `false` when the controller has
+    /// started, the share's kind has no place in an endowment, another
+    /// share already names the coordinate, or [`MAX_HANDED`] are taken.
+    /// Naming the same share again is `true`.
+    pub fn hand_on(&self, share: Handed) -> bool {
+        let Some(word) = share.pack() else {
+            return false;
+        };
+        if self.started.load(Ordering::Acquire) != IDLE {
+            return false;
+        }
+        for entry in &self.handed {
+            match entry.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(taken) if taken == word => return true,
+                Err(taken) if Handed::coordinate(taken) == Handed::coordinate(word) => {
+                    return false;
+                }
+                Err(_) => {}
+            }
+        }
+        false
     }
 
     /// Start the owner. Concurrent/repeated calls do not create another owner.
@@ -546,8 +642,27 @@ mod owner {
 
     /// The most capabilities either founding here endows: the controller's
     /// doorbell, its own kick, the heap, the host's wake, a channel-space
-    /// grant and the starter's kick.
-    const MAX_ENDOW: usize = 6;
+    /// grant and the starter's kick, and what the program has it hand on.
+    const MAX_ENDOW: usize = 6 + super::MAX_HANDED;
+    const _: () = assert!(MAX_ENDOW <= thread::MAX_WORKER_CAPS);
+
+    /// The shares `controller` hands on, as this thread can make them:
+    /// derives of its own holdings, with `DERIVE` too when `derivable`.
+    fn handed(controller: &Controller, derivable: bool, endowment: &mut Endowment) {
+        for entry in &controller.handed {
+            let Some((role, index, kind, rights)) =
+                super::Handed::unpack(entry.load(Ordering::Acquire))
+            else {
+                continue;
+            };
+            let rights = if derivable {
+                rights | Rights::DERIVE
+            } else {
+                rights
+            };
+            endowment.push(thread::share_endowment_of_kind(role, index, kind, rights));
+        }
+    }
 
     /// A founding's endowment, filled in order.
     struct Endowment {
@@ -661,6 +776,8 @@ mod owner {
             // kick, and the starter is reached through it.
             let peer_zero = endowment.push(thread::wake_endowment());
             endowment.push(thread::channel_space_endowment());
+            // The controller hands these on to every thread it founds.
+            handed(self, true, &mut endowment);
             // Any other starter is reached at its own band's peer index.
             let reached = if starter == 0 {
                 own_kick.is_some() && peer_zero
@@ -855,6 +972,7 @@ mod owner {
             }));
             endowment.push(thread::heap_endowment());
             endowment.push(thread::wake_endowment());
+            handed(self.controller, false, &mut endowment);
             let Some(thread) = thread::spawn_founder_with_arg(
                 child_entry,
                 record as *const Record as usize,
@@ -982,6 +1100,80 @@ impl Controller {
 mod tests {
     extern crate std;
     use super::*;
+    use kore_abi::cap::{ResourceKind, Rights};
+
+    fn share(role: u16, index: u16, rights: Rights) -> Handed {
+        Handed {
+            role,
+            index,
+            kind: ResourceKind::MemLease,
+            rights,
+        }
+    }
+
+    #[test]
+    fn a_handed_share_survives_its_packing() {
+        let wanted = Handed {
+            role: 0xbeef,
+            index: 0x0108,
+            kind: ResourceKind::ChanSend,
+            rights: Rights::ACCESS | Rights::DERIVE,
+        };
+        let word = wanted.pack().expect("a channel send packs");
+        assert_ne!(word, 0, "a taken entry is never the vacant word");
+        assert_eq!(
+            Handed::unpack(word),
+            Some((
+                wanted.role,
+                wanted.index,
+                ResourceKind::ChanSend as u16,
+                wanted.rights
+            ))
+        );
+        assert_eq!(Handed::unpack(0), None, "a vacant entry hands nothing on");
+        // Role and index zero with no rights is still a taken entry.
+        let bare = share(0, 0, Rights::empty()).pack().expect("packs");
+        assert!(Handed::unpack(bare).is_some());
+    }
+
+    #[test]
+    fn a_controller_hands_on_each_coordinate_once_and_only_so_many() {
+        let controller = Controller::new();
+        let first = share(7, 8, Rights::ACCESS);
+        assert!(controller.hand_on(first));
+        assert!(controller.hand_on(first), "naming the same share again");
+        assert!(
+            !controller.hand_on(share(7, 8, Rights::ACCESS | Rights::MODIFY)),
+            "one coordinate, two shares: a boot block names a coordinate once"
+        );
+        assert!(controller.hand_on(share(7, 9, Rights::ACCESS)));
+        assert!(
+            !controller.hand_on(share(9, 9, Rights::ACCESS)),
+            "the table is full"
+        );
+        let taken = controller
+            .handed
+            .iter()
+            .filter(|entry| entry.load(Ordering::Acquire) != 0)
+            .count();
+        assert_eq!(taken, MAX_HANDED);
+    }
+
+    #[test]
+    fn a_started_controller_takes_no_more_shares() {
+        let controller = Controller::new();
+        controller.started.store(PARKING, Ordering::Release);
+        assert!(
+            !controller.hand_on(share(7, 8, Rights::ACCESS)),
+            "its thread was founded without the share and cannot hand it on"
+        );
+        assert!(
+            controller
+                .handed
+                .iter()
+                .all(|entry| entry.load(Ordering::Acquire) == 0)
+        );
+    }
     fn completed(controller: &Controller, generation: u64) -> Id {
         let record = &controller.records[0];
         record.value.store(73, Ordering::Relaxed);
