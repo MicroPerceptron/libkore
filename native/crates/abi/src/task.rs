@@ -280,9 +280,12 @@ pub mod role {
     /// the face table's slot arithmetic must never interleave with a
     /// heap tier's.
     ///
-    /// Geometry contract: [`FACE_SUPPLY_BYTES`](super::FACE_SUPPLY_BYTES)
-    /// = [`FACE_RING_STRIDE`](super::FACE_RING_STRIDE) rings — the
-    /// founder mints exactly that, the face table carves exactly that.
+    /// Geometry contract, one per carrying row: the image service's
+    /// [`FACE_SUPPLY_BYTES`](super::FACE_SUPPLY_BYTES) and a broker's
+    /// [`CLAIMANT_FACE_SUPPLY_BYTES`](super::CLAIMANT_FACE_SUPPLY_BYTES),
+    /// each a whole number of
+    /// [`FACE_RING_STRIDE`](super::FACE_RING_STRIDE) rings — the founder
+    /// mints exactly that, the face table carves exactly that.
     pub const FACE_SUPPLY: u16 = 29;
     /// Read-only machine telemetry authority, endowed only to the monitor
     /// service. The capability carries `ACCESS | DERIVE`; observation is a
@@ -462,34 +465,61 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
     DESKTOP_BOOTSTRAP_WINDOW_SLOTS + 2 * DESKTOP_CONTROLLER_CAPACITY;
 
 /// Live immutable image-generation peers the boot catalogue can hold at once:
-/// the 45-row bootstrap catalogue — the desktop's `files`, its documents
+/// the 48-row bootstrap catalogue — the desktop's `files`, its documents
 /// `editor`, `photos`, `settings` and `power-ui`, the screenshot writer `capture`, beside
 /// the native filesystem verbs `append`, `sync` and `pack`, the two
 /// WebAssembly rows, `wasm-witness` and `wasm`, `jsapp`, the JS app host,
-/// `inference` / `model-data-witness`, and `shell`, the guest shell `term`
-/// opens — plus the founded shell, the graphical terminal, and three
-/// extraction parsers.
+/// `inference` / `model-data-witness`, `shell`, the guest shell `term`
+/// opens, `tcc`, the C compiler, `ioctl`, the device tool, and `vdev-test`,
+/// the virtual accelerator's driver — plus the
+/// founded shell, the graphical terminal, and three extraction parsers.
 /// Exec asserts this covers its catalogue (`kore-svc-exec`), the one place
 /// that sees both.  Named
 /// separately from the interactive reservation below because the two grow for
 /// unrelated reasons: this one when a row joins the catalogue, that one when
 /// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 50;
+pub const BOOTSTRAP_IMAGE_PEERS: usize = 53;
+
+/// Private image generations installed at runtime that can live at once,
+/// across every session: exec's `InstallFile` rows, each a file a task
+/// compiled or copied into its own tree and made executable from its own
+/// memory supply.
+///
+/// Each one costs a ring stride of face supply here (8 × 16 KiB, 128 KiB in
+/// all) and one fixed landing in exec's convey table, which takes it from
+/// exec's low convey band: eight leave that band thirty slots, above the
+/// twelve the founder claims in it (exec asserts the band still holds
+/// them). Exec lets one client face hold at most half of these rows, so no
+/// session can exhaust the rest. Raising it costs exactly those two things;
+/// lowering it below two would let one session's install starve another's.
+pub const INSTALLED_IMAGE_PEERS: usize = 8;
 
 /// Bootstrap face-supply sizing. Image and runtime grow their face tables and
-/// rings on demand; this reserves enough initial memory for the boot catalogue
-/// and for a full desktop that can still run one command per controller.
-pub const MAX_MINTED_FACE_PAIRS: usize = BOOTSTRAP_IMAGE_PEERS + INTERACTIVE_CHILD_LOADER_FACES;
+/// rings on demand; this reserves enough initial memory for the boot
+/// catalogue, the installed generations, and a full desktop that can still
+/// run one command per controller.
+pub const MAX_MINTED_FACE_PAIRS: usize =
+    BOOTSTRAP_IMAGE_PEERS + INSTALLED_IMAGE_PEERS + INTERACTIVE_CHILD_LOADER_FACES;
 
-/// Total byte length of a [`role::FACE_SUPPLY`] endowment — exactly
-/// [`MAX_MINTED_FACE_PAIRS`] ring strides.
+/// Total byte length of the image service's [`role::FACE_SUPPLY`]
+/// endowment — exactly [`MAX_MINTED_FACE_PAIRS`] ring strides.
 /// The **cross-boundary geometry contract**: the kernel founder mints a
-/// lease (or, for the device broker, a full-span sub of the shelf-held
-/// claimant band) of exactly this length; the carrying service's face
-/// table carves its slots against the same number (its claim checks the
-/// span).  One constant, cited by both sides, so a drift refuses at
-/// bind instead of carving a phantom ring.
+/// lease of exactly this length; the image face table carves its slots
+/// against the same number (its claim checks the span).  One constant,
+/// cited by both sides, so a drift refuses at bind instead of carving a
+/// phantom ring.  The device broker carries the same role under its own
+/// contract, [`CLAIMANT_FACE_SUPPLY_BYTES`].
 pub const FACE_SUPPLY_BYTES: u64 = MAX_MINTED_FACE_PAIRS as u64 * FACE_RING_STRIDE;
+
+/// Total byte length of a device broker's [`role::FACE_SUPPLY`]
+/// endowment, its claimant band — exactly
+/// [`MAX_CLAIMANT_FACES`](crate::device::MAX_CLAIMANT_FACES) ring
+/// strides, one per driver row.  The same contract as
+/// [`FACE_SUPPLY_BYTES`]: the kernel founder mints each broker's band at
+/// this length and carves the broker's full-span sub off it, and the
+/// broker refuses readiness on any other span.
+pub const CLAIMANT_FACE_SUPPLY_BYTES: u64 =
+    crate::device::MAX_CLAIMANT_FACES as u64 * FACE_RING_STRIDE;
 
 /// **Geometry roles** — the window kinds a task learns its own VAs for from the
 /// [`GeomBlock`] (`res/USERLAND.md` §4; the fixed-VA elimination rung).  Unlike

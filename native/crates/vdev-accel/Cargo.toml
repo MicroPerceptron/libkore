@@ -1,0 +1,32 @@
+[package]
+name = "kore-vdev-accel"
+version = "0.0.1"
+edition = "2024"
+description = "kore's virtual accelerator: a virtio-accel 1.0 device with no hardware behind it, computing six functions of FP8 (E4M3) values on the CPU backend."
+publish = false
+
+[dependencies]
+# The CPU backend this device is an instance of: its registered-kernel
+# program format, its admission rules and its SPMD launch. The device adds a
+# kernel registry and nothing else.
+kore-svc-accel-spmd = { path = "../../services/accel-spmd" }
+# The device model's contract, and the transport that carries a driver to
+# an implementation of it.
+kore-vdev = { path = "../vdev" }
+# The frozen protocol (MicroPerceptron/virtio-accel 1.0), at the pin every
+# accelerator row uses. `-device` is the command engine a device runs: it
+# decodes one request frame, drives the backend and writes the response.
+# `-proto` is the frame layouts and the configuration a driver reads.
+virtio-accel-core = { version = "=0.4.1", default-features = false }
+virtio-accel-device = { version = "=0.4.1", default-features = false }
+virtio-accel-proto = { version = "=0.4.1", default-features = false }
+# The configuration a driver reads is the protocol's `WireConfig`, as bytes.
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+kore-driver = { path = "../driver", features = ["accel"] }
+kore-rt = { path = "../rt", features = ["std"] }
+# The protocol's reference driver: the session test is that driver, over
+# kore's registers and queue, against this device.
+virtio-accel-guest = { version = "=0.4.1", default-features = false }
+virtio-accel-transport = { version = "=0.4.1", default-features = false }

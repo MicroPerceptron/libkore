@@ -1,0 +1,21 @@
+[package]
+name = "kore-vdev"
+version = "0.0.1"
+edition = "2024"
+description = "kore virtual devices: the transport a driver reaches a device with no hardware behind it, as memory it shares with the device's host."
+publish = false
+
+[dependencies]
+# Bounded per-chain metadata: a chain's spans and regions are at most the
+# queue's size, so they need no heap.
+heapless = { version = "0.9.3", default-features = false }
+# The queue contracts the ring implements (MicroPerceptron/virtio-accel 1.0):
+# `DeviceQueue`, `DeviceChain`, the chain-layout rules and the reset epoch.
+# The crate is dependency-free and names no memory model, which is why the
+# ring over shared memory lives here and not there.
+virtio-accel-transport = { version = "=0.4.1", default-features = false }
+
+[dev-dependencies]
+# The protocol's own in-memory split queue: the oracle the shared-memory
+# ring is held to, chain shape by chain shape.
+virtio-accel-split-queue = { version = "=0.4.1", default-features = false }

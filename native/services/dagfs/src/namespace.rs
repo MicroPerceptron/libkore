@@ -33,7 +33,7 @@
 //! while exact edge generations govern route validity.
 
 use alloc::{boxed::Box, vec::Vec};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 use crate::{
     ServiceAlloc,
@@ -312,13 +312,29 @@ struct ObjectSnapshotView {
 /// a metadata commit. A reader never spins behind a preempted writer: it
 /// returns typed [`FsError::Busy`] and lets the bounded request retry policy
 /// decide when to revisit the snapshot.
+///
+/// `epoch` and `owed` ride the same line but outside the seqlock: each is one
+/// word with its own atomic meaning.
+///
+/// - `epoch` is a directory's **change epoch** — advanced after every change
+///   to what a listing of it shows: an edge made, removed or renamed in it,
+///   a child's length, revision or incoming count moved, or an entry made or
+///   removed in a child folder (that folder's line: its count, and whether
+///   it holds folders). It is never reset, so it stays monotone across slot
+///   reuse; the generation is what tells occupants apart. Watches compare it
+///   ([`Namespace::change_epoch`]).
+/// - `owed` marks a change to what the object's parents show of it — a
+///   file's content, a folder's entries — that could not be passed on
+///   because another commit held the object's parent row; the holder settles
+///   it on release ([`HeldParents`]).
 #[repr(align(64))]
 struct ObjectSnapshot {
     sequence: AtomicU64,
     generation: AtomicU32,
-    _pad: AtomicU32,
+    owed: AtomicU32,
     len: AtomicU64,
     dir: AtomicU64,
+    epoch: AtomicU64,
 }
 
 impl ObjectSnapshot {
@@ -326,9 +342,10 @@ impl ObjectSnapshot {
         Self {
             sequence: AtomicU64::new(0),
             generation: AtomicU32::new(0),
-            _pad: AtomicU32::new(0),
+            owed: AtomicU32::new(0),
             len: AtomicU64::new(0),
             dir: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -380,6 +397,64 @@ impl ObjectSnapshot {
             dir: (dir != 0).then(|| DirId(SlotKey::from_bits(dir))),
         })
     }
+
+    /// `id`'s change epoch, validated against the slot's occupant: a slot
+    /// reused by another object answers `AccessLost`, never its successor's
+    /// count.
+    fn read_epoch(&self, id: ObjectId) -> FsResult<u64> {
+        let before = self.sequence.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return Err(FsError::Busy);
+        }
+        let generation = self.generation.load(Ordering::Relaxed);
+        // Acquire: a caller that sees the epoch move sees the change behind
+        // it (`Namespace::touch` advances it with release order).
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let after = self.sequence.load(Ordering::Acquire);
+        if before != after {
+            return Err(FsError::Busy);
+        }
+        if generation != id.key().generation() || generation == 0 {
+            return Err(FsError::AccessLost);
+        }
+        Ok(epoch)
+    }
+}
+
+/// A claim on one object's parent row that settles, on release, a change
+/// owed to the object's parents ([`Namespace::note_shown`]).
+///
+/// Every row claim in this module goes through it, so whichever commit holds
+/// the row when a change lands is the one that passes it on: the changer
+/// marks the change owed and tries the row; a holder, after letting go,
+/// looks for the mark. The two sides store before they look, across a
+/// sequentially consistent fence each, so at least one of them sees the
+/// other — the change is never lost and never waited for.
+pub(crate) struct HeldParents<'a, K> {
+    ns: &'a Namespace<K>,
+    object: ObjectId,
+    claim: Option<ParentClaim<'a>>,
+}
+
+impl<'a, K> core::ops::Deref for HeldParents<'a, K> {
+    type Target = ParentClaim<'a>;
+    fn deref(&self) -> &Self::Target {
+        self.claim.as_ref().expect("the row is held until the guard drops")
+    }
+}
+
+impl<K> core::ops::DerefMut for HeldParents<'_, K> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.claim.as_mut().expect("the row is held until the guard drops")
+    }
+}
+
+impl<K> Drop for HeldParents<'_, K> {
+    fn drop(&mut self) {
+        drop(self.claim.take());
+        fence(Ordering::SeqCst);
+        self.ns.settle_owed(self.object);
+    }
 }
 
 /// One vacant snapshot per object slot, heap-backed for the reason recorded on
@@ -394,6 +469,87 @@ fn vacant_snapshots() -> Box<[ObjectSnapshot]> {
         snapshots.push(ObjectSnapshot::vacant());
     }
     snapshots.into_boxed_slice()
+}
+
+/// Change epochs and the parent-row guard. Nothing here depends on the
+/// provider's key type: it touches only the snapshot lines and the rows.
+impl<K> Namespace<K> {
+    fn snapshot_line(&self, id: ObjectId) -> Option<&ObjectSnapshot> {
+        usize::try_from(id.key().index())
+            .ok()
+            .and_then(|index| self.snapshots.get(index))
+    }
+
+    /// Advance `dir`'s change epoch, after the change it reports is
+    /// published (release order; [`ObjectSnapshot::read_epoch`] acquires).
+    fn touch(&self, dir: ObjectId) {
+        if let Some(line) = self.snapshot_line(dir) {
+            line.epoch.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Advance the epoch of every directory that names the row's object: what
+    /// each shows of it — its length, revision, or folder count — moved.
+    fn touch_parents(&self, row: &ParentClaim<'_>) {
+        for edge in row.iter() {
+            self.touch(edge.parent);
+        }
+    }
+
+    /// Claim `object`'s parent row through the guard that settles a content
+    /// change owed while it is held.
+    fn claim_parents(&self, object: ObjectId) -> FsResult<HeldParents<'_, K>> {
+        let claim = self.parents_of.claim(object)?;
+        Ok(HeldParents {
+            ns: self,
+            object,
+            claim: Some(claim),
+        })
+    }
+
+    /// What every directory naming `object` shows of it just changed — a
+    /// file's length and revision, or a folder's entries (its line's count,
+    /// and whether it holds folders). Marked owed first, so a commit holding
+    /// the row passes the change on when it lets go ([`HeldParents`]).
+    fn note_shown(&self, object: ObjectId) {
+        let Some(line) = self.snapshot_line(object) else {
+            return;
+        };
+        line.owed.store(1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        self.settle_owed(object);
+    }
+
+    /// Pass an owed change on to `object`'s parents, if the row is free; a
+    /// row another commit holds is that commit's to settle.
+    ///
+    /// Each pass ends by letting the row go and looking again, because a
+    /// writer that found the row held during the pass left its mark for this
+    /// side. Every pass that continues consumed such a mark, so the loop does
+    /// the writers' work and never waits for anything.
+    fn settle_owed(&self, object: ObjectId) {
+        let Some(line) = self.snapshot_line(object) else {
+            return;
+        };
+        while line.owed.load(Ordering::Relaxed) != 0 {
+            let Ok(row) = self.parents_of.claim(object) else {
+                return;
+            };
+            if line.owed.swap(0, Ordering::AcqRel) != 0 {
+                self.touch_parents(&row);
+            }
+            drop(row);
+            fence(Ordering::SeqCst);
+        }
+    }
+
+    /// `dir`'s change epoch: equal readings bracket no change to what a
+    /// listing of it shows. `AccessLost` once the directory is gone.
+    pub(crate) fn change_epoch(&self, dir: ObjectId) -> FsResult<u64> {
+        self.snapshot_line(dir)
+            .ok_or(FsError::AccessLost)?
+            .read_epoch(dir)
+    }
 }
 
 impl<K: Copy + Eq> Namespace<K> {
@@ -454,6 +610,7 @@ impl<K: Copy + Eq> Namespace<K> {
         debug_assert_eq!(object.id(), id.key());
         object.commit_len(len);
         self.snapshots[id.key().index() as usize].publish(id, len, object.dir());
+        self.note_shown(id);
         object.revision()
     }
 
@@ -1066,7 +1223,7 @@ impl<K: Copy + Eq> Namespace<K> {
         // for the edge, before publishing it, so contention cannot leave a
         // visible name without its matching count or reverse entry.
         let mut child_object = self.object_mut(child)?;
-        let mut parents = self.parents_of.claim(child)?;
+        let mut parents = self.claim_parents(child)?;
         parents.reserve()?;
         let entry = entries
             .insert(DirEntry { name: *name, child })
@@ -1075,6 +1232,12 @@ impl<K: Copy + Eq> Namespace<K> {
         child_object.incoming_inc();
         let edge = EdgeId { parent, entry };
         parents.add(edge);
+        // `parent` gained an entry, and every other folder holding the child
+        // shows one more folder count: the row names them all. `parent`'s own
+        // folders see its line change (one more entry, perhaps a first
+        // folder).
+        self.touch_parents(&parents);
+        self.note_shown(parent);
         Ok(edge)
     }
 
@@ -1093,12 +1256,15 @@ impl<K: Copy + Eq> Namespace<K> {
             .ok_or(FsError::NotFound)?;
         let edge = EdgeId { parent, entry };
         let mut child_object = self.object_mut(child)?;
-        let mut parents = self.parents_of.claim(child)?;
+        let mut parents = self.claim_parents(child)?;
         entries
             .try_remove(edge.entry)
             .map_err(|error| fs_access(error, FsError::AccessLost))?;
         child_object.incoming_dec();
         parents.remove(edge);
+        self.touch(parent);
+        self.touch_parents(&parents);
+        self.note_shown(parent);
         Ok((edge, child))
     }
 
@@ -1130,7 +1296,7 @@ impl<K: Copy + Eq> Namespace<K> {
             return Err(FsError::NotEmpty);
         }
         let mut child_object = self.object_mut(child)?;
-        let mut parents = self.parents_of.claim(child)?;
+        let mut parents = self.claim_parents(child)?;
         claims
             .get_mut(parent)?
             .try_remove(entry)
@@ -1138,6 +1304,9 @@ impl<K: Copy + Eq> Namespace<K> {
         child_object.incoming_dec();
         let edge = EdgeId { parent, entry };
         parents.remove(edge);
+        self.touch(parent);
+        self.touch_parents(&parents);
+        self.note_shown(parent);
         Ok((edge, child))
     }
 
@@ -1166,6 +1335,9 @@ impl<K: Copy + Eq> Namespace<K> {
             .try_write(edge.entry)
             .map_err(|error| fs_access(error, FsError::AccessLost))?;
         entry.name = *new;
+        // Only `parent` spells the edge: the child's other folders show it
+        // under their own names, unchanged.
+        self.touch(parent);
         Ok(edge)
     }
 
@@ -1243,7 +1415,7 @@ impl<K: Copy + Eq> Namespace<K> {
 
         // The child's parent row moves with the edge; it is claimed on its
         // own, so a file mid-transaction can still be moved.
-        let mut parents = self.parents_of.claim(child)?;
+        let mut parents = self.claim_parents(child)?;
 
         // Commit: retire the source edge, then create the destination edge.
         claims
@@ -1261,6 +1433,16 @@ impl<K: Copy + Eq> Namespace<K> {
         // is deliberately not touched here; the parent row swaps in place.
         let dst_edge = EdgeId { parent: dst, entry };
         parents.replace(src_edge, dst_edge);
+        // The source lost an entry; the row now names the destination and
+        // every other folder, whose "located in" for the child moved.
+        self.touch(src);
+        self.touch_parents(&parents);
+        // Across folders, each one's line moved (one entry fewer, one more);
+        // within one folder only a spelling changed.
+        if src != dst {
+            self.note_shown(src);
+            self.note_shown(dst);
+        }
         Ok((src_edge, dst_edge))
     }
 
@@ -1360,7 +1542,7 @@ impl<K: Copy + Eq> Namespace<K> {
     /// `object`'s incoming edges, copied out of its parent row so no claim
     /// is held while they are walked.
     fn incoming_edges(&self, object: ObjectId) -> FsResult<BoundedVec<EdgeId, ServiceAlloc>> {
-        let row = self.parents_of.claim(object)?;
+        let row = self.claim_parents(object)?;
         let mut edges = BoundedVec::try_new_in(row.len(), crate::service_alloc())
             .map_err(|_| FsError::OutOfObjects)?;
         for edge in row.iter() {
@@ -1486,7 +1668,7 @@ impl<K: Copy + Eq> Namespace<K> {
         child_ids.as_mut_slice().sort_unstable_by_key(|id| id.key());
 
         let mut children = heapless::Vec::<
-            (ObjectId, ObjectWrite<'_, K>, ParentClaim<'_>),
+            (ObjectId, ObjectWrite<'_, K>, HeldParents<'_, K>),
             MAX_DIR_ENTRIES,
         >::new();
         for child in child_ids {
@@ -1494,14 +1676,14 @@ impl<K: Copy + Eq> Namespace<K> {
                 .objects
                 .try_write(child.key())
                 .map_err(|error| fs_access(error, FsError::AccessLost))?;
-            let parents = self.parents_of.claim(child)?;
+            let parents = self.claim_parents(child)?;
             children
                 .push((child, claimed, parents))
                 .map_err(|_| FsError::OutOfObjects)?;
         }
         // The reclaimed object names nothing once it is gone; its own row
         // is emptied with it (it is already empty: nothing names it).
-        let mut own_parents = self.parents_of.claim(id)?;
+        let mut own_parents = self.claim_parents(id)?;
 
         // All-or-nothing commit: decrement once per removed edge, and drop
         // its reverse entry, then record only the child generations that
@@ -1521,12 +1703,14 @@ impl<K: Copy + Eq> Namespace<K> {
         }
         own_parents.clear();
         let mut became_reclaimable = heapless::Vec::new();
-        for (id, child, _) in children.iter() {
+        for (id, child, parents) in children.iter() {
             if child.is_reclaimable() {
                 became_reclaimable
                     .push(*id)
                     .map_err(|_| FsError::OutOfObjects)?;
             }
+            // A child that keeps a folder elsewhere shows one fewer there.
+            self.touch_parents(parents);
         }
 
         if let Some(entries) = directory.take() {
@@ -2741,6 +2925,211 @@ mod tests {
         ns.note_leaked_placement();
         ns.note_leaked_placement();
         assert_eq!(ns.leaked_placements(), 2);
+    }
+
+    // ── change epochs ───────────────────────────────────────────────────────
+
+    /// Whether `dir`'s change epoch moved since `before`, and the new reading.
+    fn moved(ns: &Ns, dir: ObjectId, before: &mut u64) -> bool {
+        let now = ns.change_epoch(dir).unwrap();
+        let moved = now != *before;
+        *before = now;
+        moved
+    }
+
+    #[test]
+    fn every_change_a_listing_or_a_folder_line_shows_moves_its_epoch_and_nothing_else_does() {
+        let (mut ns, root) = ns_with_root();
+        let a = ns.create_dir_object().unwrap();
+        let b = ns.create_dir_object().unwrap();
+        ns.link(root, &name("a"), a).unwrap();
+        ns.link(root, &name("b"), b).unwrap();
+        let file = ns.create_file_object().unwrap();
+        let (mut at_a, mut at_b, mut at_root) = (
+            ns.change_epoch(a).unwrap(),
+            ns.change_epoch(b).unwrap(),
+            ns.change_epoch(root).unwrap(),
+        );
+
+        // An entry made in `a`: `a` shows it, and `root` shows `a`'s line
+        // with one more entry. `b` shows nothing new.
+        ns.link(a, &name("f"), file).unwrap();
+        assert!(moved(&ns, a, &mut at_a));
+        assert!(moved(&ns, root, &mut at_root));
+        assert!(!moved(&ns, b, &mut at_b));
+
+        // A second folder for the file: `b` gains an entry (and its line in
+        // `root` moves), and `a` shows one more folder count for it.
+        ns.link(b, &name("g"), file).unwrap();
+        assert!(moved(&ns, b, &mut at_b));
+        assert!(moved(&ns, a, &mut at_a));
+        assert!(moved(&ns, root, &mut at_root));
+
+        // A rename is one folder's spelling only: its line's count holds.
+        ns.rename(b, &name("g"), &name("h")).unwrap();
+        assert!(moved(&ns, b, &mut at_b));
+        assert!(!moved(&ns, a, &mut at_a));
+        assert!(!moved(&ns, root, &mut at_root));
+
+        // A content commit reaches every folder naming the file, and no
+        // folder line: the folders' entries are unchanged.
+        {
+            let mut object = ns.object_mut(file).unwrap();
+            ns.commit_file_len(file, &mut object, 12);
+        }
+        assert!(moved(&ns, a, &mut at_a));
+        assert!(moved(&ns, b, &mut at_b));
+        assert!(!moved(&ns, root, &mut at_root));
+
+        // A move: the source loses an entry, the destination gains one, the
+        // file's other folder sees its location move, and both folders'
+        // lines move in `root`.
+        let c = ns.create_dir_object().unwrap();
+        ns.link(root, &name("c"), c).unwrap();
+        assert!(moved(&ns, root, &mut at_root));
+        let mut at_c = ns.change_epoch(c).unwrap();
+        ns.relocate(b, &name("h"), c, &name("h")).unwrap();
+        assert!(moved(&ns, b, &mut at_b));
+        assert!(moved(&ns, c, &mut at_c));
+        assert!(moved(&ns, a, &mut at_a));
+        assert!(moved(&ns, root, &mut at_root));
+
+        // A move within one folder is a spelling: its line holds.
+        ns.relocate(c, &name("h"), c, &name("i")).unwrap();
+        assert!(moved(&ns, c, &mut at_c));
+        assert!(!moved(&ns, root, &mut at_root));
+
+        // Removing a name: the folder loses it, the other shows one fewer,
+        // and the folder's line moves.
+        ns.detach(c, &name("i")).unwrap();
+        assert!(moved(&ns, c, &mut at_c));
+        assert!(moved(&ns, a, &mut at_a));
+        assert!(moved(&ns, root, &mut at_root));
+        ns.unlink_empty(a, &name("f")).unwrap();
+        assert!(moved(&ns, a, &mut at_a));
+        assert!(moved(&ns, root, &mut at_root));
+
+        // A refused change moves nothing.
+        assert_eq!(ns.rename(a, &name("absent"), &name("x")).unwrap_err(), FsError::NotFound);
+        assert_eq!(ns.detach(a, &name("absent")).unwrap_err(), FsError::NotFound);
+        assert!(!moved(&ns, a, &mut at_a));
+        assert!(!moved(&ns, root, &mut at_root));
+    }
+
+    #[test]
+    fn a_folder_line_change_meeting_its_held_parent_row_is_passed_on_by_the_holder() {
+        let (mut ns, root) = ns_with_root();
+        let a = ns.create_dir_object().unwrap();
+        ns.link(root, &name("a"), a).unwrap();
+        let file = ns.create_file_object().unwrap();
+        let mut at_root = ns.change_epoch(root).unwrap();
+
+        // A commit holds `a`'s own row (a move of `a`, a parents walk) while
+        // an entry lands in `a`: the linker cannot reach `a`'s folders.
+        let held = ns.claim_parents(a).unwrap();
+        ns.link(a, &name("f"), file).unwrap();
+        assert!(!moved(&ns, root, &mut at_root), "the linker left the change owed");
+        drop(held);
+        assert!(moved(&ns, root, &mut at_root), "the holder passed it on");
+        drop(ns.claim_parents(a).unwrap());
+        assert!(!moved(&ns, root, &mut at_root), "owed once, settled once");
+    }
+
+    #[test]
+    fn a_reclaimed_directory_answers_access_lost_and_its_children_s_other_folders_move() {
+        let (mut ns, root) = ns_with_root();
+        let doomed = ns.create_dir_object().unwrap();
+        let kept = ns.create_dir_object().unwrap();
+        let file = ns.create_file_object().unwrap();
+        ns.link(root, &name("doomed"), doomed).unwrap();
+        ns.link(root, &name("kept"), kept).unwrap();
+        ns.link(doomed, &name("f"), file).unwrap();
+        ns.link(kept, &name("f"), file).unwrap();
+        let mut at_kept = ns.change_epoch(kept).unwrap();
+
+        let (_, child) = ns.detach(root, &name("doomed")).unwrap();
+        let mut placements: BoundedVec<u32, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
+        let mut objects: BoundedVec<ObjectId, ServiceAlloc> =
+            BoundedVec::try_new_in(MAX_OBJECTS, crate::service_alloc()).unwrap();
+        assert_eq!(ns.reclaim(child, &mut placements, &mut objects), 1);
+        assert_eq!(ns.change_epoch(doomed), Err(FsError::AccessLost));
+        assert!(moved(&ns, kept, &mut at_kept), "the file is in one folder fewer");
+
+        // A slot reused by another directory never answers for the old one.
+        let successor = ns.create_dir_object().unwrap();
+        assert_eq!(ns.change_epoch(doomed), Err(FsError::AccessLost));
+        assert!(ns.change_epoch(successor).is_ok());
+    }
+
+    #[test]
+    fn a_content_change_meeting_a_held_parent_row_is_passed_on_by_the_holder() {
+        let (mut ns, root) = ns_with_root();
+        let a = ns.create_dir_object().unwrap();
+        ns.link(root, &name("a"), a).unwrap();
+        let file = ns.create_file_object().unwrap();
+        ns.link(a, &name("f"), file).unwrap();
+        let mut at_a = ns.change_epoch(a).unwrap();
+
+        // A commit holds the file's row (a move, a parents walk) while the
+        // file's bytes commit: the writer cannot touch the parents itself.
+        let held = ns.claim_parents(file).unwrap();
+        {
+            let mut object = ns.object_mut(file).unwrap();
+            ns.commit_file_len(file, &mut object, 3);
+        }
+        assert!(!moved(&ns, a, &mut at_a), "the writer left the change owed");
+        drop(held);
+        assert!(moved(&ns, a, &mut at_a), "the holder passed it on");
+        // Owed once, settled once.
+        drop(ns.claim_parents(file).unwrap());
+        assert!(!moved(&ns, a, &mut at_a));
+    }
+
+    #[test]
+    fn concurrent_writers_and_row_holders_never_lose_a_content_change() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let (mut ns, root) = ns_with_root();
+        let a = ns.create_dir_object().unwrap();
+        ns.link(root, &name("a"), a).unwrap();
+        let file = ns.create_file_object().unwrap();
+        ns.link(a, &name("f"), file).unwrap();
+        let ns = Arc::new(ns);
+        let stop = Arc::new(AtomicBool::new(false));
+        // A holder thread keeps taking and letting go of the row, as parents
+        // walks and moves do.
+        let holder = {
+            let (ns, stop) = (Arc::clone(&ns), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(row) = ns.claim_parents(file) {
+                        core::hint::spin_loop();
+                        drop(row);
+                    }
+                }
+            })
+        };
+        for len in 0..2_000u64 {
+            let before = ns.change_epoch(a).unwrap();
+            {
+                let mut object = ns.object_mut(file).unwrap();
+                ns.commit_file_len(file, &mut object, len);
+            }
+            // Either side settles it; once both have let go, the change is in.
+            let mut settled = false;
+            for _ in 0..1_000_000 {
+                if ns.change_epoch(a).unwrap() != before {
+                    settled = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(settled, "write {len} was never passed on");
+        }
+        stop.store(true, Ordering::Relaxed);
+        holder.join().unwrap();
     }
 
     /// Write `value` as decimal ASCII into `buf`, returning the byte count.

@@ -29,6 +29,17 @@ pub use kore_rt::{thread, thread_controller};
 #[cfg(feature = "driver")]
 pub use kore_driver as driver;
 
+/// A driver's side of a virtual device, a device with no hardware behind it
+/// that Kore's virtual-device service hosts for a driver to be written
+/// against: the register block and the views of shared memory
+/// (`kore-vdev`), and the service's client (`kore-svc-vdev`, built without
+/// the service or any device model).
+#[cfg(feature = "vdev")]
+pub mod vdev {
+    pub use kore_svc_vdev::{client, face, wire};
+    pub use kore_vdev::{driver, mem, regs};
+}
+
 /// Native clocks and deadlines; wall time never coerces into monotonic time.
 pub mod time {
     pub use core::time::Duration;

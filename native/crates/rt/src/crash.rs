@@ -112,10 +112,23 @@ pub fn register(
 
 /// Returning executables share the same recursion-safe diagnostic path.
 pub fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    if crate::entry::begin_panic() {
+    report(info);
+    crate::thread::exit(crate::ExitCode::PANIC)
+}
+
+/// [`panic`]'s report without its exit: publish this thread's panic record
+/// once (a panic raised while reporting reports nothing more), and return.
+///
+/// For a panic handler that must act between the report and the thread's
+/// end — a host that ends the whole process on a worker's panic tells the
+/// host only once the record is published, so the host's barrier cannot cut
+/// the report short. `true` when this call published the record.
+pub fn report(info: &core::panic::PanicInfo<'_>) -> bool {
+    let first = crate::entry::begin_panic();
+    if first {
         report_panic_info(info);
     }
-    crate::thread::exit(crate::ExitCode::PANIC)
+    first
 }
 
 /// Best-effort software report. The entry panic handler has claimed recursion

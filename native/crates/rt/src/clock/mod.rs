@@ -92,6 +92,24 @@ pub(crate) fn monotonic_nanos() -> Option<u64> {
     uptime().ok().map(Uptime::as_nanos)
 }
 
+/// Monotonic nanoseconds now, for a thread that names a deadline to the
+/// kernel: the calibrated counter where the task has one, and the kernel's
+/// own stamp where it has none.
+///
+/// A target without a calibrated user clock (an emulator with no invariant
+/// counter, a thread founded before the clock page) can still park against
+/// a deadline, because the kernel keeps the time: a sleep to an instant
+/// already past resolves at once and returns the kernel's clock, in whole
+/// milliseconds. That costs a trap and is a millisecond coarse, so the
+/// answer may be up to a millisecond behind; a deadline made from it is
+/// never early by more than that. `None` only where the thread cannot trap
+/// at all (a host build).
+pub fn deadline_base_nanos() -> Option<u64> {
+    monotonic_nanos().or_else(|| {
+        crate::cap::verbs::sleep_until(1).map(|stamp| (stamp >> 32).saturating_mul(1_000_000))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

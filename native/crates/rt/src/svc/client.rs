@@ -487,6 +487,21 @@ pub enum AffineBundleCallError<A, B, C> {
     AfterTransfer(CallError),
 }
 
+/// Failure of a context-bundle call
+/// ([`call_with_context_bundle`](SvcClient::call_with_context_bundle)): the
+/// [`AffineBundleCallError`] discipline for a bundle with no executable
+/// member, so no witness and no first input.
+#[derive(Debug)]
+pub enum ContextBundleCallError<B, C> {
+    NotMoved {
+        error: CallError,
+        second: B,
+        third: C,
+        auxiliaries: [Option<InvocationAuxiliary>; MAX_INVOCATION_AUXILIARIES],
+    },
+    AfterTransfer(CallError),
+}
+
 /// Failure of a return call whose transferred capability is freshly staged
 /// inside the transfer session.
 ///
@@ -2260,6 +2275,170 @@ impl<'w, 't, T: Transport, S: SvcProtocol> SvcClient<'w, 't, T, S> {
                 drop(auxiliaries);
                 self.poison();
                 Err(AffineBundleCallError::AfterTransfer(error))
+            }
+        }
+    }
+
+    /// Move a service request and its context bundle in one atomic session
+    /// — [`call_with_invocation_bundle`](Self::call_with_invocation_bundle)
+    /// without the executable member. Such a request names no generation to
+    /// invoke, so it carries no witness and no input sent through an
+    /// executable endpoint; the receiver correlates the bundle with the
+    /// request by the data the request itself carries. Every other step is
+    /// the invocation's, with its helpers: the same preflights before the
+    /// request record is published, the same single transfer session, and
+    /// the same fail-closed poisoning once the record is visible.
+    pub async fn call_with_context_bundle<B: ReturnCapability, C: ReturnCapability>(
+        &mut self,
+        req: &S::Request,
+        second: B,
+        second_rights: Rights,
+        process_tx: SlotRef,
+        third: C,
+        third_rights: Rights,
+        third_tx: SlotRef,
+        auxiliaries: [Option<InvocationAuxiliary>; MAX_INVOCATION_AUXILIARIES],
+        auxiliary_tx: [SlotRef; MAX_INVOCATION_AUXILIARIES],
+    ) -> Result<CallReply<S::Response>, ContextBundleCallError<B, C>> {
+        macro_rules! not_moved {
+            ($error:expr) => {
+                ContextBundleCallError::NotMoved {
+                    error: $error,
+                    second,
+                    third,
+                    auxiliaries,
+                }
+            };
+        }
+
+        if let Err(error) = self.require_idle() {
+            return Err(not_moved!(error));
+        }
+        // Check every destination before the record is published: see the
+        // invocation bundle's note on why a post-publication rollback cannot
+        // be undone.
+        if ![process_tx, third_tx]
+            .into_iter()
+            .all(live_send_destination)
+            || auxiliaries
+                .iter()
+                .zip(auxiliary_tx)
+                .any(|(auxiliary, destination)| {
+                    auxiliary.is_some() && !live_send_destination(destination)
+                })
+        {
+            return Err(not_moved!(CallError::Refused(Status::Revoked)));
+        }
+        let request = S::encode_req(req);
+        let grants = match self.prepare_call(&request) {
+            Ok(grants) => grants,
+            Err(error) => return Err(not_moved!(error)),
+        };
+        if self.rings.req.capacity_left() == 0 {
+            return Err(not_moved!(CallError::RingFull));
+        }
+        if let Err(error) = self.ensure_grant_posts(grants).await {
+            return Err(not_moved!(error));
+        }
+        let second_slot = match preflight_return_send(&second, second_rights) {
+            Ok(slot) => slot,
+            Err(error) => return Err(not_moved!(error)),
+        };
+        let third_slot = match preflight_return_send(&third, third_rights) {
+            Ok(slot) => slot,
+            Err(error) => return Err(not_moved!(error)),
+        };
+        let mut source_slots = [SlotRef::from_wire(0); 2 + MAX_INVOCATION_AUXILIARIES];
+        source_slots[0] = second_slot;
+        source_slots[1] = third_slot;
+        let mut source_count = 2;
+        for auxiliary in auxiliaries.iter().flatten() {
+            let checked = match auxiliary.transfer {
+                AuxiliaryTransfer::Derived => {
+                    preflight_return_send(&auxiliary.capability, auxiliary.rights)
+                }
+                AuxiliaryTransfer::Exact => preflight_exact_return(&auxiliary.capability),
+            };
+            let slot = match checked {
+                Ok(slot) => slot,
+                Err(error) => return Err(not_moved!(error)),
+            };
+            source_slots[source_count] = slot;
+            source_count += 1;
+        }
+        if !invocation_sources_are_distinct(&source_slots[..source_count]) {
+            return Err(not_moved!(CallError::Refused(Status::Malformed)));
+        }
+
+        let mut transfer = SessionBuilder::new();
+        let mut malformed = transfer
+            .send(process_tx, second_slot, second_rights)
+            .and_then(|_| transfer.send(third_tx, third_slot, third_rights))
+            .is_err();
+        for (auxiliary, destination) in auxiliaries.iter().zip(auxiliary_tx) {
+            if malformed {
+                break;
+            }
+            let Some(auxiliary) = auxiliary.as_ref() else {
+                continue;
+            };
+            let Some(slot) = return_capability_sealed::Sealed::return_slot(&auxiliary.capability)
+            else {
+                return Err(not_moved!(CallError::Refused(Status::Revoked)));
+            };
+            malformed = match auxiliary.transfer {
+                AuxiliaryTransfer::Derived => {
+                    transfer.send(destination, slot, auxiliary.rights).is_err()
+                }
+                AuxiliaryTransfer::Exact => transfer.send_exact(destination, slot).is_err(),
+            };
+        }
+        if malformed {
+            return Err(not_moved!(CallError::Refused(Status::Malformed)));
+        }
+
+        let observation = ReplyObservation::begin(None).await;
+        if self.rings.req.push(request).is_err() {
+            return Err(not_moved!(CallError::RingFull));
+        }
+        let committed = match self.transport.commit(&transfer).await {
+            Ok(committed) => committed,
+            Err(_) => {
+                drop(second);
+                drop(third);
+                drop(auxiliaries);
+                self.poison();
+                return Err(ContextBundleCallError::AfterTransfer(CallError::Transport));
+            }
+        };
+        match classify_return_commit(committed, transfer.staged(), ReturnSource::Held) {
+            ReturnCommit::Moved => {
+                return_capability_sealed::Sealed::on_proven_moved(second);
+                return_capability_sealed::Sealed::on_proven_moved(third);
+                for auxiliary in auxiliaries.into_iter().flatten() {
+                    return_capability_sealed::Sealed::on_proven_moved(auxiliary.capability);
+                }
+                self.state = ClientState::AwaitingReply { request };
+                self.kick_published_request()
+                    .await
+                    .map_err(ContextBundleCallError::AfterTransfer)?;
+                self.collect_reply(observation)
+                    .await
+                    .map_err(ContextBundleCallError::AfterTransfer)
+            }
+            ReturnCommit::NotMoved(error) => {
+                // Custody stayed local, but the record is already visible
+                // and the ring has no rollback: fail closed, as the
+                // invocation bundle does.
+                self.poison();
+                Err(not_moved!(error))
+            }
+            ReturnCommit::AfterTransfer(error) => {
+                drop(second);
+                drop(third);
+                drop(auxiliaries);
+                self.poison();
+                Err(ContextBundleCallError::AfterTransfer(error))
             }
         }
     }

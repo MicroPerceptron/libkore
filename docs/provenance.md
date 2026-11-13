@@ -318,3 +318,36 @@ three ISAs. The Zig namespace and the `stdlib.h`/`pthread.h` aliases derive from
 that header's function list alone, so they are current as well. Not run locally:
 `zig fmt`, `test-foreign`, the rest of `bindings-check` and `kore-lua`'s
 Kore-target build; CI's host job runs them.
+
+## A C program's runtime, over Kore #1494's kore-rt
+
+The export records Kore `0018956a3aca19dc6acea8d28fb8ec9fadefcb09`, a commit
+on MicroPerceptron/kore#1494's branch, which brings TinyCC to Kore's shell.
+Eleven of the 26 commits since `7074bda2` reach the closure, which keeps its
+26 packages and 382 files:
+
+- `kore-rt` carries what `kore-c`'s host needs:
+  - `startup::barrier`, the process barrier without the exit;
+  - managed threads that inherit their founder's wake send;
+  - `crash::report`, a panic's report without the thread's end;
+  - also a per-thread C `errno` word, guarded worker stacks sized in bytes,
+    and the verbs and bundle call a shell's private install takes.
+- `kore-rt`'s thread controller, which `kore-ffi`'s pthreads run on, parks
+  on the futex and never polls (Kore `0018956a`). Its threads get their own
+  doorbells and the controller relays the wakes they cannot deliver to each
+  other. A thread's end reaches it through the exit hook `thread::exit`
+  runs, and its reap parks on a join arm. Here `kore-ffi`'s join parks on
+  its retirement word, which the controller wakes. `kore-c`'s main thread
+  holds a channel-space grant to mint the controller's doorbells from.
+- `kore-abi` carries the install request and its replies, and the claimant
+  band sized by driver rows (`MAX_CLAIMANT_FACES`), which the device service
+  uses.
+- The services' `boot.toml` digests were resealed three times.
+
+No exported manifest changed, so `native/Cargo.lock` did not.
+
+`kore-c` is new: the runtime of `libkore.so`, and the host of an independent
+C program (`docs/languages.md`). It is the first libkore package a C program
+on Kore links without a Rust host. Its shared object is a distribution's
+one-line `cdylib` over it. `tools/check-program.py` links that object for the
+three Kore ISAs and checks its shape and its exact exported ABI.

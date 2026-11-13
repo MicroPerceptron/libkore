@@ -19,6 +19,14 @@ def generate(check=False):
         subprocess.run([generator, '--config', 'crates/ffi/cbindgen.toml', '--crate', 'kore-ffi',
                         '--output', str(header)], cwd=ROOT, check=True)
         source = header.read_text()
+        # What libkore.so adds for an independent C program; it includes kore.h
+        # and declares none of its types again.
+        program_header = Path(directory) / 'program.h'
+        subprocess.run([generator, '--config', 'crates/c/cbindgen.toml', '--crate', 'kore-c',
+                        '--output', str(program_header)], cwd=ROOT, check=True)
+        program = program_header.read_text()
+    if 'kore_fs_run' not in program:
+        raise SystemExit('missing program export: kore_fs_run')
     # cbindgen is the declaration authority. This step only groups exported
     # names; it never reproduces signatures or guesses C/Rust type layouts.
     functions = sorted(set(re.findall(r'\b(kore_[a-z][a-z0-9_]*)\s*\(', source)))
@@ -72,7 +80,8 @@ def generate(check=False):
     pthread += '#define pthread_cleanup_pop(execute) kore_thread_cleanup_pop(&_kore_cleanup, (execute)); } while (0)\n'
     pthread += '#endif\n'
     for relative, data in [('extern/c/include/kore.h', source), ('extern/zig/src/root.zig', zig),
-                           ('extern/c/include/kore/stdlib.h', stdlib), ('extern/c/include/kore/pthread.h', pthread)]:
+                           ('extern/c/include/kore/stdlib.h', stdlib), ('extern/c/include/kore/pthread.h', pthread),
+                           ('extern/c/include/kore/program.h', program)]:
         path = ROOT / relative
         if check:
             if not path.exists() or path.read_text() != data:

@@ -58,6 +58,10 @@ pub(crate) enum RoutedRequest {
     /// A storage-ring verb: neither engine's; served by the row that owns
     /// the controller (`res/STORAGE_TRANSPORT.md` §4).
     Stor(FsRequest),
+    /// Arm a watch on a directory of one store. The request's handle is
+    /// native to that store; the plane it publishes into is the pair's one,
+    /// which the primary frontend holds.
+    Watch(Store, FsRequest),
 }
 
 #[inline]
@@ -435,6 +439,13 @@ pub(crate) fn route(request: FsRequest, has_system: bool) -> Result<RoutedReques
             let (store, handle) = split_handle(handle);
             RoutedRequest::One(store, Sync { handle })
         }
+        Watch { handle, slot, tag } => {
+            let (store, handle) = split_handle(handle);
+            RoutedRequest::Watch(store, Watch { handle, slot, tag })
+        }
+        // Disarming names no handle: the pair's one plane, in the primary
+        // frontend, holds every slot, whichever store the slot watched.
+        Unwatch { .. } => RoutedRequest::One(Store::User, request),
         LendVersion {
             handle,
             window_offset,
@@ -541,7 +552,11 @@ pub(crate) fn route(request: FsRequest, has_system: bool) -> Result<RoutedReques
         }
     };
 
-    if matches!(routed, RoutedRequest::One(Store::System, _)) && !has_system {
+    if matches!(
+        routed,
+        RoutedRequest::One(Store::System, _) | RoutedRequest::Watch(Store::System, _)
+    ) && !has_system
+    {
         Err(FsError::InvalidHandle)
     } else {
         Ok(routed)

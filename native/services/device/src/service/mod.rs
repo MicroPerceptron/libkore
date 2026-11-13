@@ -3,7 +3,7 @@
 
 use kore_abi::device::{DeviceRecord, DeviceSpecies};
 use kore_abi::session::SlotRef;
-use kore_abi::task::{FACE_RING_STRIDE, FACE_SUPPLY_BYTES, role};
+use kore_abi::task::{CLAIMANT_FACE_SUPPLY_BYTES, FACE_RING_STRIDE, role};
 use kore_rt::cap::{PlatformBusToken, RootComplexToken, SupplyToken, verbs};
 use kore_rt::entry::FixedSlotBand;
 use kore_rt::service::{
@@ -34,8 +34,11 @@ pub const DEVICE_GRANT_RIGHTS: Rights = verbs::DEVICE_OWNER_RIGHTS;
 
 /// Claimant faces the broker's [`role::FACE_SUPPLY`] band strides into —
 /// the geometry contract's own quotient, so the count can never disagree
-/// with the span the founder mints.
-pub const FACE_COUNT: usize = (FACE_SUPPLY_BYTES / FACE_RING_STRIDE) as usize;
+/// with the span the founder mints: one face per driver row
+/// ([`MAX_CLAIMANT_FACES`](kore_abi::device::MAX_CLAIMANT_FACES)).
+pub const FACE_COUNT: usize = (CLAIMANT_FACE_SUPPLY_BYTES / FACE_RING_STRIDE) as usize;
+
+const _: () = assert!(FACE_COUNT == kore_abi::device::MAX_CLAIMANT_FACES);
 
 /// The first minted face's [`Serve::via`] identity.  Minted vias start at
 /// [`MAX_SERVE_PAIRS`](kore_rt::svc::MAX_SERVE_PAIRS) — the host's rule
@@ -58,6 +61,14 @@ pub const FACE_VIA_BASE: u16 = kore_rt::svc::MAX_SERVE_PAIRS as u16;
 const FACE_LAND_BASE: u32 =
     kore_abi::task::MAX_BOOT_HANDLES as u32 + kore_rt::entry::SERVE_SCRATCH_SLOTS as u32 + 2;
 const FACE_LAND_END: u32 = FACE_LAND_BASE + 2 * FACE_COUNT as u32;
+
+// `claim_fixed_slot_band` admits nothing at or past the startup-link band,
+// so a band that crosses it refuses readiness (detail 0x204) on every
+// machine. Checked here, where the face count and the band meet.
+const _: () = assert!(
+    FACE_LAND_END <= kore_rt::entry::STARTUP_LINK_SLOT_BASE,
+    "the claimant landing band must end below the startup-link band"
+);
 
 /// A conveyed face leg must at least be postable by the broker.
 const FACE_LEG_RIGHTS: Rights = Rights::ACCESS;
@@ -915,11 +926,11 @@ impl SystemService for DeviceBroker {
             if <Self as kore_rt::svc::SvcProtocol>::SERVE_PAIRS > 1 {
                 return Err(StartFailure::new(0x205));
             }
-            if supply.len() != FACE_SUPPLY_BYTES {
+            if supply.len() != CLAIMANT_FACE_SUPPLY_BYTES {
                 return Err(StartFailure::new(0x200));
             }
             let win = verbs::map_held_rw(supply.slot()).ok_or_else(|| StartFailure::new(0x201))?;
-            if win.len() < FACE_SUPPLY_BYTES as usize {
+            if win.len() < CLAIMANT_FACE_SUPPLY_BYTES as usize {
                 return Err(StartFailure::new(0x202));
             }
             let band = rt
@@ -1178,7 +1189,7 @@ impl SystemService for DeviceBroker {
                         // image face table's recycled-slot hygiene.
                         // SAFETY: the view is live for the task's life
                         // (mapped once at start, length gated ≥
-                        // FACE_SUPPLY_BYTES there); this face is not Live,
+                        // CLAIMANT_FACE_SUPPLY_BYTES there); this face is not Live,
                         // so no attached pair aliases this stride
                         // (occupancy is the exclusion discipline); the
                         // `&mut` ends before the spec is exposed.
@@ -1370,11 +1381,15 @@ mod face_tests {
     }
 
     /// The band geometry quotient: the face count times the stride is
-    /// exactly the supply span the founder mints (`FACE_SUPPLY_BYTES`),
-    /// and the landing band holds exactly two slots per face.
+    /// exactly the supply span the founder mints
+    /// (`CLAIMANT_FACE_SUPPLY_BYTES`), and the landing band holds exactly
+    /// two slots per face.
     #[test]
     fn the_face_geometry_is_the_contracts_quotient() {
-        assert_eq!(FACE_COUNT as u64 * FACE_RING_STRIDE, FACE_SUPPLY_BYTES);
+        assert_eq!(
+            FACE_COUNT as u64 * FACE_RING_STRIDE,
+            CLAIMANT_FACE_SUPPLY_BYTES
+        );
         assert_eq!(FACE_LAND_END - FACE_LAND_BASE, 2 * FACE_COUNT as u32);
     }
 }

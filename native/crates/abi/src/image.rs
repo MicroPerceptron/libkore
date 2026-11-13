@@ -180,6 +180,18 @@ pub const PROFILE_MODEL_DATA: u32 = 1 << 13;
 /// facilities every window preset is built on.
 pub const PROFILE_WINDOW: u32 = 1 << 14;
 
+/// Launch profile: the child receives a **virtual-device face** — its own
+/// request ring and register page with the virtual-device service, a send
+/// onto that service's doorbell, and a return leg to lend it memory on
+/// (`res/VIRTUAL_DEVICE.md`).
+///
+/// The face is what lets a program be a driver of a device with no hardware
+/// behind it. It is derived per launch and dies with the child, and it
+/// carries no authority over the machine: the service it reaches holds
+/// none. A launch that asks for it and cannot be given it still launches;
+/// the program then finds no device to open.
+pub const PROFILE_VIRTUAL_DEVICE: u32 = 1 << 15;
+
 pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_FILESYSTEM
     | PROFILE_FS_VIEW_BINDER
@@ -194,7 +206,8 @@ pub const PROFILE_KNOWN: u32 = PROFILE_TELEMETRY
     | PROFILE_ENGINE
     | PROFILE_GPU
     | PROFILE_MODEL_DATA
-    | PROFILE_WINDOW;
+    | PROFILE_WINDOW
+    | PROFILE_VIRTUAL_DEVICE;
 
 /// Validate the profile vocabulary and its dependencies: both filesystem
 /// auxiliary endpoint kinds are meaningful only beside an actual FS face, an

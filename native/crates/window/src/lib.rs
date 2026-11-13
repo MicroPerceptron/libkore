@@ -6,6 +6,7 @@ pub mod appearance;
 pub mod capture;
 #[cfg(feature = "runtime")]
 pub mod channel;
+pub mod clipboard;
 #[cfg(feature = "runtime")]
 pub mod client;
 pub mod command;
@@ -21,6 +22,8 @@ pub mod configure;
 pub mod control;
 #[cfg(feature = "runtime")]
 pub mod event;
+pub mod keysplit;
+pub mod shortcut;
 mod face;
 #[cfg(feature = "runtime")]
 pub mod relay;

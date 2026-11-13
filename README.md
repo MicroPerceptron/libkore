@@ -14,12 +14,13 @@ machine's volume through the same exported owners a booted Kore runs.
 | --- | --- |
 | `kore-std` | Rust facade: filesystem, prelude, time, random, collections, process and optional driver APIs |
 | `kore-entry` | Executable-only adapter for a returning Rust `fn main()` on Kore |
-| `kore-ffi` | C headers and Zig module over a Rust-founded host, including filesystem, time, random, allocation and worker APIs; no standalone C/Zig CRT |
+| `kore-ffi` | C headers and Zig module over a Rust-founded host, including filesystem, time, random, allocation and worker APIs |
+| `kore-c` | The runtime of `libkore.so`: `kore.h` as one shared object, and the host of an independent C program (`main` on a worker, its filesystem session, its end) |
 | `kore-lua` | Embeddable Lua 5.5 engine and bridge; interactive and opt-in restricted worker policies |
 | `kore-wasi` | WASI 0.2 component host composed by an embedder with its Wasmtime engine and native owners |
 | `kore-host` | Host-side (Linux/macOS) tooling: a Kore machine's DagFS volume, offline, through the filesystem row's own engine |
 
-All six package manifests set `publish = false`; consume a reviewed Git
+All seven package manifests set `publish = false`; consume a reviewed Git
 revision or a deliberately composed local checkout, not a registry version.
 The WASI host supports the `wasi:cli/command` world and native-backed I/O,
 filesystem, clocks and random imports; unsupported imports such as sockets
