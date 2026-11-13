@@ -29,6 +29,13 @@
 #define KORE_FD_MEMORY 1
 
 /**
+ * [`KoreFdInfo::kind`]: a virtual device (`<kore/vdev.h>`). `mmap` answers
+ * its register block and memory to lend it, `read` its interrupt, and
+ * `write` rings its doorbell.
+ */
+#define KORE_FD_DEVICE 2
+
+/**
  * [`KoreFdInfo::access`]: the capability may be read.
  */
 #define KORE_FD_READ (1 << 0)
@@ -39,12 +46,99 @@
 #define KORE_FD_WRITE (1 << 1)
 
 /**
+ * Bytes in a virtual device's register block: one page.
+ */
+#define KORE_VDEV_REGISTERS_BYTES 4096
+
+/**
+ * `mmap` offset on a virtual device's descriptor: the register block
+ * ([`KoreVdevRegisters`]).
+ */
+#define KORE_VDEV_MAP_REGISTERS 0
+
+/**
+ * `mmap` offset on a virtual device's descriptor: fresh, zeroed memory the
+ * driver owns and lends the device. A device address is an offset into it.
+ * The device takes a loan only in its reset state, so map it before the
+ * first status write.
+ */
+#define KORE_VDEV_MAP_MEMORY 4096
+
+/**
+ * [`KoreVdevRegisters::magic`]: `"kvdv"`, a Kore virtual device.
+ */
+#define KORE_VDEV_MAGIC 1986295403
+
+/**
+ * [`KoreVdevRegisters::version`]: this layout.
+ */
+#define KORE_VDEV_VERSION 1
+
+/**
+ * [`KoreVdevRegisters::vendor_id`]: `"kore"`, a device Kore hosts.
+ */
+#define KORE_VDEV_VENDOR_KORE 1701998443
+
+/**
+ * [`KoreVdevRegisters::device_id`]: `"accl"`, the virtual accelerator, a
+ * virtio-accel 1.0 device. Its name is `/kore/device/virtual/accel`.
+ */
+#define KORE_VDEV_ID_ACCEL 1818452833
+
+/**
+ * Status: the driver has noticed the device (Virtio 1.3 section 2.1).
+ */
+#define KORE_VDEV_STATUS_ACKNOWLEDGE 1
+
+/**
+ * Status: the driver knows how to drive it.
+ */
+#define KORE_VDEV_STATUS_DRIVER 2
+
+/**
+ * Status: the driver is set up and the device may serve.
+ */
+#define KORE_VDEV_STATUS_DRIVER_OK 4
+
+/**
+ * Status: feature negotiation is complete.
+ */
+#define KORE_VDEV_STATUS_FEATURES_OK 8
+
+/**
+ * Status, written by the device: it cannot go on and must be reset.
+ */
+#define KORE_VDEV_STATUS_DEVICE_NEEDS_RESET 64
+
+/**
+ * Status: the driver has given up on the device.
+ */
+#define KORE_VDEV_STATUS_FAILED 128
+
+/**
+ * Feature bit 32, `VIRTIO_F_VERSION_1`: every device offers it and a
+ * driver must accept it. Written out, because the header carries this
+ * expression as it stands and `1 << 32` is not a 64-bit value in C.
+ */
+#define KORE_VDEV_F_VERSION_1 4294967296
+
+/**
+ * Bytes between the last register and the device configuration.
+ */
+#define KORE_VDEV_RESERVED_BYTES 168
+
+/**
+ * Bytes of the device configuration area, to the end of the block.
+ */
+#define KORE_VDEV_CONFIG_AREA_BYTES 3840
+
+/**
  * What a descriptor names, as the calling thread holds it
  * ([`kore_fd_describe`]).
  */
 typedef struct KoreFdInfo {
   /**
-   * What kind of capability it is: `KORE_FD_MEMORY`.
+   * What kind of capability it is: `KORE_FD_MEMORY` or `KORE_FD_DEVICE`.
    */
   uint32_t kind;
   /**
@@ -55,10 +149,117 @@ typedef struct KoreFdInfo {
   uint32_t access;
   /**
    * For `KORE_FD_MEMORY`, the supply's whole length in bytes: what the
-   * allocator and every mapping share, not what is still free.
+   * allocator and every mapping share, not what is still free. For
+   * `KORE_FD_DEVICE`, the register block's length.
    */
   uint64_t length;
 } KoreFdInfo;
+
+/**
+ * The register block of a Kore virtual device: what `mmap` at
+ * `KORE_VDEV_MAP_REGISTERS` answers, declared `volatile` by a driver.
+ *
+ * Every word is little-endian and has one writer. A driver never writes a
+ * device register, and what it writes to its own the device reads once, at
+ * the step that uses it, when the driver rings the doorbell (a `write` of
+ * one 32-bit word to the descriptor). The device answers by raising an
+ * interrupt: it increments `interrupts`, and a `read` of one 32-bit word
+ * from the descriptor returns once the count has moved.
+ *
+ * Bringing the device up is Virtio 1.3 section 3.1.1 over these registers,
+ * with the memory lent first (`KORE_VDEV_MAP_MEMORY`). A device just opened
+ * is in its reset state, both status words zero; one that is not is reset
+ * first, by writing 0 to `driver_status` and ringing. Then write
+ * `ACKNOWLEDGE | DRIVER` and ring; write the accepted features, add
+ * `FEATURES_OK`, ring, and check `device_status` carries it; lay the queue
+ * out in the lent memory, write `queue_num`, the three addresses and
+ * `queue_ready`; add `DRIVER_OK` and ring. A new value of `driver_status`
+ * is always answered with an interrupt, and a step the device refused is
+ * one its `device_status` does not carry. The value the device last saw
+ * announces nothing and is not answered, so a driver waits only for what
+ * it asked.
+ */
+typedef struct KoreVdevRegisters {
+  /**
+   * Device: `KORE_VDEV_MAGIC`.
+   */
+  uint32_t magic;
+  /**
+   * Device: `KORE_VDEV_VERSION`.
+   */
+  uint32_t version;
+  /**
+   * Device: which model this is (`KORE_VDEV_ID_ACCEL`).
+   */
+  uint32_t device_id;
+  /**
+   * Device: `KORE_VDEV_VENDOR_KORE`.
+   */
+  uint32_t vendor_id;
+  /**
+   * Device: the features it offers.
+   */
+  uint64_t device_features;
+  /**
+   * Driver: the features it accepts, a subset of the offer.
+   */
+  uint64_t driver_features;
+  /**
+   * Driver: the status it has reached (`KORE_VDEV_STATUS_*`).
+   */
+  uint32_t driver_status;
+  /**
+   * Device: the status it has accepted, and its own
+   * `KORE_VDEV_STATUS_DEVICE_NEEDS_RESET`.
+   */
+  uint32_t device_status;
+  /**
+   * Device: the largest queue it takes.
+   */
+  uint32_t queue_num_max;
+  /**
+   * Driver: the queue's size, a power of two between the longest chain
+   * the device takes (its configuration says how long) and
+   * `queue_num_max`.
+   */
+  uint32_t queue_num;
+  /**
+   * Driver: nonzero once the queue's size and addresses are written.
+   */
+  uint32_t queue_ready;
+  /**
+   * Device: changes whenever the configuration area does.
+   */
+  uint32_t config_generation;
+  /**
+   * Driver: the descriptor table's device address.
+   */
+  uint64_t queue_desc;
+  /**
+   * Driver: the available ring's device address.
+   */
+  uint64_t queue_driver;
+  /**
+   * Driver: the used ring's device address.
+   */
+  uint64_t queue_device;
+  /**
+   * Device: bytes of device configuration in `config`.
+   */
+  uint32_t config_bytes;
+  /**
+   * Device: interrupts raised, wrapping.
+   */
+  uint32_t interrupts;
+  /**
+   * Unused.
+   */
+  uint8_t reserved[KORE_VDEV_RESERVED_BYTES];
+  /**
+   * Device: the device configuration.
+   */
+  uint8_t config[KORE_VDEV_CONFIG_AREA_BYTES];
+} KoreVdevRegisters;
 
 #ifdef __cplusplus
 extern "C" {

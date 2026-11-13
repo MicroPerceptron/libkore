@@ -35,12 +35,14 @@ use kore_std::abi::task::role;
 pub(crate) mod errno {
     use core::ffi::c_int;
     pub(crate) const ENOENT: c_int = 2;
+    pub(crate) const EIO: c_int = 5;
     pub(crate) const ENXIO: c_int = 6;
     pub(crate) const EBADF: c_int = 9;
     pub(crate) const EAGAIN: c_int = 11;
     pub(crate) const ENOMEM: c_int = 12;
     pub(crate) const EACCES: c_int = 13;
     pub(crate) const EFAULT: c_int = 14;
+    pub(crate) const EBUSY: c_int = 16;
     pub(crate) const EINVAL: c_int = 22;
     pub(crate) const EMFILE: c_int = 24;
     pub(crate) const ENOTSUP: c_int = 95;
@@ -54,6 +56,14 @@ pub(crate) enum Kind {
     /// region off it, through the runtime's own reservation so the two never
     /// meet ([`crate::mmap`]).
     Memory,
+    /// A virtual device of the launch's virtual-device face, by its
+    /// register-block id: registers and lent memory through `mmap`, the
+    /// interrupt through `read`, the doorbell through `write`
+    /// ([`crate::device`]).
+    Device {
+        /// The device model's id, the register block's `DEVICE_ID`.
+        model: u32,
+    },
 }
 
 /// One row: a name and the bootstrap coordinate it stands for.
@@ -75,12 +85,29 @@ pub(crate) struct Name {
 /// `/kore/memory` is `role::HEAP@0`: the launch's memory supply, which
 /// kore-rt endows every thread that may allocate with a share of
 /// (`WorkerCap::heap`).
-pub(crate) static NAMES: [Name; 1] = [Name {
-    path: b"/kore/memory",
-    role: role::HEAP,
-    index: 0,
-    kind: Kind::Memory,
-}];
+///
+/// `/kore/device/virtual/accel` is the virtual accelerator on the launch's
+/// virtual-device face. Its row's coordinate is the face's memory, whose
+/// second page is the register block: the share of it this library founds
+/// the program's threads holding is what a thread parks on the interrupt
+/// through. The face's kick, beside it, is what a thread rings the doorbell
+/// through ([`crate::device::KICK`]).
+pub(crate) static NAMES: [Name; 2] = [
+    Name {
+        path: b"/kore/memory",
+        role: role::HEAP,
+        index: 0,
+        kind: Kind::Memory,
+    },
+    Name {
+        path: b"/kore/device/virtual/accel",
+        role: role::SVC_RING,
+        index: crate::device::FACE,
+        kind: Kind::Device {
+            model: crate::device::MODEL_ACCEL,
+        },
+    },
+];
 
 /// The row `path` names.
 pub(crate) fn resolve(path: &[u8]) -> Option<usize> {
@@ -241,14 +268,17 @@ pub(crate) fn holding(name: &Name) -> Option<Holding> {
     let slot = kore_std::runtime::entry::thread_context()?
         .bootstrap()
         .handle(name.role, name.index)?;
-    let kind = match name.kind {
-        Kind::Memory => ResourceKind::MemLease,
+    let rights = verbs::capability_rights(slot, ResourceKind::MemLease)?;
+    let writable = match name.kind {
+        Kind::Memory => rights.contains(Rights::MODIFY),
+        // What a thread writes of a device is its doorbell: a notice on the
+        // face's kick, which is a capability beside the face's memory.
+        Kind::Device { .. } => crate::device::holds_kick(),
     };
-    let rights = verbs::capability_rights(slot, kind)?;
     Some(Holding {
         slot,
         readable: rights.contains(Rights::ACCESS),
-        writable: rights.contains(Rights::MODIFY),
+        writable,
     })
 }
 
@@ -266,7 +296,17 @@ pub(crate) fn open(path: &[u8], flags: c_int) -> Result<c_int, c_int> {
     if !access.within(held.readable, held.writable) {
         return Err(errno::EACCES);
     }
-    TABLE.claim(row, access)
+    match NAMES[row].kind {
+        Kind::Memory => TABLE.claim(row, access),
+        // A device is opened as well as named: the service starts the model
+        // and writes its register block.
+        Kind::Device { model } => {
+            crate::device::open(model)?;
+            TABLE
+                .claim(row, access)
+                .inspect_err(|_| crate::device::close())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +329,16 @@ mod tests {
             assert_eq!(resolve(path), None, "{:?}", core::str::from_utf8(path));
         }
         assert_eq!((NAMES[0].role, NAMES[0].index), (role::HEAP, 0));
+        assert_eq!(resolve(b"/kore/device/virtual/accel"), Some(1));
+        assert_eq!(resolve(b"/kore/device/virtual"), None);
+        assert_eq!(resolve(b"/kore/device/virtual/accl"), None);
+        assert_eq!(NAMES[1].role, role::SVC_RING);
+        assert_eq!(
+            NAMES[1].kind,
+            Kind::Device {
+                model: u32::from_le_bytes(*b"accl")
+            }
+        );
     }
 
     #[test]

@@ -48,6 +48,10 @@ pub mod api;
 #[cfg(any(test, target_os = "none"))]
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 mod args;
+// Off Kore only the descriptor table's rows and the host suite read this:
+// the face is the Kore program's.
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+mod device;
 #[cfg(any(test, target_os = "none"))]
 mod exit;
 // Off Kore only `kore_fd_describe` and the host suite read these two: the
@@ -56,7 +60,7 @@ mod exit;
 mod fd;
 #[cfg(target_os = "none")]
 mod lock;
-#[cfg(any(test, target_os = "none"))]
+// Off Kore only the host suite and the device's mapping rules read this.
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 mod mmap;
 #[cfg(target_os = "none")]

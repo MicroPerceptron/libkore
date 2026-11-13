@@ -40,10 +40,10 @@ LIFECYCLE = {'__kore_program_start', '__kore_program_exit', '__kore_program_argu
 # The rest of the C library a program's headers declare (Kore's TCC
 # `include/`: <stdio.h>, <stdlib.h>, <string.h>, <errno.h>), which libkore.so
 # implements: kore-c-shim's printf family, streams, parsers, string routines
-# and per-thread errno, and kore-c's own abort; and <fcntl.h>, <unistd.h> and
-# <sys/mman.h>'s open, close, mmap and munmap over the capabilities the
-# program holds. The program's libc.a holds the rest: exit, atexit and the
-# routines a compiler assumes.
+# and per-thread errno, and kore-c's own abort; and <fcntl.h>, <unistd.h>,
+# <poll.h> and <sys/mman.h>'s open, close, read, write, poll, mmap and munmap
+# over the capabilities the program holds. The program's libc.a holds the
+# rest: exit, atexit and the routines a compiler assumes.
 C_LIBRARY = {'printf', 'fprintf', 'sprintf', 'snprintf', 'vprintf', 'vfprintf', 'vsprintf',
              'vsnprintf', 'fputc', 'putc', 'putchar', 'fputs', 'puts', 'fwrite', 'fflush',
              'fclose', 'stdout', 'stderr',
@@ -52,7 +52,7 @@ C_LIBRARY = {'printf', 'fprintf', 'sprintf', 'snprintf', 'vprintf', 'vfprintf', 
              'memchr', 'strchr', 'strrchr', 'strcmp', 'strncmp', 'strcpy', 'strncpy', 'strncat',
              'strstr',
              '__errno_location',
-             'open', 'close', 'mmap', 'munmap'}
+             'open', 'close', 'read', 'write', 'poll', 'mmap', 'munmap'}
 DYNAMIC_TLS = re.compile(r'TLSDESC|DTPMOD|DTPOFF|TLSGD|TLSLD|TLS_DTP')
 
 

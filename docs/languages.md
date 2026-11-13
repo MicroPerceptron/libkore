@@ -180,8 +180,8 @@ close(fd);
   are the process's, as C expects, from 3 (0 to 2 are the streams'), and no
   authority crosses a thread through one.
 - **`kore_fd_describe(fd, &info)`** reads what the calling thread holds
-  there: its kind (`KORE_FD_MEMORY`), what its rights permit, and for a
-  memory supply its whole length.
+  there: its kind (`KORE_FD_MEMORY` or `KORE_FD_DEVICE`), what its rights
+  permit, and for a memory supply its whole length.
 
 `mmap` on the memory supply answers fresh, zeroed memory, as mapping
 `/dev/zero` does elsewhere. It is three of kore-rt's verbs, the sequence a
@@ -212,6 +212,53 @@ mapped there. The rules follow from that:
   in a loop uses one region. Ever-different sizes spend supply each time and
   end with `ENOMEM`. A program holds sixteen regions, mapped and parked
   together.
+
+### A virtual device
+
+A program launched with Kore's virtual-device profile has a face with the
+virtual-device service: a device with no hardware behind it, for a driver to
+be written against (Kore's `res/VIRTUAL_DEVICE.md`). Its name is a second row
+of the table, and its descriptor has the shape Linux's UIO gives a userspace
+driver (`crates/c/src/device.rs`):
+
+```c
+int fd = open("/kore/device/virtual/accel", O_RDWR);
+volatile KoreVdevRegisters *regs =
+    mmap(NULL, KORE_VDEV_REGISTERS_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED,
+         fd, KORE_VDEV_MAP_REGISTERS);
+uint8_t *lent = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
+                     fd, KORE_VDEV_MAP_MEMORY);
+...
+uint32_t word = 1;
+write(fd, &word, sizeof word);          /* ring the doorbell */
+read(fd, &word, sizeof word);           /* wait for the interrupt */
+```
+
+- **`open` starts the device.** The service starts the model the name
+  stands for and writes its register block. A program has one device open at
+  a time (`EBUSY`), and `close` gives it up.
+- **Offset 0 is the register block**, one page the program and the device
+  both write. `KoreVdevRegisters` (`<kore/program.h>`) is its layout, held to
+  `kore-vdev`'s register constants by this crate's build.
+- **Offset one page is memory to lend.** It is fresh and zeroed, the
+  program's own, and a device address is an offset into it. The device takes
+  a loan only in its reset state, so a driver maps it before its first status
+  write. One region at a time, and it cannot be unmapped while the device is
+  open (`EBUSY`), since the device may be using it.
+- **`read` waits for an interrupt** and answers the device's interrupt count,
+  one 32-bit word. Each interrupt is read once. **`write`** of one word rings
+  the doorbell. **`poll`** waits for the interrupt with a timeout.
+- **The interrupt and the doorbell never cross a thread.** They are
+  capabilities, and capabilities are per thread, so the host founds the main
+  thread holding its own share of the face and the thread controller hands
+  the share on to every `pthread`. `read` parks the calling thread in the
+  kernel on the interrupt count, and `write` posts its notice directly.
+  `open`, the loan and `close` are requests to the service, which thread 0's
+  face carries: they are posted to it and waited for, as a mapping of the
+  memory supply is.
+
+`write` on descriptors 1 and 2 writes to `stdout` and `stderr`, in order
+with what `<stdio.h>` writes.
 
 **`main` gets its arguments.** The launcher's page carries the name it
 resolved the program by and the rest of the command line. The host reads it
