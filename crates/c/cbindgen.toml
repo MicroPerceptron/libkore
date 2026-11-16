@@ -15,9 +15,12 @@ parse_deps = false
 # these), not an application API: the C library declares them itself, as
 # its <stdlib.h> declares `abort`. `KoreFsStep` is kore.h's typedef, which
 # this header includes.
-# `open`, `close`, `mmap` and `munmap` are POSIX's, declared by <fcntl.h>,
-# <unistd.h> and <sys/mman.h>.
-exclude = ["__kore_program_start", "__kore_program_exit", "__kore_program_arguments", "abort", "open", "close", "mmap", "munmap", "KoreFsStep"]
+# `open`, `close`, `read`, `write`, `poll`, `mmap` and `munmap` are POSIX's,
+# declared by <fcntl.h>, <unistd.h>, <poll.h> and <sys/mman.h>; so is
+# `struct pollfd`.
+exclude = ["__kore_program_start", "__kore_program_exit", "__kore_program_arguments", "abort", "open", "close", "read", "write", "poll", "PollFd", "mmap", "munmap", "KoreFsStep"]
+# No function takes the register block: a program maps it.
+include = ["KoreVdevRegisters"]
 [enum]
 prefix_with_name = true
 rename_variants = "ScreamingSnakeCase"

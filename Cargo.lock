@@ -976,6 +976,8 @@ dependencies = [
  "kore-dagfs",
  "kore-driver",
  "kore-rt",
+ "kore-svc-vdev",
+ "kore-vdev",
  "zeroize",
 ]
 
@@ -1026,6 +1028,23 @@ dependencies = [
  "blake3",
  "heapless",
  "kore-rt",
+]
+
+[[package]]
+name = "kore-svc-vdev"
+version = "0.0.0"
+dependencies = [
+ "kore-abi",
+ "kore-rt",
+ "kore-vdev",
+]
+
+[[package]]
+name = "kore-vdev"
+version = "0.0.1"
+dependencies = [
+ "heapless",
+ "virtio-accel-transport",
 ]
 
 [[package]]
@@ -1677,6 +1696,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtio-accel-transport"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7747200a37db419a82c884730d5c31d1d80a6b4d14cc3de312064e4793dc289"
 
 [[package]]
 name = "wasi"

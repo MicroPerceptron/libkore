@@ -4106,6 +4106,88 @@ impl InChunk {
     pub const CHUNK_DATA: usize = 24;
 }
 
+// ─── vdev — the virtual-device service (kore-svc-vdev) ──────────────
+//
+// Kept last, after every other service's records: a record added in the
+// middle of this file moves the lines after it, and with them the panic
+// locations compiled into every image that uses those lines.
+
+/// The virtual-device request wire form (`VdevRequest`'s crossing shape).
+///
+/// The 8-byte shape of its siblings. Discriminants are **1-based**, so a
+/// zeroed record is invalid and never an administration request.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct VdevReqWire {
+    pub op: u8,
+    pub reserved: [u8; 7],
+}
+
+impl VdevReqWire {
+    /// Administration pair: one component of a driver's face; the part, then
+    /// the announced return landing as a little-endian `u32`.
+    pub const OP_ADMIT_PEER: u8 = 1;
+    pub const OP_TAKE_ADMISSION: u8 = 2;
+    /// Administration pair: the peer's arrival as a little-endian `u16`.
+    pub const OP_RETIRE_PEER: u8 = 3;
+    pub const OP_CONFIRM_RETIRED: u8 = 4;
+    /// A driver ends its own face.
+    pub const OP_CLOSE_PEER: u8 = 5;
+    /// A driver asks for a device model by its register-block id, a
+    /// little-endian `u32`.
+    pub const OP_OPEN: u8 = 6;
+    /// A driver lends the memory device addresses are offsets into: the
+    /// announced return landing as a little-endian `u32`.
+    pub const OP_LEND: u8 = 7;
+    /// A driver gives its device up, and takes back the memory it lent.
+    pub const OP_CLOSE: u8 = 8;
+}
+
+/// The virtual-device reply wire form. The service mints no authority, so
+/// `grants` is pinned zero and a non-zero value fails the codec closed.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct VdevRepWire {
+    pub tag: u8,
+    pub refusal: u8,
+    /// Always zero.
+    pub grants: u8,
+    pub reserved: [u8; 5],
+}
+
+impl VdevRepWire {
+    pub const TAG_ACCEPTED: u8 = 1;
+    pub const TAG_REFUSED: u8 = 2;
+    /// The admitted peer's arrival as a little-endian `u16`.
+    pub const TAG_PEER_ADMITTED: u8 = 3;
+    /// The memory the device now addresses, in 4 KiB pages, as a
+    /// little-endian `u32`.
+    pub const TAG_LENT: u8 = 4;
+
+    /// The request is not this face's to make.
+    pub const REFUSE_DENIED: u8 = 1;
+    /// The admission result is not published yet.
+    pub const REFUSE_PENDING: u8 = 2;
+    /// An earlier admission must be settled first.
+    pub const REFUSE_CONFLICT: u8 = 3;
+    /// The service cannot do this now: no mapping geometry, or a model that
+    /// would not start.
+    pub const REFUSE_UNAVAILABLE: u8 = 4;
+    /// No device model has that id.
+    pub const REFUSE_NO_DEVICE: u8 = 5;
+    /// The device is not in a state for this: already open, not open, or
+    /// holding a queue in the memory it has.
+    pub const REFUSE_BUSY: u8 = 6;
+    /// Every device the service hosts at once is taken.
+    pub const REFUSE_LIMIT: u8 = 7;
+    /// What was lent is not memory the device can address.
+    pub const REFUSE_MEMORY: u8 = 8;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

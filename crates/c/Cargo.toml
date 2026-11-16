@@ -19,7 +19,7 @@ name = "kore_c"
 path = "src/lib.rs"
 
 [dependencies]
-kore-std = { package = "kore-std", path = "../..", features = ["heap", "fs"] }
+kore-std = { package = "kore-std", path = "../..", features = ["heap", "fs", "vdev"] }
 # The C ABI itself, with the standard C allocation and thread names a C
 # program calls (`malloc`, `pthread_create`, ...) exported as real symbols.
 kore-ffi = { path = "../ffi", features = ["c-stdlib"] }

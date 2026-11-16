@@ -276,7 +276,9 @@ pub(crate) fn held_is_next(held_after: u32, head: u32) -> bool {
 extern crate alloc;
 
 #[cfg(target_os = "none")]
-pub(crate) use metal::{Endpoint, abandon, arm, drain, finish, flush_now, install, report};
+pub(crate) use metal::{
+    Endpoint, abandon, arm, drain, finish, flush_now, install, report, write_standard,
+};
 
 #[cfg(target_os = "none")]
 mod metal {
@@ -338,6 +340,20 @@ mod metal {
     /// the host is. Nothing is said when the launch carried no stream.
     pub(crate) fn report(line: &[u8]) {
         let _ = sink(Standard::Error, line);
+    }
+
+    /// `write` on a standard stream's descriptor: `bytes` to `stdout`, or to
+    /// `stderr` when `error`, in order with what `<stdio.h>` writes. `false`
+    /// when the launch carried no stream or it has closed.
+    pub(crate) fn write_standard(error: bool, bytes: &[u8]) -> bool {
+        sink(
+            if error {
+                Standard::Error
+            } else {
+                Standard::Output
+            },
+            bytes,
+        )
     }
 
     pub(crate) fn host_pending() -> bool {

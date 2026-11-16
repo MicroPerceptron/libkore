@@ -468,12 +468,31 @@ swap links kore-rt's futex, so its digests are this change's reseal over
 the ioctl round (`b04325e9`). No exported manifest changed, so
 `native/Cargo.lock` did not.
 
+It then moved to Kore `a07b4eae68b45ffd740e31a9cc69e708b21ad467`, the merge
+of #1494's virtual-device round into this change, once libkore#32 had merged
+into `alpha` with its export at Kore `cac17a02`. The closure is now 31
+packages and 442 files. Against Kore `625060b1`, only kore-rt's `futex.rs`
+and `thread_controller.rs` differ. Against `alpha`'s export, eleven more
+files differ, all from #1494's commits after `cac17a02`:
+
+- the C driver's protocol, rendered from the Rust that defines it
+  (`vdev-accel`'s `kore/vdev_accel.h`, its device and the header's test);
+- kore-window's pointer acceleration, from main `bb1fe70d`;
+- a command entering a task grant through one edge (the DagFS service's
+  authority, engine and service);
+- the `boot.toml` digests of DagFS, swap and vdev, from #1494's reseals.
+
+No exported manifest changed, so `native/Cargo.lock` did not.
+
 ## A relayed wake reaches its waiter alone
 
-The export records Kore `c491a40640fb5fc603e3e8ab27c0350e6ec74877`, on
+The export records Kore `b43bd0a63861feeb3e81b5d3e9f561f26b1a11b3`, on
 `ft/admiring-lovelace-69eiok`, which is stacked on `ft/brave-heisenberg-zgoaux`
-and merges its head (`c86ea1bf`). Against that branch's export at `7c0be6e8`,
-the closure keeps its 27 packages and 408 files, and only the relay differs:
+and merges its head (`4393ed08`). Against that branch's export at `a07b4eae`,
+the closure keeps its 31 packages and 442 files, and only the relay differs,
+with two services' `boot.toml`: swap and vdev link kore-rt's futex, so their
+digests are that branch's reseal over the virtual-device round (`4393ed08`),
+which followed its export.
 
 - `kore-rt`'s thread controller relays a wake to the threads it was for and no
   others (Kore `b67f198`). Managed threads hold no send into each other's
@@ -488,7 +507,7 @@ the closure keeps its 27 packages and 408 files, and only the relay differs:
   lossless: a waiter that registers after the waker's scan reads the new word
   and never parks.
 
-The five exported services' `boot.toml` digests are that branch's; this
+The six exported services' `boot.toml` digests are that branch's; this
 branch's reseal over the relay, which every service links, follows this export.
 No exported manifest changed, so `native/Cargo.lock` did not.
 
@@ -505,8 +524,11 @@ woken 208 times and the tour failed that step. Kore `e0717eb` repeated that
 over the founding wait: no wake, against 206 with the founding wait's own
 futex and controller (`36b99426`).
 
-Kore's reseal over this export measures it with all nine parked (`09a98a0`,
-built from `8b617ee`, which pins it): every step ran to `exit 42` and no wake
-reached any of them. The same tree with the futex and controller of that
+Kore's reseal over the export at `fba0662` measured it with all nine parked
+(`09a98a0`, built from `8b617ee`, which pinned it): every step ran to `exit 42`
+and no wake reached any of them. The same tree with the futex and controller of that
 branch's head (`83861dc9`), which count and sweep, delivered 1466 wakes to
-them over the 400 turns, and the tour failed that step.
+them over the 400 turns, and the tour failed that step. Neither side's futex
+or controller has changed since. Kore's next reseal (`9e477e5`, built from
+`00d666c`, which pins the export at `c491a40`) measured it again: no wake
+reached the nine parked threads, over 400 turns and 148 wakes.

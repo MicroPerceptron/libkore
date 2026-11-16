@@ -17,7 +17,7 @@ use kore_rt::svc::{PeerBundlePart, PeerId};
 use kore_svc_output::service::{OutputRequest, OutputResponse};
 
 use crate::appearance::Density;
-use crate::desktop::{DesktopRequest, DesktopState, Mode};
+use crate::desktop::{DesktopRequest, DesktopState, Mode, PointerPreference, PointerSpeed};
 const PREPARE_SETTINGS: u8 = 0x52;
 const DESKTOP: u8 = 0x53;
 
@@ -805,6 +805,12 @@ pub fn encode_req(request: &DisplayRequest) -> SurReqWire {
                     w.subject = 3.into();
                     w.a = surface.into();
                 }
+                DesktopRequest::Pointer(preference) => {
+                    w.subject = 5.into();
+                    w.a = u64::from(preference.acceleration).into();
+                    // The step is -2..=2; on the wire it is 0..=4.
+                    w.b = ((preference.speed.step() - PointerSpeed::SLOWEST.step()) as u64).into();
+                }
             }
         }
         DisplayRequest::Surface(request) => return surface::encode_req(&request),
@@ -948,6 +954,18 @@ pub fn decode_req(w: &SurReqWire) -> Option<DisplayRequest> {
                 height: u16::try_from(w.b.get()).ok()?,
             },
             3 if w.a.get() != 0 => DesktopRequest::ApplyWallpaper { surface: w.a.get() },
+            5 => DesktopRequest::Pointer(PointerPreference {
+                acceleration: match w.a.get() {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+                speed: PointerSpeed::new(
+                    i8::try_from(w.b.get())
+                        .ok()?
+                        .checked_add(PointerSpeed::SLOWEST.step())?,
+                )?,
+            }),
             _ => return None,
         }),
         ADMIT => DisplayRequest::AdmitPeer {
@@ -1256,7 +1274,11 @@ pub fn reply_matches(w: &SurReqWire, response: &DisplayResponse, grants: u8) -> 
             DisplayResponse::Desktop(_),
         ) => grants == 0,
         (
-            DisplayRequest::Desktop(DesktopRequest::ApplyWallpaper { .. } | DesktopRequest::RestoreComplete)
+            DisplayRequest::Desktop(
+                DesktopRequest::ApplyWallpaper { .. }
+                | DesktopRequest::RestoreComplete
+                | DesktopRequest::Pointer(_),
+            )
             | DisplayRequest::PrepareSettings { .. },
             DisplayResponse::Accepted,
         ) => grants == 0,
@@ -1469,6 +1491,42 @@ mod tests {
         let mut bad = encode_req(&requests[3]); bad.b = 11.into();
         assert_eq!(decode_req(&bad), None);
         assert!(!reply_matches(&encode_req(&requests[4]), &reply, 0));
+    }
+
+    #[test]
+    fn a_pointer_preference_crosses_whole_and_nothing_else_does() {
+        use kore_rt::svc::SvcProtocol;
+        for acceleration in [false, true] {
+            for speed in PointerSpeed::ALL {
+                let request = DisplayRequest::Desktop(DesktopRequest::Pointer(PointerPreference {
+                    acceleration,
+                    speed,
+                }));
+                let wire = encode_req(&request);
+                assert_eq!(decode_req(&wire), Some(request));
+                assert_eq!(WindowWire::request_grants(&wire), 0);
+                assert!(reply_matches(&wire, &DisplayResponse::Accepted, 0));
+                assert!(!reply_matches(&wire, &DisplayResponse::Accepted, 1));
+            }
+        }
+        let wire = encode_req(&DisplayRequest::Desktop(DesktopRequest::Pointer(
+            PointerPreference::default(),
+        )));
+        assert_eq!(wire.b.get(), 2, "the default speed is the middle step");
+        for (field, value) in [(0, 2), (1, 5), (1, u64::MAX), (2, 1), (3, 1)] {
+            let mut bad = wire;
+            match field {
+                0 => bad.a = value.into(),
+                1 => bad.b = value.into(),
+                2 => bad.c = value.into(),
+                _ => bad.d = value.into(),
+            }
+            assert_eq!(decode_req(&bad), None, "field {field} = {value}");
+        }
+        assert_eq!(PointerSpeed::new(3), None);
+        assert_eq!(PointerSpeed::new(-3), None);
+        assert_eq!(PointerSpeed::FASTEST.adjustment(), 1.0);
+        assert_eq!(PointerSpeed::SLOWEST.adjustment(), -1.0);
     }
 
     /// The capture vocabulary rides the controller face byte-exactly: a
