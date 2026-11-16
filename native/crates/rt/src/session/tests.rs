@@ -235,6 +235,36 @@ fn the_executable_return_is_the_finalizations_wire_twin() {
     );
 }
 
+/// The freeze is the third turn and the same wire shape: one no-argument
+/// consuming revoke, distinct from both of the others.
+#[test]
+fn the_freeze_is_a_no_argument_consuming_revoke() {
+    let source = SlotRef::from_wire(12);
+    let result = SlotRef::from_wire(13);
+    let mut builder = SessionBuilder::new();
+    let staged = builder.freeze(source, result).expect("the freeze stages");
+    assert_eq!(staged.slot(), result);
+
+    let mut out = [0u8; DESCRIPTOR_MAX];
+    let len = builder.finish(&mut out).expect("descriptor finishes");
+    assert_eq!(len, 8 + 16, "the same one-invocation descriptor");
+    let (header, invocations, args) = parse(&out[..len]);
+    assert_eq!(header.count.get(), 1);
+    assert_eq!(invocations[0].op.get(), OpCode::Revoke as u16);
+    assert_eq!(invocations[0].kind, kore_abi::session::REVOKE_KIND_FREEZE);
+    assert_eq!(invocations[0].requested, 0, "rights come from the lease");
+    assert_eq!(invocations[0].subject.get(), source.index());
+    assert_eq!(invocations[0].result.get(), result.index());
+    assert_eq!(invocations[0].arg.get(), Invocation::NO_ARG);
+    assert!(args.is_empty(), "the freeze names no second capability");
+    for other in [
+        kore_abi::session::REVOKE_KIND_EXEC,
+        kore_abi::session::REVOKE_KIND_EXEC_RETURN,
+    ] {
+        assert_ne!(kore_abi::session::REVOKE_KIND_FREEZE, other);
+    }
+}
+
 /// Length selection happens before the transport chooses registers or
 /// scratch, but both carriers must receive byte-identical output from the one
 /// encoder. `finish` writes exactly that prefix and leaves spare carrier bytes

@@ -8,7 +8,7 @@ repository = "https://github.com/MicroPerceptron/libkore"
 
 [workspace]
 resolver = "3"
-members = ["tests/consumer", "crates/ffi", "crates/entry", "crates/wasi", "crates/lua", "crates/host"]
+members = ["tests/consumer", "crates/ffi", "crates/c", "crates/entry", "crates/wasi", "crates/lua", "crates/host"]
 exclude = ["native"]
 
 [features]
@@ -17,6 +17,7 @@ fs = ["dep:kore-dagfs", "kore-dagfs/runtime"]
 heap = ["kore-rt/heap"]
 crt0 = ["kore-rt/crt0"]
 driver = ["dep:kore-driver", "kore-driver/service"]
+vdev = ["dep:kore-svc-vdev", "dep:kore-vdev"]
 
 # Byte-exact native export; source revision and hashes live in native/provenance.json.
 [dependencies]
@@ -28,6 +29,10 @@ kore-app = { path = "native/crates/app" }
 kore-rt = { path = "native/crates/rt", default-features = false }
 kore-dagfs = { path = "native/crates/dagfs", optional = true }
 kore-driver = { path = "native/crates/driver", optional = true }
+# A driver's side of a virtual device: the service's client without the
+# service (no `host`), and the register block and memory views the two share.
+kore-svc-vdev = { path = "native/services/vdev", default-features = false, optional = true }
+kore-vdev = { path = "native/crates/vdev", optional = true }
 
 [package.metadata.kore]
 # Used by tools/local-kore.py to construct one coherent local source override,
@@ -35,4 +40,4 @@ kore-driver = { path = "native/crates/driver", optional = true }
 # root: the offline volume procedure (and the filesystem service closure it
 # drives) that host programs such as vKore consume; it never enters a Kore
 # executable's graph.
-owner-paths = { kore-start = "crates/start", kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver", kore-late = "crates/late", kore-vol = "tools/kore-vol" }
+owner-paths = { kore-start = "crates/start", kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-c-shim = "crates/c-shim", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver", kore-svc-vdev = "services/vdev", kore-vdev = "crates/vdev", kore-late = "crates/late", kore-ld = "crates/ld", kore-vol = "tools/kore-vol" }

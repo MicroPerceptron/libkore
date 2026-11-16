@@ -1,0 +1,33 @@
+[package]
+name = "kore-c"
+version = "0.1.0-alpha.1"
+edition = "2024"
+publish = false
+description = "The runtime of libkore.so: the C ABI and the host of an independent C program on Kore"
+# No native library is linked: the key carries the headers this runtime
+# implements to dependents' build scripts as `DEP_KORE_INCLUDE` (`build.rs`).
+links = "kore"
+build = "build.rs"
+
+# The runtime `libkore.so` is built from: a distribution's one-line `cdylib`
+# crate names this one and links it under its own `[lib] name = "kore"`, so
+# the image is `libkore.so` (Kore's is `user/runtime/libkore`). Link it into
+# that shared object alone: it installs the process heap and the panic handler
+# a C program's runtime needs, which a Rust executable brings itself.
+[lib]
+name = "kore_c"
+path = "src/lib.rs"
+
+[dependencies]
+kore-std = { package = "kore-std", path = "../..", features = ["heap", "fs", "vdev"] }
+# The C ABI itself, with the standard C allocation and thread names a C
+# program calls (`malloc`, `pthread_create`, ...) exported as real symbols.
+kore-ffi = { path = "../ffi", features = ["c-stdlib"] }
+# Kore's C library: the `printf` family and the standard streams, `<string.h>`
+# and `<stdlib.h>`'s parsers, `errno`. Its process half without its own
+# `malloc` and `abort`: kore-ffi's allocator is this image's `malloc`, and the
+# host ends a whole program.
+kore-c-shim = { path = "../../native/crates/c-shim", default-features = false, features = ["runtime"] }
+# The link window's placer: one cursor every `mmap` of the process takes its
+# address from, as a Wasmtime engine's guest mappings do.
+kore-ld = { path = "../../native/crates/ld", default-features = false }

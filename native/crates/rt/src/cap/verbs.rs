@@ -4178,6 +4178,102 @@ mod metal {
         None
     }
 
+    /// Move a capability a client delivered into a fixed landing slot — a
+    /// service's convey bank, whose post must stand again for the next
+    /// request — into a fresh runtime-owned slot, so the service can keep it
+    /// past the request that carried it.
+    ///
+    /// The move rides a channel minted from `space` for it alone: the
+    /// landing is exact-moved through that channel's send into a post over
+    /// the new owner, and the channel is then retired. An exact move keeps
+    /// the record's rights and lineage, so retiring the private channel
+    /// reaches nothing it carried. Only the kinds the kernel moves exactly
+    /// relocate: memory leases and views, fabric routes, channel endpoints.
+    #[cfg(target_os = "none")]
+    pub fn relocate_landed(
+        space: &ChannelSpaceToken,
+        landed: SlotRef,
+    ) -> Result<crate::cap::ReturnedCapability, RelocateError> {
+        use crate::session::SessionBuilder;
+        use crate::transport::{Transport, TrapTransport};
+        use kore_abi::session::Status;
+
+        fn committed(session: &SessionBuilder) -> bool {
+            TrapTransport::new()
+                .commit_now(session)
+                .is_ok_and(|done| done.status() == Status::Ok && done.failing_index() == 0)
+        }
+
+        let crate::cap::ChannelPair { root, send, recv } =
+            mint_channel(space).map_err(|_| RelocateError::Unmoved)?;
+        let mut owner = crate::cap::ReturnedCapability::reserve();
+        let mut armed = false;
+        let mut sent = false;
+        if let Some(owner) = owner.as_mut() {
+            let mut post = SessionBuilder::new();
+            if post.post_recv(recv.slot(), owner.target()).is_ok() && committed(&post) {
+                owner.arm_post();
+                armed = true;
+                let mut moving = SessionBuilder::new();
+                sent = moving.send_exact(send.slot(), landed).is_ok() && committed(&moving);
+            }
+        }
+        // The root is the private channel's only pivot: revoking it ends
+        // both endpoints, and with them any post still naming the owner.
+        let closed = match root.try_retire() {
+            Ok(outcome) => outcome.is_closed(),
+            Err(root) => {
+                core::mem::forget(root);
+                false
+            }
+        };
+        let _ = send.try_retire();
+        let _ = recv.try_retire();
+        let Some(mut owner) = owner else {
+            return Err(RelocateError::Unmoved);
+        };
+        if sent {
+            if matches!(
+                take_delivery(owner.target()),
+                Some(crate::cap::RawDelivery::Cap)
+            ) {
+                owner.activate();
+                return Ok(owner);
+            }
+            // A committed exact move into a standing post lands, so this is
+            // a record the runtime cannot classify: keep its name out of the
+            // allocator for the task's life rather than reopen it.
+            core::mem::forget(owner);
+            return Err(RelocateError::Lost);
+        }
+        if armed && !closed {
+            // The post may still stand over this name.
+            core::mem::forget(owner);
+        } else if armed {
+            owner.disarm_post();
+        }
+        Err(RelocateError::Unmoved)
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn relocate_landed(
+        _space: &ChannelSpaceToken,
+        _landed: SlotRef,
+    ) -> Result<crate::cap::ReturnedCapability, RelocateError> {
+        Err(RelocateError::Unmoved)
+    }
+
+    /// Why [`relocate_landed`] produced no owner.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RelocateError {
+        /// Nothing moved: the delivery is still in its landing, for the
+        /// caller's own custody to keep or retire.
+        Unmoved,
+        /// The move committed but its result could not be read back; the
+        /// landing is vacant and the would-be owner is quarantined.
+        Lost,
+    }
+
     /// **The metal take-view** (`res/USERLAND.md` §5.6; Phase-A checkpoint
     /// C) — read a delivered `LeasedRegion` view record off the R/O
     /// cap-slot alias at [`SLOTS`](kore_abi::task::geom::SLOTS) alias and return
@@ -5226,7 +5322,7 @@ mod metal {
             }
             ExecFinalizeCompletion::Replaced => {
                 code.release_after_proven_move();
-                Ok(StashedLease::from_owned(output))
+                Ok(StashedLease::new(output))
             }
         }
     }
@@ -5236,6 +5332,78 @@ mod metal {
         code: ExecutableCode,
     ) -> Result<StashedLease, FinalizeExecError<ExecutableCode>> {
         Err(FinalizeExecError::Refused(code))
+    }
+
+    /// Freeze a runtime-owned writable lease (`res/IMAGE.md` §6b): consume
+    /// it with every alias and descendant capability of it, and return the
+    /// frozen successor — the same window and rights, which no lessor may
+    /// write again while it lives. This is a registrar's exclusive intake:
+    /// what it then validates is what every later reader of the window reads.
+    ///
+    /// Affine slot ownership is preserved on either outcome, as
+    /// [`finalize_stashed_exec`] preserves it: a refusal returns the exact
+    /// source, and a consumed source reports
+    /// [`Consumed`](FinalizeExecError::Consumed) with no authority back.
+    #[cfg(target_os = "none")]
+    pub fn freeze_stashed(
+        mut lease: StashedLease,
+    ) -> Result<StashedLease, FinalizeExecError<StashedLease>> {
+        let mut output = match crate::cap::OwnedSlot::reserve() {
+            Some(output) => output,
+            None => return Err(FinalizeExecError::Refused(lease)),
+        };
+        let Some(source) = lease.slot() else {
+            return Err(FinalizeExecError::Refused(lease));
+        };
+        match freeze_slot(source, &mut output) {
+            ExecFinalizeCompletion::Refused => Err(FinalizeExecError::Refused(lease)),
+            ExecFinalizeCompletion::Consumed => {
+                lease.owned.release_after_proven_move();
+                Err(FinalizeExecError::Consumed)
+            }
+            ExecFinalizeCompletion::Replaced => {
+                // The committed kernel transition cleared `source`; only its
+                // dynamic allocator reservation remains to release.
+                lease.owned.release_after_proven_move();
+                Ok(StashedLease::new(output))
+            }
+        }
+    }
+
+    /// Off metal there is no freeze session to issue.
+    #[cfg(not(target_os = "none"))]
+    pub fn freeze_stashed(
+        lease: StashedLease,
+    ) -> Result<StashedLease, FinalizeExecError<StashedLease>> {
+        Err(FinalizeExecError::Refused(lease))
+    }
+
+    /// [`freeze_stashed`] for a lease a caller delivered into a fixed landing
+    /// slot (a service's convey bank): the frozen successor moves into a
+    /// fresh runtime-owned slot, and the landing is left vacant for its post
+    /// to stand again. A registrar that validates bytes a client wrote takes
+    /// them this way, so no alias the client kept can write them afterwards.
+    ///
+    /// `Refused` leaves the delivery in `slot`, untouched, for the caller's
+    /// own custody to retire; `Consumed` reports a vacant `slot` with no
+    /// successor.
+    #[cfg(target_os = "none")]
+    pub fn freeze_landed(slot: SlotRef) -> Result<StashedLease, FinalizeExecError<()>> {
+        let mut output = match crate::cap::OwnedSlot::reserve() {
+            Some(output) => output,
+            None => return Err(FinalizeExecError::Refused(())),
+        };
+        match freeze_slot(slot, &mut output) {
+            ExecFinalizeCompletion::Refused => Err(FinalizeExecError::Refused(())),
+            ExecFinalizeCompletion::Consumed => Err(FinalizeExecError::Consumed),
+            ExecFinalizeCompletion::Replaced => Ok(StashedLease::new(output)),
+        }
+    }
+
+    /// Off metal there is no freeze session to issue.
+    #[cfg(not(target_os = "none"))]
+    pub fn freeze_landed(_slot: SlotRef) -> Result<StashedLease, FinalizeExecError<()>> {
+        Err(FinalizeExecError::Refused(()))
     }
 
     #[cfg(target_os = "none")]
@@ -5274,10 +5442,10 @@ mod metal {
         }
     }
 
-    /// The writable successor's shape proof — [`exec_result_state`]'s twin.
-    /// The rights differ (`MODIFY` is back), and checking the exact set is
-    /// what makes a wrong-shaped record `Malformed` rather than silently
-    /// accepted.
+    /// The full-lifecycle successor's shape proof — a return's or a
+    /// freeze's, [`exec_result_state`]'s twin. The rights differ (`MODIFY`
+    /// is there), and checking the exact set is what makes a wrong-shaped
+    /// record `Malformed` rather than silently accepted.
     #[cfg(target_os = "none")]
     fn writable_result_state(output: SlotRef) -> ExecResultState {
         use kore_abi::cap::{CapRecord, ResourceKind};
@@ -5313,6 +5481,34 @@ mod metal {
 
         let mut b = SessionBuilder::new();
         if b.return_writable(source, output.slot()).is_err() {
+            return ExecFinalizeCompletion::Refused;
+        }
+        let Ok(committed) = TrapTransport::new().commit_now(&b) else {
+            return ExecFinalizeCompletion::Refused;
+        };
+        if committed.status() != kore_abi::session::Status::Ok || committed.failing_index() != 0 {
+            return ExecFinalizeCompletion::Refused;
+        }
+        match writable_result_state(output.slot()) {
+            ExecResultState::Replaced => ExecFinalizeCompletion::Replaced,
+            ExecResultState::Vacant => ExecFinalizeCompletion::Consumed,
+            ExecResultState::Malformed => {
+                output.quarantine_unknown_publish();
+                ExecFinalizeCompletion::Consumed
+            }
+        }
+    }
+
+    /// Freeze `source` into `output`, mirroring [`return_writable_slot`]:
+    /// the successor carries the full lifecycle grant, so the same shape
+    /// proof classifies it.
+    #[cfg(target_os = "none")]
+    fn freeze_slot(source: SlotRef, output: &mut crate::cap::OwnedSlot) -> ExecFinalizeCompletion {
+        use crate::session::SessionBuilder;
+        use crate::transport::{Transport, TrapTransport};
+
+        let mut b = SessionBuilder::new();
+        if b.freeze(source, output.slot()).is_err() {
             return ExecFinalizeCompletion::Refused;
         }
         let Ok(committed) = TrapTransport::new().commit_now(&b) else {

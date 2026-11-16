@@ -1,0 +1,29 @@
+[package]
+name = "kore-svc-vdev"
+version = "0.0.0"
+edition = "2024"
+description = "kore virtual-device service: hosts device models with no hardware behind them, one per driver, over memory the driver shares."
+publish = false
+
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+kore-rt = { path = "../../crates/rt" }
+# The transport a driver reaches a device model through.
+kore-vdev = { path = "../../crates/vdev" }
+# The first model. Only the service hosts it.
+kore-vdev-accel = { path = "../../crates/vdev-accel", optional = true }
+
+[features]
+default = ["host"]
+# The service itself: the device table and the models it hosts. A crate that
+# only speaks to the service (a driver's library, which carries no device
+# model) builds without it and keeps the wire, the face and the client.
+host = ["dep:kore-vdev-accel"]
+
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }
+# The driver the host tests drive a hosted device with: the protocol's
+# reference guest, over kore-vdev's driver half.
+virtio-accel-guest = { version = "=0.4.1", default-features = false }
+virtio-accel-proto = { version = "=0.4.1", default-features = false }
+virtio-accel-transport = { version = "=0.4.1", default-features = false }

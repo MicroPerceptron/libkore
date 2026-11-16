@@ -248,6 +248,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-c-shim"
+version = "0.1.0"
+dependencies = [
+ "kore-rt",
+ "rustc_apfloat",
+]
+
+[[package]]
 name = "kore-collections"
 version = "0.1.0"
 
@@ -374,6 +382,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-svc-accel-spmd"
+version = "0.0.1"
+dependencies = [
+ "kore-driver",
+ "kore-rt",
+ "virtio-accel-core",
+]
+
+[[package]]
 name = "kore-svc-block"
 version = "0.0.1"
 dependencies = [
@@ -478,8 +495,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-svc-vdev"
+version = "0.0.0"
+dependencies = [
+ "kore-abi",
+ "kore-rt",
+ "kore-vdev",
+ "kore-vdev-accel",
+ "virtio-accel-guest",
+ "virtio-accel-proto",
+ "virtio-accel-transport",
+]
+
+[[package]]
 name = "kore-uart"
 version = "0.0.0"
+
+[[package]]
+name = "kore-vdev"
+version = "0.0.1"
+dependencies = [
+ "heapless",
+ "virtio-accel-split-queue",
+ "virtio-accel-transport",
+]
+
+[[package]]
+name = "kore-vdev-accel"
+version = "0.0.1"
+dependencies = [
+ "kore-driver",
+ "kore-rt",
+ "kore-svc-accel-spmd",
+ "kore-vdev",
+ "virtio-accel-core",
+ "virtio-accel-device",
+ "virtio-accel-guest",
+ "virtio-accel-proto",
+ "virtio-accel-transport",
+ "zerocopy",
+]
 
 [[package]]
 name = "kore-vol"
@@ -584,6 +639,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc_apfloat"
+version = "0.2.3+llvm-462a31f5a5ab"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad"
+dependencies = [
+ "bitflags",
+ "smallvec",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -621,6 +686,12 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "smallvec"
+version = "1.16.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "stable_deref_trait"
@@ -741,6 +812,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-accel-device"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad6a272d3b25527b3a6ea2de02088fead249efb8bbd8d2a2590f7151eb0ea463"
+dependencies = [
+ "virtio-accel-core",
+ "virtio-accel-proto",
+ "virtio-accel-transport",
+ "zerocopy",
+]
+
+[[package]]
+name = "virtio-accel-guest"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520c262718f4214d42333ed985f3f86e9589d8f3509a1afe69f4606cd120f4da"
+dependencies = [
+ "bitflags",
+ "virtio-accel-proto",
+ "virtio-accel-transport",
+ "zerocopy",
+]
+
+[[package]]
+name = "virtio-accel-proto"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cda1ee8cd8ebd8b100ceae0ccd9de228036d3c1dc50483f37c5f5b9c63c0f0f"
+dependencies = [
+ "bitflags",
+ "zerocopy",
+]
+
+[[package]]
+name = "virtio-accel-split-queue"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bf3ad9ce01297c6bf1f01ffaf9cc4e11bff4d639661af6b5c1136d2819d6291"
+dependencies = [
+ "virtio-accel-transport",
+]
+
+[[package]]
 name = "virtio-accel-transport"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -778,18 +892,18 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.56"
+version = "0.8.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
+checksum = "d35102a9f36d089ccae9e4c6802bc118be4487b80aaffc0ab4e0cf5ce92d2873"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.56"
+version = "0.8.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
+checksum = "146c01f5ab44258da43cf276c74a2763db2ff3969c9c652c3f2de07041d0b2bc"
 dependencies = [
  "proc-macro2",
  "quote",

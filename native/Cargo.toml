@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/abi",
     "crates/app",
+    "crates/c-shim",
     "crates/collections",
     "crates/dagfs",
     "crates/driver",
@@ -15,8 +16,11 @@ members = [
     "crates/scrub",
     "crates/start",
     "crates/uart",
+    "crates/vdev",
+    "crates/vdev-accel",
     "crates/window",
     "drivers/nvme",
+    "services/accel-spmd",
     "services/block",
     "services/dagfs",
     "services/device",
@@ -26,5 +30,6 @@ members = [
     "services/mm",
     "services/output",
     "services/swap",
+    "services/vdev",
     "tools/kore-vol",
 ]

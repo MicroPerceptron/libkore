@@ -1,6 +1,7 @@
 //! The two text helpers every command needs and none should re-spell: a
-//! bounded whitespace splitter over one command line, and a bounded line
-//! buffer for composing an answer out of pieces.
+//! bounded whitespace splitter over one command line (with `"quoted"` words,
+//! so a name with spaces can be named), and a bounded line buffer for
+//! composing an answer out of pieces.
 
 /// A whitespace splitter over one completed command line.
 ///
@@ -18,12 +19,26 @@ impl<'a> Args<'a> {
         Self { rest: line }
     }
 
-    /// The next space-separated word, or `None` at the end of the line.
+    /// The next word, or `None` at the end of the line. A word is a run of
+    /// non-spaces, or — opened by `"` — everything up to the next `"`,
+    /// spaces included and quotes excluded, so `inspect "Untitled Folder"`
+    /// names the folder Files makes. A quote left open runs to the end of
+    /// the line. Borrowed either way: a quoted word is a span of the line.
     pub fn next(&mut self) -> Option<&'a [u8]> {
         let start = self.skip_spaces();
         if start >= self.rest.len() {
             self.rest = &self.rest[self.rest.len()..];
             return None;
+        }
+        if self.rest[start] == b'"' {
+            let open = start + 1;
+            let close = self.rest[open..]
+                .iter()
+                .position(|&byte| byte == b'"')
+                .map_or(self.rest.len(), |at| open + at);
+            let word = &self.rest[open..close];
+            self.rest = &self.rest[(close + 1).min(self.rest.len())..];
+            return Some(word);
         }
         let mut end = start;
         while end < self.rest.len() && self.rest[end] != b' ' {
@@ -126,6 +141,21 @@ mod tests {
         assert_eq!(args.next(), Some(&b"world"[..]));
         assert_eq!(args.next(), None);
         assert_eq!(args.rest(), b"");
+    }
+
+    #[test]
+    fn a_quoted_word_keeps_its_spaces_and_drops_its_quotes() {
+        let mut args = Args::new(b"remove \"Untitled Folder\" next \"\" \"open to the end");
+        assert_eq!(args.next(), Some(&b"remove"[..]));
+        assert_eq!(args.next(), Some(&b"Untitled Folder"[..]));
+        assert_eq!(args.next(), Some(&b"next"[..]));
+        assert_eq!(args.next(), Some(&b""[..]), "an empty quote is an empty word");
+        assert_eq!(args.next(), Some(&b"open to the end"[..]));
+        assert_eq!(args.next(), None);
+        // A quote inside a word is part of it: only a word's first byte opens.
+        let mut args = Args::new(b"a\"b c");
+        assert_eq!(args.next(), Some(&b"a\"b"[..]));
+        assert_eq!(args.next(), Some(&b"c"[..]));
     }
 
     #[test]

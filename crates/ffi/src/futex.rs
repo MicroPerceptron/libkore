@@ -91,7 +91,8 @@ pub unsafe extern "C" fn kore_futex_wait(
             Ok(time) => time.as_nanos(),
             Err(_) => return KoreFutexOutcome::Unsupported,
         };
-        let slice = deadline.map_or(1_000_000, |end| end.saturating_sub(now).min(1_000_000));
+        let slice = crate::thread_local::CANCEL_SLICE_NS;
+        let slice = deadline.map_or(slice, |end| end.saturating_sub(now).min(slice));
         let outcome = futex::wait(word, expected, Some(Duration::from_nanos(slice)));
         unsafe { crate::kore_thread_testcancel() };
         if outcome != futex::WaitOutcome::TimedOut {

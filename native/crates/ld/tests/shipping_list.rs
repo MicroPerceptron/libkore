@@ -69,9 +69,9 @@ const UNSHIPPED: &[(&str, &str)] = &[
     (
         "accel-spmd",
         "backend crate: the CPU-SIMD `Accelerator` impl over kore-rt's SPMD \
-         region launch, the third tenant crates/abi/src/svc.rs declares. No boot \
-         row yet — its compute step (`SpmdBackend::run_pending`) needs a serve \
-         loop to drive it, and that lands with the row",
+         region launch. It is the backend of the virtual accelerator \
+         (crates/vdev-accel), linked into user/services/vdev, whose founded \
+         image is kore-svc-vdev; it is not a boot row of its own",
     ),
     (
         "swap-nvme",

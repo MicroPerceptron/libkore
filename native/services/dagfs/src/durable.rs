@@ -79,7 +79,8 @@ use kore_svc_block::{BlockClient, BlockRefusal, BlockService, ProvisionRequest, 
 
 use crate::persistence::{PersistentFs, VolumeProbe, bootstrap_data_start};
 use crate::{
-    FsEndowment, FsError, FsRequest, FsResponse, FsService, ProviderError, RamService, SessionId,
+    FsEndowment, FsError, FsRequest, FsResponse, FsResult, FsService, Handle, ObjectId,
+    ProviderError, RamService, SessionId,
     persistence::{CommitStage, PersistenceError, PersistenceState, commit_engine},
     provider::BlockProvider,
     router::{self, RoutedRequest, Store},
@@ -1248,6 +1249,65 @@ impl MountedEngine {
         }
     }
 
+    fn attach_watch_plane(&mut self, peer: PeerId, aux: &'static mut [u8]) -> bool {
+        match self {
+            Self::Durable { fs, .. } => fs.attach_watch_plane(peer, aux),
+            Self::Volatile(fs) => fs.attach_watch_plane(peer, aux),
+        }
+    }
+
+    fn detach_watch_plane(&mut self, peer: PeerId) {
+        match self {
+            Self::Durable { fs, .. } => fs.detach_watch_plane(peer),
+            Self::Volatile(fs) => fs.detach_watch_plane(peer),
+        }
+    }
+
+    fn watch_target(&self, session: SessionId, handle: Handle) -> FsResult<(ObjectId, u64)> {
+        match self {
+            Self::Durable { fs, .. } => fs.watch_target(session, handle),
+            Self::Volatile(fs) => fs.watch_target(session, handle),
+        }
+    }
+
+    fn watch_epoch(&self, session: SessionId, handle: Handle, dir: ObjectId) -> FsResult<u64> {
+        match self {
+            Self::Durable { fs, .. } => fs.watch_epoch(session, handle, dir),
+            Self::Volatile(fs) => fs.watch_epoch(session, handle, dir),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn arm_watch(
+        &mut self,
+        via: u16,
+        session: SessionId,
+        slot: u8,
+        tag: u32,
+        store: Store,
+        handle: Handle,
+        target: FsResult<(ObjectId, u64)>,
+    ) -> FsResponse {
+        match self {
+            Self::Durable { fs, .. } => fs.arm_watch(via, session, slot, tag, store, handle, target),
+            Self::Volatile(fs) => fs.arm_watch(via, session, slot, tag, store, handle, target),
+        }
+    }
+
+    fn settle_watches(&mut self, system: impl FnMut(SessionId, Handle, ObjectId) -> FsResult<u64>) {
+        match self {
+            Self::Durable { fs, .. } => fs.settle_watches(system),
+            Self::Volatile(fs) => fs.settle_watches(system),
+        }
+    }
+
+    fn owed_watch_wakes(&mut self, owed: &mut [Option<PeerId>]) -> usize {
+        match self {
+            Self::Durable { fs, .. } => fs.owed_watch_wakes(owed),
+            Self::Volatile(fs) => fs.owed_watch_wakes(owed),
+        }
+    }
+
     async fn serve_request_async(
         &mut self,
         request: FsRequest,
@@ -1415,6 +1475,16 @@ impl MountedFs {
 
     fn has_system(&self) -> bool {
         self.system.is_some()
+    }
+
+    /// Publish what every armed watch saw: the primary frontend holds the
+    /// planes, and each watch is read through the engine of its own store.
+    fn settle_watches(&mut self) {
+        let system = self.system.as_ref();
+        self.user.settle_watches(|session, handle, dir| match system {
+            Some(system) => system.watch_epoch(session, handle, dir),
+            None => Err(FsError::AccessLost),
+        });
     }
 
     fn durable(&self) -> bool {
@@ -1711,6 +1781,24 @@ impl MountedFs {
                 }
                 FsResponse::Done
             }
+            // A watch on the user volume is the primary frontend's own verb.
+            RoutedRequest::Watch(Store::User, request) => {
+                self.user.serve_request_async(request, sv).await
+            }
+            // One on the system volume is resolved by the system engine and
+            // recorded in the pair's own plane: the client holds one plane.
+            RoutedRequest::Watch(Store::System, FsRequest::Watch { handle, slot, tag }) => {
+                let Some(system) = self.system.as_ref() else {
+                    return FsResponse::Refused(FsError::InvalidHandle);
+                };
+                let Some(session) = system.session_for_via(sv.via()) else {
+                    return FsResponse::Refused(FsError::AccessDenied);
+                };
+                let target = system.watch_target(session, handle);
+                self.user
+                    .arm_watch(sv.via(), session, slot, tag, Store::System, handle, target)
+            }
+            RoutedRequest::Watch(Store::System, _) => FsResponse::Refused(FsError::Unsupported),
             RoutedRequest::Both(_) => FsResponse::Refused(FsError::Unsupported),
             // `DurableService::serve_async` answers the ring verbs before the
             // engines are consulted; reaching here means this row has none.
@@ -3319,6 +3407,28 @@ impl SystemService for DurableService {
         self.advance_stor();
     }
 
+    /// A recyclable peer's pair carries its watch plane after the rings; the
+    /// primary frontend keeps it, whichever volume a watch names.
+    fn attach_peer_aux(&mut self, peer: PeerId, aux: &'static mut [u8]) -> bool {
+        self.fs
+            .as_mut()
+            .is_some_and(|fs| fs.user.attach_watch_plane(peer, aux))
+    }
+
+    fn peer_detaching(&mut self, peer: PeerId) {
+        if let Some(fs) = self.fs.as_mut() {
+            fs.user.detach_watch_plane(peer);
+        }
+    }
+
+    fn take_owed_wakes(&mut self, owed: &mut [Option<PeerId>]) -> usize {
+        let Some(fs) = self.fs.as_mut() else {
+            return 0;
+        };
+        fs.settle_watches();
+        fs.user.owed_watch_wakes(owed)
+    }
+
     fn peer_closed(&mut self, via: u16, reason: PeerClose) -> bool {
         // A departed session's ring goes first: its targets are client
         // memory mapped into the controller, and a command still in flight
@@ -3480,6 +3590,14 @@ impl SvcProtocol for DurableService {
 
     const REPLY_GRANTS: usize = <crate::FsProtocol as SvcProtocol>::REPLY_GRANTS;
     const SERVE_PAIRS: usize = <crate::FsProtocol as SvcProtocol>::SERVE_PAIRS;
+
+    fn init_pair_window(
+        window: &mut [u8],
+        req_cap: u32,
+        rep_cap: u32,
+    ) -> Result<(), kore_ring::spsc::RingError> {
+        <crate::FsProtocol as SvcProtocol>::init_pair_window(window, req_cap, rep_cap)
+    }
 
     fn reply_matches(request: &Self::ReqWire, response: &FsResponse, grants: u8) -> bool {
         <crate::FsProtocol as SvcProtocol>::reply_matches(request, response, grants)

@@ -67,6 +67,8 @@ mod view;
 #[cfg(feature = "runtime")]
 mod walk;
 #[cfg(feature = "runtime")]
+pub mod watch;
+#[cfg(feature = "runtime")]
 pub mod wire;
 
 #[cfg(feature = "runtime")]

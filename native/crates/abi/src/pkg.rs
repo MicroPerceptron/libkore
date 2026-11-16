@@ -27,13 +27,27 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Layout version.  A zeroed record reads `abi == 0` and is *not a
 /// manifest*; a reader refuses rather than guessing.
-pub const PACKAGE_ABI: u16 = 1;
-/// Members one manifest may declare.  The bootstrap archive today carries
-/// 33 executables and 3 libraries (`BOOTSTRAP_EXECUTABLES` /
-/// `BOOTSTRAP_LIBRARIES` in exec), and the system package `kore` must list
-/// every one of them; 48 leaves a third free before the record grows a
-/// second page.  `size_of::<PackageManifest>()` is pinned below.
-pub const MAX_PACKAGE_MEMBERS: usize = 48;
+///
+/// 2: [`MAX_PACKAGE_MEMBERS`] grew from 48 to 96, so the record grew with
+/// it. Version 1 manifests were only ever written — exec rewrites the
+/// system package's in place at every boot, and no installer reads one
+/// yet — so nothing has to read both shapes; the bump is what lets a future
+/// reader tell them apart rather than misread one as the other.
+pub const PACKAGE_ABI: u16 = 2;
+/// Members one manifest may declare: every bootstrap executable and library
+/// (`BOOTSTRAP_EXECUTABLES` / `BOOTSTRAP_LIBRARIES` in exec), which the
+/// system package `kore` must list in full.
+///
+/// **Where the number comes from.** The record is read whole by one
+/// `ReadVersion` transfer (`MAX_TRANSFER`, 4096 bytes): 48 bytes of header
+/// and name, then 40 a member, so one page holds 100. 96 is the most of
+/// that in whole 32-member steps. 48 was the first ceiling, reached exactly
+/// when the catalogue held 45 executables and 3 libraries; the C compiler
+/// was the 49th member. **What breaks if it moves.** Larger needs a second
+/// transfer to read the record (a reader change, and another
+/// [`PACKAGE_ABI`]); smaller fails exec's build, which asserts the
+/// catalogue fits. `size_of::<PackageManifest>()` is pinned below.
+pub const MAX_PACKAGE_MEMBERS: usize = 96;
 /// A member or package name: the store's own name bound
 /// ([`FS_NAME_BYTES`](crate::svc::FS_NAME_BYTES)), zero-padded, so a
 /// manifest name is always a legal DagFS name and never needs clamping.
@@ -255,12 +269,13 @@ impl PackageManifest {
 }
 
 const _: () = assert!(core::mem::size_of::<PackageMember>() == 8 + PACKAGE_NAME_BYTES);
-/// 16-byte header + 32-byte name + 48 × 40-byte members = 1968 bytes: one
+/// 16-byte header + 32-byte name + 96 × 40-byte members = 3888 bytes: one
 /// `ReadVersion` transfer (`MAX_TRANSFER` = 4096) reads a whole manifest.
 const _: () = assert!(
     core::mem::size_of::<PackageManifest>()
         == 16 + PACKAGE_NAME_BYTES + MAX_PACKAGE_MEMBERS * (8 + PACKAGE_NAME_BYTES)
 );
+const _: () = assert!(core::mem::size_of::<PackageManifest>() <= 4096);
 
 #[cfg(test)]
 mod tests {
@@ -281,7 +296,7 @@ mod tests {
     fn a_manifest_round_trips_through_its_bytes_and_validates() {
         let manifest = system_package();
         let bytes = manifest.as_bytes();
-        assert_eq!(bytes.len(), 1968);
+        assert_eq!(bytes.len(), 3888);
         let read = PackageManifest::read_from_bytes(bytes).unwrap();
         assert_eq!(read, manifest);
         assert_eq!(read.validate(), Ok(()));
@@ -297,7 +312,7 @@ mod tests {
 
     #[test]
     fn a_zeroed_record_is_not_a_manifest() {
-        let zero = PackageManifest::read_from_bytes(&[0u8; 1968]).unwrap();
+        let zero = PackageManifest::read_from_bytes(&[0u8; 3888]).unwrap();
         assert_eq!(zero.validate(), Err(ManifestError::Abi(0)));
     }
 
@@ -333,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn push_refuses_duplicates_and_the_forty_ninth_member() {
+    fn push_refuses_duplicates_and_a_member_past_the_ceiling() {
         let mut manifest = system_package();
         assert!(
             manifest
