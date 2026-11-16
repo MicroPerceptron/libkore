@@ -339,6 +339,7 @@ fn check_variant<A: RelocArch>(root: &Path, variant: &str, required: bool) -> us
         ("sleep", ImageKind::Executable),
         ("status", ImageKind::NeedsLibrary("libpci_names.so")),
         ("lspci", ImageKind::NeedsLibrary("libpci_names.so")),
+        ("ioctl", ImageKind::NeedsLibrary("libpci_names.so")),
         ("help", ImageKind::Executable),
         ("window", ImageKind::Executable),
         ("clear", ImageKind::Executable),

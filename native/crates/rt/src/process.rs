@@ -53,6 +53,13 @@ pub fn initialize_with_context(
     page.initialize_with_context(args, context, TelemetrySnapshot::EMPTY)
 }
 
+/// Publish the name the launcher resolved the program by
+/// ([`ProcessIo::command`]), after the page is initialized and before START.
+pub fn write_command(window: &mut [u8], name: &[u8]) -> Result<(), ProcessIoError> {
+    let (page, _) = ProcessIo::mut_from_prefix(window).map_err(|_| ProcessIoError::Invalid)?;
+    page.write_command(name)
+}
+
 /// Publish the launcher's filesystem snapshot, same window as the telemetry
 /// snapshot and the same lifecycle point: after founding, before START.
 pub fn write_filesystem(

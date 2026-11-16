@@ -184,6 +184,22 @@ impl SystemService for RamService {
     fn peer_arena(&self) -> Option<&'static (dyn core::alloc::Allocator + Sync)> {
         Some(crate::service_alloc())
     }
+
+    /// A recyclable peer's pair carries its watch plane after the rings.
+    fn attach_peer_aux(&mut self, peer: PeerId, aux: &'static mut [u8]) -> bool {
+        self.attach_watch_plane(peer, aux)
+    }
+
+    fn peer_detaching(&mut self, peer: PeerId) {
+        self.detach_watch_plane(peer);
+    }
+
+    /// Publish what every armed watch saw since the last unit of work. A lone
+    /// engine has no system volume, so nothing can be watched on one.
+    fn take_owed_wakes(&mut self, owed: &mut [Option<PeerId>]) -> usize {
+        self.settle_watches(|_, _, _| Err(FsError::AccessLost));
+        self.owed_watch_wakes(owed)
+    }
 }
 
 impl<P: crate::provider::StorageProvider> FsService<P> {
@@ -429,6 +445,19 @@ impl<P: crate::provider::StorageProvider> FsService<P> {
                     Err(error) => FsResponse::Refused(error),
                 };
             }
+            FsRequest::Watch { handle, slot, tag } => {
+                let target = self.watch_target(session, handle);
+                self.arm_watch(
+                    sv.via(),
+                    session,
+                    slot,
+                    tag,
+                    crate::router::Store::User,
+                    handle,
+                    target,
+                )
+            }
+            FsRequest::Unwatch { slot } => self.disarm_watch(sv.via(), session, slot),
             FsRequest::MatchView { handle, announced } => {
                 let Some(mut input) = sv.returned_input(announced) else {
                     return FsResponse::Refused(FsError::AccessDenied);
@@ -500,6 +529,14 @@ impl SvcProtocol for RamService {
     /// is what keeps the serving side from drifting from the client it answers.
     const REPLY_GRANTS: usize = <DagfsProtocol as SvcProtocol>::REPLY_GRANTS;
     const SERVE_PAIRS: usize = <DagfsProtocol as SvcProtocol>::SERVE_PAIRS;
+
+    fn init_pair_window(
+        window: &mut [u8],
+        req_cap: u32,
+        rep_cap: u32,
+    ) -> Result<(), kore_ring::spsc::RingError> {
+        DagfsProtocol::init_pair_window(window, req_cap, rep_cap)
+    }
 
     fn reply_matches(request: &FsReqWire, response: &FsResponse, grants: u8) -> bool {
         DagfsProtocol::reply_matches(request, response, grants)

@@ -43,6 +43,11 @@ use kore_ffi as _;
 use kore_c_shim as _;
 
 pub mod api;
+// Off Kore only the host suite reads the vector's storage: the page it is
+// read from and the hook that answers it are the Kore program's alone.
+#[cfg(any(test, target_os = "none"))]
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+mod args;
 #[cfg(any(test, target_os = "none"))]
 mod exit;
 // Off Kore only `kore_fd_describe` and the host suite read these two: the

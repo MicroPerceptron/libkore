@@ -3145,6 +3145,21 @@ pub enum SystemMetric {
     IommuUnit = 35,
     /// Indexed capabilities and scope counts, Unit::features() observation.
     IommuUnitFeatures = 36,
+    /// One PCI function's live state; operand = its catalog index, as for
+    /// [`DeviceRow`](Self::DeviceRow).  The pair is
+    /// [`DeviceState::to_observation`](crate::device::DeviceState::to_observation):
+    /// whether a driver claimed it, the founded row driving its DMA, which
+    /// BARs exist, may be mapped and are mapped, and how it can interrupt.
+    /// A snapshot, never permission; no address.
+    DeviceState = 37,
+    /// One BAR's shape; operand =
+    /// [`device_bar_operand`](crate::device::device_bar_operand) of the
+    /// function's catalog index and the BAR number.  The pair is
+    /// [`DeviceBar::to_observation`](crate::device::DeviceBar::to_observation):
+    /// the BAR's size and the length a driver may map.  Lengths only: where
+    /// the BAR lives never crosses.  A BAR the function has not answers the
+    /// zero shape.
+    DeviceBar = 38,
 }
 
 /// Records the kernel retains for [`SystemMetric::IommuFaultRecord`].
@@ -3516,6 +3531,8 @@ impl SystemObserveReq {
         matches!(
             metric,
             SystemMetric::DeviceRow
+                | SystemMetric::DeviceState
+                | SystemMetric::DeviceBar
                 | SystemMetric::ProcessorCapture
                 | SystemMetric::ProcessorIdentity
                 | SystemMetric::ProcessorTopology

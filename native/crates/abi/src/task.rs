@@ -465,19 +465,19 @@ pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
     DESKTOP_BOOTSTRAP_WINDOW_SLOTS + 2 * DESKTOP_CONTROLLER_CAPACITY;
 
 /// Live immutable image-generation peers the boot catalogue can hold at once:
-/// the 46-row bootstrap catalogue — the desktop's `files`, its documents
+/// the 47-row bootstrap catalogue — the desktop's `files`, its documents
 /// `editor`, `photos`, `settings` and `power-ui`, the screenshot writer `capture`, beside
 /// the native filesystem verbs `append`, `sync` and `pack`, the two
 /// WebAssembly rows, `wasm-witness` and `wasm`, `jsapp`, the JS app host,
 /// `inference` / `model-data-witness`, `shell`, the guest shell `term`
-/// opens, and `tcc`, the C compiler — plus the founded shell, the graphical
-/// terminal, and three extraction parsers.
+/// opens, `tcc`, the C compiler, and `ioctl`, the device tool — plus the
+/// founded shell, the graphical terminal, and three extraction parsers.
 /// Exec asserts this covers its catalogue (`kore-svc-exec`), the one place
 /// that sees both.  Named
 /// separately from the interactive reservation below because the two grow for
 /// unrelated reasons: this one when a row joins the catalogue, that one when
 /// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 51;
+pub const BOOTSTRAP_IMAGE_PEERS: usize = 52;
 
 /// Private image generations installed at runtime that can live at once,
 /// across every session: exec's `InstallFile` rows, each a file a task

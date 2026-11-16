@@ -106,6 +106,10 @@ pub struct Fs<'w, 't> {
     pub(crate) ring_files: u64,
     /// Why the last whole-file read did or did not take that ring.
     pub(crate) ring_note: &'static str,
+    /// This pair's watch plane — the event channel the service formats
+    /// after the rings in this pair's own window (`crate::watch`) — or
+    /// `None` on a pair formatted without one.
+    pub(crate) watch: Option<crate::watch::WatchSink<'static>>,
 }
 
 impl<'w, 't> Fs<'w, 't> {
@@ -128,11 +132,13 @@ impl<'w, 't> Fs<'w, 't> {
         // window only through the SPSC protocol.
         let window: &'static mut [u8] =
             unsafe { core::slice::from_raw_parts_mut(window.cast::<u8>().as_ptr(), window.len()) };
-        // An *attach*, not an init: the filesystem row's own `init_window`
-        // formatted this ring at founding, and `client_rings` fail-closes
-        // on an unformatted window rather than reading a zeroed page as an
-        // empty ring.
-        let rings = client_rings::<DagfsProtocol>(window, REQ_CAP, kore_rt::svc::REP_CAP).ok()?;
+        // An *attach*, not an init: the filesystem row's own formatter
+        // laid out this window at founding — the rings, then the watch
+        // plane — and both attaches fail closed on an unformatted window
+        // rather than reading a zeroed page as an empty ring.
+        let (pair, tail) = window.split_at_mut(crate::watch::PLANE_AT.min(window.len()));
+        let rings = client_rings::<DagfsProtocol>(pair, REQ_CAP, kore_rt::svc::REP_CAP).ok()?;
+        let watch = crate::watch::sink(tail).ok();
         let kick = rt
             .bootstrap()
             .handle(role::SVC_SEND, process_face::REQUEST_KICK)?;
@@ -223,7 +229,68 @@ impl<'w, 't> Fs<'w, 't> {
             ring,
             ring_files: 0,
             ring_note: "unused",
+            watch,
         })
+    }
+
+    /// This pair's watch plane, if the pair carries one.
+    pub fn watch_plane(&self) -> Option<&crate::watch::WatchSink<'static>> {
+        self.watch.as_ref()
+    }
+
+    /// Arm watch `slot` on the directory `dir`, tagged `tag` (a non-zero
+    /// name of the client's own for this arming): the plane counts every
+    /// change to what listing `dir` shows from now on. The view stays the
+    /// caller's — closing it ends the watch. `Unsupported` on a pair without
+    /// a plane.
+    pub async fn watch(&mut self, dir: &crate::View, slot: u8, tag: u32) -> Result<(), Refusal> {
+        if self.watch.is_none() {
+            return Err(Refusal::Fs(crate::FsError::Unsupported));
+        }
+        self.checked(&FsRequest::Watch {
+            handle: dir.handle(),
+            slot,
+            tag,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Disarm watch `slot`.
+    pub async fn unwatch(&mut self, slot: u8) -> Result<(), Refusal> {
+        self.checked(&FsRequest::Unwatch { slot }).await.map(|_| ())
+    }
+
+    /// The plane's wake word, read before a caller drains its sources: a
+    /// park published against it ([`Self::arm_watch_park`]) is lossless.
+    /// Zero, and never moving, on a pair without a plane.
+    pub fn watch_seq(&self) -> u32 {
+        self.watch.as_ref().map_or(0, crate::watch::WatchSink::seq)
+    }
+
+    /// The plane's state, `None` on a pair without one (or mid-publish,
+    /// which the caller treats as nothing new and reads again next pass —
+    /// the publish ends by moving the wake word).
+    pub fn watch_state(&self) -> Option<kore_abi::svc::FsWatchState> {
+        self.watch.as_ref().and_then(crate::watch::WatchSink::state)
+    }
+
+    /// Publish this task's intent to wait on the plane, for a caller about to
+    /// enter one executor wait that every source shares (the multiplexed
+    /// park, `res/FILES_DESKTOP.md`): the service's next batch then owes
+    /// this task a notice on its doorbell. `false` when the plane already
+    /// moved past `seen` — drain again instead of waiting. Always `true` on
+    /// a pair without a plane, which has nothing to wait for.
+    pub fn arm_watch_park(&self, seen: u32) -> bool {
+        self.watch.as_ref().is_none_or(|sink| sink.park(seen))
+    }
+
+    /// Withdraw the intent [`Self::arm_watch_park`] published, however the
+    /// wait ended, so a departed waiter is never charged a notice.
+    pub fn withdraw_watch_park(&self) {
+        if let Some(sink) = self.watch.as_ref() {
+            sink.unpark();
+        }
     }
 
     /// The bulk data window, read side. Bytes a verb landed here are valid

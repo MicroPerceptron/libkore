@@ -17,7 +17,7 @@ parse_deps = false
 # this header includes.
 # `open`, `close`, `mmap` and `munmap` are POSIX's, declared by <fcntl.h>,
 # <unistd.h> and <sys/mman.h>.
-exclude = ["__kore_program_start", "__kore_program_exit", "abort", "open", "close", "mmap", "munmap", "KoreFsStep"]
+exclude = ["__kore_program_start", "__kore_program_exit", "__kore_program_arguments", "abort", "open", "close", "mmap", "munmap", "KoreFsStep"]
 [enum]
 prefix_with_name = true
 rename_variants = "ScreamingSnakeCase"

@@ -213,9 +213,21 @@ mapped there. The rules follow from that:
   end with `ENOMEM`. A program holds sixteen regions, mapped and parked
   together.
 
-The C library's half is two weak references. Its start calls
-`__kore_program_start(program, end)` when the program links libkore, and its
-exit calls `__kore_program_exit`. A program without libkore is unchanged. On
+**`main` gets its arguments.** The launcher's page carries the name it
+resolved the program by and the rest of the command line. The host reads it
+once, on thread 0 before the main thread exists, and splits the rest as every
+Kore program that wants words does: a POSIX shell's quoting, without
+expansion. `argv[0]` is the name, or the empty string when the launcher gave
+none, `argv[argc]` is null, and the strings are the program's to change. A
+line that does not split (an unclosed quote, a lone trailing backslash) is
+not handed to `main`: the host says why on `stderr` and the program ends with
+status 5 before it runs. `envp` is the empty vector, since a Kore task has no
+environment. A launch that carried no page runs with `argc` zero.
+
+The C library's half is three weak references. Its start calls
+`__kore_program_start(program, end)` when the program links libkore, asks
+`__kore_program_arguments(&argv)` for the vector before it calls `main`, and
+its exit calls `__kore_program_exit`. A program without libkore is unchanged. On
 Kore those are the start files Kore ships with TCC. `tools/check-program.py`
 (`make cross`, and CI per ISA) links the shared object as a distribution does
 and checks it:

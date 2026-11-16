@@ -276,7 +276,7 @@ pub(crate) fn held_is_next(held_after: u32, head: u32) -> bool {
 extern crate alloc;
 
 #[cfg(target_os = "none")]
-pub(crate) use metal::{Endpoint, abandon, arm, drain, finish, flush_now, install};
+pub(crate) use metal::{Endpoint, abandon, arm, drain, finish, flush_now, install, report};
 
 #[cfg(target_os = "none")]
 mod metal {
@@ -331,6 +331,13 @@ mod metal {
         }
         // SAFETY: on thread 0, after `install` wrote it (see `EndpointCell`).
         Some(unsafe { (*ENDPOINT.0.get()).assume_init_ref() })
+    }
+
+    /// A line on `stderr` from the host itself: what it must say when the
+    /// program cannot run. Kept in order and relayed as any write made on
+    /// the host is. Nothing is said when the launch carried no stream.
+    pub(crate) fn report(line: &[u8]) {
+        let _ = sink(Standard::Error, line);
     }
 
     pub(crate) fn host_pending() -> bool {

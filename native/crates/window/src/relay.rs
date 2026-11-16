@@ -148,7 +148,25 @@ impl RelayProducer<'_> {
     /// Loss is explicit, bounded and nonblocking. While a Reset is pending,
     /// no snapshot is published, even if the consumer has freed ring slots.
     pub fn push(&mut self, focus: Focus, report: InputReport) -> bool {
-        if focus.target != FocusTarget::Window || focus.encode().is_none() || !keyboard(report) {
+        if focus.target != FocusTarget::Window {
+            return false;
+        }
+        self.publish(focus, report)
+    }
+
+    /// On the terminal route, the keys its window keeps from the shell
+    /// ([`crate::keysplit`]): the same snapshot ring and loss rule, tagged
+    /// with the terminal route's epoch, so the compositor hands them to the
+    /// terminal window and to nothing a later route focuses.
+    pub fn push_window_keys(&mut self, focus: Focus, report: InputReport) -> bool {
+        if focus.target != FocusTarget::Terminal {
+            return false;
+        }
+        self.publish(focus, report)
+    }
+
+    fn publish(&mut self, focus: Focus, report: InputReport) -> bool {
+        if focus.encode().is_none() || !keyboard(report) {
             return false;
         }
         if self.cell.reset_epoch.load(Ordering::Acquire) == 0
@@ -546,11 +564,31 @@ mod tests {
         malformed.data[0] = 1;
         assert!(!input.reports.push(focus, malformed));
         assert!(!input.reports.push(Focus { epoch: 0, ..focus }, report));
+        assert!(!input.reports.push_window_keys(focus, report), "a window route's keys are pushed whole");
         assert_eq!(input.reports.dropped(), 0);
         assert!(!input.reports.needs_wake());
         assert!(!compositor.reports.pending());
         assert_eq!(compositor.reports.poll(), None);
         assert_eq!(compositor.echo.pop(), None);
+    }
+
+    /// The terminal route's window keys ride the ring under its own epoch.
+    #[test]
+    fn a_terminal_routes_window_keys_ride_under_its_epoch() {
+        let mut page = Page([0; 4096]);
+        let (mut input, mut compositor) = split(&mut page.0).unwrap();
+        let chord = InputReport::keyboard(1, kore_abi::keyboard::modifier::LEFT_GUI, [6, 0, 0, 0, 0, 0]);
+        assert!(input.reports.push_window_keys(Focus::INITIAL, chord));
+        assert_eq!(
+            compositor.reports.poll(),
+            Some(RelayEvent::Snapshot {
+                epoch: Focus::INITIAL.epoch,
+                report: chord
+            })
+        );
+        let mut malformed = chord;
+        malformed.data[0] = 1;
+        assert!(!input.reports.push_window_keys(Focus::INITIAL, malformed));
     }
 
     /// The seat's lock state rides the snapshot to the window unchanged — a

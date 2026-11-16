@@ -428,12 +428,52 @@ and `thread_controller.rs`, the record, and five services' `boot.toml`
 digests differ. The digests come from #1494's own reseal (`f2644e5b`), which
 followed its export.
 
+It then moved to Kore `eb59823a29cc9b0cfe0ea27a386c3fac266534ef`, the merge
+of #1494's merge of Kore main `f2dc8309`. Main reaches the closure in four
+places:
+
+- the seat clipboard and Cmd chords (#1469): kore-abi's insert into a held
+  input line and a window's clipboard chunks, and kore-window's clipboard,
+  key split and shortcuts;
+- Files' live folder and sidebar (#1450, #1456): a DagFS watch plane in the
+  `dagfs` crate and service, and kore-rt's owed service wakes
+  (`SystemService::take_owed_wakes`), which the serve host delivers after
+  each unit of work;
+- DagFS's cwd anchor and `MatchView`, `.` and `..` in `resolve`, and a dead
+  view reaped by asking the kernel;
+- five services' `boot.toml` digests, from #1494's reseal over the merge
+  (`e6b108d1`).
+
+The closure is now 27 packages and 406 files. Against Kore `e6b108d1`, only
+kore-rt's `futex.rs` and `thread_controller.rs` differ. No exported manifest
+changed, so `native/Cargo.lock` did not.
+
+It then moved to Kore `5c09f155b03682e95f24f924cdd65188fc9ebc60`, the merge
+of #1494's next round into this change. That round lets the kernel observe a
+PCI function's live state and its BARs' shapes, and puts the name a program
+was run by in its process page. libkore#32 exported it first, at Kore
+`dfece644`. The closure is now 27 packages and 407 files. Against Kore
+`4b236fbe`, only kore-rt's `futex.rs` and `thread_controller.rs` differ.
+Against libkore#32's export, five services' `boot.toml` digests differ as
+well, from #1494's reseals that followed it. No exported manifest changed,
+so `native/Cargo.lock` did not.
+
+It then moved to Kore `7c0be6e84ac2e8ee67591b44c0f42d46ab596f83`, the merge
+of #1494's next round into this change. That round has the kernel offer a
+function to drivers only on positive evidence and name each claim's holder,
+which kore-abi's device state and its new device classes carry. The closure
+is now 27 packages and 408 files. Against Kore `fe9603e3`, only kore-rt's
+`futex.rs` and `thread_controller.rs` differ, and `services/swap/boot.toml`:
+swap links kore-rt's futex, so its digests are this change's reseal over
+the ioctl round (`b04325e9`). No exported manifest changed, so
+`native/Cargo.lock` did not.
+
 ## A relayed wake reaches its waiter alone
 
-The export records Kore `fba0662d3485d065ef85ffd400acd4643e73460f`, on
+The export records Kore `c491a40640fb5fc603e3e8ab27c0350e6ec74877`, on
 `ft/admiring-lovelace-69eiok`, which is stacked on `ft/brave-heisenberg-zgoaux`
-and merges its head (`83861dc9`). Against that branch's export at `4a56f827`,
-the closure keeps its 27 packages and 401 files, and two things differ:
+and merges its head (`c86ea1bf`). Against that branch's export at `7c0be6e8`,
+the closure keeps its 27 packages and 408 files, and only the relay differs:
 
 - `kore-rt`'s thread controller relays a wake to the threads it was for and no
   others (Kore `b67f198`). Managed threads hold no send into each other's
@@ -447,10 +487,9 @@ the closure keeps its 27 packages and 401 files, and two things differ:
   kicks each band that still waits. The registry's Dekker argument makes this
   lossless: a waiter that registers after the waker's scan reads the new word
   and never parks.
-- `services/swap/boot.toml`'s digests, from that branch's reseal (`83861dc9`),
-  which followed its export. This branch's reseal over the relay follows this
-  export in turn.
 
+The five exported services' `boot.toml` digests are that branch's; this
+branch's reseal over the relay, which every service links, follows this export.
 No exported manifest changed, so `native/Cargo.lock` did not.
 
 Nothing in `kore-ffi` or `kore-c` changes. A C program's futex wakes take the

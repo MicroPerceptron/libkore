@@ -413,6 +413,21 @@ pub trait SystemService: crate::svc::SvcProtocol + Sized {
     /// retryable domain custody still closes in `peer_closed` afterward.
     fn peer_detaching(&mut self, _peer: crate::svc::PeerId) {}
 
+    /// Recyclable peers this service owes one wake: it published a batch into
+    /// an event channel it keeps in their pair's tail (`attach_peer_aux`,
+    /// `res/EVENT.md`) and the batch's commit found the consumer parked.
+    ///
+    /// [`ServeHost`](crate::svc::ServeHost) asks after every unit of work —
+    /// a request, a teardown, an idle recheck — and sends each peer named in
+    /// `owed[..n]` one notice through the endpoint it owns, so a service never
+    /// copies an affine endpoint out of its peer bundle to wake a client. Name
+    /// each peer once per owed wake and clear it as it is handed over; a full
+    /// batch is asked again. The default owes nothing: the request/reply shape,
+    /// whose only wake is the reply's.
+    fn take_owed_wakes(&mut self, _owed: &mut [Option<crate::svc::PeerId>]) -> usize {
+        0
+    }
+
     /// Observe completion of an admission requested through
     /// [`Serve::admit_peer`]. The host, not the wire request, chooses the
     /// generational identity and reports only the authenticated result.

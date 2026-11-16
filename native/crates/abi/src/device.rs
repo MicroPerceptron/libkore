@@ -20,9 +20,13 @@
 //! route) — and teardown is an ordinary `Revoke` of the leaf.
 
 mod census;
+mod class;
 mod i2c_admission;
+mod state;
 pub use census::*;
+pub use class::*;
 pub use i2c_admission::*;
+pub use state::*;
 
 /// An I/O virtual address — a device-domain address translated by the
 /// IOMMU. **Never** a physical address: userland holds only this, so it can
