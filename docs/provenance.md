@@ -483,3 +483,61 @@ files differ, all from #1494's commits after `cac17a02`:
 - the `boot.toml` digests of DagFS, swap and vdev, from #1494's reseals.
 
 No exported manifest changed, so `native/Cargo.lock` did not.
+
+## A relayed wake reaches its waiter alone
+
+The export records Kore `b43bd0a63861feeb3e81b5d3e9f561f26b1a11b3`, on
+`ft/admiring-lovelace-69eiok`, which is stacked on `ft/brave-heisenberg-zgoaux`
+and merges its head (`4393ed08`). Against that branch's export at `a07b4eae`,
+the closure keeps its 31 packages and 442 files, and only the relay differs,
+with two services' `boot.toml`: swap and vdev link kore-rt's futex, so their
+digests are that branch's reseal over the virtual-device round (`4393ed08`),
+which followed its export.
+
+- `kore-rt`'s thread controller relays a wake to the threads it was for and no
+  others (Kore `b67f198`). Managed threads hold no send into each other's
+  doorbells, so a wake between two of them goes through the controller's hub.
+  The hub used to count relays, and the controller swept: it kicked every
+  thread with a doorbell waiter, whatever word that thread waited on, so every
+  relayed wake woke every parked thread in the program. Now a waker owes the
+  hub the bands of the waiters it found and could not kick before it moves the
+  hub's word: `wake` owes its first, `wake_all` all of them and `wake_thread`
+  its target. The controller takes the owed bands after it reads that word and
+  kicks each band that still waits. The registry's Dekker argument makes this
+  lossless: a waiter that registers after the waker's scan reads the new word
+  and never parks.
+
+The six exported services' `boot.toml` digests are that branch's; this
+branch's reseal over the relay, which every service links, follows this export.
+No exported manifest changed, so `native/Cargo.lock` did not.
+
+Nothing in `kore-ffi` or `kore-c` changes. A C program's futex wakes take the
+controller's relay as before and reach fewer threads; `docs/runtime.md` now
+says so. The metal evidence is Kore's `keytest-tcc-x86`. The libkore tour has
+two threads take 400 turns through a mutex and a condition variable on the
+futex while `main` and as many more threads as the controller admits, up to
+eight, wait parked on words nobody stores. Before the founder's arena, the
+controller admitted two managed threads at once, so `main` was the only
+parked thread. On the image built from `4f913c4` no wake reached it; with
+kore-rt's futex and controller from `a4ab7234`, which count and sweep, it was
+woken 208 times and the tour failed that step. Kore `e0717eb` repeated that
+over the founding wait: no wake, against 206 with the founding wait's own
+futex and controller (`36b99426`).
+
+Kore's reseal over the export at `fba0662` measured it with all nine parked
+(`09a98a0`, built from `8b617ee`, which pinned it): every step ran to `exit 42`
+and no wake reached any of them. The same tree with the futex and controller of
+that branch's head (`83861dc9`), which count and sweep, delivered 1466 wakes to
+them over the 400 turns, and the tour failed that step. Since then the merges
+have changed neither side's `futex.rs`. They brought the same change to both
+sides' controller: #1494's `hand_on`, which acts at founding. So the relay is
+still the only difference between the two. Kore's next reseal (`9e477e5`, built
+from `00d666c`, which pins the export at `c491a40`) measured it again: no wake
+reached the nine parked threads, over 400 turns and 148 wakes.
+
+Kore's reseal over this export (`c6308c60`, built from `a68fa19`, which pins
+it) measured it once more, with #1494's virtual-device round merged. Every
+step ran to `exit 42`, and no wake reached the nine parked threads, over 400
+turns and 43 wakes. The keytest ran as its target runs it, and its new step
+passed too: a driver in C brought the virtual accelerator up and gave it back,
+twice.

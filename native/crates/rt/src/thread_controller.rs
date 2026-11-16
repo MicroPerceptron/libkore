@@ -30,8 +30,11 @@
 //! The child runs its callback once its founding is published, which follows
 //! the adopted send, so the controller reaches every wait the callback makes.
 //! Children and the starter relay through the controller's hub, so a wake
-//! between two threads neither can kick directly still arrives: the controller
-//! sweeps ([`futex::sweep`]).
+//! between two threads neither can kick directly still arrives: the waker
+//! owes the hub the bands it found waiting and could not kick, and the
+//! controller kicks those and no others ([`futex::deliver`]). A wake between
+//! two of a C program's threads costs one kick into the controller and one
+//! out of it, however many of the program's threads are parked.
 //!
 //! Both the controller and every child take a founder's arena (the
 //! founding granule of capability slots): the controller holds each live child's handle,
@@ -891,8 +894,6 @@ mod owner {
         /// reap: the controller never spends an arena slot to observe.
         scratch: Option<JoinScratch>,
         children: [Option<Child>; COUNT],
-        /// The hub's relay count at the last sweep.
-        swept: u32,
     }
 
     /// What one reap attempt came to.
@@ -935,7 +936,6 @@ mod owner {
                 starter,
                 scratch: JoinScratch::reserve(),
                 children: [const { None }; COUNT],
-                swept: controller.hub.relays(),
             }
         }
 
@@ -944,10 +944,15 @@ mod owner {
             let controller = self.controller;
             loop {
                 let seen = controller.hub.word().load(Ordering::SeqCst);
-                let owed = controller.hub.relays();
-                if owed != self.swept {
-                    self.swept = owed;
-                    futex::sweep();
+                // The bands relayed here, taken after the word is read and
+                // before the park on it: a relay owes its bands before it
+                // moves the word, so one this take misses moved the word
+                // after `seen`, and the park below cannot sleep through it.
+                // Owed bands keep until taken, so none owed before this
+                // thread's first pass is lost.
+                let owed = controller.hub.take_owed();
+                if owed != 0 {
+                    futex::deliver(owed);
                 }
                 let mut watch = None;
                 let mut failed = false;

@@ -87,9 +87,9 @@
 //! A waiter that no send this thread holds can reach is handed to a
 //! **relay**: the star's hub (one notice on `DOORBELL@`[`RELAY`], answered by
 //! a kick to every peer), or a [`Hub`] this thread adopted — a hub that is
-//! itself a waiter, woken through its own word, which kicks only the threads
-//! with waiters registered ([`sweep`]). Nothing in the wait/wake API changes
-//! with either.
+//! itself a waiter, woken through its own word and told which bands the
+//! waker found waiting and could not kick, which it kicks and no others
+//! ([`deliver`]). Nothing in the wait/wake API changes with either.
 //!
 //! **For a word in a shared window the gap is closed** by the kernel
 //! address-wait (`res/EVENT.md` §6).  A word that
@@ -134,14 +134,15 @@
 //! The condition's writer stores it (`SeqCst`), then wakes the thread. That
 //! is mechanism 2 again, with the condition in the word's place. The writer
 //! stores, then reads the waiter's registration — [`wake_thread`] reads it
-//! before it kicks or relays, and a hub's sweep reads it again before it
-//! kicks — and the waiter registers, then reads the condition, so one of
-//! the two sees the other. A writer that misses the registration is one whose
-//! store the waiter's read follows: the waiter does not park. A writer that
-//! sees it kicks a post that already stands, since the waiter armed before it
-//! registered, and that kick resolves the park the waiter is in or about to
-//! enter. A wait that can be ended therefore carries no timeout it does not
-//! need: nothing re-reads, on a slice, a condition its writer announces.
+//! before it kicks or relays, and a hub delivering the relay reads it again
+//! before it kicks ([`deliver`]) — and the waiter registers, then reads the
+//! condition, so one of the two sees the other. A writer that misses the
+//! registration is one whose store the waiter's read follows: the waiter
+//! does not park. A writer that sees it kicks a post that already stands,
+//! since the waiter armed before it registered, and that kick resolves the
+//! park the waiter is in or about to enter. A wait that can be ended
+//! therefore carries no timeout it does not need: nothing re-reads, on a
+//! slice, a condition its writer announces.
 //!
 //! A stoppable wait parks on its doorbell even for a word in a noted window:
 //! the kernel's word wait ends only on its word, and a stop arrives as a kick.
@@ -937,9 +938,34 @@ pub fn wake(word: &AtomicU32) -> bool {
 /// is handed on ([`relay_missed`]); a [`Hub`]'s own signal is not, since the
 /// hub is the relay.
 fn wake_one(word: &AtomicU32, relay: bool) -> bool {
-    let addr = address_of(word);
-    let route = crate::cap::mapped::locate(word as *const AtomicU32 as *const u8);
+    wake_one_with(
+        address_of(word),
+        crate::cap::mapped::locate(word as *const AtomicU32 as *const u8),
+        imp::kick,
+        imp::wake_word,
+        |bands| relay && relay_missed(bands),
+    )
+}
+
+/// [`wake_one`]'s scan over the registry for the waiters on `addr`, with
+/// its deliveries injected so the host suite can hold the selection to
+/// account, as [`deliver_with`]'s kick is: `kick` posts into band `t`'s
+/// doorbell, `wake_word` releases up to `count` waiters parked on the word
+/// through `route`, this side's mapping of it, and `relay` hands on the
+/// doorbell bands neither reached ([`relay_missed`]). Each answers whether
+/// it went.
+fn wake_one_with(
+    addr: usize,
+    route: Option<(kore_abi::session::SlotRef, u32)>,
+    mut kick: impl FnMut(usize) -> bool,
+    mut wake_word: impl FnMut(kore_abi::session::SlotRef, u32, u32) -> bool,
+    relay: impl FnOnce(u32) -> bool,
+) -> bool {
     let mut unreachable_waiter = false;
+    // The doorbell waiter the relay is for: the first this caller found and
+    // could not kick. A wake for one waiter relays one, so the hub kicks
+    // that band and leaves every other thread parked.
+    let mut relayed = 0;
     for thread in 0..MAX_THREADS as usize {
         let (bell, on_word) = thread_wait_modes(thread, addr);
         // A word-parked waiter is reached on the memory, by this side's own
@@ -948,7 +974,7 @@ fn wake_one(word: &AtomicU32, relay: bool) -> bool {
         // first when both modes stand.
         if on_word {
             if let Some((subject, offset)) = route
-                && imp::wake_word(subject, offset, 1)
+                && wake_word(subject, offset, 1)
             {
                 STAT_KICKS.fetch_add(1, Ordering::Relaxed);
                 return true;
@@ -956,11 +982,14 @@ fn wake_one(word: &AtomicU32, relay: bool) -> bool {
             unreachable_waiter = true;
         }
         if bell {
-            if imp::kick(thread) {
+            if kick(thread) {
                 STAT_KICKS.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
             unreachable_waiter = true;
+            if relayed == 0 {
+                relayed = band_bit(thread);
+            }
         }
     }
     // A registered waiter this caller holds no peer send for is the
@@ -969,7 +998,7 @@ fn wake_one(word: &AtomicU32, relay: bool) -> bool {
     // flight toward the waiter.  No hub wired → today's honest miss.
     if unreachable_waiter {
         STAT_MISSED.fetch_add(1, Ordering::Relaxed);
-        if relay && relay_missed() {
+        if relay(relayed) {
             STAT_RELAYS.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -977,12 +1006,30 @@ fn wake_one(word: &AtomicU32, relay: bool) -> bool {
     false
 }
 
+/// Band `thread`'s bit in a [`Hub`]'s owed bands.
+const fn band_bit(thread: usize) -> u32 {
+    1 << thread
+}
+
+/// Every band's bit.
+const BANDS: u32 = u32::MAX >> (u32::BITS - MAX_THREADS);
+
+// A hub owes bands as bits of one word.
+const _: () = assert!(MAX_THREADS <= u32::BITS);
+
 /// Hand the waiters this thread could not reach to the thread that can:
-/// its adopted [`Hub`], through the hub's own word, or else the star's hub
-/// through one raw notice on `DOORBELL@`[`RELAY`]. `true` when either went.
-fn relay_missed() -> bool {
+/// its adopted [`Hub`], told the doorbell `bands` to kick, or else the
+/// star's hub through one raw notice on `DOORBELL@`[`RELAY`], which kicks
+/// every peer it holds. `true` when either went.
+///
+/// A hub is not woken for no band: a waiter parked on the word itself is
+/// the kernel address-wait's to end, which no kick can, so a wake that
+/// missed only such waiters leaves the hub asleep, and the waiter's slice
+/// bounds it as it always did. The star's notice is unchanged: it goes for
+/// any waiter missed.
+fn relay_missed(bands: u32) -> bool {
     match imp::hub() {
-        Some(hub) => hub.relay(),
+        Some(hub) => hub.relay(bands),
         None => imp::relay(),
     }
 }
@@ -994,10 +1041,28 @@ fn relay_missed() -> bool {
 /// before it looks. Callers use it for telemetry and tests, never as a
 /// synchronization fact.
 pub fn wake_all(word: &AtomicU32) -> usize {
-    let addr = address_of(word);
-    let route = crate::cap::mapped::locate(word as *const AtomicU32 as *const u8);
+    wake_all_with(
+        address_of(word),
+        crate::cap::mapped::locate(word as *const AtomicU32 as *const u8),
+        imp::kick,
+        imp::wake_word,
+        relay_missed,
+    )
+}
+
+/// [`wake_all`]'s scan over the registry for the waiters on `addr`, its
+/// deliveries injected as [`wake_one_with`]'s are.
+fn wake_all_with(
+    addr: usize,
+    route: Option<(kore_abi::session::SlotRef, u32)>,
+    mut kick: impl FnMut(usize) -> bool,
+    mut wake_word: impl FnMut(kore_abi::session::SlotRef, u32, u32) -> bool,
+    relay: impl FnOnce(u32) -> bool,
+) -> usize {
     let mut woken = 0;
     let mut missed = false;
+    // Every doorbell waiter this caller could not kick, for the relay.
+    let mut relayed = 0;
     let mut word_waiters = 0;
     for thread in 0..MAX_THREADS as usize {
         let (bell, on_word) = thread_wait_modes(thread, addr);
@@ -1005,12 +1070,13 @@ pub fn wake_all(word: &AtomicU32) -> usize {
             word_waiters += 1;
         }
         if bell {
-            if imp::kick(thread) {
+            if kick(thread) {
                 STAT_KICKS.fetch_add(1, Ordering::Relaxed);
                 woken += 1;
             } else {
                 STAT_MISSED.fetch_add(1, Ordering::Relaxed);
                 missed = true;
+                relayed |= band_bit(thread);
             }
         }
     }
@@ -1018,7 +1084,7 @@ pub fn wake_all(word: &AtomicU32) -> usize {
     // (the kernel keys them by the word's physical identity), counted per
     // thread it reached — the same unit the kicks above are counted in.
     if word_waiters > 0 {
-        if route.is_some_and(|(subject, offset)| imp::wake_word(subject, offset, u32::MAX)) {
+        if route.is_some_and(|(subject, offset)| wake_word(subject, offset, u32::MAX)) {
             STAT_KICKS.fetch_add(word_waiters, Ordering::Relaxed);
             woken += word_waiters as usize;
         } else {
@@ -1027,10 +1093,11 @@ pub fn wake_all(word: &AtomicU32) -> usize {
         }
     }
     // The relay hop (the star, `res/SPMD.md` §3, or this thread's `Hub`):
-    // every waiter this caller could not kick is the hub's job — one relay
-    // covers them all, counted once.  With the intra-chunk kick mesh this
-    // is the exception path (cross-chunk waiters), not the release path.
-    if missed && relay_missed() {
+    // every doorbell waiter this caller could not kick is the hub's job —
+    // one relay covers them all, counted once.  With the intra-chunk kick
+    // mesh this is the exception path (cross-chunk waiters), not the
+    // release path.
+    if missed && relay(relayed) {
         STAT_RELAYS.fetch_add(1, Ordering::Relaxed);
         woken += 1;
     }
@@ -1050,8 +1117,9 @@ pub fn wake_all(word: &AtomicU32) -> usize {
 /// The kick goes directly when this thread holds a send into the target's
 /// doorbell, and otherwise through this thread's relay: the hub it adopted
 /// (the [`thread_controller`](crate::thread_controller) of the threads it
-/// founds), whose sweep kicks every thread with a doorbell waiter
-/// registered, or the star's hub. `true` when a kick or a relay went out.
+/// founds), owed this band alone and kicking it if a doorbell waiter is
+/// still registered there, or the star's hub. `true` when a kick or a relay
+/// went out.
 /// `false` when no kick was needed or this thread has no route to the
 /// target, which a caller that must reach it checks before it publishes.
 pub fn wake_thread(band: usize) -> bool {
@@ -1064,7 +1132,7 @@ fn wake_thread_with(
     me: Option<usize>,
     band: usize,
     kick: impl FnOnce(usize) -> bool,
-    relay: impl FnOnce() -> bool,
+    relay: impl FnOnce(u32) -> bool,
 ) -> bool {
     if band >= MAX_THREADS as usize || me == Some(band) || !waits_on_bell(band) {
         return false;
@@ -1074,9 +1142,9 @@ fn wake_thread_with(
         return true;
     }
     // Refused: no send into that doorbell, or its post already spent — the
-    // relay covers both, as it does for `wake`.
+    // relay covers both, as it does for `wake`, and names this band alone.
     STAT_MISSED.fetch_add(1, Ordering::Relaxed);
-    if relay() {
+    if relay(band_bit(band)) {
         STAT_RELAYS.fetch_add(1, Ordering::Relaxed);
         return true;
     }
@@ -1089,30 +1157,45 @@ fn wake_thread_with(
 /// [`word`](Self::word) like any other waiter.
 ///
 /// A thread that adopted the hub ([`adopt_hub`]) relays a wake it cannot
-/// deliver by counting it in [`relays`](Self::relays), then [`signal`]ing
-/// the hub: an ordinary store-then-wake of the hub's word, with every
-/// property [`wake`] has. The hub reads `relays` after each wake and, when
-/// it moved, [`sweep`]s.
+/// deliver by **owing** the hub the bands of the doorbell waiters it found
+/// and could not kick, then [`signal`]ing it: an ordinary store-then-wake of
+/// the hub's word, with every property [`wake`] has. Each pass, after it
+/// reads its word and before it parks on it, the hub
+/// [takes](Self::take_owed) what it is owed and [`deliver`]s it, one kick
+/// per band. A wake between two of its threads therefore costs a kick to
+/// the hub and a kick to the waiter, however many other threads are parked.
 ///
-/// Why a count and not the star's raw notice: this hub is woken for work of
-/// its own, and a notice says nothing about why it came. A hub that took
+/// Why owed bands and not the star's raw notice: this hub is woken for work
+/// of its own, and a notice says nothing about why it came. A hub that took
 /// every notice for a relay would kick every parked thread on every
 /// unrelated event; one that took none would lose a relay whose notice
-/// coalesced with another on its doorbell. The count is bumped before the
-/// word, so a hub that sees the word move sees the relay behind it.
+/// coalesced with another on its doorbell. Why bands and not a count of
+/// relays: a count says only that *someone* is owed, so every relay would
+/// cost a kick to every parked thread. Why a bit and not a queue: two
+/// relays for one band are one kick — the kicked thread re-checks every
+/// word it waits on — so what a hub can be owed is bounded by the band, and
+/// owing it never fails.
+///
+/// The bands are owed before the word moves, and that order is the hub's
+/// whole lost-relay argument. A pass reads the word, then takes the bands:
+/// a relay whose bands the take missed moved the word after the pass read
+/// it, so the pass's park finds its word changed and returns at once — or,
+/// had it registered first, is kicked by the relay's own signal — and the
+/// next pass takes them.
 ///
 /// [`signal`]: Self::signal
 #[repr(align(128))]
 pub(crate) struct Hub {
     word: AtomicU32,
-    relays: AtomicU32,
+    /// The bands owed a kick and not yet taken, a bit each ([`band_bit`]).
+    owed: AtomicU32,
 }
 
 impl Hub {
     pub(crate) const fn new() -> Self {
         Self {
             word: AtomicU32::new(0),
-            relays: AtomicU32::new(0),
+            owed: AtomicU32::new(0),
         }
     }
 
@@ -1122,25 +1205,46 @@ impl Hub {
         &self.word
     }
 
-    /// Relays owed so far, wrapping: the hub sweeps whenever this moved
-    /// since its last sweep.
+    /// Take every band owed so far, leaving none: the hub's half of a relay,
+    /// after its pass read the word and before it parks on it.
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
-    pub(crate) fn relays(&self) -> u32 {
-        self.relays.load(Ordering::SeqCst)
+    pub(crate) fn take_owed(&self) -> u32 {
+        // Looked at before it is taken: a pass owed nothing leaves the line
+        // its relayers write shared rather than claiming it. A band owed
+        // after this load is one the word covers, as for the take itself.
+        if self.owed.load(Ordering::SeqCst) == 0 {
+            return 0;
+        }
+        self.owed.swap(0, Ordering::SeqCst)
     }
 
     /// Tell the hub something changed — store, then wake, the order this
     /// module requires. Delivered directly or not at all: the hub has no
     /// relay but itself. `true` when a kick reached it.
     pub(crate) fn signal(&self) -> bool {
-        self.word.fetch_add(1, Ordering::SeqCst);
-        wake_one(&self.word, false)
+        self.signal_with(|word| wake_one(word, false))
     }
 
-    /// One relay: counted before the word moves.
-    fn relay(&self) -> bool {
-        self.relays.fetch_add(1, Ordering::SeqCst);
-        self.signal()
+    /// [`signal`](Self::signal) with its wake injected.
+    fn signal_with(&self, wake: impl FnOnce(&AtomicU32) -> bool) -> bool {
+        self.word.fetch_add(1, Ordering::SeqCst);
+        wake(&self.word)
+    }
+
+    /// One relay for `bands`: owed before the word moves, and not sent for
+    /// none ([`relay_missed`]).
+    fn relay(&self, bands: u32) -> bool {
+        self.relay_with(bands, || self.signal())
+    }
+
+    /// [`relay`](Self::relay) with its signal injected, so the host suite
+    /// can see what is owed by the time the word moves.
+    fn relay_with(&self, bands: u32, signal: impl FnOnce() -> bool) -> bool {
+        if bands == 0 {
+            return false;
+        }
+        self.owed.fetch_or(bands, Ordering::SeqCst);
+        signal()
     }
 }
 
@@ -1185,31 +1289,41 @@ pub(crate) fn reaches(peer: u32) -> bool {
     imp::reaches(peer as usize)
 }
 
-/// The hub's answer to a relay ([`Hub`]): kick every thread this one can
-/// reach that has a doorbell waiter registered, itself excepted, and return
-/// how many were kicked.
+/// The hub's answer to its relays ([`Hub`]): kick each band in `owed` that
+/// still has a doorbell waiter registered, itself excepted, and return how
+/// many were kicked.
 ///
-/// A relay does not say which word it was for, so every such thread is a
-/// candidate and each kick is a wake its target re-checks — spurious for one
-/// whose word did not move, which every waiter tolerates by contract, and
-/// paid only when a relay was owed. A word-parked waiter is not kicked: the
-/// kernel's address-wait, not its doorbell, holds it, and its slice bounds
-/// a relay it misses.
+/// Only the owed bands. A relay names the doorbell waiters its waker found
+/// and could not kick, and that is every band a kick is owed to, by the
+/// registry's own argument (module docs, mechanism 2): the waker stored its
+/// word before it scanned, so a waiter that registered after the scan reads
+/// the new word and never parks. Every other thread stays parked.
+///
+/// A band whose registration is gone by the time the hub looks is skipped:
+/// the waiter stopped waiting after the waker's scan saw it, so it re-checks
+/// a word the waker had already stored. A band waiting again, on any word,
+/// is kicked — at worst a spurious wake, which every waiter tolerates by
+/// contract. A word-parked waiter is never owed, since a kick cannot end the
+/// kernel's address-wait.
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
-pub(crate) fn sweep() -> usize {
+pub(crate) fn deliver(owed: u32) -> usize {
     let Some(me) = current_thread() else {
         return 0;
     };
-    imp::sweep(me)
+    imp::deliver(me, owed)
 }
 
-/// [`sweep`]'s selection over the registry, with the kick injected so the
-/// host suite can hold it to account.
+/// [`deliver`]'s selection over the owed bands, with the kick injected so
+/// the host suite can hold it to account.
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
-fn sweep_with(me: usize, mut kick: impl FnMut(usize) -> bool) -> usize {
+fn deliver_with(me: usize, owed: u32, mut kick: impl FnMut(usize) -> bool) -> usize {
     let mut kicked = 0;
-    for thread in 0..MAX_THREADS as usize {
-        if thread != me && waits_on_bell(thread) && kick(thread) {
+    // A band past the registry is no thread's; a hub never kicks itself.
+    let mut bands = owed & BANDS & !band_bit(me);
+    while bands != 0 {
+        let thread = bands.trailing_zeros() as usize;
+        bands &= bands - 1;
+        if waits_on_bell(thread) && kick(thread) {
             STAT_KICKS.fetch_add(1, Ordering::Relaxed);
             kicked += 1;
         }
@@ -1546,8 +1660,8 @@ mod imp {
         kick_with(&rt, index)
     }
 
-    /// [`kick`] against a context the caller already resolved — the sweep
-    /// kicks many peers off one boot-page parse.
+    /// [`kick`] against a context the caller already resolved — a hub's
+    /// delivery kicks many peers off one boot-page parse.
     fn kick_with(rt: &crate::entry::Rt, index: usize) -> bool {
         let Some(send) = send_for(rt, index) else {
             return false;
@@ -1577,11 +1691,11 @@ mod imp {
         let _ = crate::entry::geometry::set_late_kick(index, None);
     }
 
-    pub(super) fn sweep(me: usize) -> usize {
+    pub(super) fn deliver(me: usize, owed: u32) -> usize {
         let Some(rt) = crate::entry::thread_context() else {
             return 0;
         };
-        super::sweep_with(me, |thread| kick_with(&rt, thread))
+        super::deliver_with(me, owed, |thread| kick_with(&rt, thread))
     }
 
     /// The hub this thread relays through, if it adopted one.
@@ -1732,7 +1846,7 @@ mod imp {
 
     pub(super) fn forget_peer(_index: usize) {}
 
-    pub(super) fn sweep(_me: usize) -> usize {
+    pub(super) fn deliver(_me: usize, _owed: u32) -> usize {
         0
     }
 
@@ -2115,19 +2229,142 @@ mod tests {
     }
 
     #[test]
-    fn a_relay_is_counted_before_the_hub_word_moves() {
-        // The hub's lost-relay argument: it reads `relays` after it sees its
-        // word move, so the count must already have moved by then. Off metal
-        // the kick refuses, but the two stores are the shared half.
-        static HUB: Hub = Hub::new();
-        let (word, relays) = (HUB.word().load(Ordering::SeqCst), HUB.relays());
-        assert!(!HUB.relay(), "off metal no kick reaches the hub");
-        assert_eq!(HUB.relays(), relays.wrapping_add(1));
-        assert_eq!(HUB.word().load(Ordering::SeqCst), word.wrapping_add(1));
-        // A plain signal moves the word and owes no relay.
-        assert!(!HUB.signal());
-        assert_eq!(HUB.relays(), relays.wrapping_add(1));
-        assert_eq!(HUB.word().load(Ordering::SeqCst), word.wrapping_add(2));
+    fn a_relay_owes_its_bands_before_the_hub_word_moves() {
+        // The hub's lost-relay argument: a pass reads its word, then takes
+        // what it is owed, so the bands must be owed by the time the word
+        // moves, and the word must move before the hub is woken. Each step
+        // is injected and looks at the hub as the next one starts.
+        let hub = Hub::new();
+        let word = hub.word().load(Ordering::SeqCst);
+        let sent = hub.relay_with(0b0110, || {
+            assert_eq!(
+                hub.owed.load(Ordering::SeqCst),
+                0b0110,
+                "the hub was signalled before its bands were owed"
+            );
+            assert_eq!(
+                hub.word().load(Ordering::SeqCst),
+                word,
+                "the word moved before the bands were owed"
+            );
+            hub.signal_with(|moved| {
+                assert_eq!(
+                    moved.load(Ordering::SeqCst),
+                    word.wrapping_add(1),
+                    "the hub was woken before its word moved"
+                );
+                true
+            })
+        });
+        assert!(sent, "a relay answers whether its signal went");
+        // Owed bands accumulate until taken; two relays for one band owe it
+        // once, and a take leaves nothing owed.
+        assert!(hub.relay_with(0b0100 | 0b1_0000, || true));
+        assert_eq!(hub.take_owed(), 0b1_0110);
+        assert_eq!(hub.take_owed(), 0);
+        // A relay whose signal reached nobody (off metal no kick reaches the
+        // hub) still owes its bands, for whatever pass the hub runs next.
+        assert!(!hub.relay(0b1000));
+        assert_eq!(hub.take_owed(), 0b1000);
+        // No band, no relay: the hub is not woken for a waiter no kick ends.
+        let word = hub.word().load(Ordering::SeqCst);
+        assert!(!hub.relay_with(0, || panic!("the hub was signalled for no band")));
+        assert_eq!(hub.word().load(Ordering::SeqCst), word);
+        // A plain signal moves the word and owes nothing.
+        assert!(!hub.signal());
+        assert_eq!(hub.word().load(Ordering::SeqCst), word.wrapping_add(1));
+        assert_eq!(hub.take_owed(), 0);
+    }
+
+    #[test]
+    fn a_wake_relays_the_doorbell_waiters_it_could_not_kick_and_no_others() {
+        // Rows 22..=25: a waiter parked on the word itself (22), two doorbell
+        // waiters on the same word (23, 24), and a doorbell waiter on another
+        // word (25) — an idle thread no wake of this word is for.
+        static WORD: AtomicU32 = AtomicU32::new(0);
+        static OTHER: AtomicU32 = AtomicU32::new(0);
+        let rows = 22..=25;
+        for row in rows.clone() {
+            reset_thread(row);
+        }
+        let addr = address_of(&WORD);
+        claim_wait_on_word(22, addr).expect("a word waiter");
+        claim_wait(23, addr).expect("a doorbell waiter");
+        claim_wait(24, addr).expect("a second doorbell waiter");
+        claim_wait(25, address_of(&OTHER)).expect("an idle waiter on another word");
+        let no_route = |_: kore_abi::session::SlotRef, _: u32, _: u32| -> bool {
+            panic!("a word was woken through a mapping this caller lacks")
+        };
+
+        // `wake`: no kick reaches either doorbell waiter, so the relay is
+        // for the first of them alone — one waiter woken, through the hub.
+        // The word waiter is never owed: no kick ends the kernel's
+        // address-wait.
+        let mut kicked = std::vec::Vec::new();
+        let mut owed = None;
+        let woke = wake_one_with(
+            addr,
+            None,
+            |thread| {
+                kicked.push(thread);
+                false
+            },
+            no_route,
+            |bands| {
+                owed = Some(bands);
+                true
+            },
+        );
+        assert!(woke, "a relay in flight is a wake");
+        assert_eq!(kicked, [23, 24], "a kick went to a thread not waiting here");
+        assert_eq!(owed, Some(band_bit(23)), "wake relayed other than its first miss");
+        // A relay that did not go is no wake.
+        assert!(!wake_one_with(addr, None, |_| false, no_route, |_| false));
+        // A waiter the caller reaches needs no relay, whatever it missed first.
+        assert!(wake_one_with(
+            addr,
+            None,
+            |thread| thread == 24,
+            no_route,
+            |_| panic!("a reached waiter was relayed")
+        ));
+
+        // `wake_all`: every doorbell waiter it could not kick is owed, and
+        // none other; the one it reached is not.
+        let mut owed = None;
+        let woken = wake_all_with(addr, None, |_| false, no_route, |bands| {
+            owed = Some(bands);
+            true
+        });
+        assert_eq!(owed, Some(band_bit(23) | band_bit(24)));
+        assert_eq!(woken, 1, "the relay counts once, as one notice");
+        let mut owed = None;
+        let woken = wake_all_with(addr, None, |thread| thread == 23, no_route, |bands| {
+            owed = Some(bands);
+            true
+        });
+        assert_eq!(owed, Some(band_bit(24)));
+        assert_eq!(woken, 2);
+
+        // A word waiter alone is owed nothing, so a hub is not woken for it
+        // (`relay_missed`), by either wake.
+        reset_thread(23);
+        reset_thread(24);
+        let mut owed = None;
+        assert!(!wake_one_with(addr, None, |_| false, no_route, |bands| {
+            owed = Some(bands);
+            false
+        }));
+        assert_eq!(owed, Some(0));
+        let mut owed = None;
+        wake_all_with(addr, None, |_| false, no_route, |bands| {
+            owed = Some(bands);
+            false
+        });
+        assert_eq!(owed, Some(0));
+        for row in rows {
+            reset_thread(row);
+        }
     }
 
     #[test]
@@ -2139,33 +2376,48 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_kicks_only_doorbell_waiters_other_than_itself() {
-        // Rows 8..=11: the hub (8), a doorbell waiter (9), a word-parked
-        // waiter (10), and a thread waiting on nothing (11).
-        for row in 8..=11 {
+    fn the_hub_kicks_only_owed_bands_still_waiting_on_the_bell() {
+        // Rows 26..=31: the hub itself (26), owed while waiting on its own
+        // word; owed doorbell waiters on the relayed word (27) and on
+        // another (31); an owed band parked on a word (28); an owed band no
+        // longer waiting (29); and an idle doorbell waiter nobody owes (30).
+        static RELAYED: AtomicU32 = AtomicU32::new(0);
+        static LATER: AtomicU32 = AtomicU32::new(0);
+        static HUB_WORD: AtomicU32 = AtomicU32::new(0);
+        static IDLE: AtomicU32 = AtomicU32::new(0);
+        let rows = 26..=31;
+        for row in rows.clone() {
             reset_thread(row);
         }
-        let a = AtomicU32::new(0);
-        let b = AtomicU32::new(0);
-        claim_wait(8, address_of(&a)).expect("the hub's own wait");
-        claim_wait(9, address_of(&a)).expect("a doorbell waiter");
-        claim_wait_on_word(10, address_of(&b)).expect("a word waiter");
+        claim_wait(26, address_of(&HUB_WORD)).expect("the hub's own wait");
+        claim_wait(27, address_of(&RELAYED)).expect("a relayed doorbell waiter");
+        claim_wait_on_word(28, address_of(&RELAYED)).expect("a word waiter");
+        claim_wait(30, address_of(&IDLE)).expect("an idle parked thread");
+        claim_wait(31, address_of(&LATER)).expect("a thread waiting again");
+        let owed = [26, 27, 28, 29, 31]
+            .into_iter()
+            .fold(0, |bands, row| bands | band_bit(row));
+
         let mut kicked = std::vec::Vec::new();
-        // The sweep scans every row, and tests in parallel register rows of
-        // their own: only this test's rows are delivered and recorded, and
-        // another's is a refused kick, which is not counted.
-        let n = sweep_with(8, |thread| {
-            let ours = (8..=11).contains(&thread);
-            if ours {
-                kicked.push(thread);
-            }
-            ours
+        // Only the owed bands are looked at, so the rows tests running in
+        // parallel register never reach the kick: everything it records is
+        // this test's.
+        let n = deliver_with(26, owed, |thread| {
+            kicked.push(thread);
+            true
         });
-        assert_eq!(kicked, [9], "the sweep kicked a thread no kick can wake");
-        assert_eq!(n, 1);
+        // Not itself, not the word waiter a kick cannot end, not the band
+        // that stopped waiting, and never the parked thread no wake was for.
+        assert_eq!(kicked, [27, 31], "the hub kicked a band it was not owed");
+        assert_eq!(n, 2);
         // A kick that refuses is not counted as a wake.
-        assert_eq!(sweep_with(8, |_| false), 0);
-        for row in 8..=11 {
+        assert_eq!(deliver_with(26, owed, |_| false), 0);
+        // Owed nothing, the hub kicks nothing, however many threads wait.
+        assert_eq!(
+            deliver_with(26, 0, |_| panic!("a hub owed nothing kicked")),
+            0
+        );
+        for row in rows {
             reset_thread(row);
         }
     }
@@ -2268,7 +2520,7 @@ mod tests {
                         post.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
                             .is_ok()
                     },
-                    || false,
+                    |_| false,
                 );
             };
             if at == At::BeforeArm {
@@ -2324,7 +2576,7 @@ mod tests {
         reset_thread(ROW);
         let word = AtomicU32::new(0);
         let never = |_: usize| -> bool { panic!("kicked a thread no kick can wake") };
-        let no_relay = || -> bool { panic!("relayed a wake that needed none") };
+        let no_relay = |_: u32| -> bool { panic!("relayed a wake that needed none") };
         // A running thread (nothing registered), a band past the registry,
         // and the caller itself are not kicked.
         let past = MAX_THREADS as usize;
@@ -2334,7 +2586,8 @@ mod tests {
         let waiter = WaitSlot { thread: ROW, slot };
         assert!(!wake_thread_with(Some(ROW), ROW, never, no_relay));
         // A registered doorbell waiter: kicked directly, relayed when the
-        // kick refuses, and `false` only when neither went out.
+        // kick refuses — the relay owing its band and no other — and `false`
+        // only when neither went out.
         assert!(wake_thread_with(
             None,
             ROW,
@@ -2344,8 +2597,11 @@ mod tests {
             },
             no_relay
         ));
-        assert!(wake_thread_with(None, ROW, |_| false, || true));
-        assert!(!wake_thread_with(None, ROW, |_| false, || false));
+        assert!(wake_thread_with(None, ROW, |_| false, |bands| {
+            assert_eq!(bands, band_bit(ROW), "a thread's wake relayed another band");
+            true
+        }));
+        assert!(!wake_thread_with(None, ROW, |_| false, |_| false));
         drop(waiter);
         // A word-parked waiter is the kernel's address-wait's to end.
         let slot = claim_wait_on_word(ROW, address_of(&word)).expect("a free wait slot");

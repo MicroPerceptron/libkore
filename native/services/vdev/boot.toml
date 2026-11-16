@@ -26,5 +26,5 @@ protocol  = "kore_svc_vdev::VdevService"
 endows    = []
 exec_client = true                           # pair 1 administers per-launch driver faces
 heap_supply_bytes = 0x00C0_0000
-digest_x86_64  = "blake3:845a6ad797b2f718a31345a4b89a7279be6a5e550dcd741e58dbe101e55f5717"  # res/x86_64/; make boot-digests
-digest_aarch64 = "blake3:5f28836ba4be218c10a700db505261c04d9801617a220520a8f3fbccb5e6df01"  # res/aarch64/; make boot-digests-aarch64
+digest_x86_64  = "blake3:b42acd37e654cd834a02c735dd4a883922eb47fd92a4c4ab844b43a15e66cf5e"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:ea5be837eabb59d0f54f16dea3af07f4f1ddcfe004f1a7f39f32907647662e04"  # res/aarch64/; make boot-digests-aarch64

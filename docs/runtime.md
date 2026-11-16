@@ -134,7 +134,11 @@ capabilities; portable handles contain identifiers, never arena slot authority.
 Calls use bounded shared records and futex parks: the controller parks until a
 request, a thread's end or a relayed wake moves its word, and a waiting caller
 parks until the controller wakes it. Only a thread the controller cannot wake
-parks in bounded 1 ms slices. Calls must run on native threads, not executor
+parks in bounded 1 ms slices. Managed threads hold no send into each other's
+doorbells, so a futex wake between two of them is relayed through the
+controller, which kicks only the thread the waker found waiting: a mutex or
+condition handed between two threads leaves the threads parked on other words
+asleep. Calls must run on native threads, not executor
 callbacks that owe other futures progress. Capacity depends on native bands and
 the controller's capability arena; ordinary slot exhaustion is refused before
 spending a band.
