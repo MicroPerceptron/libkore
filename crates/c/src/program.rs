@@ -167,11 +167,13 @@ impl Request {
     }
 }
 
-/// Anything the host must answer: an end, a session, or a mapping.
+/// Anything the host must answer: an end, a session, a mapping, or a
+/// request of the program's device.
 fn pending() -> bool {
     EXIT.posted().is_some()
         || SESSION.state.load(Ordering::Acquire) == POSTED
         || crate::mmap::posted()
+        || crate::device::posted()
 }
 
 // ── Entry points the C library calls ────────────────────────────────────
@@ -392,10 +394,22 @@ impl Founded {
         // thread starts kore-rt's thread controller there, which mints the
         // doorbells its threads park on (`thread_controller`). Without one the
         // controller still runs, taking the deadline park.
-        let grant = thread::channel_space_endowment();
+        //
+        // And its share of the launch's virtual-device face, when it carried
+        // one: the interrupt and the doorbell are a thread's own
+        // capabilities, so each thread of the program is founded holding
+        // them. This thread gives the main thread its share here; the
+        // controller the main thread starts hands it on to every thread it
+        // founds.
+        let mut endowment: alloc::vec::Vec<thread::WorkerCap> =
+            thread::channel_space_endowment().into_iter().collect();
+        endowment.extend(crate::device::shares());
+        for share in kore_std::vdev::client::THREAD_SHARES {
+            let _ = kore_ffi::hand_on_to_threads(share);
+        }
         match thread::spawn_with_doorbell_on(
             main_thread,
-            grant.as_slice(),
+            &endowment,
             WorkerStack::Bytes(crate::api::KORE_MAIN_STACK_BYTES),
         ) {
             Some(worker) => Some(Self {
@@ -480,6 +494,7 @@ async fn host(
 ) -> Result<Exit, Fatal> {
     let mut wake = NoticeRx::new(transport, worker.wake_recv());
     let mut filesystem = Filesystem::new(rt, transport);
+    let mut device = crate::device::Host::new(rt, transport);
     // The one writer the host can kick, woken when its room is made.
     let wake_main = || {
         let _ = worker.kick();
@@ -499,6 +514,17 @@ async fn host(
         // A thread's `mmap` or `munmap`: thread 0 holds the supply's root.
         if crate::mmap::serve() {
             wake_main();
+            continue;
+        }
+        // A thread's request of the program's device: this thread holds
+        // the face. The service's answer is waited for like a session's, so
+        // an end requested meanwhile still ends the program.
+        if crate::device::posted() {
+            let request = pin!(device.serve());
+            let ended = pin!(until_exit(&mut wake, output, &wake_main));
+            if race(request, ended).await.is_some() {
+                wake_main();
+            }
             continue;
         }
         if SESSION.state.load(Ordering::Acquire) == POSTED {

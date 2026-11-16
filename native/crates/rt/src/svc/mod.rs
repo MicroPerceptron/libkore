@@ -498,6 +498,8 @@ const _: () = {
     assert!(!kernel_reserved(COOKIE_HOMES));
     assert!(COOKIE_HOMES != COOKIE_STORE);
     assert!(!kernel_reserved(COOKIE_SPMD));
+    assert!(!kernel_reserved(COOKIE_VDEV));
+    assert!(COOKIE_VDEV != COOKIE_SPMD);
     assert!(!kernel_reserved(COOKIE_LUA));
     assert!(!kernel_reserved(COOKIE_LUA_REPL));
     assert!(!kernel_reserved(COOKIE_MPY));
@@ -998,6 +1000,17 @@ pub const COOKIE_EXEC_CLEANUP_C: u64 = 0x6B72_5F65_7843_6C43; // "kr_exClC"
 /// gates key on it (production metal has no serial; a terminal rerun of
 /// `spmd-witness` prints the detailed line instead).
 pub const COOKIE_SPMD: u64 = 0x6B72_5F73_706D_6457; // "kr_spmdW"
+
+/// Completion cookie for the boot virtual-device run (`"kr_vdevT"`), posted
+/// by INIT beside [`COOKIE_SPMD`]: it launches `vdev-test` through the
+/// ordinary generation-bound spawn path, with the face exec mints for the
+/// virtual-device profile, and forwards the verdict. Payload 0 is the clean
+/// run; 900 no row/capability; 1000+s is a nonzero exit s, where application
+/// slots 256..262 are `vdev-test`'s stages (open, identity, lend, bring-up,
+/// command, result, close) and 4 a launch that was given no face. Anything
+/// else is the launch's spawn rung. Non-fatal, as every boot verdict is: the
+/// gates key on it, and a terminal rerun of `vdev-test` prints the stage.
+pub const COOKIE_VDEV: u64 = 0x6B72_5F76_6465_7654; // "kr_vdevT"
 
 /// Completion cookie for INIT's production Lua VM validation (`"kr_luaOK"`).
 /// The same archive generation exposed to each shell is launched through the

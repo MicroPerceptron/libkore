@@ -187,7 +187,7 @@ impl<L, V, const N: usize> Regions<L, V, N> {
 }
 
 #[cfg(target_os = "none")]
-pub(crate) use metal::{arm, map, posted, serve, unmap};
+pub(crate) use metal::{arm, map, map_zeroed, place, posted, serve, unmap};
 
 #[cfg(target_os = "none")]
 mod metal {
@@ -228,13 +228,23 @@ mod metal {
         }
     }
 
+    /// An address for `len` bytes in the window regions land in, which is
+    /// spent for the life of the program. `None` when the window is unarmed
+    /// or has no room.
+    pub(crate) fn place(len: usize) -> Option<usize> {
+        WINDOW
+            .choose(len as u64, PAGE as u64)
+            .ok()
+            .and_then(|base| usize::try_from(base).ok())
+    }
+
     /// Map `lease` whole at `base`, zeroed, with the request's access.
     ///
     /// The lease is mapped writable to be zeroed whatever was asked: a parked
     /// region holds what its last user left, and a fresh one is zeroed too
     /// rather than trusted to be. A read-only request is then mapped again
     /// without write.
-    fn map_zeroed(
+    pub(crate) fn map_zeroed(
         lease: &StashedLease,
         base: usize,
         len: usize,
@@ -307,11 +317,7 @@ mod metal {
                     .and_then(verbs::lease_geometry)
                     .and_then(|(_, len)| usize::try_from(len).ok())
                     .ok_or(errno::ENOMEM)?;
-                let base = WINDOW
-                    .choose(len as u64, PAGE as u64)
-                    .ok()
-                    .and_then(|base| usize::try_from(base).ok())
-                    .ok_or(errno::ENOMEM)?;
+                let base = place(len).ok_or(errno::ENOMEM)?;
                 (row, lease, base, len)
             }
         };

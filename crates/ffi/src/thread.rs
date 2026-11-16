@@ -31,6 +31,15 @@ pub const KORE_THREAD_ECANCELED: i32 = 125;
 pub const KORE_THREAD_ENOTSUP: i32 = 95;
 
 static THREADS: Controller = Controller::new();
+
+/// Have every thread this process starts through `pthread_create` hold
+/// `share`: a capability its founder holds at a boot-block coordinate, which
+/// each founding re-derives (`Controller::hand_on`). For a program's host to
+/// call before the first thread is created; `false` once the controller has
+/// started, or when it can hand on no more.
+pub fn hand_on_to_threads(share: kore::runtime::thread_controller::Handed) -> bool {
+    THREADS.hand_on(share)
+}
 struct Ticket {
     id: Id,
     control: Arc<Control>,

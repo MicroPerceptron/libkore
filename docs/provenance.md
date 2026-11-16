@@ -467,3 +467,19 @@ is now 27 packages and 408 files. Against Kore `fe9603e3`, only kore-rt's
 swap links kore-rt's futex, so its digests are this change's reseal over
 the ioctl round (`b04325e9`). No exported manifest changed, so
 `native/Cargo.lock` did not.
+
+It then moved to Kore `a07b4eae68b45ffd740e31a9cc69e708b21ad467`, the merge
+of #1494's virtual-device round into this change, once libkore#32 had merged
+into `alpha` with its export at Kore `cac17a02`. The closure is now 31
+packages and 442 files. Against Kore `625060b1`, only kore-rt's `futex.rs`
+and `thread_controller.rs` differ. Against `alpha`'s export, eleven more
+files differ, all from #1494's commits after `cac17a02`:
+
+- the C driver's protocol, rendered from the Rust that defines it
+  (`vdev-accel`'s `kore/vdev_accel.h`, its device and the header's test);
+- kore-window's pointer acceleration, from main `bb1fe70d`;
+- a command entering a task grant through one edge (the DagFS service's
+  authority, engine and service);
+- the `boot.toml` digests of DagFS, swap and vdev, from #1494's reseals.
+
+No exported manifest changed, so `native/Cargo.lock` did not.
