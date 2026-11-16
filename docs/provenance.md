@@ -526,9 +526,18 @@ futex and controller (`36b99426`).
 
 Kore's reseal over the export at `fba0662` measured it with all nine parked
 (`09a98a0`, built from `8b617ee`, which pinned it): every step ran to `exit 42`
-and no wake reached any of them. The same tree with the futex and controller of that
-branch's head (`83861dc9`), which count and sweep, delivered 1466 wakes to
-them over the 400 turns, and the tour failed that step. Neither side's futex
-or controller has changed since. Kore's next reseal (`9e477e5`, built from
-`00d666c`, which pins the export at `c491a40`) measured it again: no wake
+and no wake reached any of them. The same tree with the futex and controller of
+that branch's head (`83861dc9`), which count and sweep, delivered 1466 wakes to
+them over the 400 turns, and the tour failed that step. Since then the merges
+have changed neither side's `futex.rs`. They brought the same change to both
+sides' controller: #1494's `hand_on`, which acts at founding. So the relay is
+still the only difference between the two. Kore's next reseal (`9e477e5`, built
+from `00d666c`, which pins the export at `c491a40`) measured it again: no wake
 reached the nine parked threads, over 400 turns and 148 wakes.
+
+Kore's reseal over this export (`c6308c60`, built from `a68fa19`, which pins
+it) measured it once more, with #1494's virtual-device round merged. Every
+step ran to `exit 42`, and no wake reached the nine parked threads, over 400
+turns and 43 wakes. The keytest ran as its target runs it, and its new step
+passed too: a driver in C brought the virtual accelerator up and gave it back,
+twice.
