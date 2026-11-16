@@ -15,12 +15,6 @@ pub const KORE_THREAD_CANCEL_ENABLE: i32 = 0;
 pub const KORE_THREAD_CANCEL_DISABLE: i32 = 1;
 pub const KORE_THREAD_CANCEL_DEFERRED: i32 = 0;
 pub const KORE_THREAD_CANCEL_ASYNCHRONOUS: i32 = 1;
-/// How long one park lasts at a cancellation point that waits: a request is
-/// a flag no wake carries, so a cancellable wait re-checks it this often.
-/// One millisecond is the cadence the native runtime parks an unreachable
-/// waiter at (`kore-rt`'s `pace::CEDE_NS`): a cancellation is acted on within
-/// one, and an idle cancellable waiter wakes no more often than that.
-pub(crate) const CANCEL_SLICE_NS: u64 = 1_000_000;
 pub type KoreThreadKey = u64;
 pub type KoreThreadDestructor = Option<unsafe extern "C" fn(*mut c_void)>;
 
@@ -84,6 +78,16 @@ pub(crate) fn leave() {
 }
 pub(crate) fn cancellable() -> bool {
     !CURRENT.get().is_null() && !DISABLED.get() && !FINISHING.get()
+}
+/// An enabled cancellation request is pending for this managed thread: what
+/// testcancel acts on, and the stop a cancellation point's wait re-reads once
+/// it is registered (`futex::wait_unless`). `SeqCst`, as the canceller's store
+/// is: the canceller stores, then reads this thread's registration before it
+/// wakes it, so one of the two sees the other.
+pub(crate) fn cancel_pending() -> bool {
+    // SAFETY: CURRENT is non-null while cancellable, and points at this
+    // managed thread's Control until `leave`.
+    cancellable() && unsafe { &*CURRENT.get() }.cancel.load(Ordering::SeqCst)
 }
 fn active() -> bool {
     !CURRENT.get().is_null()
@@ -368,7 +372,7 @@ pub unsafe extern "C" fn kore_thread_setcanceltype(kind: i32, old_type: *mut i32
 /// never cross live Rust RAII guards or executor callbacks at a cancellation point.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kore_thread_testcancel() {
-    if cancellable() && unsafe { &*CURRENT.get() }.cancel.load(Ordering::Acquire) {
+    if cancel_pending() {
         unsafe {
             kore_thread_exit(kore_thread_canceled());
         }

@@ -31,7 +31,7 @@
 //! complete; and a reset gives every object a new namespace, so an id a
 //! driver kept from before the reset names nothing afterwards.
 
-use kore_svc_accel_spmd::SpmdBackend;
+use kore_svc_accel_spmd::{REGISTERED_RESIDENT_BYTES, SpmdBackend};
 use kore_vdev::device::{ReadableBytes, Unrecoverable, VirtualDevice, WritableBytes};
 use virtio_accel_core::{ByteSink, ByteSource, TransportByteSink, TransportByteSource};
 use virtio_accel_device::{
@@ -68,6 +68,17 @@ pub const MAX_BUFFER_BACKING_BYTES: u64 = 2 << 20;
 /// registered kernel's handle, a few bytes; 64 KiB admits every program the
 /// backend's own count limit allows many times over.
 pub const MAX_PROGRAM_RESIDENT_BYTES: u64 = 64 * 1024;
+
+/// The resident charge a driver states when it loads one of this device's
+/// programs (`LOAD_PROGRAM`'s `resident_bytes`): what the device will hold
+/// for it. A registered kernel's handle is a few words, whose exact size is
+/// the host's business; a driver states this round figure, which covers it
+/// on every target, and a thousand programs fit the device's limit.
+pub const PROGRAM_RESIDENT_BYTES: u64 = 64;
+const _: () = {
+    assert!(PROGRAM_RESIDENT_BYTES >= REGISTERED_RESIDENT_BYTES);
+    assert!(PROGRAM_RESIDENT_BYTES <= MAX_PROGRAM_RESIDENT_BYTES);
+};
 
 /// What a driver reads from the register block's device id: `"accl"`. The
 /// protocol assigns itself no Virtio device id, so the name is kore's.

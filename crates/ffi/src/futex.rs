@@ -61,7 +61,8 @@ pub extern "C" fn kore_futex_available() -> u32 {
 /// all waits/wakes. All concurrent accesses must be compatible 32-bit atomic
 /// operations (C atomic builtins or Zig atomics); never mix ordinary accesses
 /// or differently sized atomics. Managed-thread waits are cancellation points:
-/// they may exit without stack unwinding, as specified by kore_thread_testcancel.
+/// they may exit without stack unwinding, as specified by kore_thread_testcancel,
+/// and a cancellation requested while the thread waits wakes it to act.
 /// Publish the condition with a sequentially consistent atomic store BEFORE waking.
 /// No address-space sharing is implied.
 #[unsafe(no_mangle)]
@@ -77,32 +78,51 @@ pub unsafe extern "C" fn kore_futex_wait(
     if !crate::thread_local::cancellable() {
         return futex::wait(word, expected, timeout).into();
     }
-    // A bounded native park makes cancellation observable even without a peer
-    // kick capability. Recompute against one deadline; slices never restart it.
     unsafe { crate::kore_thread_testcancel() };
-    let start = match kore::time::uptime() {
-        Ok(time) => time.as_nanos(),
-        Err(_) => return KoreFutexOutcome::Unsupported,
+    let outcome = match crate::thread::slice() {
+        // A cancellation's wake reaches this thread (kore_thread_cancel), and
+        // the wait re-reads the request once it is registered: it parks until
+        // a wake, the caller's deadline or that request, and never polls.
+        None => futex::wait_unless(word, expected, timeout, crate::thread_local::cancel_pending),
+        Some(slice) => unsafe { sliced(word, expected, timeout_ns, slice) },
     };
-    let deadline = timeout.map(|_| start.saturating_add(timeout_ns));
+    unsafe { crate::kore_thread_testcancel() };
+    outcome.into()
+}
+
+/// A cancellable wait on a thread the controller cannot wake: no wake would
+/// announce a cancellation, so it parks one `slice` at a time and acts on a
+/// request between slices, against one deadline that slices never restart.
+/// # Safety
+/// A managed thread's cancellation point, as kore_futex_wait.
+unsafe fn sliced(
+    word: &AtomicU32,
+    expected: u32,
+    timeout_ns: u64,
+    slice: Duration,
+) -> futex::WaitOutcome {
+    let Ok(start) = kore::time::uptime() else {
+        return futex::WaitOutcome::Unsupported;
+    };
+    let deadline =
+        (timeout_ns != KORE_FUTEX_INFINITE).then(|| start.as_nanos().saturating_add(timeout_ns));
+    let slice = u64::try_from(slice.as_nanos()).unwrap_or(u64::MAX);
     loop {
         unsafe { crate::kore_thread_testcancel() };
-        let now = match kore::time::uptime() {
-            Ok(time) => time.as_nanos(),
-            Err(_) => return KoreFutexOutcome::Unsupported,
+        let Ok(now) = kore::time::uptime() else {
+            return futex::WaitOutcome::Unsupported;
         };
-        let slice = crate::thread_local::CANCEL_SLICE_NS;
-        let slice = deadline.map_or(slice, |end| end.saturating_sub(now).min(slice));
-        let outcome = futex::wait(word, expected, Some(Duration::from_nanos(slice)));
+        let bound = deadline.map_or(slice, |end| end.saturating_sub(now.as_nanos()).min(slice));
+        let outcome = futex::wait(word, expected, Some(Duration::from_nanos(bound)));
         unsafe { crate::kore_thread_testcancel() };
         if outcome != futex::WaitOutcome::TimedOut {
-            return outcome.into();
+            return outcome;
         }
         if let Some(end) = deadline {
             match kore::time::uptime() {
                 Ok(time) if time.as_nanos() < end => {}
-                Ok(_) => return KoreFutexOutcome::TimedOut,
-                Err(_) => return KoreFutexOutcome::Unsupported,
+                Ok(_) => return futex::WaitOutcome::TimedOut,
+                Err(_) => return futex::WaitOutcome::Unsupported,
             }
         }
     }
