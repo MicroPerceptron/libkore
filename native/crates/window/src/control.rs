@@ -40,10 +40,17 @@ const SET_LAYOUT_HINTS: u8 = 0x4e;
 const PREPARE_CAPTURE: u8 = 0x4f;
 const REQUEST_CAPTURE: u8 = 0x50;
 const RELEASE_CAPTURE: u8 = 0x51;
+const READ_CLIPBOARD: u8 = 0x54;
 const ACCEPTED: u8 = 0x40;
 const ADMITTED: u8 = 0x41;
 const REFUSED: u8 = 0x42;
 const SHELL_ACTION: u8 = 0x4d;
+const CLIPBOARD_TEXT: u8 = 0x54;
+
+/// Bytes of clipboard text one [`DisplayRequest::ReadClipboard`] answer
+/// carries inline: the reply record's four data words. A shell paste takes at
+/// most one line of the shell's line editor, a few of these.
+pub const CLIPBOARD_TEXT_BYTES: usize = 32;
 
 /// Bound on one window's published tab strip.
 pub const MAX_TABS: usize = 8;
@@ -310,6 +317,12 @@ pub enum ShellAction {
     /// with `token` (never zero), by which it claims the pick. Data only;
     /// the compositor brokers the answer.
     Pick { token: u64, types: u64 },
+    /// The user pasted into this controller's terminal window
+    /// (`res/CLIPBOARD.md`): read the clipboard with
+    /// [`DisplayRequest::ReadClipboard`] under `ticket` (never zero) and type
+    /// what the line can hold. The ticket reads the text the user pasted and
+    /// no other: a copy made since refuses it.
+    Paste { ticket: u64 },
 }
 
 impl ShellAction {
@@ -361,6 +374,7 @@ impl ShellAction {
                 refusal: CaptureRefusal::from_code(b as u8)?,
             })),
             6 if a != 0 && b != 0 => Some(Some(Self::Pick { token: a, types: b })),
+            7 if a != 0 && b == 0 => Some(Some(Self::Paste { ticket: a })),
             _ => None,
         }
     }
@@ -397,6 +411,7 @@ impl ShellAction {
                 (5, mode.code() as u64, refusal.code() as u64)
             }
             Some(Self::Pick { token, types }) => (6, token, types),
+            Some(Self::Paste { ticket }) => (7, ticket, 0),
         }
     }
 }
@@ -668,7 +683,64 @@ pub enum DisplayRequest {
     ReleaseCapture {
         ticket: u32,
     },
+    /// Controller verb: read the clipboard text the user pasted into this
+    /// controller's terminal, from `offset`, under the ticket its
+    /// [`ShellAction::Paste`] carried.
+    ReadClipboard { ticket: u64, offset: u32 },
 }
+
+/// Clipboard text read for a controller: bytes `offset..offset + len` of a
+/// `total`-byte text, the first `len` of `bytes` (the rest zero).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipboardText {
+    pub offset: u32,
+    pub len: u8,
+    pub total: u32,
+    pub bytes: [u8; CLIPBOARD_TEXT_BYTES],
+}
+
+impl ClipboardText {
+    /// The text this answer carries.
+    pub fn text(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    /// The answer's word: `offset | total << 24 | len << 48`.
+    const fn word(&self) -> u64 {
+        self.offset as u64 | (self.total as u64) << 24 | (self.len as u64) << 48
+    }
+
+    fn from_words(word: u64, data: [u64; 4]) -> Option<Self> {
+        let (offset, total, len) = ((word & 0xff_ffff) as u32, (word >> 24 & 0xff_ffff) as u32, (word >> 48) as u16);
+        let mut bytes = [0; CLIPBOARD_TEXT_BYTES];
+        for (word, chunk) in data.into_iter().zip(bytes.chunks_exact_mut(8)) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        let len = u8::try_from(len).ok()?;
+        (len != 0
+            && usize::from(len) <= CLIPBOARD_TEXT_BYTES
+            && total != 0
+            && total as usize <= crate::clipboard::CLIPBOARD_BYTES
+            && u64::from(offset) + u64::from(len) <= u64::from(total)
+            && bytes[usize::from(len)..].iter().all(|&byte| byte == 0))
+        .then_some(Self {
+            offset,
+            len,
+            total,
+            bytes,
+        })
+    }
+
+    fn data(&self) -> [u64; 4] {
+        core::array::from_fn(|word| {
+            u64::from_le_bytes(self.bytes[word * 8..word * 8 + 8].try_into().unwrap())
+        })
+    }
+}
+
+const _: () = assert!(
+    crate::clipboard::CLIPBOARD_BYTES < 1 << 24 && CLIPBOARD_TEXT_BYTES == 4 * 8
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayResponse {
@@ -689,6 +761,7 @@ pub enum DisplayResponse {
     Configured(Configure),
     ControlRefused(ControlRefusal),
     ShellAction(Option<ShellAction>),
+    ClipboardText(ClipboardText),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -848,6 +921,11 @@ pub fn encode_req(request: &DisplayRequest) -> SurReqWire {
             w.op = RELEASE_CAPTURE;
             w.subject = u64::from(ticket).into();
         }
+        DisplayRequest::ReadClipboard { ticket, offset } => {
+            w.op = READ_CLIPBOARD;
+            w.subject = ticket.into();
+            w.a = u64::from(offset).into();
+        }
     }
     w
 }
@@ -981,6 +1059,16 @@ pub fn decode_req(w: &SurReqWire) -> Option<DisplayRequest> {
                 .ok()
                 .filter(|ticket| *ticket != 0)?,
         },
+        READ_CLIPBOARD => {
+            let offset = u32::try_from(w.a.get()).ok()?;
+            if w.subject.get() == 0 || offset as usize >= crate::clipboard::CLIPBOARD_BYTES {
+                return None;
+            }
+            DisplayRequest::ReadClipboard {
+                ticket: w.subject.get(),
+                offset,
+            }
+        }
         op if op & OUTPUT != 0 => {
             DisplayRequest::Output(kore_svc_output::wire::decode_req(&OutReqWire {
                 op: op & !OUTPUT,
@@ -1053,6 +1141,15 @@ pub fn encode_rep(response: &DisplayResponse, grants: u8) -> SurRepWire {
             w.a = a.into();
             w.b = b.into();
         }
+        DisplayResponse::ClipboardText(text) => {
+            w.tag = CLIPBOARD_TEXT;
+            w.id = text.word().into();
+            let [a, b, c, d] = text.data();
+            w.a = a.into();
+            w.b = b.into();
+            w.c = c.into();
+            w.d = d.into();
+        }
     }
     w
 }
@@ -1119,6 +1216,9 @@ pub fn decode_rep(w: &SurRepWire) -> Option<(DisplayResponse, u8)> {
         SHELL_ACTION => {
             DisplayResponse::ShellAction(ShellAction::from_wire(w.id.get(), w.a.get(), w.b.get())?)
         }
+        CLIPBOARD_TEXT if w.id.get() >> 56 == 0 => DisplayResponse::ClipboardText(
+            ClipboardText::from_words(w.id.get(), [w.a.get(), w.b.get(), w.c.get(), w.d.get()])?,
+        ),
         tag if tag & OUTPUT != 0 => {
             DisplayResponse::Output(kore_svc_output::wire::decode_rep(&OutRepWire {
                 tag: tag & !OUTPUT,
@@ -1193,6 +1293,10 @@ pub fn reply_matches(w: &SurReqWire, response: &DisplayResponse, grants: u8) -> 
             DisplayResponse::Accepted,
         ) => true,
         (DisplayRequest::TakeShellAction, DisplayResponse::ShellAction(_)) => true,
+        (
+            DisplayRequest::ReadClipboard { offset, .. },
+            DisplayResponse::ClipboardText(text),
+        ) => text.offset == offset,
         (DisplayRequest::TakeAdmission, DisplayResponse::Admitted { .. }) => true,
         (
             DisplayRequest::CancelAdmission,
@@ -1220,7 +1324,8 @@ pub fn reply_matches(w: &SurReqWire, response: &DisplayResponse, grants: u8) -> 
             | DisplayRequest::TakeShellAction
             | DisplayRequest::PrepareCapture { .. }
             | DisplayRequest::RequestCapture { .. }
-            | DisplayRequest::ReleaseCapture { .. },
+            | DisplayRequest::ReleaseCapture { .. }
+            | DisplayRequest::ReadClipboard { .. },
             DisplayResponse::ControlRefused(_),
         ) => true,
         (DisplayRequest::CancelAdmission, DisplayResponse::ControlRefused(_)) => true,
@@ -1817,6 +1922,67 @@ mod tests {
         assert_eq!(decode_rep(&wire), None);
         wire.a = (1 | (1 << 24)).into();
         assert_eq!(decode_rep(&wire), None);
+    }
+
+    /// A shell paste names its ticket; a clipboard read answers its own
+    /// offset with a piece inside its text, zero past its length, and
+    /// nothing else; and an unticketed or out-of-bound read refuses.
+    #[test]
+    fn a_shell_paste_reads_its_ticketed_text_and_fails_closed() {
+        let paste = DisplayResponse::ShellAction(Some(ShellAction::Paste { ticket: 0xfeed }));
+        assert_eq!(decode_rep(&encode_rep(&paste, 0)), Some((paste, 0)));
+        let mut bad = encode_rep(&paste, 0);
+        bad.a = 0.into();
+        assert_eq!(decode_rep(&bad), None, "no ticket");
+        bad.a = 1.into();
+        bad.b = 1.into();
+        assert_eq!(decode_rep(&bad), None, "a stray word");
+
+        let read = DisplayRequest::ReadClipboard {
+            ticket: 0xfeed,
+            offset: 32,
+        };
+        let wire = encode_req(&read);
+        assert_eq!(decode_req(&wire), Some(read));
+        for (ticket, offset) in [(0, 0), (1, crate::clipboard::CLIPBOARD_BYTES as u32)] {
+            assert_eq!(
+                decode_req(&encode_req(&DisplayRequest::ReadClipboard { ticket, offset })),
+                None,
+                "ticket {ticket} offset {offset}"
+            );
+        }
+        let mut bytes = [0; CLIPBOARD_TEXT_BYTES];
+        bytes[..5].copy_from_slice(b"ls -l");
+        let text = ClipboardText {
+            offset: 32,
+            len: 5,
+            total: 37,
+            bytes,
+        };
+        let answer = DisplayResponse::ClipboardText(text);
+        let reply = encode_rep(&answer, 0);
+        assert_eq!(decode_rep(&reply), Some((answer, 0)));
+        assert_eq!(text.text(), b"ls -l");
+        assert!(reply_matches(&wire, &answer, 0));
+        assert!(!reply_matches(&wire, &answer, 1));
+        assert!(reply_matches(&wire, &DisplayResponse::ControlRefused(ControlRefusal::Stale), 0));
+        let elsewhere = encode_req(&DisplayRequest::ReadClipboard {
+            ticket: 0xfeed,
+            offset: 0,
+        });
+        assert!(!reply_matches(&elsewhere, &answer, 0));
+        let mut tail = reply;
+        tail.d = (tail.d.get() | 1 << 56).into();
+        assert_eq!(decode_rep(&tail), None, "a live byte past the piece");
+        for (offset, len, total) in [(0u32, 0u16, 5u32), (0, 33, 64), (33, 5, 37), (0, 1, 0)] {
+            let mut bad = reply;
+            bad.id = (u64::from(offset) | u64::from(total) << 24 | u64::from(len) << 48).into();
+            bad.a = 0.into();
+            bad.b = 0.into();
+            bad.c = 0.into();
+            bad.d = 0.into();
+            assert_eq!(decode_rep(&bad), None, "{offset} {len} {total}");
+        }
     }
 
     #[test]

@@ -1754,19 +1754,20 @@ pub enum QuiesceFault {
     Unenforced,
 }
 
-/// Why a writable lease did not become an executable successor.
+/// Why a consuming lease transition did not yield its successor: a
+/// finalization, the return to writable, or a freeze.
 ///
-/// Finalization has one abort door: a refusal before commit returns the exact
-/// affine source.  Once the kernel has retired that source and begun clearing
+/// Each has one abort door: a refusal before commit returns the exact affine
+/// source.  Once the kernel has retired that source and begun clearing
 /// aliases, rollback is impossible; a later containment or publication
 /// failure is therefore reported as [`Consumed`](Self::Consumed), never as a
-/// writable lease that no longer exists.
+/// lease that no longer exists.
 #[must_use]
 #[derive(Debug)]
 pub enum FinalizeExecError<T> {
-    /// The session did not commit; the writable source is unchanged.
+    /// The session did not commit; the source is unchanged.
     Refused(T),
-    /// The source was consumed, but no executable successor was published.
+    /// The source was consumed, but no successor was published.
     Consumed,
 }
 
@@ -2852,17 +2853,6 @@ impl ReturnedCapability {
 #[derive(Debug)]
 pub struct StashedLease {
     owned: OwnedSlot,
-}
-
-impl StashedLease {
-    /// Adopt an already-activated owned slot the kernel just published as a
-    /// writable lease — the executable → writable return's landing
-    /// (`res/IMAGE.md` §6a). Crate-internal: the caller must have proved
-    /// the record's shape first (`writable_result_state`).
-    #[cfg(target_os = "none")]
-    pub(crate) fn from_owned(owned: OwnedSlot) -> Self {
-        Self { owned }
-    }
 }
 
 /// Transferable memory custody: an allocation lease or a scoped mapping loan.

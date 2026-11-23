@@ -53,6 +53,9 @@ pub enum ClientError {
     EventMalformed,
     /// A menu the encoder refused before anything reached the compositor.
     Menu(crate::menu::MenuError),
+    /// A clipboard text past [`crate::clipboard::CLIPBOARD_BYTES`], or one
+    /// longer than its reader can hold: refused whole, never cut short.
+    TooLong,
 }
 
 impl ClientError {
@@ -946,6 +949,101 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
         }
     }
 
+    /// Put `text` on this window's seat's clipboard (`res/CLIPBOARD.md`), a
+    /// request plane at a time. Only the seat's focused window may, on a key
+    /// press, button press or menu choice it was just delivered and has not
+    /// spent ([`SurfaceRefusal::Denied`] otherwise). An empty text is no
+    /// copy; one past the clipboard's bound is refused before anything is
+    /// sent, and one that is not UTF-8 the compositor refuses whole.
+    /// `OutOfMemory` leaves the clipboard and the gesture as they were, so a
+    /// retry may succeed.
+    pub async fn copy(&mut self, text: &[u8]) -> Result<(), ClientError> {
+        let total = u32::try_from(text.len())
+            .ok()
+            .filter(|&total| total as usize <= crate::clipboard::CLIPBOARD_BYTES)
+            .ok_or(ClientError::TooLong)?;
+        if total == 0 {
+            return Err(ClientError::Protocol);
+        }
+        let mut offset = 0_u32;
+        for piece in text.chunks(crate::clipboard::CHUNK_BYTES.min(self.menu.len())) {
+            self.menu[..piece.len()].copy_from_slice(piece);
+            let len = piece.len() as u16;
+            match self
+                .surface_request(SurfaceRequest::CopyChunk { offset, len, total })
+                .await?
+            {
+                SurfaceResponse::Copied { through } if through == offset + u32::from(len) => {
+                    offset = through;
+                }
+                _ => return Err(ClientError::Protocol),
+            }
+        }
+        Ok(())
+    }
+
+    /// Read this window's seat's clipboard (`res/CLIPBOARD.md`): `begin`
+    /// learns the text's length before any of it, and may refuse it
+    /// (`false`: longer than the caller can hold, [`ClientError::TooLong`]);
+    /// `piece` then takes the text in order, a request plane at a time, and
+    /// answers whether it wants more (`false` ends the read there: a reader
+    /// that needs only the text's start reads no more of it). Answers the
+    /// length, zero when the clipboard holds no text. Gated as [`Self::copy`]
+    /// is; a copy landing while the read is under way refuses it
+    /// ([`SurfaceRefusal::Unknown`]) rather than mixing two texts.
+    pub async fn paste(
+        &mut self,
+        begin: impl FnOnce(u32) -> bool,
+        mut piece: impl FnMut(&[u8]) -> bool,
+    ) -> Result<u32, ClientError> {
+        let mut begin = Some(begin);
+        let mut offset = 0_u32;
+        let mut buffer = [0_u8; PASTE_STAGE_BYTES];
+        loop {
+            let (at, len, total) = match self.surface_request(SurfaceRequest::Paste { offset }).await? {
+                SurfaceResponse::Clipboard { offset: at, len, total } => (at, len, total),
+                SurfaceResponse::ClipboardEmpty if offset == 0 => return Ok(0),
+                _ => return Err(ClientError::Protocol),
+            };
+            if at != offset || usize::from(len) > self.menu.len() {
+                return Err(ClientError::Protocol);
+            }
+            if let Some(begin) = begin.take()
+                && !begin(total)
+            {
+                return Err(ClientError::TooLong);
+            }
+            // The compositor wrote the plane before it answered; read it as
+            // the shared memory it is, after the reply's acquire.
+            let plane = shared_plane(self.menu);
+            for chunk in plane[..usize::from(len)].chunks(buffer.len()) {
+                for (byte, shared) in buffer.iter_mut().zip(chunk) {
+                    *byte = shared.load(core::sync::atomic::Ordering::Relaxed);
+                }
+                if !piece(&buffer[..chunk.len()]) {
+                    return Ok(total);
+                }
+            }
+            offset += u32::from(len);
+            if offset == total {
+                return Ok(total);
+            }
+        }
+    }
+
+    /// Ask for the clipboard to be typed into this terminal window's shell
+    /// line (`res/CLIPBOARD.md` §Shell): queued for its controller, which
+    /// takes what the line can hold. Gated as [`Self::copy`] is, and only the
+    /// seat's terminal window may ask. Answers the text's length, zero when
+    /// the clipboard holds no text.
+    pub async fn paste_to_shell(&mut self) -> Result<u32, ClientError> {
+        match self.surface_request(SurfaceRequest::PasteToShell).await? {
+            SurfaceResponse::PasteQueued { total } => Ok(total),
+            SurfaceResponse::ClipboardEmpty => Ok(0),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
     async fn read_configuration(&mut self) -> Result<Configure, ClientError> {
         let reply = self
             .control
@@ -1390,6 +1488,22 @@ impl<'w, 't, T: Transport> WindowClient<'w, 't, T> {
         *backing = None;
         Ok(())
     }
+}
+
+/// A paste's piece reaches its reader through this much stack at a time:
+/// the plane is read atomically, a byte at a time, and handed on as a slice.
+/// Small enough for any task's stack, large enough that a 4 KiB piece is
+/// sixteen calls.
+const PASTE_STAGE_BYTES: usize = 256;
+
+/// The request plane as the memory it is: shared with the compositor, which
+/// writes it while it answers a paste.
+fn shared_plane(plane: &[u8]) -> &[core::sync::atomic::AtomicU8] {
+    // SAFETY: `AtomicU8` has `u8`'s size and alignment, and every access the
+    // returned view makes is atomic, so the compositor's writes race with none
+    // of this process's plain accesses: the plane's plain writers run only
+    // between requests, never while this view is live.
+    unsafe { &*(core::ptr::from_ref(plane) as *const [core::sync::atomic::AtomicU8]) }
 }
 
 fn valid_configuration(previous: Option<Configure>, next: Configure) -> bool {

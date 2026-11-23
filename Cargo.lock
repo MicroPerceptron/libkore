@@ -803,6 +803,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-c"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "kore-c-shim",
+ "kore-ffi",
+ "kore-ld",
+ "kore-std",
+]
+
+[[package]]
+name = "kore-c-shim"
+version = "0.1.0"
+dependencies = [
+ "kore-rt",
+]
+
+[[package]]
 name = "kore-collections"
 version = "0.1.0"
 
@@ -959,6 +976,8 @@ dependencies = [
  "kore-dagfs",
  "kore-driver",
  "kore-rt",
+ "kore-svc-vdev",
+ "kore-vdev",
  "zeroize",
 ]
 
@@ -1009,6 +1028,23 @@ dependencies = [
  "blake3",
  "heapless",
  "kore-rt",
+]
+
+[[package]]
+name = "kore-svc-vdev"
+version = "0.0.0"
+dependencies = [
+ "kore-abi",
+ "kore-rt",
+ "kore-vdev",
+]
+
+[[package]]
+name = "kore-vdev"
+version = "0.0.1"
+dependencies = [
+ "heapless",
+ "virtio-accel-transport",
 ]
 
 [[package]]
@@ -1314,9 +1350,9 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",
@@ -1660,6 +1696,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtio-accel-transport"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7747200a37db419a82c884730d5c31d1d80a6b4d14cc3de312064e4793dc289"
 
 [[package]]
 name = "wasi"

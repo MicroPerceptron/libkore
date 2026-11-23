@@ -847,6 +847,7 @@ fn launch<const N: usize>(
         //    ticket whose founding never happened refuses its join and
         //    detaches (the band stays spent — visible, never hidden). ──
         decide(ctx, ABORT);
+        let mut detached = false;
         for staged in workers.iter_mut().filter_map(Option::take) {
             // A refused join here is a transient observation failure on
             // a worker that is already exiting; one bounded retry, then
@@ -855,7 +856,10 @@ fn launch<const N: usize>(
                 Ok(_) => {}
                 Err(e) => match crate::thread::join_reserved(e.into_thread(), &mut join_scratch) {
                     Ok(_) => {}
-                    Err(e) => e.into_thread().detach(),
+                    Err(e) => {
+                        detached = true;
+                        e.into_thread().detach()
+                    }
                 },
             }
         }
@@ -865,6 +869,15 @@ fn launch<const N: usize>(
             // implementation cannot fail; keep the result explicit if that
             // invariant changes later.
             let _ = star.finish();
+        }
+        // Every worker this launch founded is joined, so none can read the
+        // gate again: restage it, and the next launch over `ctx` may run.
+        // A detached worker may still be parked on it, and a restaged gate
+        // would release it into the next launch's body: `ctx` then stays
+        // aborted, refusing every launch over it, rather than hand one
+        // region's job to another's worker.
+        if !detached {
+            ctx.restage();
         }
         return None;
     }
@@ -1539,6 +1552,10 @@ fn dispatch_resident(
                 .map(|m| m.fitting_width())
                 .unwrap_or(1)
                 .clamp(1, DISPATCH_CAP as u32);
+            // No wider than this thread's arena can found: a resident gang
+            // holds its founder's names for the task's life, and a thread
+            // other than thread 0 founds from a fixed arena.
+            let fit = affordable(fit, false);
             let founded = (fit >= 2)
                 .then(|| {
                     found_resident::<DISPATCH_CAP>(
@@ -1556,7 +1573,15 @@ fn dispatch_resident(
                 // contract says; an executable takes `PROFILE_CHANNELS`
                 // to found the star.
                 Some(region) if !region.star_active() => {
-                    let _ = region.retire();
+                    // The retire told every worker to end before its first
+                    // join, so each join it could not complete is one still
+                    // to finish: collect them all, as a dispatch collects its
+                    // own.  Dropping the region instead would leave the gang
+                    // running, its bands, stacks and slots spent for the
+                    // task's life.
+                    if let Err(refused) = region.retire() {
+                        join_dispatched(refused.spmd);
+                    }
                     gang.state.store(RESIDENT_REFUSED, Relaxed);
                     return ResidentOutcome::Unavailable;
                 }
@@ -1764,6 +1789,104 @@ fn block_split(span: u32, workers: u32, worker: u32) -> (u32, u32) {
     (start, start + len)
 }
 
+/// What a [`launch`] founds beside its workers: what its arena budget
+/// ([`launch_slots`]) depends on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(all(not(target_os = "none"), not(test)), allow(dead_code))]
+struct LaunchShape {
+    /// The star a launch here mints: `Some(founder_kick)` — whether each
+    /// member's mesh carries the founder's kick — or `None` for a starless
+    /// launch.
+    star: Option<bool>,
+    /// Whether the launch founds the star's relay hub: a one-shot region does,
+    /// a resident one does not.
+    hub: bool,
+    /// Whether each worker takes a TLS block.
+    tls: bool,
+    /// Whether each compute worker is endowed the process heap.
+    heap: bool,
+}
+
+/// The arena names a [`launch`] of `width` workers holds at its peak.
+///
+/// The launch holds its join landing and the star's wires
+/// ([`star::wires_slots`](crate::star::wires_slots)) throughout. Each gang
+/// session then holds every one of its workers' founding names at its commit
+/// ([`thread::gang_founding_slots`](crate::thread::gang_founding_slots)), on
+/// top of what the sessions before it kept ([`RETAINED_SLOTS`] a worker), and
+/// the hub's session holds its own on top of all of them.  A launch whose peak
+/// fits the arena cannot run out of names part way through, where a refusal
+/// leaks what it claimed.  The sessions are [`launch`]'s own split
+/// ([`founding_sessions`]): a starred session carries at most
+/// [`MESH_CEILING`](crate::star::MESH_CEILING) workers.
+///
+/// [`RETAINED_SLOTS`]: crate::thread::RETAINED_SLOTS
+#[cfg_attr(all(not(target_os = "none"), not(test)), allow(dead_code))]
+fn launch_slots(width: u32, shape: LaunchShape) -> usize {
+    use crate::thread::{RETAINED_SLOTS, gang_founding_slots};
+    let wires = shape
+        .star
+        .map_or(0, |_| crate::star::wires_slots(width as usize));
+    let mut held = 1 + wires;
+    let mut peak = held;
+    let ceiling = match shape.star {
+        Some(_) => crate::star::MESH_CEILING,
+        None => crate::session::MAX_SESSION_FOUNDS,
+    };
+    for (start, end) in founding_sessions(width, ceiling as u32) {
+        let chunk = (end - start) as usize;
+        let mesh = shape
+            .star
+            .map_or(0, |kick| crate::star::mesh_caps(kick, chunk));
+        let endowments = chunk * (mesh + usize::from(shape.heap));
+        peak = peak.max(held + gang_founding_slots(chunk, shape.tls, endowments));
+        held += chunk * (RETAINED_SLOTS + usize::from(shape.tls));
+    }
+    if shape.hub && shape.star.is_some() {
+        // The hub's endowment: its own recv and a send to every worker.
+        peak = peak.max(held + gang_founding_slots(1, shape.tls, 1 + width as usize));
+    }
+    peak
+}
+
+/// The widest launch of at most `want` workers whose peak
+/// ([`launch_slots`]) fits `available` arena names, or 0 when not one worker
+/// fits.
+///
+/// Every width is weighed, widest first: the peak is not monotonic in the
+/// width, because a wider gang splits into more sessions whose meshes are
+/// smaller (seven meshed workers cost one session of seven; eight cost two of
+/// four).
+#[cfg_attr(all(not(target_os = "none"), not(test)), allow(dead_code))]
+fn affordable_width(want: u32, shape: LaunchShape, available: usize) -> u32 {
+    (1..=want)
+        .rev()
+        .find(|&width| launch_slots(width, shape) <= available)
+        .unwrap_or(0)
+}
+
+/// The shape a launch over this thread would take, read before it mints
+/// anything.
+#[cfg(target_os = "none")]
+fn launch_shape(hub: bool) -> LaunchShape {
+    LaunchShape {
+        star: crate::star::shape().map(|star| star.founder_kick),
+        hub,
+        tls: crate::entry::geometry::tls_template().is_some(),
+        heap: worker_heap().is_some(),
+    }
+}
+
+/// [`affordable_width`] on this thread's arena, now.
+#[cfg(target_os = "none")]
+fn affordable(want: u32, hub: bool) -> u32 {
+    affordable_width(
+        want,
+        launch_shape(hub),
+        crate::entry::geometry::available_cap_slots(),
+    )
+}
+
 /// **The parallel-for** — run `body` over `0..tiles`, sized to the
 /// machine, with no thread configuration at all.
 ///
@@ -1854,6 +1977,12 @@ fn dispatch_erased(
         ResidentOutcome::Done(dispatched) => return Some(dispatched),
         ResidentOutcome::Busy => return None,
         ResidentOutcome::Unavailable => {}
+    }
+    // The one-shot region, as wide as asked and no wider than this thread's
+    // arena can found whole; `None` only when not one worker fits.
+    let width = affordable(width, true);
+    if width == 0 {
+        return None;
     }
     let env = &body as *const &(dyn Fn(&'static SpmdCtx, u32) + Sync) as *mut ();
     let region = launch::<DISPATCH_CAP>(
@@ -2317,6 +2446,100 @@ mod tests {
         assert_eq!(split(4), [4], "a Lunar Lake gang founds whole");
         assert_eq!(split(meshed + 1), [(meshed + 1) / 2, (meshed + 2) / 2]);
         assert_eq!(split(12), [6, 6]);
+    }
+
+    const fn shape(star: Option<bool>, hub: bool, tls: bool) -> LaunchShape {
+        LaunchShape {
+            star,
+            hub,
+            tls,
+            heap: true,
+        }
+    }
+
+    /// The budget counts what the founding holds, step by step: the join
+    /// landing and the star's wires, every worker's founding names and mesh
+    /// at the session's commit, what each session keeps, then the hub's
+    /// session on top.  Three meshed workers founded off thread 0 peak at 46
+    /// names: two more than a 64-slot worker's arena had left, the C
+    /// `main` that `kore_spmd_dispatch` refused on.
+    #[test]
+    fn a_launch_budget_counts_what_its_founding_holds() {
+        // Resident, starred, no founder kick: 1 + 9 wires, then 3 × 7
+        // founding names and 3 × (4 mesh + heap) endowments.
+        assert_eq!(launch_slots(3, shape(Some(false), false, false)), 46);
+        // The one-shot's hub founds after the gang returned its plan: 10
+        // held + 3 × 4 kept + 7 + (1 + 3) endowments = 33, under the gang's
+        // peak.
+        assert_eq!(launch_slots(3, shape(Some(false), true, false)), 46);
+        // Thread 0's star carries its kick: one more mesh cap a worker.
+        assert_eq!(launch_slots(3, shape(Some(true), false, false)), 49);
+        // Starless: the landing, then 3 × (7 + heap).
+        assert_eq!(launch_slots(3, shape(None, true, false)), 25);
+        // A TLS block is one more founding name and one more kept name.
+        assert_eq!(launch_slots(3, shape(None, false, true)), 28);
+        // Two sessions: the second commits over what the first kept.
+        // 8 meshed workers: 1 + 19, then 4 × 7 + 4 × 6 = 72, keeping 16;
+        // then 36 + 52 = 88.
+        assert_eq!(launch_slots(8, shape(Some(false), false, false)), 88);
+    }
+
+    /// A wider gang can cost less at its peak: past the mesh ceiling it
+    /// splits into sessions whose meshes are smaller.  The clamp weighs every
+    /// width for that reason.
+    #[test]
+    fn a_launch_peak_is_not_monotonic_in_its_width() {
+        let meshed = crate::star::MESH_CEILING as u32;
+        let starred = shape(Some(false), false, false);
+        assert!(launch_slots(meshed + 1, starred) < launch_slots(meshed, starred));
+        let between = launch_slots(meshed + 1, starred);
+        assert_eq!(affordable_width(meshed + 1, starred, between), meshed + 1);
+        assert!(affordable_width(meshed, starred, between) < meshed);
+    }
+
+    /// The clamp takes the widest width that fits and refuses only when one
+    /// worker does not: the 44 names a 64-slot C `main` had left found two of
+    /// its three workers, and a founder's arena founds every one.
+    #[test]
+    fn a_launch_is_clamped_to_its_arena() {
+        let resident = shape(Some(false), false, false);
+        assert_eq!(affordable_width(3, resident, 44), 2);
+        assert_eq!(affordable_width(3, resident, 46), 3);
+        assert_eq!(
+            affordable_width(3, resident, launch_slots(1, resident) - 1),
+            0
+        );
+        assert_eq!(affordable_width(0, resident, usize::MAX), 0);
+        // A founder's dynamic names: the founding granule below the linker
+        // band, after a doorbell worker's boot names and runtime layout.
+        let founder = crate::entry::STARTUP_LINK_SLOT_BASE as usize - (3 + 5 + 1 + 10 + 2);
+        for tls in [false, true] {
+            for hub in [false, true] {
+                let widest = crate::thread::MAX_THREADS - 1;
+                let width = affordable_width(widest, shape(Some(false), hub, tls), founder);
+                assert!(width >= 16, "tls {tls} hub {hub}: {width}");
+            }
+        }
+    }
+
+    /// The starless degrade (a refused mint) never needs more than the
+    /// starred launch its budget was weighed for, at any width, so a launch
+    /// sized for its star cannot run out of names when the star fails.
+    #[test]
+    fn the_starless_degrade_fits_its_starred_budget() {
+        for width in 1..crate::thread::MAX_THREADS {
+            for kick in [false, true] {
+                for tls in [false, true] {
+                    for hub in [false, true] {
+                        assert!(
+                            launch_slots(width, shape(None, hub, tls))
+                                <= launch_slots(width, shape(Some(kick), hub, tls)),
+                            "width {width} kick {kick} tls {tls} hub {hub}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A scripted worker: joins yield the scripted outcomes in order.

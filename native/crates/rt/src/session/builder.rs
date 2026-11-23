@@ -1264,6 +1264,27 @@ impl SessionBuilder {
         Ok(Staged(result))
     }
 
+    /// Consume a writable lease and return its **frozen** successor
+    /// (`Revoke × REVOKE_KIND_FREEZE`) — the exclusive intake of
+    /// `res/IMAGE.md` §6b.
+    ///
+    /// The kernel requires `ACCESS|MODIFY|DERIVE|REVOKE` on `subject`, kills
+    /// its complete descendant lineage, removes every CPU/DMA/guest alias,
+    /// and writes an `ACCESS|MODIFY|DERIVE|REVOKE` lease over the same window
+    /// into `result`. No lessor may write that window again while the
+    /// successor lives — the successor and its carves included.
+    pub fn freeze(&mut self, subject: SlotRef, result: SlotRef) -> Result<Staged, BuildError> {
+        self.push(Inv {
+            op: OpCode::Revoke as u16,
+            requested: 0,
+            kind: kore_abi::session::REVOKE_KIND_FREEZE,
+            subject: subject.index(),
+            result: result.index(),
+            arg: Invocation::NO_ARG,
+        })?;
+        Ok(Staged(result))
+    }
+
     /// `Derive × DERIVE_KIND_ARENA_EXTEND` on the task's own space
     /// self-view (slice E): grow the caller's cap arena by one chunk.
     /// An **effect**, not a mint — the request is empty, the arg is the

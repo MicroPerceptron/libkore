@@ -565,8 +565,11 @@ pub const PROCESS_OUTPUT_BYTES: usize = PROCESS_IO_BYTES - HEADER_BYTES - PROCES
 /// would take that word for zero-or-corrupt. Each change shifts an offset or
 /// a meaning and therefore burns a version.  13: the system snapshot's
 /// scheduler-timer arm census, paid from the argument buffer together with
-/// the output bytes its status row needs, so no report lost a row.
-pub const PROCESS_IO_ABI: u16 = 13;
+/// the output bytes its status row needs, so no report lost a row.  14: the
+/// second reserved word gains a meaning, the length of the command name the
+/// launcher resolved the program by, which rides the argument buffer after
+/// the tail ([`ProcessIo::command`]): a `13` reader requires that word zero.
+pub const PROCESS_IO_ABI: u16 = 14;
 
 /// One launch-time snapshot of exec's bounded process table.
 ///
@@ -717,9 +720,12 @@ pub struct ProcessIo {
     /// holds the frame service's diagnostic face.
     net: crate::monitor::NetSnapshot,
     // `reserved[0]` was intentionally available for an additive ABI field.
-    // It now carries the immutable launcher-context live length; the remaining
-    // words stay reserved and must be zero.
+    // It now carries the immutable launcher-context live length, and
+    // `reserved[1]` the command name's length; the remaining words stay
+    // reserved and must be zero.
     reserved: [U32; 4],
+    /// The argument tail, `arg_len` bytes, then the command name,
+    /// `reserved[1]` bytes; zero after them.
     args: [u8; PROCESS_ARG_BYTES],
     /// Alternating payload: launcher context before START, child output after
     /// execution. The task lifecycle is the exclusive-ownership boundary.
@@ -776,8 +782,10 @@ impl ProcessIo {
             && self.flags.get() == 0
             && self.telemetry.validate()
             && self.filesystem.validate()
-            && self.reserved[1..].iter().all(|v| v.get() == 0)
+            && self.reserved[2..].iter().all(|v| v.get() == 0)
             && usize::from(self.arg_len.get()) <= PROCESS_ARG_BYTES
+            && usize::try_from(self.reserved[1].get())
+                .is_ok_and(|name| name <= PROCESS_ARG_BYTES - usize::from(self.arg_len.get()))
             && usize::try_from(self.reserved[0].get()).is_ok_and(|len| len <= PROCESS_CONTEXT_BYTES)
             && usize::from(self.output_len.get()) <= PROCESS_OUTPUT_BYTES
             && (self.reserved[0].get() == 0 || self.output_len.get() == 0)
@@ -789,6 +797,36 @@ impl ProcessIo {
             return Err(ProcessIoError::Invalid);
         }
         Ok(&self.args[..usize::from(self.arg_len.get())])
+    }
+
+    /// The name the launcher resolved this program by: the first word of the
+    /// command line it was run from, which the tail in [`Self::args`] does
+    /// not hold. Empty when the launcher gave none. A label: it selects
+    /// nothing and proves nothing about the image.
+    pub fn command(&self) -> Result<&[u8], ProcessIoError> {
+        if !self.validate() {
+            return Err(ProcessIoError::Invalid);
+        }
+        let tail = usize::from(self.arg_len.get());
+        Ok(&self.args[tail..tail + self.reserved[1].get() as usize])
+    }
+
+    /// Publish the command name before the child starts. It shares the
+    /// argument buffer with the tail, so a name the buffer has no room for
+    /// after the tail is refused whole and the page is unchanged.
+    pub fn write_command(&mut self, name: &[u8]) -> Result<(), ProcessIoError> {
+        if !self.validate() {
+            return Err(ProcessIoError::Invalid);
+        }
+        let tail = usize::from(self.arg_len.get());
+        let end = tail
+            .checked_add(name.len())
+            .filter(|end| *end <= PROCESS_ARG_BYTES)
+            .ok_or(ProcessIoError::ArgumentsTooLong)?;
+        self.args[tail..].fill(0);
+        self.args[tail..end].copy_from_slice(name);
+        self.reserved[1].set(name.len() as u32);
+        Ok(())
     }
 
     /// Immutable launcher context for this invocation. It is data, never an
@@ -1246,6 +1284,55 @@ mod tests {
             .unwrap();
         page.output_len.set(u16::MAX);
         assert_eq!(page.output(), Err(ProcessIoError::Invalid));
+    }
+
+    #[test]
+    fn the_command_name_rides_after_the_tail_and_leaves_it_alone() {
+        let mut page = ProcessIo::new_zeroed();
+        page.initialize_with_context(
+            b"-v 'two words'",
+            b"context",
+            crate::monitor::TelemetrySnapshot::EMPTY,
+        )
+        .unwrap();
+        // A launcher that names nothing leaves the name empty.
+        assert_eq!(page.command().unwrap(), b"");
+        page.write_command(b"answer").unwrap();
+        assert_eq!(page.command().unwrap(), b"answer");
+        assert_eq!(page.args().unwrap(), b"-v 'two words'");
+        assert_eq!(page.context().unwrap(), b"context");
+        // A second name replaces the first whole, a shorter one included.
+        page.write_command(b"a").unwrap();
+        assert_eq!(page.command().unwrap(), b"a");
+        // The buffer is the tail's and the name's together: a name that
+        // does not fit after the tail is refused and nothing changes.
+        let long = [b'n'; PROCESS_ARG_BYTES];
+        assert_eq!(
+            page.write_command(&long),
+            Err(ProcessIoError::ArgumentsTooLong)
+        );
+        assert_eq!(page.command().unwrap(), b"a");
+        assert_eq!(page.args().unwrap(), b"-v 'two words'");
+        let fits = &long[..PROCESS_ARG_BYTES - page.args().unwrap().len()];
+        page.write_command(fits).unwrap();
+        assert_eq!(page.command().unwrap(), fits);
+        // The next launch starts with no name.
+        page.initialize(b"", crate::monitor::TelemetrySnapshot::EMPTY)
+            .unwrap();
+        assert_eq!(page.command().unwrap(), b"");
+    }
+
+    #[test]
+    fn a_command_name_past_the_buffer_fails_closed() {
+        let mut page = ProcessIo::new_zeroed();
+        page.initialize(b"tail", crate::monitor::TelemetrySnapshot::EMPTY)
+            .unwrap();
+        page.reserved[1].set((PROCESS_ARG_BYTES - 3) as u32);
+        assert_eq!(page.command(), Err(ProcessIoError::Invalid));
+        assert_eq!(page.args(), Err(ProcessIoError::Invalid));
+        page.reserved[1].set(0);
+        page.reserved[2].set(1);
+        assert_eq!(page.args(), Err(ProcessIoError::Invalid));
     }
 
     #[test]

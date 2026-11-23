@@ -1,0 +1,18 @@
+[package]
+name = "kore-svc-accel-spmd"
+version = "0.0.1"
+edition = "2024"
+description = "kore CPU accelerator backend candidate: the CPU-SIMD implementation of the AccelRequest contract, executing registered kernels over kore-rt's SPMD region launch."
+publish = false
+
+[dependencies]
+kore-driver = { path = "../../crates/driver", features = ["accel"] }
+# The SPMD region launch (`spmd::dispatch_slices`) this row's `submit` is
+# built on, and the heap its buffers come from.
+kore-rt = { path = "../../crates/rt" }
+# The frozen accelerator contracts the backend speaks. Same pin as the
+# founded device rows: one protocol and one coherent type family.
+virtio-accel-core = { version = "=0.4.1", default-features = false }
+
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }

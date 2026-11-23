@@ -7,14 +7,22 @@
 
 use crate::image::{ImageName, NAME_BYTES};
 
-/// Snapshot wire version.
-pub const COMMAND_SNAPSHOT_ABI: u8 = 1;
+/// Snapshot wire version.  2: an entry may carry no usage.  A launcher
+/// carries the usage of the rows its command line names and only the name
+/// and summary of the rest ([`CommandSnapshotBuilder::push_listed`]), so the
+/// record grows with the catalogue's names and summaries rather than with
+/// every row's usage, and has room for the programs a task installs.  A `1`
+/// reader refuses an empty usage.
+pub const COMMAND_SNAPSHOT_ABI: u8 = 2;
 /// The largest task-local command set accepted by the decoder.  Raised
 /// from 32 when the desktop's `editor` and `power-ui` rows joined the two
 /// native filesystem verbs, and from 40 when Files and the documents editor
-/// became two rows; the byte budget (`PROCESS_CONTEXT_BYTES`) is the other
-/// bound, proven by exec's host test over the real catalogue.
-pub const MAX_COMMAND_SNAPSHOT_ENTRIES: usize = 48;
+/// became two rows; and from 48 for the programs a task installs, which
+/// its launcher lists beside the catalogue (47 rows and a shell's share of
+/// the installed pool no longer fit 48).  The byte budget
+/// (`PROCESS_CONTEXT_BYTES`) is the other bound; exec's host test proves
+/// both over the real catalogue with that share installed.
+pub const MAX_COMMAND_SNAPSHOT_ENTRIES: usize = 64;
 /// The launcher holds a power-control face and therefore handles these two
 /// privileged controls in-process.
 pub const COMMAND_SNAPSHOT_SYSTEM_POWER: u8 = 1 << 0;
@@ -38,6 +46,8 @@ pub enum CommandSnapshotError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandDescription<'a> {
     pub local_name: &'a str,
+    /// The command's usage, or empty when the launcher carried none for
+    /// this row.
     pub usage: &'a str,
     pub summary: &'a str,
 }
@@ -67,9 +77,31 @@ impl<'a> CommandSnapshotBuilder<'a> {
         })
     }
 
-    /// Append one local namespace row. The executable capability paired with
-    /// this metadata deliberately is not accepted by this API.
+    /// Append one local namespace row with its usage. The executable
+    /// capability paired with this metadata deliberately is not accepted by
+    /// this API.
     pub fn push(
+        &mut self,
+        local_name: &ImageName,
+        usage: &[u8],
+        summary: &[u8],
+    ) -> Result<(), CommandSnapshotError> {
+        validate_text(usage, false)?;
+        self.append(local_name, usage, summary)
+    }
+
+    /// Append one local namespace row without its usage: a row the reader
+    /// lists but was not asked to describe.
+    pub fn push_listed(
+        &mut self,
+        local_name: &ImageName,
+        summary: &[u8],
+    ) -> Result<(), CommandSnapshotError> {
+        self.append(local_name, &[], summary)
+    }
+
+    /// `usage` is valid text, or empty for a row that carries none.
+    fn append(
         &mut self,
         local_name: &ImageName,
         usage: &[u8],
@@ -82,7 +114,6 @@ impl<'a> CommandSnapshotBuilder<'a> {
             .as_str()
             .ok_or(CommandSnapshotError::InvalidText)?;
         validate_text(name.as_bytes(), true)?;
-        validate_text(usage, false)?;
         validate_text(summary, false)?;
         if name.len() > u8::MAX as usize
             || usage.len() > u8::MAX as usize
@@ -260,7 +291,10 @@ fn decode_entry(
     cursor += usage_len;
     let summary = &bytes[cursor..cursor + summary_len];
     validate_text(name, true)?;
-    validate_text(usage, false)?;
+    // A row the launcher only listed carries no usage.
+    if !usage.is_empty() {
+        validate_text(usage, false)?;
+    }
     validate_text(summary, false)?;
     Ok((
         CommandDescription {
@@ -316,6 +350,47 @@ mod tests {
         assert_eq!(entries.next(), None);
         assert_eq!(snapshot.find(b"ls").unwrap().usage, "ls [-l] [path]");
         assert!(snapshot.find(b"touch").is_none());
+    }
+
+    #[test]
+    fn a_listed_row_carries_its_name_and_summary_and_no_usage() {
+        let mut bytes = [0u8; 256];
+        let mut builder = CommandSnapshotBuilder::new(&mut bytes, 0).unwrap();
+        builder
+            .push_listed(&image("hello"), b"dynamic-linker witness")
+            .unwrap();
+        builder
+            .push(&image("ls"), b"ls [-l] [path]", b"list directory entries")
+            .unwrap();
+        let listed_only = 4 + "hello".len() + "dynamic-linker witness".len();
+        let len = builder.finish();
+        let snapshot = CommandSnapshot::parse(&bytes[..len]).unwrap();
+        assert_eq!(
+            snapshot.find(b"hello"),
+            Some(CommandDescription {
+                local_name: "hello",
+                usage: "",
+                summary: "dynamic-linker witness",
+            })
+        );
+        assert_eq!(snapshot.find(b"ls").unwrap().usage, "ls [-l] [path]");
+        // The usage a listed row leaves out is exactly what it saves.
+        assert_eq!(
+            len,
+            8 + listed_only + 4 + "ls".len() + "ls [-l] [path]".len() + 22
+        );
+        // A row that is described carries a usage: `push` takes no empty one,
+        // and a summary is never optional.
+        let mut bytes = [0u8; 64];
+        let mut builder = CommandSnapshotBuilder::new(&mut bytes, 0).unwrap();
+        assert_eq!(
+            builder.push(&image("one"), b"", b"first"),
+            Err(CommandSnapshotError::InvalidText)
+        );
+        assert_eq!(
+            builder.push_listed(&image("one"), b""),
+            Err(CommandSnapshotError::InvalidText)
+        );
     }
 
     #[test]

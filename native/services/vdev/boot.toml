@@ -1,0 +1,30 @@
+# services/vdev/boot.toml — this service's boot-manifest row (the design
+# lives in res/boot.toml's header).  The row rides beside the crate it
+# endows; whether and WHEN it founds is the root manifest's `services` list.
+
+# The virtual-device service (res/VIRTUAL_DEVICE.md): hosts a device model
+# with no hardware behind it for each driver that opens one.
+#
+# Unchained, and before the device..exec retained-founder chain for the
+# reason power is: exec owns pair one's client face and its retained return
+# leg, so the row must exist before exec's founder can publish that face.
+#
+# Pair zero is the founder's control face. Pair one belongs to exec, which
+# uses it only to admit and retire one recyclable face per program launched
+# with the virtual-device profile. The shell receives no face.
+#
+# The row is endowed with nothing: no device, no authority over the machine.
+# Its heap is where every open device lives. Four devices may be open at
+# once, each holding at most 2 MiB of buffers for its driver
+# (`kore_svc_vdev::host::DEVICE_HEAP_BYTES`, 8 MiB); the lease below covers
+# that with 4 MiB over for the engines' own tables, the seat table and the
+# runtime. The service's tests hold the two numbers together.
+[service]
+image     = "kore-svc-vdev"
+endowment = "kore_svc_vdev::VdevEndowment"
+protocol  = "kore_svc_vdev::VdevService"
+endows    = []
+exec_client = true                           # pair 1 administers per-launch driver faces
+heap_supply_bytes = 0x00C0_0000
+digest_x86_64  = "blake3:33b4bd37c5e76b836ff3bb9f041b37184483f33ba7c37c4b04b09e11cc4b1b00"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:344e1f6da34c1ef515b0c0b9988b5e3b9e673cf08df6f6065ecd5bc661fe42de"  # res/aarch64/; make boot-digests-aarch64

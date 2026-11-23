@@ -110,6 +110,49 @@ pub(crate) struct StarPlan {
     wires: Wires,
 }
 
+/// Arena names a star of `workers` holds in its founder for the region's
+/// life: each worker's channel root and the parent's send into it (the mint's
+/// third name, the parent's recv, is retired at once), and the hub channel's
+/// root, send and recv.  [`provision`]'s peak is the same count: the last
+/// mint's recv is the hub's, kept.
+pub(crate) const fn wires_slots(workers: usize) -> usize {
+    2 * workers + 3
+}
+
+/// The star a thread could mint, before it mints one: whether it holds a
+/// channel space to mint from, and whether its members would carry the
+/// founder's kick.  [`provision`] mints exactly this shape, and a launch
+/// budgets its arena by it (`spmd::launch_slots`).
+#[cfg(target_os = "none")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StarShape {
+    /// The founder's own kick rides every member's mesh: only thread 0
+    /// holds a send into its own doorbell (`DOORBELL@PEER_BASE`).
+    pub(crate) founder_kick: bool,
+}
+
+/// This thread's [`StarShape`], or `None` with no `CHANNEL_SPACE` grant.
+#[cfg(target_os = "none")]
+pub(crate) fn shape() -> Option<StarShape> {
+    let rt = crate::entry::thread_context()?;
+    rt.bootstrap()
+        .handle(kore_abi::task::role::CHANNEL_SPACE, 0)?;
+    Some(StarShape {
+        founder_kick: founder_kick(&rt).is_some(),
+    })
+}
+
+/// The founder kick a member's mesh carries (see [`StarShape`]).
+#[cfg(target_os = "none")]
+fn founder_kick(rt: &crate::entry::Rt) -> Option<kore_abi::session::SlotRef> {
+    if crate::entry::geometry::shard_index() == Some(0) {
+        rt.bootstrap()
+            .handle(kore_abi::task::role::DOORBELL, crate::futex::PEER_BASE)
+    } else {
+        None
+    }
+}
+
 /// Mint the region's whole forest, all-or-nothing: `workers` channels
 /// plus the hub's.  `None` — no `CHANNEL_SPACE` boot grant, dynamic
 /// arena slots exhausted, a refused mint — releases everything minted
@@ -164,12 +207,7 @@ pub(crate) fn provision(workers: usize) -> Option<StarPlan> {
     // doorbell — a spawned thread's `DOORBELL@PEER_BASE` names thread 0's —
     // so a region founded elsewhere carries no founder kick and its
     // launcher rides the park's slice (`res/SPMD.md` §14.2).
-    let founder_kick = if crate::entry::geometry::shard_index() == Some(0) {
-        rt.bootstrap()
-            .handle(kore_abi::task::role::DOORBELL, crate::futex::PEER_BASE)
-    } else {
-        None
-    };
+    let founder_kick = founder_kick(&rt);
 
     Some(StarPlan {
         wires: Wires {
@@ -184,6 +222,11 @@ pub(crate) fn provision(workers: usize) -> Option<StarPlan> {
             workers,
         },
     })
+}
+
+/// [`StarPlan::mesh_caps`] before a plan exists, for a launch's budget.
+pub(crate) const fn mesh_caps(founder_kick: bool, chunk: usize) -> usize {
+    2 + founder_kick as usize + chunk.saturating_sub(1)
 }
 
 /// Descriptor invocations one meshed worker costs its gang session in a
@@ -219,6 +262,14 @@ pub(crate) const MESH_CEILING: usize = {
 
 #[cfg(target_os = "none")]
 impl StarPlan {
+    /// Capabilities one member of a chunk of `chunk` carries in its mesh:
+    /// its own recv, the hub's send, the founder's kick when the plan has
+    /// one, and a send to every chunk sibling — the count
+    /// [`worker_endow_mesh`](Self::worker_endow_mesh) fills.
+    pub(crate) const fn mesh_caps(&self, chunk: usize) -> usize {
+        mesh_caps(self.wires.founder_kick.is_some(), chunk)
+    }
+
     /// Worker `w`'s endowments — **the intra-chunk kick mesh**: its own
     /// recv (→ `DOORBELL@0`, which the stamped landing name at
     /// `DOORBELL@1` completes into a working park), the hub send
