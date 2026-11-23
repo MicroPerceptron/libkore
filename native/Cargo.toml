@@ -39,6 +39,5 @@ members = [
     "services/swap",
     "services/vdev",
     "tools/kore-vol",
-    "vendor/smoltcp",
 ]
-exclude = ["vendor/xhci"]
+exclude = ["vendor/smoltcp", "vendor/xhci"]

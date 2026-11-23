@@ -43,7 +43,7 @@
     "vendor/smoltcp": "smoltcp",
     "vendor/xhci": "xhci"
   },
-  "workspace_sha256": "11e7dcfaaba733c2593ad54eb2189b1f0092768f51e355ed7cfd8574b7e4e177",
+  "workspace_sha256": "5e489e025eea6f3c2a8ba94c3e2d495c0716b8b118e0ba96beb7d37cb3c14dd1",
   "files": {
     "LICENSE": "c9b2b12d3bad9080090798a442b4b2a77c48312ae75089f041281b7c8ad21738",
     "crates/abi/Cargo.toml": "f9a4811b4b6d06947a47a763354cad3bc739a5ea387194a4dcf22409351f3c7b",
