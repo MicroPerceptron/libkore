@@ -49,6 +49,7 @@ fn a_host_tree_installs_and_reads_back_through_the_distribution() {
     assert!(installed.after > formatted.generation);
 
     let (listing, mut walked, log) = volume::read(&image, None, |mount| {
+        assert_eq!(mount.status().format_version, volume::FORMAT_VERSION);
         let listing = mount.list(0, Some("pictures/screenshots"))?;
         let mut walked = Vec::new();
         mount.walk(0, "pictures", &mut |entry| {

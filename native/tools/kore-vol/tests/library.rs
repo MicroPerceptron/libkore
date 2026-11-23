@@ -43,6 +43,7 @@ fn a_tree_put_through_the_library_reads_back_whole_through_a_mount() {
     let expected = host_files(&source);
     let (listing, files, walked_dirs) = kore_vol::read(&image, None, |mount| {
         assert_eq!(mount.status().generation, installed.after);
+        assert_eq!(mount.status().format_version, kore_vol::FORMAT_VERSION);
         assert!(!mount.status().used_fallback_root);
         let listing = mount.list(0, Some("js/hello"))?;
         let mut files = BTreeMap::new();
