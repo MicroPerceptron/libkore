@@ -139,12 +139,14 @@ struct Request {
 enum Operation {
     Filesystem { step: KoreFsStep, user: *mut c_void },
     Ping { address: [u8; 4], timeout_ms: u32 },
+    Socket(crate::socket::Request),
 }
 
 #[derive(Clone, Copy)]
 enum Outcome {
     Filesystem(KoreStatus, KoreFsError),
     Ping(Result<u64, crate::api::KoreNetStatus>),
+    Socket(Result<usize, core::ffi::c_int>),
 }
 
 struct Payload {
@@ -295,6 +297,17 @@ pub(crate) fn ping(address: [u8; 4], timeout_ms: u32) -> Result<u64, crate::api:
     }) {
         Some(Outcome::Ping(result)) => result,
         _ => Err(crate::api::KoreNetStatus::Unavailable),
+    }
+}
+
+/// # Safety
+/// Any buffer in the request remains valid and exclusively under the
+/// caller's control until this returns. The host completes or abandons the
+/// request before the main thread resumes or is stopped at the exit barrier.
+pub(crate) unsafe fn socket(request: crate::socket::Request) -> Result<usize, core::ffi::c_int> {
+    match call_host(Operation::Socket(request)) {
+        Some(Outcome::Socket(result)) => result,
+        _ => Err(crate::fd::errno::ENOTSUP),
     }
 }
 
@@ -569,6 +582,11 @@ async fn host(
                         address,
                         timeout_ms,
                     } => Outcome::Ping(network.ping(address, timeout_ms).await),
+                    Operation::Socket(request) => {
+                        // SAFETY: the main thread is parked until the answer;
+                        // socket() keeps the buffers valid over that interval.
+                        Outcome::Socket(unsafe { network.socket(request).await })
+                    }
                 }
             });
             let ended = pin!(until_exit(&mut wake, output, &wake_main));

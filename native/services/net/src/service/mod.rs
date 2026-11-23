@@ -40,8 +40,8 @@ use kore_driver::net::window::{
     TX_DEPTH, WINDOW_BYTES, rx_frame_at, rx_slot_of, tx_frame_at,
 };
 use kore_driver::net::{
-    FRAME_MAX, FRAME_MIN, FrameDesc, FrameFilter, FrameHead, LinkState, MAX_VIFS, MacAddr,
-    NicBackend, NicCounters, NicHost, PacketFilter, PolicyRefusal, TxCompletion, TxCookie,
+    EtherType, FRAME_MAX, FRAME_MIN, FrameDesc, FrameFilter, FrameHead, LinkState, MAX_VIFS,
+    MacAddr, NicBackend, NicCounters, NicHost, PacketFilter, PolicyRefusal, TxCompletion, TxCookie,
     TxStatus, VifId, VifMapping, VifPolicy, VifRefusal, VifTable,
 };
 use kore_inet::flow::FlowCap;
@@ -57,6 +57,7 @@ use kore_rt::svc::{PeerBundlePart, PeerId, ServeTable};
 pub mod peers;
 use kore_rt::transport::Transport;
 
+use crate::arp::Neighbor;
 use crate::verbs::NetVerbs;
 use crate::{COOKIE_NET_LINK, COOKIE_NET_RX};
 
@@ -948,6 +949,8 @@ struct Vif<L> {
     via: u16,
     /// The policy-approved filter. Not what was asked for: what was granted.
     filter: FrameFilter,
+    /// The scoped ARP exchange installed alongside a connected IP flow.
+    neighbor: Option<Neighbor>,
     /// The address this vif answers to.
     mac: MacAddr,
     /// Its ordinal in the device address plan — freed on close.
@@ -1457,6 +1460,7 @@ impl<H: NetHost> NetService<H> {
         Ok(Vif {
             via,
             filter,
+            neighbor: None,
             mac,
             ordinal,
             frames,
@@ -2061,6 +2065,14 @@ fn validate_tx<L>(vif: &Vif<L>, slot: u32, desc: &FrameDesc) -> Result<(), ()> {
     if head.ethertype.0 != desc.ethertype {
         return Err(());
     }
+    if head.ethertype == EtherType::ARP
+        && let Some(neighbor) = &vif.neighbor
+    {
+        return neighbor
+            .accepts_request(&head, bytes, vif.mac)
+            .then_some(())
+            .ok_or(());
+    }
     if !vif.filter.ethertype.accepts(head.ethertype) {
         return Err(());
     }
@@ -2100,6 +2112,11 @@ impl<H: NetHost> NetService<H> {
 
     /// Give the machine its address.
     pub fn configure(&mut self, identity: Identity) {
+        if self.inet.identity() != Some(&identity) {
+            for (_, vif) in self.vifs.iter_mut() {
+                vif.neighbor = None;
+            }
+        }
         self.inet.set_identity(identity);
     }
 
@@ -2146,7 +2163,7 @@ impl<H: NetHost> NetService<H> {
         gateway: Option<Ipv4Addr>,
     ) -> Result<(), NetRefusal> {
         let identity = Identity::new(addr, prefix_len, gateway)?;
-        self.inet.set_identity(identity);
+        self.configure(identity);
         Ok(())
     }
 
@@ -2166,6 +2183,12 @@ impl<H: NetHost> NetService<H> {
         local_port: Option<u16>,
         peer: (Ipv4Addr, u16),
     ) -> Result<FlowCap, OpenRefusal> {
+        let neighbor = self.inet.identity().and_then(|identity| {
+            Some(Neighbor {
+                local: identity.addr().0,
+                next_hop: identity.next_hop(peer.0)?.0,
+            })
+        });
         let Self {
             inet, vifs, policy, ..
         } = self;
@@ -2174,6 +2197,7 @@ impl<H: NetHost> NetService<H> {
             policy,
             via,
             touched: false,
+            neighbor,
         };
         let out = inet
             .open_flow(vif, grant, proto, local_port, peer, &mut install)
@@ -2201,6 +2225,7 @@ impl<H: NetHost> NetService<H> {
             policy,
             via,
             touched: false,
+            neighbor: None,
         };
         let out = inet
             .open_listener(vif, grant, proto, local_port, &mut install)
@@ -2230,6 +2255,7 @@ impl<H: NetHost> NetService<H> {
             policy,
             via,
             touched: false,
+            neighbor: None,
         };
         let closed = inet.close(vif, &mut install).await;
         if install.touched {
@@ -2302,7 +2328,9 @@ fn install_filter<L>(
     // Resolved mutably only once the answer is known, so no borrow is held
     // across the policy consultation and no partial state exists on any
     // refusal path above.
-    vifs.get_mut(id)?.filter = granted;
+    let vif = vifs.get_mut(id)?;
+    vif.filter = granted;
+    vif.neighbor = None;
     Ok(id)
 }
 
@@ -2320,6 +2348,7 @@ struct VifInstall<'a, L> {
     /// Whether anything was installed, so the caller refreshes the device
     /// filter once rather than per mint.
     touched: bool,
+    neighbor: Option<Neighbor>,
 }
 
 impl<L> FlowInstall for VifInstall<'_, L> {
@@ -2338,6 +2367,14 @@ impl<L> FlowInstall for VifInstall<'_, L> {
     async fn install(&mut self, vif: VifId, filter: FrameFilter) -> Result<(), InstallRefusal> {
         match install_filter(self.vifs, self.policy, self.via, vif, filter) {
             Ok(_) => {
+                if let Some(cell) = pair_index(self.via)
+                    && self.policy[cell].ethertype.accepts(EtherType::ARP)
+                {
+                    self.vifs
+                        .get_mut(vif)
+                        .map_err(|_| InstallRefusal::NoVif)?
+                        .neighbor = self.neighbor.take();
+                }
                 self.touched = true;
                 Ok(())
             }
@@ -2423,15 +2460,23 @@ fn classify<L>(
         // The *complete* decision: the L2 half and the flow half. Taking the
         // L2 half alone would deliver another connection's datagrams to a
         // vif that asked for one flow.
-        if !vif.filter.accepts(&head, vif.mac) {
-            continue;
-        }
-        if vif.filter.flow.is_some() {
-            let tuple = parsed.get_or_insert_with(|| {
-                kore_driver::net::flow::FiveTuple::parse(head.ethertype, payload)
-            });
-            if !vif.filter.accepts_flow_parsed(tuple.as_ref()) {
+        if head.ethertype == EtherType::ARP
+            && let Some(neighbor) = &vif.neighbor
+        {
+            if !neighbor.accepts_reply(&head, frame, vif.mac) {
                 continue;
+            }
+        } else {
+            if !vif.filter.accepts(&head, vif.mac) {
+                continue;
+            }
+            if vif.filter.flow.is_some() {
+                let tuple = parsed.get_or_insert_with(|| {
+                    kore_driver::net::flow::FiveTuple::parse(head.ethertype, payload)
+                });
+                if !vif.filter.accepts_flow_parsed(tuple.as_ref()) {
+                    continue;
+                }
             }
         }
         if fanout >= MAX_RX_FANOUT {
@@ -3234,8 +3279,7 @@ mod tests {
         svc.configure_arm(Ipv4Addr([10, 0, 0, 2]), 24, None)
             .expect("the station takes an address");
 
-        let (first, _c1) =
-            open(&mut svc, 0, FrameFilter::protocol(EtherType::IPV4)).expect("open");
+        let (first, _c1) = open(&mut svc, 0, FrameFilter::protocol(EtherType::IPV4)).expect("open");
         let grant = svc.flow_grant(0);
         run(svc.open_listener(0, first, grant, IpProto::UDP, 8080)).expect("binds its port");
         svc.close_vif(0, first).expect("its owner closes it");
@@ -4533,6 +4577,10 @@ mod tests {
                 port: 53
             }
         );
+        let neighbor = svc.vifs.get(vif).unwrap().neighbor.as_ref().unwrap();
+        assert_eq!((neighbor.local, neighbor.next_hop), (ME.0, PEER.0));
+        svc.configure(Identity::new(GW, 24, None).unwrap());
+        assert!(svc.vifs.get(vif).unwrap().neighbor.is_none());
     }
 
     /// A close gives the ports back and shuts the filter, on the same path.

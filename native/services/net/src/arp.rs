@@ -1,8 +1,5 @@
-//! **The founding self-test's ARP vocabulary** — the one protocol this row
-//! knows, and it knows it *here*, beside the self-test, rather than
-//! anywhere the datapath can reach. The frame service carries frames; it
-//! does not know what ARP is, and this module is the reason it does not
-//! have to.
+//! ARP vocabulary for the founding self-test and for connected flows that
+//! need to resolve their authorized next hop.
 //!
 //! Two things: building a request, and reading what came back. Reading is
 //! a classification, not a parser — the self-test needs to know whether a
@@ -29,6 +26,41 @@ const _: () = assert!(TARGET_IP_AT + 4 == FRAME_LEN);
 /// The operation codes, big-endian on the wire.
 const OP_REQUEST: [u8; 2] = 1u16.to_be_bytes();
 const OP_REPLY: [u8; 2] = 2u16.to_be_bytes();
+
+/// ARP traffic a connected flow may exchange with its next hop. The service
+/// derives both addresses from the station identity and the admitted peer.
+pub(crate) struct Neighbor {
+    pub(crate) local: [u8; 4],
+    pub(crate) next_hop: [u8; 4],
+}
+
+impl Neighbor {
+    pub(crate) fn accepts_request(&self, head: &FrameHead, frame: &[u8], mac: MacAddr) -> bool {
+        head.src == mac
+            && head.dst.is_broadcast()
+            && valid_header(frame, OP_REQUEST)
+            && frame[SENDER_MAC_AT..SENDER_IP_AT] == mac.0
+            && frame[SENDER_IP_AT..TARGET_MAC_AT] == self.local
+            && frame[TARGET_MAC_AT..TARGET_IP_AT] == [0; 6]
+            && frame[TARGET_IP_AT..FRAME_LEN] == self.next_hop
+    }
+
+    pub(crate) fn accepts_reply(&self, head: &FrameHead, frame: &[u8], mac: MacAddr) -> bool {
+        head.dst == mac
+            && head.src.is_valid_source()
+            && valid_header(frame, OP_REPLY)
+            && frame[SENDER_MAC_AT..SENDER_IP_AT] == head.src.0
+            && frame[SENDER_IP_AT..TARGET_MAC_AT] == self.next_hop
+            && frame[TARGET_MAC_AT..TARGET_IP_AT] == mac.0
+            && frame[TARGET_IP_AT..FRAME_LEN] == self.local
+    }
+}
+
+fn valid_header(frame: &[u8], operation: [u8; 2]) -> bool {
+    frame.len() >= FRAME_LEN
+        && frame[14..OP_AT] == [0, 1, 0x08, 0, 6, 4]
+        && frame[OP_AT..SENDER_MAC_AT] == operation
+}
 
 /// One ARP request from `mac` at `sender_ip`, addressed to `dst` on the
 /// wire (broadcast, or one station), asking who holds `target_ip`.
@@ -147,6 +179,32 @@ mod tests {
         let unicast = request(ME, [10, 0, 2, 15], GATEWAY, [10, 0, 2, 2]);
         assert_eq!(&unicast[0..6], &GATEWAY.0, "addressed to the station");
         assert_eq!(&unicast[14..], &f[14..], "the ARP body does not change");
+    }
+
+    #[test]
+    fn a_flow_can_resolve_only_its_own_next_hop() {
+        let neighbor = Neighbor {
+            local: [10, 0, 2, 15],
+            next_hop: [10, 0, 2, 2],
+        };
+        let mut query = request(ME, neighbor.local, MacAddr::BROADCAST, neighbor.next_hop);
+        let header = FrameHead::parse(&query).unwrap();
+        assert!(neighbor.accepts_request(&header, &query, ME));
+        query[SENDER_IP_AT] ^= 1;
+        assert!(!neighbor.accepts_request(&header, &query, ME));
+        query[SENDER_IP_AT] ^= 1;
+        query[TARGET_IP_AT] ^= 1;
+        assert!(!neighbor.accepts_request(&header, &query, ME));
+
+        let mut reply = request(GATEWAY, neighbor.next_hop, ME, neighbor.local);
+        reply[OP_AT..SENDER_MAC_AT].copy_from_slice(&OP_REPLY);
+        reply[TARGET_MAC_AT..TARGET_IP_AT].copy_from_slice(&ME.0);
+        let header = FrameHead::parse(&reply).unwrap();
+        assert!(neighbor.accepts_reply(&header, &reply, ME));
+        assert!(!neighbor.accepts_reply(&header, &reply, GATEWAY));
+        assert!(!neighbor.accepts_reply(&header, &reply[..FRAME_LEN - 1], ME));
+        reply[SENDER_MAC_AT] ^= 1;
+        assert!(!neighbor.accepts_reply(&header, &reply, ME));
     }
 
     /// A reply names the responder and the address it holds; a request

@@ -37,6 +37,11 @@ pub struct UdpSocket<F: FlowFace> {
     stack: IpStack<F>,
     local: (Ipv4Addr, u16),
     peer: Option<(Ipv4Addr, u16)>,
+    // A send waiting on ARP may have to read past a datagram. Preserve the
+    // first one in arrival order, with the ordinary bounded-queue behavior
+    // of dropping subsequent arrivals when the queue is full.
+    deferred: Option<(usize, (Ipv4Addr, u16))>,
+    deferred_bytes: [u8; kore_driver::net::FRAME_MAX],
 }
 
 impl<F: FlowFace> UdpSocket<F> {
@@ -67,7 +72,13 @@ impl<F: FlowFace> UdpSocket<F> {
         if !stack.bind_udp(local.1) {
             return Err(SocketRefusal::Unpinned);
         }
-        Ok(Self { stack, local, peer })
+        Ok(Self {
+            stack,
+            local,
+            peer,
+            deferred: None,
+            deferred_bytes: [0; kore_driver::net::FRAME_MAX],
+        })
     }
 
     /// The endpoint this socket is.
@@ -95,8 +106,7 @@ impl<F: FlowFace> UdpSocket<F> {
         self.stack.ifnet_mut()
     }
 
-    /// Drain the interface once, discarding what this socket is not waiting
-    /// for.
+    /// Drain the interface once, keeping the first pending datagram.
     ///
     /// Called from every future here before the operation it is attempting,
     /// and that ordering is load-bearing: the ARP reply that unblocks a send
@@ -104,7 +114,20 @@ impl<F: FlowFace> UdpSocket<F> {
     /// could never learn the translation it is waiting for.
     pub fn sweep(&mut self) -> bool {
         let now = self.stack.ifnet().now_ms();
-        self.stack.input(now, |_| {})
+        let port = self.local.1;
+        self.stack.input(now, |event| {
+            if let Event::Udp {
+                from,
+                local_port,
+                payload,
+            } = event
+                && local_port == port
+                && self.deferred.is_none()
+            {
+                self.deferred_bytes[..payload.len()].copy_from_slice(payload);
+                self.deferred = Some((payload.len(), from));
+            }
+        })
     }
 
     /// Send `data` to `peer`.
@@ -125,7 +148,6 @@ impl<F: FlowFace> UdpSocket<F> {
         }
         let port = self.local.1;
         poll_fn(|cx| {
-            self.sweep();
             let now = self.stack.ifnet().now_ms();
             match self.stack.send_udp(port, peer, data, now) {
                 Ok(()) => Poll::Ready(Ok(data.len())),
@@ -133,6 +155,7 @@ impl<F: FlowFace> UdpSocket<F> {
                 // waker is nudged because nothing else will — Tier 1 offers
                 // no readiness signal (see the module docs).
                 Err(OutputError::Pending | OutputError::NoSlot) => {
+                    self.sweep();
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
@@ -161,6 +184,11 @@ impl<F: FlowFace> UdpSocket<F> {
         &mut self,
         out: &mut [u8],
     ) -> Result<(usize, (Ipv4Addr, u16)), SocketRefusal> {
+        if let Some((len, from)) = self.deferred.take() {
+            let n = len.min(out.len());
+            out[..n].copy_from_slice(&self.deferred_bytes[..n]);
+            return Ok((n, from));
+        }
         let port = self.local.1;
         poll_fn(|cx| {
             let now = self.stack.ifnet().now_ms();
