@@ -46,6 +46,7 @@ pub use kore_ring::spsc::region_bytes;
 mod client;
 mod recyclable;
 mod serve;
+mod verb;
 
 pub use client::{
     AffineBundleCallError, CallError, CallReply, ClientEndpoints, ContextBundleCallError, GrantPin,
@@ -63,6 +64,7 @@ pub use serve::{
     peer_slot_bytes,
 };
 pub(crate) use serve::{ServiceOwner, own_service};
+pub use verb::{End, Row, ServeTable, ServeVerb, Verb, VerbTable, VerbWire};
 
 /// The **service-protocol codec seam**: what a service crate's `wire.rs`
 /// declares so the generic request path can carry its vocabulary — the
@@ -539,8 +541,16 @@ pub const INIT_FS_SEARCH_READY: u64 = 1 << 63;
 /// They live in `kore-abi` because the founding block stores them; they are
 /// re-exported here because the services that SET them speak `kore-rt`.
 pub use kore_abi::founding::{
-    NET_FRAME_RT_READY, NET_LOAD_READY, NET_PCI_FRAME_READY, NET_VIF_ISOLATION_READY,
-    NET_WIFI_FW_ALIVE, SERVING_WITNESS_BITS,
+    mt7925_ladder_bits, mt7925_ladder_has_own_bit, mt7925_ladder_name, mt7925_ladder_of,
+    mt7925_ladder_short,
+    INET_DNS_READY, INET_ICMP_RT_READY, INET_PING_WAN_READY, NET_FRAME_RT_READY,
+    NET_LOAD_READY, NET_PCI_FRAME_READY, NET_VIF_ISOLATION_READY,
+    NET_MT7925_FW_PINNED, NET_MT7925_LADDER_MASK, NET_MT7925_LADDER_SHIFT,
+    NET_MT7925_PATCH_RESIDENT, NET_WIFI_FW_ALIVE,
+    MT7925_LADDER_D0, MT7925_LADDER_D1_MCU, MT7925_LADDER_D1_RING,
+    MT7925_LADDER_FW_ALIVE, MT7925_LADDER_MAX, MT7925_LADDER_NONE,
+    MT7925_LADDER_PATCH, MT7925_LADDER_PHY_UP, MT7925_LADDER_RAM_SENT,
+    SERVING_WITNESS_BITS,
 };
 
 /// INIT's control-plane bit and the durable testimony carve must not overlap:

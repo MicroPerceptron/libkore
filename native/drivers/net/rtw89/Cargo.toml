@@ -1,0 +1,28 @@
+[package]
+name = "kore-rtw89"
+version = "0.0.1"
+edition = "2024"
+description = "kore Realtek RTL8922AE (rtw89, BE generation) driver core: the Wi-Fi 7 part in the metal x86 target, brought up over PCI to firmware-alive — the first metal PCI network part."
+publish = false
+
+# Pure logic over the driver substrate's seam and class contract. No
+# `kore-rt`: the production composition (broker claim, capability host,
+# serve loop) is `kore-svc-net`'s, exactly as kore-e1000e's is. The
+# in-crate hardware double is `#[cfg(test)]` only.
+[dependencies]
+kore-abi = { path = "../../../crates/abi" }
+# The seam (`Regs`/`RegsNarrow`/`Dma`/`DmaPool`) and the wait tier
+# (`Budget`/`handshake_until`).
+kore-driver = { path = "../../../crates/driver" }
+# The firmware digest, as `drivers/ivpu` pins its blob: `pure` keeps it
+# `no_std`, no SIMD dispatch, no allocator.
+blake3 = { version = "1.8.7", default-features = false, features = ["pure"] }
+
+[dev-dependencies]
+# The host-memory DMA double the mock device dereferences through.
+kore-driver = { path = "../../../crates/driver", features = ["host-double"] }
+
+[features]
+# Userland posture, threaded through to the substrate; off for a heapless
+# build. Mirrors kore-e1000e / kore-usbnet so the driver template is uniform.
+alloc = ["kore-driver/alloc"]

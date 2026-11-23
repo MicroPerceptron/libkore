@@ -1,0 +1,24 @@
+[package]
+name = "kore-svc-net"
+version = "0.0.1"
+edition = "2024"
+description = "kore L2 frame service: capability-scoped virtual interfaces (vifs) over a raw-frame data plane, so a client binds a policy-approved filter rather than a socket."
+publish = false
+
+# Deliberately no `kore-svc-exec` / `-fs` / `-image`: this row's whole
+# dependency set stays clear of the `blake3 -> arrayref` chain.
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+kore-rt = { path = "../../crates/rt" }
+kore-ring = { path = "../../crates/ring" }
+# The seam, the network class contract (`kore_driver::net`), and the userland
+# device host (`service` feature) this row's binding composes over.
+kore-driver = { path = "../../crates/driver", features = ["service"] }
+kore-inet = { path = "../../crates/inet" }
+kore-svc-device = { path = "../device" }
+kore-e1000e = { path = "../../drivers/net/e1000e" }
+kore-mt7925 = { path = "../../drivers/net/mt7925" }
+kore-rtw89 = { path = "../../drivers/net/rtw89" }
+kore-usbnet = { path = "../../drivers/net/usbnet", features = ["alloc"] }
+kore-xhci = { path = "../../drivers/xhci", features = ["alloc"] }
+zerocopy = { version = "0.8", default-features = false }

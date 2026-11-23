@@ -19,7 +19,7 @@ name = "kore_c"
 path = "src/lib.rs"
 
 [dependencies]
-kore-std = { package = "kore-std", path = "../..", features = ["heap", "fs", "vdev"] }
+kore-std = { package = "kore-std", path = "../..", features = ["heap", "fs", "vdev", "driver"] }
 # The C ABI itself, with the standard C allocation and thread names a C
 # program calls (`malloc`, `pthread_create`, ...) exported as real symbols.
 kore-ffi = { path = "../ffi", features = ["c-stdlib"] }
@@ -31,3 +31,8 @@ kore-c-shim = { path = "../../native/crates/c-shim", default-features = false, f
 # The link window's placer: one cursor every `mmap` of the process takes its
 # address from, as a Wasmtime engine's guest mappings do.
 kore-ld = { path = "../../native/crates/ld", default-features = false }
+
+[target.'cfg(target_os = "none")'.dependencies]
+kore-inet = { path = "../../native/crates/inet" }
+kore-svc-net = { path = "../../native/services/net" }
+kore-svc-mm = { path = "../../native/services/mm" }

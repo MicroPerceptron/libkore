@@ -467,6 +467,32 @@ impl FaceLayout {
             grant_stride: 2,
         }
     }
+
+    /// The layout for the row this boot block founded — [`Self::for_row`]
+    /// over the pair count the founder stamped (#1202), which is the row's
+    /// own `serve_pairs` plus one pair per declared `clients` link it
+    /// PROVIDES.  A chained driver may now be a declared provider (the
+    /// usb-host → input / net shape), and its extra pairs are stamped at
+    /// `serve_pairs..`, exactly where the broker faces used to start; the
+    /// founder places the faces past the whole run and this is the one
+    /// reading that agrees with it.  A row that provides nothing carries no
+    /// datum and gets its historical bank bit for bit.  The datum is
+    /// clamped below so a malformed block can only widen the bank, never
+    /// alias the row's own pairs.
+    pub fn for_bootstrap(
+        boot: &kore_abi::task::Bootstrap<'_>,
+        serve_pairs: usize,
+        reply_grants: usize,
+    ) -> Self {
+        let declared = boot
+            .datum(
+                kore_abi::task::role::SVC_RING,
+                kore_abi::task::SERVICE_PAIR_COUNT_DATUM,
+            )
+            .map_or(serve_pairs, |count| count as usize)
+            .clamp(serve_pairs, kore_rt::svc::MAX_SERVE_PAIRS);
+        Self::for_row(declared, reply_grants)
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +517,33 @@ mod face_layout_tests {
         assert_eq!(two_pairs_one_grant.return_base, 4);
         assert_eq!(two_pairs_one_grant.grant_recv_base, 2);
         assert_eq!(two_pairs_one_grant.grant_stride, 2);
+    }
+
+    /// A row that provides declared pairs reads the founder's pair-count
+    /// datum and moves its faces past them; a row without the datum, or
+    /// with a datum below its own pairs, keeps its historical bank.
+    #[test]
+    fn faces_follow_the_founders_pair_count_datum() {
+        use kore_abi::task::{BootBlock, Bootstrap, SERVICE_PAIR_COUNT_DATUM, role};
+        let mut block = BootBlock::new();
+        assert_eq!(
+            FaceLayout::for_bootstrap(&Bootstrap::of(&block).unwrap(), 1, 0),
+            FaceLayout::for_row(1, 0)
+        );
+        // One own pair plus two declared consumers: faces start at 3.
+        assert!(block.push_data(role::SVC_RING, SERVICE_PAIR_COUNT_DATUM, 3));
+        let widened = FaceLayout::for_bootstrap(&Bootstrap::of(&block).unwrap(), 1, 1);
+        assert_eq!(widened, FaceLayout::for_row(3, 1));
+        assert_eq!(widened.face_base, 3);
+        assert_eq!(widened.return_base, 6);
+        assert_eq!(widened.grant_recv_base, 3);
+        // A datum below the row's own pairs cannot shrink the bank.
+        let mut block = BootBlock::new();
+        assert!(block.push_data(role::SVC_RING, SERVICE_PAIR_COUNT_DATUM, 1));
+        assert_eq!(
+            FaceLayout::for_bootstrap(&Bootstrap::of(&block).unwrap(), 2, 1),
+            FaceLayout::for_row(2, 1)
+        );
     }
 }
 

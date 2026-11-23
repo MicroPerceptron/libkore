@@ -64,6 +64,8 @@ mod lock;
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 mod mmap;
 #[cfg(target_os = "none")]
+mod net;
+#[cfg(target_os = "none")]
 mod posix;
 #[cfg(target_os = "none")]
 mod program;

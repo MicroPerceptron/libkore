@@ -1,0 +1,3 @@
+# The proprietary Realtek firmware blob is operator-provided, never committed
+# (see README.md). Only the loader's trust root (manifest.toml) and docs live here.
+*.bin

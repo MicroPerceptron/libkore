@@ -4447,6 +4447,103 @@ mod recyclable_session_tests {
         ));
     }
 
+    /// A command reads a system view file by file — a compiler and its
+    /// headers, each entered through the view's grant. Entering the grant
+    /// again must cost the session nothing it has not already spent: an edge
+    /// left behind per entry filled the session's edge arena, and the read
+    /// after that was refused `OutOfEdges`.
+    #[test]
+    fn entering_a_task_grant_again_adds_no_authority_edge() {
+        let mut service = RamService::default();
+        assert!(service.establish_admin_source());
+        assert!(service.establish_admin_share());
+        assert!(service.establish_admin_workspace());
+        let home = Name::new("terminal-0").unwrap();
+        service
+            .register_private_invocation_view(0xA1, &home, Rights::HOME, None)
+            .unwrap();
+        let baseline = service.engine.authority_edge_count();
+        let command = admit_view(&mut service, 0x106, 0xA1, Rights::HOME);
+        let owner = service
+            .invocation_views
+            .iter()
+            .flatten()
+            .find(|view| view.scope == 0xA1)
+            .unwrap()
+            .task_session;
+        let share = service
+            .engine
+            .grants(owner)
+            .unwrap()
+            .into_iter()
+            .find(|grant| grant.display_name == Some(Name::new(SYSTEM_SHARE_VIEW).unwrap()))
+            .expect("the system share is a named grant of the task view");
+        let attached = service.engine.authority_edge_count();
+
+        // A refused entry leaves nothing behind, before any projection exists.
+        assert!(matches!(
+            service
+                .engine
+                .open_task_grant(command, owner, share.grant, Rights::WRITE),
+            Err(FsError::AccessDenied)
+        ));
+        assert_eq!(service.engine.authority_edge_count(), attached);
+
+        // The first entry projects the grant into the command's session…
+        let first = service
+            .engine
+            .open_task_grant(command, owner, share.grant, Rights::READ)
+            .unwrap();
+        let projected = service.engine.authority_edge_count();
+        assert_eq!(projected, attached + 1);
+        service.engine.close(command, first.handle).unwrap();
+
+        // …and every later one, far past a session's edge arena, reuses it.
+        for _ in 0..4 * crate::bounds::MAX_EDGES_PER_SESSION {
+            let opened = service
+                .engine
+                .open_task_grant(command, owner, share.grant, Rights::READ)
+                .expect("entering the same grant again");
+            service.engine.close(command, opened.handle).unwrap();
+        }
+        assert_eq!(service.engine.authority_edge_count(), projected);
+
+        // Handles held together share it, each with the rights it asked for:
+        // the share is read-only, so neither can create beneath it.
+        let held = service
+            .engine
+            .open_task_grant(command, owner, share.grant, Rights::READ)
+            .unwrap();
+        let beside = service
+            .engine
+            .open_task_grant(command, owner, share.grant, Rights::READ)
+            .unwrap();
+        assert_ne!(held.handle, beside.handle);
+        assert_eq!(service.engine.authority_edge_count(), projected);
+        let note = Name::new("note").unwrap();
+        assert!(matches!(
+            block_on(
+                service
+                    .engine
+                    .create(command, held.handle, &note, ObjectKind::File)
+            ),
+            Err(FsError::AccessDenied)
+        ));
+        // A refused entry beside live handles leaves their projection alone.
+        assert!(matches!(
+            service
+                .engine
+                .open_task_grant(command, owner, share.grant, Rights::WRITE),
+            Err(FsError::AccessDenied)
+        ));
+        assert!(service.engine.stat(command, held.handle).is_ok());
+        assert!(service.engine.stat(command, beside.handle).is_ok());
+
+        // The command's end takes the projection with it.
+        assert!(service.peer_closed(0x106, PeerClose::Orderly));
+        assert_eq!(service.engine.authority_edge_count(), baseline);
+    }
+
     /// Recovery calls this on a volume that already carries the directory, so
     /// a second call must adopt the standing grant rather than mint a rival
     /// (or refuse on the taken display name) — otherwise the first reboot

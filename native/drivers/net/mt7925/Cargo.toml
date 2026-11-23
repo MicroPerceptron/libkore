@@ -1,0 +1,30 @@
+[package]
+name = "kore-mt7925"
+version = "0.0.1"
+edition = "2024"
+description = "kore MediaTek MT7925 (RZ717) driver core: the Wi-Fi 7 part in the Framework 13, brought up over PCI — the only NIC the lab can bind (res/NETWORK_RESTART.md route 3)."
+publish = false
+
+# Pure logic over the driver substrate's seam. No `kore-rt`: the production
+# composition is `kore-svc-net`'s, exactly as kore-rtw89's and kore-e1000e's
+# are. The in-crate hardware double is `#[cfg(test)]` only.
+[dependencies]
+kore-abi = { path = "../../../crates/abi" }
+# The firmware pin is checked on the device path, so this is a real
+# dependency. `pure` keeps it off any assembly backend the kernel target
+# does not carry, exactly as kore-rtw89 takes it.
+blake3 = { version = "1.8.7", default-features = false, features = ["pure"] }
+# The seam (`Regs`) and the wait tier (`Budget`/`handshake_until`).
+kore-driver = { path = "../../../crates/driver" }
+
+# The host-memory DMA double the in-crate mock's `ReachableBuf` wraps.
+# A **dev**-dependency, not a normal one with the feature turned on as
+# kore-rtw89 does it: features unify into the test build only, so the
+# service ELF never links a host allocator it cannot use.
+[dev-dependencies]
+kore-driver = { path = "../../../crates/driver", features = ["host-double"] }
+
+[features]
+# Userland posture, threaded through to the substrate; off for a heapless
+# build. Mirrors kore-rtw89 / kore-e1000e so the driver template is uniform.
+alloc = ["kore-driver/alloc"]

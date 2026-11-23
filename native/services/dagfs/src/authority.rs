@@ -1370,6 +1370,54 @@ impl Authority {
         Ok(grants)
     }
 
+    /// The edge through which `holder` already holds `parent` whole: issued
+    /// by `issuer`, unnamed, with `parent`'s own root, rights and quota.
+    ///
+    /// A command enters a grant its task view holds through such an edge
+    /// (`Engine::open_task_grant`), and enters it again for every file it
+    /// reads beneath it. The edge says only "this session holds that grant";
+    /// what one open may do is on its handle. So one edge serves every open,
+    /// and a session's edges follow the grants it enters, not how many times
+    /// it enters them.
+    ///
+    /// `parent` is a generational id, so an edge left by a grant since
+    /// retired and reissued cannot match; and that edge went with the
+    /// retired grant's closure anyway.
+    pub(crate) fn whole_projection(
+        &self,
+        holder: SessionId,
+        issuer: SessionId,
+        parent: GrantId,
+        source: &AuthorityEdge,
+    ) -> FsResult<Option<GrantId>> {
+        let slot = self.session_slot(holder)?;
+        let Some(arena) = self.arena(slot) else {
+            return Ok(None);
+        };
+        for index in 0..arena.edges.capacity() {
+            let Some(id) = arena.edges.live_id_at(index) else {
+                continue;
+            };
+            let edge = arena.edges.try_read(id).map_err(|_| FsError::Busy)?;
+            if edge.holder() == holder
+                && edge.issuer() == issuer
+                && edge.parent() == Some(parent)
+                && edge.kind() == AuthorityKind::Grant
+                && edge.display_name().is_none()
+                && edge.root() == source.root()
+                && edge.rights() == source.rights()
+                && edge.quota() == source.quota()
+            {
+                return Ok(Some(GrantId::from_key(join(
+                    slot,
+                    id,
+                    MAX_EDGES_PER_SESSION,
+                ))));
+            }
+        }
+        Ok(None)
+    }
+
     /// `true` if `session` already sees an attachment named `name`.
     ///
     /// Used to keep a sender from overwriting a name in the recipient's view

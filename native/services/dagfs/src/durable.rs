@@ -223,8 +223,24 @@ const OP_BUDGET_NS: u64 = 1_000_000_000;
 /// [`kore_rt::hint::wait_on`]: ../../kore_rt/hint/fn.wait_on.html
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 const MONITOR_CAP: core::time::Duration = core::time::Duration::from_micros(4);
+/// The filesystem's face onto the driver its manifest row names `client_of`
+/// (block): past the row's own serving pairs, block's two grant receives
+/// after the row's (empty) grant run, no return — `kore_abi::task::chain_face`,
+/// the derivation the kernel founder stamps by (#1212).
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
-const BLOCK_CLIENT_INDEX: u16 = <DurableService as SvcProtocol>::SERVE_PAIRS as u16;
+const BLOCK_FACE: kore_abi::task::chain_face::ChainFace =
+    kore_abi::task::chain_face::ChainFace::past_own_pairs(
+        <DurableService as SvcProtocol>::SERVE_PAIRS as u16,
+        (<DurableService as SvcProtocol>::SERVE_PAIRS
+            * <DurableService as SvcProtocol>::REPLY_GRANTS) as u16,
+        false,
+        <BlockService as SvcProtocol>::REPLY_GRANTS as u16,
+    );
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+const BLOCK_GRANT_BASE: u16 = match BLOCK_FACE.grant_base {
+    Some(index) => index,
+    None => panic!("block exposes reply grants the filesystem receives"),
+};
 
 pub struct NvmeFsBinding;
 
@@ -3462,10 +3478,10 @@ async fn open_block_channel(
     use kore_rt::service::MAX_GRANTS;
 
     let kick = boot
-        .handle(role::SVC_SEND, BLOCK_CLIENT_INDEX)
+        .handle(role::SVC_SEND, BLOCK_FACE.kick)
         .ok_or(StartFailure::new(1))?;
     let ring = boot
-        .handle(role::SVC_RING, BLOCK_CLIENT_INDEX)
+        .handle(role::SVC_RING, BLOCK_FACE.ring)
         .ok_or(StartFailure::new(2))?;
     let leased = kore_rt::cap::verbs::take_view(ring).ok_or(StartFailure::new(3))?;
     let window = kore_rt::cap::verbs::map_view(leased).ok_or(StartFailure::new(4))?;
@@ -3481,11 +3497,11 @@ async fn open_block_channel(
     .map_err(|_| StartFailure::new(5))?;
     let mut grants = [const { None }; MAX_GRANTS];
     grants[0] = Some(GrantPin::retained(
-        boot.handle(role::SVC_GRANT, 0)
+        boot.handle(role::SVC_GRANT, BLOCK_GRANT_BASE)
             .ok_or(StartFailure::new(6))?,
     ));
     grants[1] = Some(GrantPin::retained(
-        boot.handle(role::SVC_GRANT, 1)
+        boot.handle(role::SVC_GRANT, BLOCK_GRANT_BASE + 1)
             .ok_or(StartFailure::new(7))?,
     ));
     let mut client = RingBlock(SvcClient::new(

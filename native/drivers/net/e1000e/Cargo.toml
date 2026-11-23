@@ -1,0 +1,28 @@
+[package]
+name = "kore-e1000e"
+version = "0.0.1"
+edition = "2024"
+description = "kore Intel 82574L (e1000e) driver core: a NicBackend over PCI descriptor rings and an MSI-family route — the first PCI frame path, proven on QEMU's e1000e."
+publish = false
+
+# Pure logic over the driver substrate's seam and class contract. No
+# `kore-rt`: the production composition (broker claim, capability host,
+# serve loop) is `kore-svc-net`'s, exactly as kore-usbnet's is. The
+# in-crate hardware double is `#[cfg(test)]` only.
+[dependencies]
+kore-abi = { path = "../../../crates/abi" }
+# The seam (`Regs`/`Dma`/`DmaPool`), the rings (`SubRing`/`CompRing`/
+# `CookieTable`), the wait tier (`Budget`/`handshake_field`), and the
+# network class contract (`kore_driver::net` — `NicBackend`, `TxFrame`,
+# `MacAddr`, `PacketFilter`).
+kore-driver = { path = "../../../crates/driver" }
+
+[dev-dependencies]
+# The host-memory DMA double the mock device dereferences through.
+kore-driver = { path = "../../../crates/driver", features = ["host-double"] }
+
+[features]
+# Userland posture, threaded through to the substrate; off for a heapless
+# build. Mirrors kore-nvme / kore-xhci / kore-usbnet so the driver template
+# is uniform.
+alloc = ["kore-driver/alloc"]

@@ -21,6 +21,7 @@ def export(checkout: Path, revision: str, check: bool = False):
     config = tomllib.loads((ROOT / "Cargo.toml").read_text())
     pending = list(config["package"]["metadata"]["kore"]["owner-paths"].values())
     packages = {}
+    standalone = set()
     while pending:
         path = pending.pop()
         if path in packages:
@@ -29,6 +30,8 @@ def export(checkout: Path, revision: str, check: bool = False):
             raise ValueError("dependency path escapes Kore")
         manifest = tomllib.loads(git("show", f"{revision}:{path}/Cargo.toml").decode())
         packages[path] = manifest["package"]["name"]
+        if "workspace" in manifest:
+            standalone.add(path)
 
         def visit(table):
             for key, value in table.items():
@@ -61,7 +64,9 @@ def export(checkout: Path, revision: str, check: bool = False):
             buffers[str(path)] = (data, 0o755 if member.mode & 0o111 else 0o644)
             hashes[str(path)] = hashlib.sha256(data).hexdigest()
     workspace = '[workspace]\nresolver = "3"\nmembers = [\n'
-    workspace += "".join(f"    {json.dumps(path)},\n" for path in sorted(packages)) + ']\n'
+    workspace += "".join(f"    {json.dumps(path)},\n" for path in sorted(set(packages) - standalone)) + ']\n'
+    if standalone:
+        workspace += f"exclude = {json.dumps(sorted(standalone))}\n"
     record = {
         "repository": "https://github.com/MicroPerceptron/kore",
         "revision": revision,

@@ -267,6 +267,37 @@ impl<R: RegsNarrow + ?Sized> RegsNarrow for RegsWindow<'_, R> {
     }
 }
 
+/// Whether `len` bytes at `iova` lie wholly inside a device address space
+/// `address_bits` wide.
+///
+/// **The one place this question is answered**, because the second driver to
+/// ask it is where the shape gets standardized rather than copied:
+/// `kore_rtw89::desc::addressable` asked it of a 36-bit part and
+/// `kore_mt7925::dma::addressable` of a 32-bit one, with identical bodies
+/// and different numbers. Each driver keeps its own constant — the width is
+/// a fact about *its* silicon — and delegates the arithmetic here.
+///
+/// The end is exclusive: `iova + len` must not exceed `1 << address_bits`.
+/// Overflow is a refusal rather than a wrap, which is the whole point —
+/// a reach check that wraps approves exactly the addresses it exists to
+/// reject. `address_bits >= 64` admits everything without shifting out of
+/// range.
+///
+/// The matching *host-side* declaration is
+/// [`PciBindingContract::DMA_ADDRESS_BITS`](crate::host::PciBindingContract::DMA_ADDRESS_BITS),
+/// which is what places the window; this is what checks a buffer drawn from
+/// it before an address is written into a descriptor.
+#[inline]
+pub const fn within_dma_reach(iova: u64, len: u64, address_bits: u32) -> bool {
+    if address_bits >= 64 {
+        return iova.checked_add(len).is_some();
+    }
+    match iova.checked_add(len) {
+        Some(end) => end <= 1u64 << address_bits,
+        None => false,
+    }
+}
+
 /// A **device-visible DMA buffer** — the RUNG-2 lease's two windows,
 /// abstracted: a CPU-side pointer the driver writes/reads through, and the
 /// [`IovaAddr`] the device sees for the same frames (typed — "no phys in

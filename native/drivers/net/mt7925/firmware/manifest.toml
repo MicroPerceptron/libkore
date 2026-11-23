@@ -1,0 +1,72 @@
+# Pinned firmware trust root for kore-mt7925 (the sibling of
+# `drivers/net/rtw89/firmware/manifest.toml`, and deliberately the same
+# shape).
+#
+# A maintainer hashes the blobs obtained from the pinned `source` commit and
+# commits the digests for review — that commit IS the trust decision. The
+# mirror is a host, not the decision; the digests below are.
+#
+# Record with the in-repo hasher, from the blobs fetched at the pinned
+# commit:
+#
+#     cargo run -q -p kore-b3sum -- \
+#       vendor/firmware/mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin
+#     cargo run -q -p kore-b3sum -- \
+#       vendor/firmware/mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin
+#
+# **Two blobs, not one**, which is the first way this part differs from the
+# RTL8922AE: a ROM patch with a big-endian header and a RAM code with a
+# little-endian region table and trailer. C2 is two verifications and two
+# downloads against two targets (`res/NETWORK_C2_TO_PING.md` §2).
+#
+# **The distribution ships these `.zst`-compressed.** Kore has no
+# decompressor in the firmware path, so the pin and the packer both take the
+# **uncompressed** bytes — these sizes and digests are of the plain files.
+#
+# Recorded 2026-11-09, by fetching both blobs at the pinned commit and
+# running them through this crate's own parser (`fw::Patch`, `fw::RamCode`),
+# then byte-comparing against the copy the lab's Framework 13 runs
+# (`linux-firmware-20260910`, via NixOS): **identical**. So the pin is the
+# bytes the analysis was done against *and* the bytes the only machine in
+# the lab already loads under Linux.
+#
+# What the parse established, which the download ladder depends on and which
+# is not guessable from the sizes:
+#
+#   * The RAM code's regions do not cover the file. 172 bytes at offset
+#     `0x153c40` are a vendor build-info block — sixteen `#`, a `u32` length
+#     of 136, three tagged records (build tag
+#     `…MT7925_E1_ASIC_ROM_RAM_CE_2249_CCN16-20260813112803`,
+#     `CMD_VER:0001.0000.0000.0000`, sixteen binary bytes), sixteen `#`.
+#     Upstream admits it by construction: `mt76_connac2_fw_check` compares
+#     its running sum with `<=`, never `==` (`mt76_connac_mcu.c:3064-3073`),
+#     and never reads it. `RamCode::slack_bytes` reports it and a test
+#     asserts regions + slack + table + trailer = the file, exactly.
+#     `res/MT7925_EVIDENCE.md` §14.2.
+#
+#   * **Region 4 is `FW_FEATURE_NON_DL | FW_TYPE_CLC`, 303,936 bytes** of
+#     country-location data that `mt7925_load_clc` parses host-side. The
+#     download skips it while still advancing the image cursor, so
+#     **1,275,712 bytes cross into the device**, not the 1,580,280 that is
+#     the sum of both files. `res/NETWORK_RESTART.md` §4's figure is the
+#     file sum and is not the carve size.
+#
+#   * A patch section carries **two** lengths — `sec->size` at +8 and
+#     `sec->info.len` at +16 — and upstream downloads the latter. Both are
+#     read here and both bound the extent check. The field at +20 is
+#     `info.sec_key_idx`, not a mode word.
+#
+# `file` is the local/boot-module name; `source` carries the upstream path,
+# exactly as the rtw89 and NPU pins do.
+
+[firmware.mt7925_patch_mcu]     # MT7925 ROM patch (Framework 13, route 3)
+file   = "WIFI_MT7925_PATCH_MCU_1_1_hdr.bin"
+size   = 188192
+blake3 = "9aea52922074ac58e9920ce5208636afe2a2fa8f53d440eefc4b0c856afd7541"
+source = "kernelorg-mirror/linux_kernel_git_firmware_linux-firmware@173d4852f468f77039ada8011409efed67caed16:mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin"
+
+[firmware.mt7925_ram_code]      # MT7925 RAM code (N9 + WM + CLC)
+file   = "WIFI_RAM_CODE_MT7925_1_1.bin"
+size   = 1392088
+blake3 = "22f81e2022f9324296c3eaaf9ff6a38bc7d627f8385bf1fb4270b0f0f3d1943b"
+source = "kernelorg-mirror/linux_kernel_git_firmware_linux-firmware@173d4852f468f77039ada8011409efed67caed16:mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin"

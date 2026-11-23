@@ -14,12 +14,15 @@
 //!   other stations.
 //! - [`source_mac`](VifPolicy::source_mac) lets a client *speak as* an
 //!   address the service did not assign it.
+//! - [`flow`](VifPolicy::flow) bounds which *connections* a client may bind,
+//!   and each of its three dimensions is refused by name.
 //!
 //! Bundling them into one "privileged" bit would mean a client that needs to
 //! answer broadcast also gets to impersonate its neighbour.
 
 use super::addr::MacAddr;
 use super::filter::{EtherTypeMatch, FrameFilter, MulticastMatch};
+use super::flow::FlowMatch;
 
 /// What a client's authority permits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +39,19 @@ pub struct VifPolicy {
     pub source_mac: bool,
     /// Vifs this authority may hold open at once.
     pub max_vifs: u8,
+    /// The widest flow this authority may bind, or `None` to impose no L3
+    /// restriction at all.
+    ///
+    /// The containment here runs **opposite** to the matches above, because
+    /// `None` is the *widest* value rather than the narrowest: a grant of
+    /// `None` admits any request, and a request that binds no flow under a
+    /// grant that names one is a widening, refused as
+    /// [`PolicyRefusal::FlowRequired`].
+    ///
+    /// That inversion is what keeps every policy written before flows existed
+    /// meaning what it meant — `None` is "this authority says nothing about
+    /// L3", which was the only thing it could say.
+    pub flow: Option<FlowMatch>,
 }
 
 impl VifPolicy {
@@ -49,6 +65,7 @@ impl VifPolicy {
             promiscuous: false,
             source_mac: false,
             max_vifs: 1,
+            flow: None,
         }
     }
 
@@ -63,6 +80,7 @@ impl VifPolicy {
             promiscuous: false,
             source_mac: false,
             max_vifs: 1,
+            flow: None,
         }
     }
 
@@ -78,6 +96,9 @@ impl VifPolicy {
         promiscuous: false,
         source_mac: false,
         max_vifs: 0,
+        // `max_vifs: 0` is what denies here; an L3 restriction on an
+        // authority that may open nothing would be decoration.
+        flow: None,
     };
 }
 
@@ -100,6 +121,17 @@ pub enum PolicyRefusal {
     Promiscuous,
     /// The request asked to transmit from an unassigned source address.
     SourceMac,
+    /// The authority may only bind a restricted flow, and the request bound
+    /// none — which would have accepted every datagram reaching its address.
+    FlowRequired,
+    /// The request named an IP protocol the authority may not bind, or
+    /// claimed [`ProtoMatch::Any`](super::flow::ProtoMatch::Any) without it.
+    FlowProto,
+    /// The request named a local endpoint outside the authority's grant —
+    /// binding an address or port that is not its to bind.
+    FlowLocal,
+    /// The request named a peer endpoint outside the authority's grant.
+    FlowPeer,
     /// The authority already holds [`VifPolicy::max_vifs`] vifs open.
     TooManyVifs,
 }
@@ -120,6 +152,18 @@ impl VifPolicy {
         if open_vifs >= self.max_vifs as usize {
             return Err(PolicyRefusal::TooManyVifs);
         }
+        self.authorize_filter(request)
+    }
+
+    /// Authorize `request` **for a vif this authority already holds**.
+    ///
+    /// Every dimension of [`authorize`](Self::authorize) except the open-vif
+    /// census: re-filtering an open vif creates no new vif, so counting the
+    /// one being re-filtered would refuse a client at exactly its granted
+    /// ceiling for doing nothing new. Split out rather than duplicated, so a
+    /// dimension added above is enforced on both paths or on neither — the
+    /// drift that a second hand-written check would eventually produce.
+    pub fn authorize_filter(&self, request: &FrameFilter) -> Result<FrameFilter, PolicyRefusal> {
         if !request.ethertype.within(&self.ethertype) {
             return Err(PolicyRefusal::EtherType);
         }
@@ -131,6 +175,32 @@ impl VifPolicy {
         }
         if request.promiscuous && !self.promiscuous {
             return Err(PolicyRefusal::Promiscuous);
+        }
+        // Checked per dimension rather than wholesale, so the refusal names
+        // which half of the flow exceeded — the rule the rest of this
+        // vocabulary already follows.
+        match (&request.flow, &self.flow) {
+            (_, None) => {}
+            // Releasing an authority installs the empty predicate
+            // ([`FrameFilter::CLOSED`]), which binds no flow because it binds
+            // nothing at all. `FlowRequired` exists to stop a filter that
+            // would accept every datagram reaching its address; one that
+            // accepts no frame whatsoever is the opposite of that, and
+            // refusing it here would leave the authority being released still
+            // enforced.
+            (None, Some(_)) if request.admits_nothing() => {}
+            (None, Some(_)) => return Err(PolicyRefusal::FlowRequired),
+            (Some(r), Some(g)) => {
+                if !r.proto.within(&g.proto) {
+                    return Err(PolicyRefusal::FlowProto);
+                }
+                if !r.local.within(&g.local) {
+                    return Err(PolicyRefusal::FlowLocal);
+                }
+                if !r.peer.within(&g.peer) {
+                    return Err(PolicyRefusal::FlowPeer);
+                }
+            }
         }
         Ok(*request)
     }
@@ -281,5 +351,234 @@ mod tests {
             "DENY names no EtherType at all"
         );
         assert!(MAX_FILTER_ETHERTYPES > 0);
+    }
+
+    // ── the flow dimension ──────────────────────────────────────────────
+
+    const LOCAL: crate::net::flow::Ipv4Addr = crate::net::flow::Ipv4Addr([10, 0, 2, 15]);
+    const REMOTE: crate::net::flow::Ipv4Addr = crate::net::flow::Ipv4Addr([10, 0, 2, 2]);
+
+    fn ip_policy(flow: Option<crate::net::flow::FlowMatch>) -> VifPolicy {
+        let mut p = VifPolicy::protocol(EtherType::IPV4);
+        p.flow = flow;
+        p
+    }
+
+    fn ip_request(flow: Option<crate::net::flow::FlowMatch>) -> FrameFilter {
+        let mut f = FrameFilter::protocol(EtherType::IPV4);
+        f.flow = flow;
+        f
+    }
+
+    /// The compatibility property the additive design rests on: an authority
+    /// that says nothing about L3 behaves exactly as it did before flows
+    /// existed, for both kinds of request.
+    #[test]
+    fn a_grant_with_no_flow_is_unchanged() {
+        let policy = ip_policy(None);
+
+        assert!(policy.authorize(&ip_request(None), 0).is_ok());
+        assert!(
+            policy
+                .authorize(
+                    &ip_request(Some(crate::net::flow::FlowMatch::connection(
+                        crate::net::flow::IpProto::TCP,
+                        (LOCAL, 443),
+                        (REMOTE, 44000),
+                    ))),
+                    0
+                )
+                .is_ok(),
+            "narrowing yourself is never an escalation"
+        );
+    }
+
+    /// The inversion that makes `None` dangerous to get wrong: an authority
+    /// restricted to one flow must not be satisfied by a request that binds
+    /// none, because that request accepts every datagram reaching the address.
+    #[test]
+    fn an_unrestricted_request_under_a_restricting_grant_is_refused() {
+        let policy = ip_policy(Some(crate::net::flow::FlowMatch::connection(
+            crate::net::flow::IpProto::TCP,
+            (LOCAL, 443),
+            (REMOTE, 44000),
+        )));
+
+        assert_eq!(
+            policy.authorize(&ip_request(None), 0),
+            Err(PolicyRefusal::FlowRequired)
+        );
+    }
+
+    /// Each widening dimension is refused **by name**, separately — the rule
+    /// the rest of this vocabulary already follows, so an operator can tell
+    /// which grant to widen and a caller can tell escalation from typo.
+    #[test]
+    fn each_flow_dimension_is_refused_by_name() {
+        use crate::net::flow::{EndpointMatch, FlowMatch, IpProto, ProtoMatch};
+
+        let grant = FlowMatch::connection(IpProto::TCP, (LOCAL, 443), (REMOTE, 44000));
+        let policy = ip_policy(Some(grant));
+
+        let mut wide_proto = grant;
+        wide_proto.proto = ProtoMatch::Any;
+        assert_eq!(
+            policy.authorize(&ip_request(Some(wide_proto)), 0),
+            Err(PolicyRefusal::FlowProto),
+            "any-protocol is not within one named protocol"
+        );
+
+        let mut wide_local = grant;
+        wide_local.local = EndpointMatch::Any;
+        assert_eq!(
+            policy.authorize(&ip_request(Some(wide_local)), 0),
+            Err(PolicyRefusal::FlowLocal),
+            "any local endpoint reaches other vifs' addresses"
+        );
+
+        let mut wide_peer = grant;
+        wide_peer.peer = EndpointMatch::Any;
+        assert_eq!(
+            policy.authorize(&ip_request(Some(wide_peer)), 0),
+            Err(PolicyRefusal::FlowPeer)
+        );
+
+        let mut other_port = grant;
+        other_port.local = EndpointMatch::AddrPort {
+            addr: LOCAL,
+            port: 80,
+        };
+        assert_eq!(
+            policy.authorize(&ip_request(Some(other_port)), 0),
+            Err(PolicyRefusal::FlowLocal),
+            "binding a port that is not yours to bind"
+        );
+    }
+
+    /// A grant by address admits a request that pins a port under it, and
+    /// never the reverse — the asymmetry `EndpointMatch::within` encodes.
+    #[test]
+    fn a_port_pin_is_within_an_address_grant() {
+        use crate::net::flow::{EndpointMatch, FlowMatch, IpProto, ProtoMatch};
+
+        let policy = ip_policy(Some(FlowMatch {
+            proto: ProtoMatch::Only(IpProto::UDP),
+            local: EndpointMatch::Addr(LOCAL),
+            peer: EndpointMatch::Any,
+        }));
+
+        let pinned = FlowMatch {
+            proto: ProtoMatch::Only(IpProto::UDP),
+            local: EndpointMatch::AddrPort {
+                addr: LOCAL,
+                port: 68,
+            },
+            peer: EndpointMatch::Any,
+        };
+        assert!(policy.authorize(&ip_request(Some(pinned)), 0).is_ok());
+
+        let elsewhere = FlowMatch {
+            proto: ProtoMatch::Only(IpProto::UDP),
+            local: EndpointMatch::Addr(REMOTE),
+            peer: EndpointMatch::Any,
+        };
+        assert_eq!(
+            policy.authorize(&ip_request(Some(elsewhere)), 0),
+            Err(PolicyRefusal::FlowLocal),
+            "another station's address is not within this grant"
+        );
+    }
+
+    // ── re-filtering an open vif ────────────────────────────────────────
+
+    /// The census is the *only* difference between the two entry points, so a
+    /// dimension enforced at open is enforced on a re-filter too.
+    ///
+    /// Split rather than duplicated precisely so this holds: a second
+    /// hand-written check would eventually drift and leave a dimension
+    /// enforced on one path only — which is a policy bypass reachable by
+    /// asking twice.
+    #[test]
+    fn a_re_filter_is_checked_on_every_dimension_an_open_is() {
+        let policy = VifPolicy::protocol(EtherType::KORE_PEER);
+        let mut capture = FrameFilter::protocol(EtherType::KORE_PEER);
+        capture.promiscuous = true;
+        assert_eq!(
+            policy.authorize_filter(&capture),
+            Err(PolicyRefusal::Promiscuous)
+        );
+        assert_eq!(
+            policy.authorize_filter(&capture),
+            policy.authorize(&capture, 0),
+            "the two answers agree wherever the census does not decide"
+        );
+
+        let mut any = FrameFilter::protocol(EtherType::KORE_PEER);
+        any.ethertype = EtherTypeMatch::Any;
+        assert_eq!(policy.authorize_filter(&any), Err(PolicyRefusal::EtherType));
+
+        let narrow = ip_policy(Some(crate::net::flow::FlowMatch::connection(
+            crate::net::flow::IpProto::UDP,
+            (LOCAL, 68),
+            (REMOTE, 67),
+        )));
+        assert_eq!(
+            narrow.authorize_filter(&ip_request(None)),
+            Err(PolicyRefusal::FlowRequired),
+            "and the flow dimension too"
+        );
+    }
+
+    /// A vif at the authority's ceiling may still be re-filtered: no new vif
+    /// is created, so the open-vif census must not be consulted.
+    ///
+    /// Counting it would refuse exactly the client that has spent its whole
+    /// grant — the one with the most reason to narrow what it already holds.
+    #[test]
+    fn a_re_filter_does_not_consult_the_vif_census() {
+        let policy = VifPolicy::protocol(EtherType::IPV4);
+        assert_eq!(policy.max_vifs, 1);
+        let request = FrameFilter::protocol(EtherType::IPV4);
+        assert_eq!(
+            policy.authorize(&request, 1),
+            Err(PolicyRefusal::TooManyVifs),
+            "a second vif is refused"
+        );
+        assert!(
+            policy.authorize_filter(&request).is_ok(),
+            "but re-filtering the one it holds is not"
+        );
+    }
+
+    /// **Releasing an authority is never refused for binding no flow.** The
+    /// empty predicate accepts no frame at all, so the hazard
+    /// `FlowRequired` exists to stop — a filter accepting every datagram
+    /// reaching its address — provably does not apply to it.
+    ///
+    /// Without this, a grant that names a flow would refuse the release of
+    /// its own authority, leaving the old filter installed and enforced after
+    /// the capability behind it was given up. Fail-open, and silently.
+    #[test]
+    fn the_empty_predicate_is_installable_under_a_flow_bearing_grant() {
+        let narrow = ip_policy(Some(crate::net::flow::FlowMatch::connection(
+            crate::net::flow::IpProto::UDP,
+            (LOCAL, 68),
+            (REMOTE, 67),
+        )));
+        assert_eq!(
+            narrow.authorize_filter(&ip_request(None)),
+            Err(PolicyRefusal::FlowRequired),
+            "a request that would admit everything at this address is refused"
+        );
+        assert_eq!(
+            narrow.authorize_filter(&FrameFilter::CLOSED),
+            Ok(FrameFilter::CLOSED),
+            "but one that admits nothing is not the hazard the rule guards"
+        );
+        assert_eq!(
+            VifPolicy::DENY.authorize_filter(&FrameFilter::CLOSED),
+            Ok(FrameFilter::CLOSED),
+            "and the deny-everything authority can still release"
+        );
     }
 }

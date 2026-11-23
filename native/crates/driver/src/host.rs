@@ -51,6 +51,8 @@ use kore_rt::service::{
     PciMsixBlock, PciSelector, QuiesceSweep,
 };
 
+use crate::net::MAX_VIFS;
+use crate::net::window::WINDOW_BYTES;
 use crate::seam::{
     Dma, DmaPool, DmaReleaseFailure, Quiet, Regs, Regs64, RegsNarrow, RegsRegion, RegsWindowError,
 };
@@ -70,6 +72,210 @@ const PAGE: u64 = 4096;
 /// where this pool cannot reach, and that check belongs in a `const`
 /// assertion rather than in a comment.
 pub const DMA_IOVA_BASE: u64 = 0x1_0000_0000;
+
+/// Where a pool goes for a device whose DMA master cannot reach
+/// [`DMA_IOVA_BASE`].
+///
+/// `DMA_IOVA_BASE` is 4 GiB **exactly**, so a 32-bit device's very first
+/// buffer is already past its own ceiling — not a hypothetical: the
+/// MediaTek MT7925's WFDMA descriptor carries a 32-bit buffer pointer and
+/// the part enables no address extension (`res/MT7925_EVIDENCE.md` §15).
+///
+/// 1 GiB, and the two halves of that choice are separable. It is **high**
+/// enough to stay clear of the low addresses firmware and legacy devices
+/// use, which is the same reason `DMA_IOVA_BASE` is where it is. It is
+/// **low** enough that a 32-bit device still has three gibibytes of room
+/// above it for [`DeviceResources::grow_dma`]'s extensions, which are
+/// placed upward from the highest existing window — a window packed against
+/// the ceiling instead would make the first growth unplaceable.
+///
+/// The driver owns its IOMMU domain, so where a window sits is bookkeeping
+/// rather than a physical constraint; what was missing was the device
+/// saying how far it can reach, which is
+/// [`PciBindingContract::DMA_ADDRESS_BITS`].
+pub const NARROW_DMA_IOVA_BASE: u64 = 0x4000_0000;
+
+/// The highest IOVA a device with `address_bits` of DMA reach can emit.
+///
+/// `address_bits >= 64` saturates rather than shifting out of range.
+pub const fn dma_iova_ceiling(address_bits: u32) -> u64 {
+    if address_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << address_bits) - 1
+    }
+}
+
+/// Where to place a `len`-byte DMA window for a device with `address_bits`
+/// of reach, or `None` when no placement this host knows about fits.
+///
+/// [`DMA_IOVA_BASE`] whenever the device can reach it — which is every
+/// 33-bit-or-wider device, so no existing binding's placement moves — and
+/// [`NARROW_DMA_IOVA_BASE`] otherwise. A narrow device that cannot reach
+/// even that is refused here rather than handed a window whose addresses it
+/// would silently truncate.
+pub const fn dma_iova_base(address_bits: u32, len: u64) -> Option<u64> {
+    let mut candidates = [DMA_IOVA_BASE, NARROW_DMA_IOVA_BASE];
+    let mut i = 0;
+    while i < candidates.len() {
+        let base = candidates[i];
+        // `len == 0` is not a window; `base + len - 1` is the last byte.
+        if len > 0 && crate::seam::within_dma_reach(base, len, address_bits) {
+            return Some(base);
+        }
+        i += 1;
+    }
+    // Silence the unused-assignment lint in a const context.
+    candidates[0] = 0;
+    None
+}
+
+/// Granule every window this host places upward is aligned to.
+///
+/// [`DeviceResources::grow_dma`] rounds each extension up to it, so the gap
+/// between the pool and anything placed above it is only usable for growth
+/// in multiples of this. 2 MiB is also the leaf size the founder's
+/// `LEASE_ALIGN_2M` endowment and the stage-1 walker's block coalescing
+/// want, so a window aligned here maps as blocks rather than as pages.
+pub const DMA_GROWTH_ALIGN: u64 = 2 << 20;
+
+/// Bytes one frame service's vif windows occupy together, rounded up to
+/// [`DMA_GROWTH_ALIGN`].
+///
+/// A vif arena is reserved whole rather than per-vif: `kore-svc-net`'s
+/// engine hands out [`WINDOW_BYTES`] strides from one base, so what a
+/// placement has to guarantee is that *every* stride is reachable and clear
+/// of the pool — a fact about the whole span, not about the first window.
+/// At [`MAX_VIFS`] × ~132 KiB this is a single 2 MiB block.
+pub const VIF_ARENA_BYTES: u64 = {
+    let raw = (MAX_VIFS * WINDOW_BYTES) as u64;
+    (raw + (DMA_GROWTH_ALIGN - 1)) & !(DMA_GROWTH_ALIGN - 1)
+};
+
+/// Where a frame service's vif arena sits for a device that can reach it.
+///
+/// The historic placement — 4 GiB above [`DMA_IOVA_BASE`] — kept as the
+/// *preferred* candidate rather than as the answer, so that every device
+/// already running keeps the addresses it has today and only a device that
+/// cannot reach here moves. See [`vif_iova_base`].
+pub const VIF_IOVA_BASE: u64 = 0x2_0000_0000;
+
+/// Where to place the frame service's vif arena for a device with
+/// `address_bits` of DMA reach whose own pool window is `pool_bytes` long,
+/// or `None` when no placement this host knows about fits.
+///
+/// **The defect this replaces.** `VIF_IOVA_BASE` used to be a global
+/// constant in `kore-svc-net`, guarded by `VIF_IOVA_BASE > DMA_IOVA_BASE`.
+/// That guard was written when every pool sat at [`DMA_IOVA_BASE`], and it
+/// is blind to the only case that can go wrong: the MediaTek MT7925 is a
+/// 32-bit DMA master (`res/MT7925_EVIDENCE.md` §15 — the WFDMA descriptor
+/// carries a 32-bit buffer pointer and the part enables no address
+/// extension), so [`dma_iova_base`] places its pool at
+/// [`NARROW_DMA_IOVA_BASE`] and an 8 GiB vif window is an address its
+/// descriptors physically cannot carry. The device would not refuse it; it
+/// would emit the low 32 bits and the controller would read whatever
+/// happens to live there — a corruption, and a silent one, which is exactly
+/// the failure [`dma_iova_base`] exists to prevent for the pool.
+///
+/// Two properties, both checked here rather than assumed by the caller:
+///
+/// - **Reachable.** `base + VIF_ARENA_BYTES` stays inside the device's own
+///   reach ([`dma_iova_ceiling`]), for the *last* vif's last byte and not
+///   merely for the base.
+/// - **Disjoint from the pool.** The pool's placement is recomputed through
+///   [`dma_iova_base`] — the same seam that really places it in
+///   [`intake`] — so the two can never disagree about where it is.
+///
+/// **Why a narrow device's arena goes against its ceiling** rather than
+/// immediately above its pool: the whole argument for
+/// [`NARROW_DMA_IOVA_BASE`] being *low* is that it leaves room above the
+/// pool for [`DeviceResources::grow_dma`]'s extensions, which are placed
+/// upward from the highest retained window. An arena packed against the
+/// pool would spend that corridor on ~1 MiB of vif windows and make the
+/// first growth unplaceable; against the ceiling it leaves the corridor as
+/// wide as the device's reach allows (just under 3 GiB for a 32-bit master
+/// with the standard 2 MiB leaf).
+///
+/// `pool_bytes == 0` means no pool is placed — a frame host with no bound
+/// device, which has nothing to stay clear of.
+pub const fn vif_iova_base(address_bits: u32, pool_bytes: u64) -> Option<u64> {
+    let pool_end = if pool_bytes == 0 {
+        0
+    } else {
+        match dma_iova_base(address_bits, pool_bytes) {
+            Some(base) => match base.checked_add(pool_bytes) {
+                Some(end) => end,
+                None => return None,
+            },
+            // A device that cannot be given its own pool is not one this
+            // host can give client windows to either.
+            None => return None,
+        }
+    };
+
+    // The placement every device that can reach it keeps, so no running
+    // row's windows move.
+    if VIF_IOVA_BASE >= pool_end
+        && crate::seam::within_dma_reach(VIF_IOVA_BASE, VIF_ARENA_BYTES, address_bits)
+    {
+        return Some(VIF_IOVA_BASE);
+    }
+
+    // Otherwise hard against the device's ceiling. `ceiling + 1` is the
+    // exclusive end of its reach and overflows only for a 64-bit master,
+    // which took the branch above.
+    let limit = match dma_iova_ceiling(address_bits).checked_add(1) {
+        Some(limit) => limit,
+        None => return None,
+    };
+    let base = match limit.checked_sub(VIF_ARENA_BYTES) {
+        Some(base) => base & !(DMA_GROWTH_ALIGN - 1),
+        None => return None,
+    };
+    if base >= pool_end && crate::seam::within_dma_reach(base, VIF_ARENA_BYTES, address_bits) {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+/// The relation the old `VIF_IOVA_BASE > DMA_IOVA_BASE` assertion was
+/// standing in for, over the reaches and pool leaves a driver row is
+/// actually founded with: 32 bits (the MT7925), 36 (the RTL8852 family,
+/// `drivers/net/rtw89`), 64 (the default), each against the small, the
+/// standard (`DRIVER_DMA_POOL_BYTES`) and the large (`LARGE_DMA_POOL_BYTES`)
+/// endowment leaves. Sampled, because the pool's span is a runtime fact the
+/// host measures; the exhaustive sweep is in this module's tests.
+const _: () = {
+    let reaches = [32u32, 36, 64];
+    let pools = [0x1000u64, 0x20_0000, 0x800_0000];
+    let mut i = 0;
+    while i < reaches.len() {
+        let bits = reaches[i];
+        let mut j = 0;
+        while j < pools.len() {
+            let pool = pools[j];
+            let base = match vif_iova_base(bits, pool) {
+                Some(base) => base,
+                None => panic!("every founded reach must admit a vif arena"),
+            };
+            assert!(
+                crate::seam::within_dma_reach(base, VIF_ARENA_BYTES, bits),
+                "the last vif's last byte must be an address the device can emit"
+            );
+            let pool_base = match dma_iova_base(bits, pool) {
+                Some(base) => base,
+                None => panic!("a founded reach must admit its own pool"),
+            };
+            assert!(
+                base >= pool_base + pool,
+                "the vif arena must not overlap the driver's own DMA pool window"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 /// The two concrete device-root species accepted by the common driver host.
 /// The enum is private so class bindings continue to see only realized
@@ -260,6 +466,16 @@ pub enum IntakeError {
     /// The DMA window could not be prepared or its completed graph could not
     /// be activated in the device's domain.
     DmaUnavailable,
+    /// No IOVA this host places is inside the device's own DMA reach.
+    ///
+    /// Distinct from [`IntakeError::DmaUnavailable`] because the condition is
+    /// not a shortage: the backing exists and the mapping would succeed —
+    /// the **device** cannot emit an address that high. A part declaring
+    /// [`PciBindingContract::DMA_ADDRESS_BITS`] narrower than the window
+    /// needs is refused here instead of being given descriptors whose
+    /// addresses it would truncate, which is a memory corruption wearing a
+    /// successful bind's clothes.
+    DmaUnreachable,
     /// The DMA window refused, stage-coded: `code[2:0]` the
     /// [`DmaMapFault`](kore_rt::cap::verbs::DmaMapFault) stage (1 bounds,
     /// 2 slot exhaustion, 3 carve, 4 CPU-view map, 5 geometry, 6 device
@@ -324,6 +540,10 @@ impl IntakeError {
             Self::InterruptUnavailable => (8, 0),
             Self::DmaUnavailable => (9, 0),
             Self::DmaMap { code } => (10, code as u64),
+            // Appended at 12 rather than slotted beside the other DMA
+            // classes: a diagnostic code is read off a panel photograph, and
+            // renumbering one makes every earlier photograph lie.
+            Self::DmaUnreachable => (12, 0),
             Self::ClassBindRefused { at, code } => {
                 let stage = match at {
                     ClassStage::Prepare => 1,
@@ -349,10 +569,12 @@ impl IntakeError {
                 role: role::DEVICE,
                 index: 0,
             },
-            Self::DmaUnavailable | Self::DmaMap { .. } => BindError::BadHandle {
-                role: role::DMA_POOL,
-                index: 0,
-            },
+            Self::DmaUnavailable | Self::DmaMap { .. } | Self::DmaUnreachable => {
+                BindError::BadHandle {
+                    role: role::DMA_POOL,
+                    index: 0,
+                }
+            }
         }
     }
 }
@@ -1816,6 +2038,11 @@ struct DmaOwner {
     ///   so a 2 MiB leaf cannot be installed where a 4 KiB mapping once lived
     ///   — the kernel's map refuses with `AlreadyMapped` and fail-stops.
     import_floor: u64,
+    /// The highest IOVA this device's DMA master can emit, from its class's
+    /// [`PciBindingContract::DMA_ADDRESS_BITS`]. Kept here rather than
+    /// recomputed because [`DeviceResources::grow_dma`] has no class type
+    /// parameter and must still refuse an extension past the ceiling.
+    iova_ceiling: u64,
 }
 
 /// Imports stop here, refused typed, rather than reach an IOVA the domain
@@ -2419,10 +2646,16 @@ impl DeviceResources<DmaActive> {
                 .map_or(end, |window| end.max(window.iova() + window.len()))
         });
         let iova = end
-            .checked_add((2 << 20) - 1)
+            .checked_add(DMA_GROWTH_ALIGN - 1)
             .ok_or(IntakeError::DmaUnavailable)?
-            & !((2 << 20) - 1);
-        iova.checked_add(len).ok_or(IntakeError::DmaUnavailable)?;
+            & !(DMA_GROWTH_ALIGN - 1);
+        let end = iova.checked_add(len).ok_or(IntakeError::DmaUnavailable)?;
+        // An extension past the device's own reach is refused typed. The
+        // placement that made room for growth is `NARROW_DMA_IOVA_BASE`'s
+        // whole point; this is what happens when the room runs out.
+        if len == 0 || end - 1 > dma.iova_ceiling {
+            return Err(IntakeError::DmaUnreachable);
+        }
         regions
             .try_reserve(1)
             .map_err(|_| IntakeError::DmaUnavailable)?;
@@ -2638,6 +2871,21 @@ pub trait PciBindingContract {
     const BARS: PciBarMask;
     /// Exact consecutive vector block, including whether absence is lawful.
     const INTERRUPTS: InterruptPolicy;
+    /// How many address bits this device's DMA master can emit.
+    ///
+    /// **64 unless the device says otherwise**, which is every part in the
+    /// tree but one — so this default is not a guess, it is the common case
+    /// stated once. A narrower device declares its own width and the host
+    /// places its window below that ceiling
+    /// ([`dma_iova_base`]); without the declaration the window would sit at
+    /// [`DMA_IOVA_BASE`] and every descriptor the device fetched would
+    /// carry a truncated address, which is a corruption rather than a
+    /// refusal.
+    ///
+    /// The value is the device's, read from its own documentation or from
+    /// the DMA mask its vendor driver asks for — not from what the platform
+    /// happens to offer.
+    const DMA_ADDRESS_BITS: u32 = 64;
 }
 
 /// Class-specific composition contract. The host owns capability intake,
@@ -3374,8 +3622,14 @@ fn realize_host_resources<B: DeviceBinding>(
     };
 
     let len = pool.len();
+    // Where the window goes is the device's reach, not a constant: a part
+    // that cannot address `DMA_IOVA_BASE` gets a window below its own
+    // ceiling, and a part that can reach nothing this host places is refused
+    // here rather than handed addresses it would truncate.
+    let iova_base = dma_iova_base(B::Pci::DMA_ADDRESS_BITS, len)
+        .ok_or(IntakeError::DmaUnreachable)?;
     let (window, pool) = device
-        .dma_window(pool, len, DMA_IOVA_BASE)
+        .dma_window(pool, len, iova_base)
         .map_err(|fault| IntakeError::DmaMap { code: fault.code() })?;
     // The founder-delivered pool on its first window: minted fresh for this
     // row by the kernel (`Mem::derive_zeroed_dram`) and unwritten since — the
@@ -3402,6 +3656,7 @@ fn realize_host_resources<B: DeviceBinding>(
             _pool: pool,
             device: Some(device),
             import_floor: 0,
+            iova_ceiling: dma_iova_ceiling(B::Pci::DMA_ADDRESS_BITS),
         }),
         pool: Some(cap_pool),
         bars,
@@ -3441,6 +3696,184 @@ fn validate_declaration<B: DeviceBinding>() -> Result<(u8, Option<InterruptBlock
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::seam::within_dma_reach;
+
+    /// **A wide device's window does not move.** Every binding in the tree
+    /// but one takes the default 64 bits, so this is the regression that
+    /// matters most: the placement they have had all along.
+    #[test]
+    fn a_wide_device_keeps_the_window_it_always_had() {
+        for bits in [64u32, 48, 39, 36, 33] {
+            assert_eq!(
+                dma_iova_base(bits, 0x20_0000),
+                Some(DMA_IOVA_BASE),
+                "{bits} bits"
+            );
+        }
+    }
+
+    /// A 32-bit device is placed below its own ceiling instead of at a base
+    /// it cannot emit.
+    ///
+    /// `DMA_IOVA_BASE` is 4 GiB **exactly**, so a 32-bit master's first
+    /// buffer would otherwise already be past its reach — the MediaTek
+    /// MT7925's condition, `res/MT7925_EVIDENCE.md` §15.
+    #[test]
+    fn a_thirty_two_bit_device_is_placed_below_its_ceiling() {
+        let len = 0x20_0000;
+        assert_eq!(dma_iova_base(32, len), Some(NARROW_DMA_IOVA_BASE));
+        let base = NARROW_DMA_IOVA_BASE;
+        assert!(base + len - 1 <= dma_iova_ceiling(32));
+        // And the placement leaves room above it for growth, which is why
+        // it is not packed against the ceiling.
+        assert!(dma_iova_ceiling(32) - (base + len) > 0x8000_0000);
+    }
+
+    /// The ceiling saturates rather than shifting out of range.
+    #[test]
+    fn the_ceiling_saturates_at_the_full_width() {
+        assert_eq!(dma_iova_ceiling(64), u64::MAX);
+        assert_eq!(dma_iova_ceiling(65), u64::MAX);
+        assert_eq!(dma_iova_ceiling(32), 0xffff_ffff);
+        assert_eq!(dma_iova_ceiling(36), 0xf_ffff_ffff);
+    }
+
+    /// A device too narrow for any placement this host knows is refused,
+    /// not squeezed in.
+    #[test]
+    fn a_device_narrower_than_every_placement_is_refused() {
+        // 30 bits is 1 GiB, which is exactly `NARROW_DMA_IOVA_BASE` — the
+        // window would start at its own ceiling.
+        assert_eq!(dma_iova_base(30, 0x20_0000), None);
+        assert_eq!(dma_iova_base(16, 4096), None);
+        // A zero-length window is not a window.
+        assert_eq!(dma_iova_base(64, 0), None);
+        // …and a length that would wrap the address space is refused rather
+        // than overflowing.
+        assert_eq!(dma_iova_base(64, u64::MAX), None);
+    }
+
+    /// **Every vif window a 32-bit master is handed is one it can emit.**
+    ///
+    /// The regression: the vif base used to be the constant `0x2_0000_0000`
+    /// in `kore-svc-net`, asserted only to be above `DMA_IOVA_BASE`. For the
+    /// MT7925 — a 32-bit DMA master whose pool therefore sits at
+    /// `NARROW_DMA_IOVA_BASE` — every one of those addresses is past the
+    /// ceiling, and the part truncates rather than refusing.
+    ///
+    /// The **last** vif's last byte, not the first: an arena whose base is
+    /// reachable and whose end is not is the same corruption one window
+    /// later.
+    #[test]
+    fn a_narrow_master_reaches_its_last_vif_window() {
+        let base = vif_iova_base(32, 0x20_0000).expect("a 32-bit master must get an arena");
+        let last = base + ((MAX_VIFS - 1) * WINDOW_BYTES) as u64 + WINDOW_BYTES as u64 - 1;
+        assert!(
+            last <= dma_iova_ceiling(32),
+            "the last vif's last byte {last:#x} is past a 32-bit master's ceiling"
+        );
+        for ordinal in 0..MAX_VIFS {
+            let window = base + (ordinal * WINDOW_BYTES) as u64;
+            assert!(
+                within_dma_reach(window, WINDOW_BYTES as u64, 32),
+                "vif {ordinal} at {window:#x} is not an address a 32-bit master can emit"
+            );
+        }
+    }
+
+    /// **The arena never overlaps the device's own DMA pool window**, at
+    /// either reach and at every endowment leaf a driver row is founded
+    /// with. An overlap would hand a client's ring the same device address
+    /// as a descriptor the driver itself programmed.
+    #[test]
+    fn the_vif_arena_clears_the_pool_window() {
+        for bits in [32u32, 33, 36, 39, 48, 64] {
+            for pool in [0x1000u64, 0x20_0000, 0x800_0000] {
+                let pool_base = dma_iova_base(bits, pool).expect("a pool placement");
+                let base = vif_iova_base(bits, pool).expect("a vif arena");
+                assert!(
+                    base >= pool_base + pool,
+                    "{bits}-bit, {pool:#x} pool: arena {base:#x} overlaps the pool window \
+                     [{pool_base:#x}, {:#x})",
+                    pool_base + pool
+                );
+                assert!(
+                    within_dma_reach(base, VIF_ARENA_BYTES, bits),
+                    "{bits}-bit, {pool:#x} pool: arena {base:#x} is past the device's reach"
+                );
+            }
+        }
+    }
+
+    /// **A wide device's vif windows do not move.** Every binding in the
+    /// tree but the MT7925 reaches the historic base, so deriving the
+    /// placement must leave all of them exactly where they are.
+    #[test]
+    fn a_wide_master_keeps_the_historic_vif_base() {
+        for bits in [64u32, 48, 39, 36, 34] {
+            assert_eq!(
+                vif_iova_base(bits, 0x20_0000),
+                Some(VIF_IOVA_BASE),
+                "{bits} bits"
+            );
+        }
+        assert_eq!(VIF_IOVA_BASE, 0x2_0000_0000);
+    }
+
+    /// A narrow master's arena is pushed against its ceiling rather than
+    /// against its pool, so [`DeviceResources::grow_dma`] keeps the corridor
+    /// `NARROW_DMA_IOVA_BASE` exists to leave it — the growth placement is
+    /// upward from the highest retained window, so an arena sitting just
+    /// above the pool would consume it.
+    #[test]
+    fn a_narrow_masters_arena_leaves_the_growth_corridor() {
+        let pool = 0x20_0000;
+        let base = vif_iova_base(32, pool).expect("a 32-bit arena");
+        let corridor = base - (NARROW_DMA_IOVA_BASE + pool);
+        assert!(
+            corridor > 0x8000_0000,
+            "only {corridor:#x} left for grow_dma between the pool and the vif arena"
+        );
+        assert_eq!(base % DMA_GROWTH_ALIGN, 0, "an arena growth can abut");
+    }
+
+    /// A device too narrow for a pool has no vif plan either — refused,
+    /// never squeezed in beside or below the pool.
+    #[test]
+    fn a_master_with_no_pool_placement_gets_no_vif_arena() {
+        assert_eq!(vif_iova_base(30, 0x20_0000), None);
+        assert_eq!(vif_iova_base(16, 4096), None);
+        // 31 bits: the pool is placeable at 1 GiB, but 2 GiB of reach
+        // cannot hold both it and the arena clear of it… it can, just:
+        // the arena lands at 2 GiB − 2 MiB.
+        let base = vif_iova_base(31, 0x20_0000).expect("31 bits still fits");
+        assert!(base >= NARROW_DMA_IOVA_BASE + 0x20_0000);
+        assert!(within_dma_reach(base, VIF_ARENA_BYTES, 31));
+    }
+
+    /// A host with no bound device has no pool to stay clear of, and still
+    /// answers — the degraded frame row's posture.
+    #[test]
+    fn a_hostless_plan_still_places_the_arena() {
+        assert_eq!(vif_iova_base(64, 0), Some(VIF_IOVA_BASE));
+        let base = vif_iova_base(32, 0).expect("a narrow arena with no pool");
+        assert!(within_dma_reach(base, VIF_ARENA_BYTES, 32));
+    }
+
+    /// The new refusal has its own diagnostic class and does not disturb
+    /// the ones a panel photograph may already have recorded.
+    #[test]
+    fn the_unreachable_refusal_has_its_own_class() {
+        assert_eq!(IntakeError::DmaUnreachable.diagnostic_code() & 0xff, 12);
+        assert_eq!(IntakeError::DmaUnavailable.diagnostic_code() & 0xff, 9);
+        assert_eq!(IntakeError::DmaMap { code: 4 }.diagnostic_code() & 0xff, 10);
+        assert_ne!(
+            IntakeError::DmaUnreachable.diagnostic_code(),
+            IntakeError::DmaUnavailable.diagnostic_code()
+        );
+    }
+
     #[test]
     fn cpu_view_denial_precedes_dma_publication() {
         assert!(!super::IntakeError::DmaMap {

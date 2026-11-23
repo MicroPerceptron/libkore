@@ -1,0 +1,31 @@
+[package]
+name = "kore-usbnet"
+version = "0.0.1"
+edition = "2024"
+description = "kore CDC-ECM USB Ethernet driver core: a NicBackend over the xHCI bulk/interrupt pipes, so the L2 frame service rides a USB adaptor on hardware with no Ethernet port."
+publish = false
+
+# Pure logic over the driver substrate's seam and class contract plus the
+# xHCI core's endpoint surface.  No `kore-rt`: the production composition
+# (broker claim, capability host, serve loop) is `kore-svc-net`'s, exactly as
+# kore-nvme's is kore-svc-swap-nvme's.  The in-crate hardware double is
+# `#[cfg(test)]` only.
+[dependencies]
+kore-abi = { path = "../../../crates/abi" }
+# The seam (`Regs`/`Dma`/`DmaPool`) and the network class contract
+# (`kore_driver::net` — `NicBackend`, `TxFrame`, `MacAddr`, `PacketFilter`).
+kore-driver = { path = "../../../crates/driver" }
+# The endpoint surface this core is written against: control transfers,
+# string descriptors, the configuration walk, and bulk submit/complete.
+kore-xhci = { path = "../../xhci" }
+
+[features]
+# Userland posture, threaded through to the substrate; off for a heapless
+# build.  Mirrors kore-nvme / kore-xhci so the driver template is uniform.
+alloc = ["kore-driver/alloc"]
+
+# The xHCI hardware double, for this crate's own tests only. Taken as a
+# dev-dependency with the `mock` feature so the emulated controller is
+# unreachable from any production build of either crate.
+[dev-dependencies]
+kore-xhci = { path = "../../xhci", features = ["mock"] }
