@@ -56,4 +56,5 @@ version = "0.2.14"
 default-features = false
 
 [dependencies.paste]
-version = "1.0.4"
+package = "pastey"
+version = "0.2.3"

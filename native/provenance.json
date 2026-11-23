@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/MicroPerceptron/kore",
-  "revision": "3a96715dabe2757d259a9da62dc6964e16a75a66",
+  "revision": "0bb41c2db50cbc299f4b2017bdf2770a07469a5f",
   "packages": {
     "crates/abi": "kore-abi",
     "crates/app": "kore-app",
@@ -745,7 +745,7 @@
     "vendor/xhci/.github/workflows/rust.yml": "792a0ac2f8c9618e2dd5ba918fef403a08261034428ac0f105cbb211702e22e2",
     "vendor/xhci/.gitignore": "ec9bd8fca53f9b07b6807dc5e3bfd58969504bef67051950f2c78639abc0c24c",
     "vendor/xhci/CHANGELOG.md": "72e23d71be38c32216f3c2c38123add24ba926fa147db51d5df9e5a197decb82",
-    "vendor/xhci/Cargo.toml": "f7baad7771171d91a2aa352f92c669ff6d30fad8838cef2b4d2223304db00fef",
+    "vendor/xhci/Cargo.toml": "d135a98dd20b3dc5d723f453081f72845831a786328b69e2be6703113fa16fa7",
     "vendor/xhci/Cargo.toml.orig": "aa0843ff58ca69d398f420d72721331f63c239fdfc934b891a2668c9e5379647",
     "vendor/xhci/KORE-PATCH.md": "37a956d8eeebbc7233c797f228b843701a728b93015987938db44f96a113da92",
     "vendor/xhci/LICENSE-APACHE": "c95bae1d1ce0235ecccd3560b772ec1efb97f348a79f0fbe0a634f0c2ccefe2c",
