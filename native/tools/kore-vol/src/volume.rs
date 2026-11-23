@@ -374,6 +374,8 @@ fn walk(
 /// What recovery found when the volume was mounted to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MountStatus {
+    /// Actual recovered on-disk format; not this build's writer version.
+    pub format_version: u32,
     /// The root generation the mount reads.
     pub generation: u64,
     /// Recovery had to take the fallback root: kore itself mounts this
@@ -477,6 +479,7 @@ impl Mount {
     pub fn status(&self) -> MountStatus {
         let status = self.volume.status();
         MountStatus {
+            format_version: self.volume.format_version(),
             generation: status.generation,
             used_fallback_root: status.used_fallback_root,
         }

@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/MicroPerceptron/kore",
-  "revision": "7074bda28c416ffe34562857ee43cbc883482782",
+  "revision": "576ccc99ae11b3c83227c4a6d4fca74693b44f07",
   "packages": {
     "crates/abi": "kore-abi",
     "crates/app": "kore-app",
@@ -319,7 +319,7 @@
     "services/dagfs/src/object.rs": "ce3468a2a536069eddd3598e8593c7eddc8e5107bd96f6e939af0133eb02fb91",
     "services/dagfs/src/parent_index.rs": "a46346a378ff2e9dd2ffe2d8a9514d8c777a7d0170ff3b90a9345def3b452a02",
     "services/dagfs/src/path.rs": "98ddd0026e43f6a4957b896bfa0c33ec217b016229662ebc0402283d1e8b0518",
-    "services/dagfs/src/persistence.rs": "1bf80a2654317434ce174fe950ce47f080083ddacc8ebc0ba10bdc5337ea7b12",
+    "services/dagfs/src/persistence.rs": "a43432a9e23f36fde53cbdcdd0bdf71d3e1c52b18e28936b104eb9e56bb41247",
     "services/dagfs/src/provider/block.rs": "89180a583d3e651c8edebfa851b155a991da33dda4df66c3fe1e259f67245bde",
     "services/dagfs/src/provider/extent.rs": "94656ebe2ddaab5b257c89c2af8a1ab56e745eddc301fd02c99a28fabff9d6bb",
     "services/dagfs/src/provider/mod.rs": "1e40047a77fc1f5140626bc25c9d57e681a38302d8b7a30c9e1c01c140cb3db8",
@@ -408,10 +408,10 @@
     "tools/kore-vol/src/lib.rs": "41f7fc123e770cc1f34e97de0c2fc6a0ee9211cc29172e23cb42f01e84d2b034",
     "tools/kore-vol/src/main.rs": "badf82b2ca2c83e5c29af760f4b50021d679ad75e65a94259b01efc082019a25",
     "tools/kore-vol/src/source.rs": "eaa9da2c97057be86b4dc8543213728ee22ecbf1be7484f3899affd03c09c68b",
-    "tools/kore-vol/src/volume.rs": "67bb73f4a5ae5cc90b2511ecd1e74c91d573ca593f2fff986d6cbdad478f76e6",
+    "tools/kore-vol/src/volume.rs": "80892db536129b9f91ac8d6bb20646abe9488943057f533c8ad50afbc24dd175",
     "tools/kore-vol/tests/cli.rs": "66983b612af2ec94f30a4dcecdd73a38e52e97523f2efecd678d450e7e984bd4",
     "tools/kore-vol/tests/common/mod.rs": "b561540f1cca00f440adf90123eafad96076ed5c8291af634528b4ce2edbb159",
     "tools/kore-vol/tests/device.rs": "4082b44d7c9dc05b23b459eaed612a6160cd964da40496295d0136d4b546074b",
-    "tools/kore-vol/tests/library.rs": "a2e943e86b00edf9a3fffbd3894fa5bca581e1495d30e72f0dc661bc7b90fc0e"
+    "tools/kore-vol/tests/library.rs": "4c1994be1e09cab4d3438ff5419412bc73bd70255d80a635a28f2ced791a11ac"
   }
 }

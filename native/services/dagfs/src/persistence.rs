@@ -762,6 +762,14 @@ impl<D: DirectBlockDevice, const B: usize, const O: usize> PersistentFs<D, B, O>
         self.state.status()
     }
 
+    /// Format version of the recovered root (or the last committed root).
+    /// Older readable volumes keep their own version until a commit upgrades
+    /// them; the writer's FORMAT_VERSION is not the medium's identity.
+    pub const fn format_version(&self) -> u32 {
+        self.state.version
+    }
+
+
     pub async fn commit(&mut self, session: SessionId) -> Result<u64, PersistenceError> {
         self.commit_with_cut(session, None).await
     }
@@ -3358,6 +3366,7 @@ mod tests {
 
             // The ordinary recovery path, over v2 bytes.
             let mut recovered = crate::block_on(volume.restart(session)).unwrap();
+            assert_eq!(recovered.format_version(), DERIVED_FORMAT_VERSION);
             assert_eq!(
                 recovered.status().mode,
                 MountMode::ReadWrite,
@@ -5275,6 +5284,7 @@ mod tests {
             let mut volume = crate::block_on(volume.restart(session)).unwrap();
             assert_eq!(volume.status().mode, MountMode::ReadWrite);
             assert_eq!(active_version(&volume), SUBTYPE_FORMAT_VERSION);
+            assert_eq!(volume.format_version(), SUBTYPE_FORMAT_VERSION);
             let root = volume
                 .engine_mut()
                 .open_root(session, crate::Rights::ALL)
@@ -5288,6 +5298,7 @@ mod tests {
             .unwrap();
             crate::block_on(volume.commit(session)).unwrap();
             assert_eq!(active_version(&volume), DIGEST_FORMAT_VERSION);
+            assert_eq!(volume.format_version(), DIGEST_FORMAT_VERSION);
 
             let mut volume = crate::block_on(volume.restart(session)).unwrap();
             let root = volume
