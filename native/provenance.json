@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/MicroPerceptron/kore",
-  "revision": "a3729555941d094e4cbdd452cc8f7f018d0d5e35",
+  "revision": "73e6619fc8e2379b02c4d4ac9be9c4a99ed3b7d8",
   "packages": {
     "crates/abi": "kore-abi",
     "crates/app": "kore-app",
@@ -564,7 +564,7 @@
     "services/net/src/client.rs": "30f6d66bbf3bdbe0794b4ced6cfb06156f6267500fb0928aee35c05d36d3848e",
     "services/net/src/entry.rs": "1de131aead1fc7f27262d8d01a02cf97f5f7148610978c11f1be65837cbdaca4",
     "services/net/src/lib.rs": "bc07549ca493f17fa679addc8dac7a9dfd630fb1d05b01e3dff5f538dc6a78b4",
-    "services/net/src/metal/mod.rs": "d9106df54c9cd1cf19604f3e21301700a356013a8d8ecd281d0f5e35a79dac63",
+    "services/net/src/metal/mod.rs": "7254f95aa3ecf9b28c3a221e3018c81fe584a6e494f21942f349b7e972d9438e",
     "services/net/src/metal/mt7925.rs": "18906cceccf0a65304ffe4078f06135b0b5775c81641868ea8d14078f4c9b49a",
     "services/net/src/metal/pci.rs": "963a9430ffd174b88061fcdbe1a5e1f88c050b2f898794e35a16ede00ca5e492",
     "services/net/src/metal/usb.rs": "43a7fa58a215dc28218b2fa198a8ab5cd4404b6b3debf077ca4e6e24cb17a70e",

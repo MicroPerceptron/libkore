@@ -50,11 +50,8 @@ pub use wifi::*;
 
 /// The rights a vif-window transfer must carry.
 ///
-/// **Re-exported, not redefined.** [`crate::client::WINDOW_RIGHTS`] is the one
-/// definition; this service's `RETURN_MODE` names it as `minimum_rights`, so
-/// the requirement the row enforces and the rights a client sends are the same
-/// constant by construction. They were two constants that disagreed, which is
-/// why no real client could open a vif at all (#1194).
+/// `adopt_window` checks the same rights that clients use to transfer the
+/// window.
 pub use crate::client::WINDOW_RIGHTS;
 
 // ── the device host ────────────────────────────────────────────────────
@@ -1269,20 +1266,12 @@ impl kore_rt::service::SystemService for NetRow {
     const NAME: &'static str = "kore-svc-net";
     type Endowment = NetEndowment;
 
-    /// A vif window is **retained** service authority: attached once per vif
-    /// and kept until that vif closes, with both sides writing their own
-    /// subregions.
-    ///
-    /// `MemLease` rather than `LeasedRegion`, and the difference is
-    /// load-bearing: this service makes *two* children of the delivery — the
-    /// CPU leaf it validates frames through and the device leaf the
-    /// controller fetches them through — and only a lease can parent both.
-    /// A view could be mapped but never shared into a domain, which would
-    /// force transmit through a bounce buffer.
-    const RETURN_MODE: kore_rt::service::ReturnMode = kore_rt::service::ReturnMode::Retained {
-        kind: kore_abi::cap::ResourceKind::MemLease,
-        minimum_rights: WINDOW_RIGHTS,
-    };
+    /// Exec sends a ring lease plus channel endpoints when admitting a peer.
+    /// This shares the host's return mechanism with VIF window transfers.
+    /// The peer assembler checks each component's authority. `adopt_window`
+    /// requires a `MemLease` with `WINDOW_RIGHTS` before mapping it for CPU
+    /// access or deriving the controller's read-only DMA leaf.
+    const RETURN_MODE: kore_rt::service::ReturnMode = kore_rt::service::ReturnMode::RetainedAny;
 
     /// The two hosts this row can claim, **neither required**. Index 0 is
     /// the xHCI class (`entry::SELECTOR_XHCI`), index 1 the 82574L
@@ -1445,35 +1434,12 @@ mod tests {
     use super::*;
     use kore_rt::service::{DeviceSelector, PciInterruptRequirement, SystemService};
 
-    /// The row's retained minimum **is** the constant clients send -- the same
-    /// constant, not an equal one.
-    ///
-    /// These were two constants that disagreed: the client sent
-    /// `ACCESS | MODIFY` and `RETURN_MODE` demanded `ACCESS | MODIFY | DERIVE`.
-    /// The kernel refuses a retained delivery below the declared minimum, so
-    /// every real client's `OpenVif` was refused at the return post, and the
-    /// only path that worked was the row's own self-test, whose windows come
-    /// from the row's pool rather than a transfer -- which is exactly why no
-    /// test caught it (#1194).
-    ///
-    /// Note what this test can and cannot do. Now that `metal` re-exports the
-    /// client's definition, *equality* is tautological -- it compares a
-    /// constant to itself and cannot fail. What it still guards is the
-    /// **shape**: that this is a `Retained`/`MemLease` delivery whose minimum
-    /// is drawn from the client path at all. Re-introduce a second constant
-    /// here and the `assert_eq!` stops being free, which is the drift being
-    /// prevented. The substantive assertion is the `DERIVE` test below.
     #[test]
-    fn the_retained_minimum_is_the_clients_own_window_rights() {
-        let kore_rt::service::ReturnMode::Retained {
-            kind,
-            minimum_rights,
-        } = NetRow::RETURN_MODE
-        else {
-            panic!("a vif window is a retained delivery");
-        };
-        assert_eq!(kind, kore_abi::cap::ResourceKind::MemLease);
-        assert_eq!(minimum_rights, crate::client::WINDOW_RIGHTS);
+    fn the_return_post_can_receive_the_channels_in_a_peer_bundle() {
+        assert!(matches!(
+            NetRow::RETURN_MODE,
+            kore_rt::service::ReturnMode::RetainedAny
+        ));
     }
 
     /// `DERIVE` specifically, because the reason is load-bearing: the row
