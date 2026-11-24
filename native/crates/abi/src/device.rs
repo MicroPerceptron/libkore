@@ -95,8 +95,9 @@ pub const MAX_ROOT_COMPLEXES: usize = 8;
 
 /// Claimant faces one device broker can mint: one per driver row, the
 /// founder minting face `n` for driver row `n` (`MintFace`,
-/// `res/DEVICE_SERVICE.md` §10). Five today: input, block, accel, net and
-/// Xe.
+/// `res/DEVICE_SERVICE.md` §10). Six: the headless image's input, block,
+/// accel, net, serial line (kore-svc-output) and Xe; the desktop founds the
+/// first five of those and leaves the last face unminted.
 ///
 /// The bound is shared, not chosen. The kernel founder seats driver row
 /// `n`'s one executor bell at a fixed slot of its common pin island and
@@ -111,7 +112,14 @@ pub const MAX_ROOT_COMPLEXES: usize = 8;
 /// Deliberately not the image service's face count: that one grows with
 /// the executable catalogue, and a broker band sized by it would grow with
 /// every program the system can run.
-pub const MAX_CLAIMANT_FACES: usize = 5;
+pub const MAX_CLAIMANT_FACES: usize = 6;
+
+/// `PNP0501`, the 16550A-compatible COM port, as the compressed EISA id a
+/// platform row stores: what a serial driver row selects on
+/// (`DeviceSelector::Platform { hid: HID_SERIAL_16550, .. }`). The kernel
+/// scout files `PNP0500` ports under it too, and asserts it is the value its
+/// own encoder derives.
+pub const HID_SERIAL_16550: u32 = 0x0105_d041;
 
 impl DeviceSpecies {
     /// Decode the wire byte; `None` for an unknown species (fail-closed —
@@ -190,6 +198,12 @@ pub struct DeviceRecord {
 impl DeviceRecord {
     /// PCI MSI-X Message Control encodes `table_size - 1` in eleven bits.
     pub const MAX_MSIX_TABLE_ENTRIES: u16 = 2_048;
+
+    /// A port-decoding `PLATFORM_CLASS_HID` row's first declared I/O port
+    /// in [`Self::diag`]`[15:0]` — where its registers start (`0x2F8` for
+    /// a COM2 the firmware describes there). Description, not authority:
+    /// the ports are reachable only through the row's own port grant.
+    pub const PLATFORM_PORT_BASE_MASK: u32 = 0xffff;
 
     /// Platform I2C controller model encoded in [`Self::diag`].
     pub const PLATFORM_I2C_DESIGNWARE: u32 = 1;

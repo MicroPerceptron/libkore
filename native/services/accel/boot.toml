@@ -1,0 +1,50 @@
+# services/accel/boot.toml — the accel row's boot-manifest fragment (the
+# design lives in res/boot.toml's header).  The row rides beside the
+# class-protocol crate it serves; the composition (the iVPU backend, the
+# claim ladder, the entry loop) lives in services/accel-ivpu, whose types
+# this row cites.
+
+# The iVPU accelerator row (res/DEVICE_SERVICE.md §8.1) — the Intel
+# NPU (Lunar Lake and Panther Lake generations) behind the AccelRequest protocol, the THIRD driver claimant and
+# the first row founded entirely on the hardened broker path: no founder
+# edit, no SERVE_PAIRS bump — a minted face and this manifest row.
+#
+# Chained, like every claiming driver: its founder must still hold the
+# broker's control-pair roots to mint the claimant face this row rides.
+#
+# No DEVICE beside the supplies — the NPU is CLAIMED from the broker at
+# startup (the block-driver posture): DMA_POOL@1 is the class-agnostic
+# LARGE supply (the firmware runtime alone is 64 MiB), and CHANNEL_SPACE
+# roots the Signal verb's minted completion channels.
+#
+# FIRMWARE_STORE@0 and @4 are the NPU firmware byte stores — the image
+# archive's siblings, one per implemented silicon generation: the operator
+# stages `vpu_40xx_v1.bin` (Lunar Lake) and `vpu_50xx_v1.bin` (Panther
+# Lake) with `make fetch-firmware`, the ISO carries them as the
+# `kore-ivpu-firmware` / `kore-ivpu-50xx-firmware` Limine modules, and the
+# founder leases each whole module R/O to this row.  The row claims Intel's
+# NPU class vendor-wide, selects the generation ONCE from the audited
+# identity table, and BLAKE3-verifies exactly that generation's module
+# against its pinned digest before bring-up (the boot ROM then checks
+# Intel's on-device RSA).  Both are OPTIONAL: an un-fetched build ships no
+# module, the founder stamps the coordinate vacant, and — when this row
+# claims an NPU — it founds degraded (note: NO_FIRMWARE), never dead (an
+# NPU-less machine founds NO_MATCH regardless).  (#605 favoured a durable
+# fs store; that path needs two unbuilt subsystems and carries the ~1 MiB in
+# boot media anyway, so the boot-module path — one live in-tree precedent,
+# no new mechanism — was chosen for this validation phase.)
+[service]
+image     = "kore-svc-accel"
+chain     = true                             # a driver row by class (chained +
+                                             # non-empty DEVICES).  Init's `client_of`
+                                             # names this row (#1202): its founding
+                                             # pair is init's accelerator face.
+# Intel silicon only: the row founds on x86_64 and is skipped everywhere
+# else BEFORE acquire — no aarch64 artifact, column, module, or founding
+# row exists for it (the fragment vocabulary in res/boot.toml's header).
+arch      = ["x86_64"]
+endowment = "kore_svc_accel_ivpu::IvpuAccelEndowment"
+protocol  = "kore_svc_accel_ivpu::IvpuAccel"
+exec_face = "npu"                          # pair 1 administers per-launch application faces
+endows    = ["DMA_POOL@1", "CHANNEL_SPACE@0", "FIRMWARE_STORE@0", "FIRMWARE_STORE@4"]
+digest_x86_64  = "blake3:41b954c8684569dcc660bb97e11cfc81d53caf550544ad7e5665d87f083705a5"  # res/x86_64/; make boot-digests

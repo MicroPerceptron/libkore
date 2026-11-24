@@ -1,0 +1,9 @@
+[package]
+name = "axgfx"
+version = "0.1.0"
+edition = "2024"
+description = "Cross-platform graphics submission and surface-lifecycle contract for Axiom"
+
+[dependencies]
+axinput = { path = "../axinput" }
+axui-core = { path = "../axui-core" }

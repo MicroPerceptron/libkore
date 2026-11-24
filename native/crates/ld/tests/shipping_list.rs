@@ -7,8 +7,9 @@
 //! unreachable on the metal target — it looks alive because it compiles.
 //!
 //! The declaration already exists: a founded service carries
-//! `services/<name>/boot.toml`, and `res/boot.toml` names the image the boot
-//! chain measures and starts. What was missing is anything requiring a crate
+//! `services/<name>/boot.toml`, and an image under `res/images/` names it in
+//! its founding order (`res/IMAGE_PROFILES.md`) — the image the boot chain
+//! measures and starts. What was missing is anything requiring a crate
 //! to be in that set or to admit it is not. This test is that requirement,
 //! so an unshipped service is a written-down fact with a reason rather than
 //! a silence nobody can see.
@@ -16,7 +17,7 @@
 //! Adding a service crate therefore means one of two things:
 //!
 //! - it ships — give it `services/<name>/boot.toml` and list its image in
-//!   `res/boot.toml`; or
+//!   an image's founding order (`res/images/<name>.toml`); or
 //! - it does not ship yet — add it to [`UNSHIPPED`] with the reason, which is
 //!   a line in a review rather than a discovery six months later.
 //!
@@ -55,11 +56,6 @@ const UNSHIPPED: &[(&str, &str)] = &[
     ),
     // Genuinely unreachable today. Recorded here so the state is visible in
     // review instead of being inferred from a missing file.
-    (
-        "output",
-        "superseded: kore-svc-compositor serves OutReqWire/OutChunk; \
-         nothing founds kore-svc-output",
-    ),
     (
         "accel-ivpu",
         "backend crate: the Lunar Lake NPU `Accelerator` impl linked into \
@@ -114,10 +110,38 @@ fn declares_boot_manifest(root: &Path, name: &str) -> bool {
     root.join("services").join(name).join("boot.toml").is_file()
 }
 
-/// Whether `res/boot.toml` names this service's image, which is what the boot
-/// chain measures and starts.
+/// Whether an image's founding order names this service's image, which is
+/// what the boot chain measures and starts.
 fn named_in_boot_manifest(boot_toml: &str, name: &str) -> bool {
     boot_toml.contains(&format!("\"kore-svc-{name}\""))
+}
+
+/// The default image — the one whose sealed artifacts are committed under
+/// `res/<arch>/` (`res/IMAGE_PROFILES.md` §7).
+const DEFAULT_IMAGE: &str = "res/images/desktop.toml";
+
+/// The default image's founding order, as text.
+fn default_image(root: &Path) -> String {
+    std::fs::read_to_string(root.join(DEFAULT_IMAGE)).expect(DEFAULT_IMAGE)
+}
+
+/// Every declared image's founding order, as one text: the services some
+/// image founds.  A fragment no image founds is a landmine, and the
+/// bootloader must be able to carry any image's rows.
+fn every_image(root: &Path) -> String {
+    let mut text = String::new();
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(root.join("res/images"))
+        .expect("res/images")
+        .map(|entry| entry.expect("res/images entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "res/images declares no image");
+    for path in paths {
+        text.push_str(&std::fs::read_to_string(&path).expect("image file"));
+        text.push('\n');
+    }
+    text
 }
 
 /// Service-shaped committed artifacts that intentionally are not founded.
@@ -203,17 +227,18 @@ fn every_service_crate_is_founded_or_declared_unshipped() {
     assert!(
         unaccounted.is_empty(),
         "these service crates are neither founded nor declared unshipped: {unaccounted:?}\n\
-         Give each one `services/<name>/boot.toml` plus an image in res/boot.toml, \
+         Give each one `services/<name>/boot.toml` plus a place in an image's founding \
+         order (res/images/<name>.toml), \
          or add it to UNSHIPPED in this test with the reason it stays out."
     );
 }
 
-/// The two halves of "founded" must agree: a per-service manifest without an
-/// image in `res/boot.toml` builds a service the boot chain never starts.
+/// The two halves of "founded" must agree: a per-service manifest that no
+/// image founds builds a service the boot chain never starts.
 #[test]
 fn a_services_boot_manifest_matches_the_boot_chains_image_list() {
     let root = repo_root();
-    let boot_toml = std::fs::read_to_string(root.join("res/boot.toml")).expect("res/boot.toml");
+    let boot_toml = every_image(&root);
 
     let mut disagreed = Vec::new();
     for name in service_crates(&root) {
@@ -226,8 +251,8 @@ fn a_services_boot_manifest_matches_the_boot_chains_image_list() {
 
     assert!(
         disagreed.is_empty(),
-        "service boot.toml and res/boot.toml disagree (name, has services/<n>/boot.toml, \
-         named in res/boot.toml): {disagreed:?}"
+        "service boot.toml and the images disagree (name, has services/<n>/boot.toml, \
+         named in an image under res/images/): {disagreed:?}"
     );
 }
 
@@ -241,7 +266,9 @@ fn a_services_boot_manifest_matches_the_boot_chains_image_list() {
 #[test]
 fn committed_service_artifacts_match_the_founded_set() {
     let root = repo_root();
-    let boot_toml = std::fs::read_to_string(root.join("res/boot.toml")).expect("res/boot.toml");
+    // Committed artifacts are the default image's; other images are sealed
+    // per build.
+    let boot_toml = default_image(&root);
     let every_arch = founded_image_names(&boot_toml);
     let allowed: BTreeSet<&str> = NON_FOUNDED_SERVICE_ARTIFACTS
         .iter()
@@ -298,7 +325,7 @@ fn the_arch_column_gates_exactly_the_silicon_bound_rows() {
 }
 
 /// Modules the bootloader carries that are **not** service rows, so the
-/// cross-check below expects them beyond `res/boot.toml`'s `services` list.
+/// cross-check below expects them beyond the images' `services` lists.
 ///
 /// The linker stub is deliberately absent: `iso-boot-x86` appends its
 /// `module_string` at ISO time rather than declaring it in the checked-in
@@ -309,7 +336,7 @@ const NON_ROW_MODULES: &[&str] = &["kore-image-archive"];
 /// carries**, and every service module it carries must be a founded row.
 ///
 /// This is the third question in "how does this reach metal?", and the one
-/// nothing was asking. `res/boot.toml` says which rows found; `USER_SERVICES` stages
+/// nothing was asking. The image says which rows found; `USER_SERVICES` stages
 /// their ELFs into the ISO; but Limine only loads what `boot/limine.conf`
 /// names, and the founder resolves a row to its module **by name**
 /// (`boot_modules().find(|m| m.cmdline() == name)`). A row present in the
@@ -320,7 +347,9 @@ const NON_ROW_MODULES: &[&str] = &["kore-image-archive"];
 #[test]
 fn every_founded_row_is_carried_by_the_bootloader() {
     let root = repo_root();
-    let boot_toml = std::fs::read_to_string(root.join("res/boot.toml")).expect("res/boot.toml");
+    // The config is the universe's: it must carry any declared image's rows
+    // (each image's build filters it to its own).
+    let boot_toml = every_image(&root);
     let limine = std::fs::read_to_string(root.join("boot/limine.conf")).expect("boot/limine.conf");
 
     // What the bootloader is told to load.
@@ -345,14 +374,14 @@ fn every_founded_row_is_carried_by_the_bootloader() {
         .collect();
     assert!(
         founded.len() > 5,
-        "res/boot.toml yielded only {} founded rows — the parse is wrong, not the manifest",
+        "res/images yielded only {} founded rows — the parse is wrong, not the images",
         founded.len()
     );
 
     let missing: Vec<&&str> = founded.iter().filter(|n| !carried.contains(*n)).collect();
     assert!(
         missing.is_empty(),
-        "these rows are founded by res/boot.toml but no bootloader module carries them: \
+        "these rows are founded by an image but no bootloader module carries them: \
          {missing:?}\nAdd a `module_path` / `module_string` pair to boot/limine.conf — \
          without it the row founds FAILED and the boot goes DEGRADED."
     );
@@ -364,7 +393,7 @@ fn every_founded_row_is_carried_by_the_bootloader() {
         .collect();
     assert!(
         stray.is_empty(),
-        "boot/limine.conf carries service modules that res/boot.toml does not found: \
+        "boot/limine.conf carries service modules that no image founds: \
          {stray:?}\nDrop them, or add the row to the `services` list."
     );
 

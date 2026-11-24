@@ -47,15 +47,18 @@ pub(crate) mod errno {
     pub(crate) const EBUSY: c_int = 16;
     pub(crate) const EINVAL: c_int = 22;
     pub(crate) const EMFILE: c_int = 24;
+    pub(crate) const EPIPE: c_int = 32;
     pub(crate) const ENOTSOCK: c_int = 88;
     pub(crate) const EMSGSIZE: c_int = 90;
     pub(crate) const EPROTONOSUPPORT: c_int = 93;
     pub(crate) const ENOTSUP: c_int = 95;
     pub(crate) const EAFNOSUPPORT: c_int = 97;
     pub(crate) const ENETUNREACH: c_int = 101;
+    pub(crate) const ECONNRESET: c_int = 104;
     pub(crate) const EISCONN: c_int = 106;
     pub(crate) const ENOTCONN: c_int = 107;
     pub(crate) const ETIMEDOUT: c_int = 110;
+    pub(crate) const ECONNREFUSED: c_int = 111;
 }
 
 /// What kind of capability a name stands for: which operations its

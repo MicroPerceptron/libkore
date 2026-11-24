@@ -1,0 +1,11 @@
+[package]
+name = "bspl"
+version = "0.2.1"
+edition = "2024"
+
+[features]
+default = ["safe-lz4-decode"]
+safe-lz4-decode = ["lz4_flex/safe-decode"]
+
+[dependencies]
+lz4_flex = { version = "0.13.0", default-features = false }

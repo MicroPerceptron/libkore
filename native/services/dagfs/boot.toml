@@ -1,5 +1,5 @@
 # services/dagfs/boot.toml — the filesystem service's boot-manifest row.
-# Founding order lives in res/boot.toml; this fragment declares only the
+# Founding order lives in the image (res/images/<name>.toml); this fragment declares only the
 # service-local image, bundle, and protocol citations.
 
 # The filesystem follows the terminal in the retained chain: it consumes a
@@ -9,6 +9,7 @@
 [service]
 image     = "kore-svc-dagfs"
 chain     = true
+core      = "filesystem"                     # the filesystem round
 client_of = "kore-svc-block"                 # the founder hands block's founding pair
                                              # to this row: the request kick, the pair
                                              # window, and block's two grant receivers
@@ -52,5 +53,5 @@ exec_face = "fs"
 # `dagfs_heap_supply_holds_every_session` holds this row to it; the rest is
 # room for the proofs open handles carry, allocated per open at their depth.
 heap_supply_bytes = 0x00D0_0000
-digest_x86_64  = "blake3:11a95d0cc1d074e7a7c0638f24f86239d525d25868e461e1173680724bcbbe65"
-digest_aarch64 = "blake3:3378f1908340b44c3f88420be7963589f3418069814c7e0b4b327ac6835c6498"
+digest_x86_64  = "blake3:92e6b329d0575b6d7ee178e71f0a81c0d715230416cd38208f3678f313f91b26"
+digest_aarch64 = "blake3:33317b77cfcc62116c2078b86d6c9e1459998a257dcac81782e6fc3cdbad5d29"

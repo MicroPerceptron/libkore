@@ -15,10 +15,126 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "ax"
+version = "0.1.0"
+dependencies = [
+ "axnn",
+]
+
+[[package]]
+name = "ax-exec"
+version = "0.1.0"
+dependencies = [
+ "ax",
+ "axnn",
+ "axnn-cpu",
+ "virtio-accel-core",
+]
+
+[[package]]
+name = "axboot"
+version = "0.1.0"
+dependencies = [
+ "ax",
+ "axnn-cpu",
+ "axrd",
+ "axshader",
+ "core_maths",
+]
+
+[[package]]
+name = "axcomp"
+version = "0.1.0"
+dependencies = [
+ "ax",
+ "axgfx",
+ "axinput",
+ "axmath",
+ "axnn-cpu",
+ "axui-core",
+]
+
+[[package]]
+name = "axgfx"
+version = "0.1.0"
+dependencies = [
+ "axinput",
+ "axui-core",
+]
+
+[[package]]
+name = "axinput"
+version = "0.1.0"
+dependencies = [
+ "axmath",
+]
+
+[[package]]
+name = "axmath"
+version = "0.1.7"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "axnn"
+version = "0.3.0"
+
+[[package]]
+name = "axnn-cpu"
+version = "0.2.0"
+dependencies = [
+ "axmath",
+ "axnn",
+ "heapless",
+]
+
+[[package]]
+name = "axrd"
+version = "0.1.2"
+dependencies = [
+ "ax",
+ "axinput",
+ "axmath",
+ "axnn",
+ "core_maths",
+ "femtofont",
+ "pkg-config",
+ "ttf-parser",
+]
+
+[[package]]
+name = "axshader"
+version = "0.1.0"
+dependencies = [
+ "ax",
+ "naga",
+]
+
+[[package]]
+name = "axui-core"
+version = "0.1.0"
+
+[[package]]
 name = "az"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
+
+[[package]]
+name = "bit-set"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ec2f926cc3060f09db9ebc5b52823d85268d24bb917e472c0c4bea35780a7d"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
 
 [[package]]
 name = "bit_field"
@@ -94,6 +210,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "cfg_aliases"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+
+[[package]]
+name = "codespan-reporting"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
+dependencies = [
+ "unicode-width",
+]
+
+[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -104,6 +235,15 @@ name = "core-json"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "043d2b0b61dd6d1e9c6f7f78789a283357ea37254377f6470c5f83492caa071b"
+
+[[package]]
+name = "core_maths"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77745e017f5edba1a9c1d854f6f3a52dac8a12dd5af5d2f54aecf61e43d80d30"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -130,10 +270,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
 name = "elf"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
+
+[[package]]
+name = "embedded-bitmap-fonts"
+version = "0.1.2"
+dependencies = [
+ "embedded-graphics",
+]
 
 [[package]]
 name = "embedded-graphics"
@@ -175,6 +328,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "femtofont"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c56316fed6fd1500fab915589d8099e9fc426b4234f7e1e1ca69ff861fe0434"
+dependencies = [
+ "ttf-parser",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -190,6 +352,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "gpt_disk_types"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -199,6 +367,18 @@ dependencies = [
  "crc",
  "ucs2",
  "uguid",
+]
+
+[[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "num-traits",
+ "zerocopy",
 ]
 
 [[package]]
@@ -215,6 +395,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+]
 
 [[package]]
 name = "heapless"
@@ -223,7 +406,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "411fdef4df93751117bd9ef8caa0e7f99c65dafec5bd84313eb8e2fdd75e32f2"
 dependencies = [
  "hash32",
+ "portable-atomic",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "hidreport"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bba4f2ebef8032ef0125a72c7052481c9d63e50f1d48d35c0933ae11aa58c6d"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
@@ -251,6 +444,30 @@ dependencies = [
  "kore-abi",
  "kore-dagfs",
  "kore-window",
+]
+
+[[package]]
+name = "kore-axiom"
+version = "0.0.1"
+dependencies = [
+ "ax",
+ "ax-exec",
+ "axboot",
+ "axcomp",
+ "axgfx",
+ "axinput",
+ "axnn",
+ "axnn-cpu",
+ "axrd",
+ "axshader",
+ "blake3",
+ "core_maths",
+ "embedded-bitmap-fonts",
+ "kore-abi",
+ "kore-rt",
+ "kore-svc-accel",
+ "kore-window",
+ "kore-xe-kernels",
 ]
 
 [[package]]
@@ -311,6 +528,47 @@ name = "kore-hint"
 version = "0.0.0"
 dependencies = [
  "raw-cpuid",
+]
+
+[[package]]
+name = "kore-i2c"
+version = "0.0.1"
+dependencies = [
+ "kore-driver",
+]
+
+[[package]]
+name = "kore-i2c-dw"
+version = "0.0.1"
+dependencies = [
+ "kore-driver",
+ "kore-i2c",
+]
+
+[[package]]
+name = "kore-i2c-geni"
+version = "0.0.1"
+dependencies = [
+ "kore-driver",
+ "kore-i2c",
+]
+
+[[package]]
+name = "kore-i2c-hid"
+version = "0.0.1"
+dependencies = [
+ "hidreport",
+ "kore-abi",
+ "kore-i2c",
+ "zerocopy",
+]
+
+[[package]]
+name = "kore-i8042"
+version = "0.0.1"
+dependencies = [
+ "kore-abi",
+ "kore-driver",
 ]
 
 [[package]]
@@ -425,6 +683,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-svc-accel"
+version = "0.0.1"
+dependencies = [
+ "heapless",
+ "kore-abi",
+ "kore-driver",
+ "kore-rt",
+ "virtio-accel-conformance",
+ "virtio-accel-core",
+ "virtio-accel-device",
+ "virtio-accel-mock",
+ "zerocopy",
+]
+
+[[package]]
 name = "kore-svc-accel-spmd"
 version = "0.0.1"
 dependencies = [
@@ -510,6 +783,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-svc-input"
+version = "0.0.1"
+dependencies = [
+ "kore-abi",
+ "kore-axiom",
+ "kore-driver",
+ "kore-i2c",
+ "kore-i2c-dw",
+ "kore-i2c-geni",
+ "kore-i2c-hid",
+ "kore-i8042",
+ "kore-ring",
+ "kore-rt",
+ "kore-svc-device",
+ "kore-xhci",
+ "zerocopy",
+]
+
+[[package]]
 name = "kore-svc-mm"
 version = "0.0.0"
 dependencies = [
@@ -542,6 +834,8 @@ dependencies = [
  "kore-abi",
  "kore-ring",
  "kore-rt",
+ "kore-svc-device",
+ "kore-svc-input",
  "kore-uart",
 ]
 
@@ -628,6 +922,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-xe-kernels"
+version = "0.0.1"
+dependencies = [
+ "kore-driver",
+ "virtio-accel-core",
+]
+
+[[package]]
 name = "kore-xhci"
 version = "0.0.1"
 dependencies = [
@@ -641,6 +943,12 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "linux-raw-sys"
@@ -679,6 +987,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3c8dda44ff03a2f238717214da50f65d5a53b45cd213a7370424ffdb6fae815"
 
 [[package]]
+name = "naga"
+version = "30.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd0dd362bf26c0ffdd143df6da66a25d287e196eff482f117771010b207ad163"
+dependencies = [
+ "arrayvec",
+ "bit-set",
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "codespan-reporting",
+ "half",
+ "hashbrown",
+ "indexmap",
+ "libm",
+ "log",
+ "naga-types",
+ "num-traits",
+ "once_cell",
+ "rustc-hash",
+ "thiserror",
+ "unicode-ident",
+]
+
+[[package]]
+name = "naga-types"
+version = "30.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14474170feb673cfb18b3565111a9869797cc1d290fb9ec969c53f5e1e231c6d"
+dependencies = [
+ "hashbrown",
+ "indexmap",
+ "rustc-hash",
+ "thiserror",
+]
+
+[[package]]
 name = "num-derive"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -696,13 +1041,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+ "libm",
 ]
+
+[[package]]
+name = "once_cell"
+version = "1.21.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "proc-macro-crate"
@@ -739,6 +1103,12 @@ checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
  "bitflags 2.13.1",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc_apfloat"
@@ -857,6 +1227,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "thiserror"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "tinybmp"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -902,6 +1292,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ttf-parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+dependencies = [
+ "core_maths",
+]
+
+[[package]]
 name = "ucs2"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -924,6 +1323,21 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-width"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
+
+[[package]]
+name = "virtio-accel-conformance"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bbb36cb6e003353b241bb7e5a309f29f0f1d3e871bb6b4a72c2be994c898edd"
+dependencies = [
+ "virtio-accel-core",
+]
 
 [[package]]
 name = "virtio-accel-core"
@@ -957,6 +1371,15 @@ dependencies = [
  "virtio-accel-proto",
  "virtio-accel-transport",
  "zerocopy",
+]
+
+[[package]]
+name = "virtio-accel-mock"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c554ba16f23c4f765abbc0ce5237ad5fa81e9bdce91124a976ce63002d24a9d"
+dependencies = [
+ "virtio-accel-core",
 ]
 
 [[package]]

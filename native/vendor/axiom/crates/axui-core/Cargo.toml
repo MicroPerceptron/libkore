@@ -1,0 +1,7 @@
+[package]
+name = "axui-core"
+version = "0.1.0"
+edition = "2024"
+description = "Backend-neutral display-list contract for Axiom user interfaces"
+
+[dependencies]

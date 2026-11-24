@@ -1,0 +1,22 @@
+[package]
+name = "kore-i2c"
+version = "0.0.1"
+edition = "2024"
+description = "kore I2C master seam: the controller contract, the generic transfer engine, and the narrow bus trait a protocol driver consumes. One engine, one impl per controller IP."
+publish = false
+
+# The seam only. No controller IP appears here — DesignWare lives in
+# `kore-i2c-dw`, GENI (Qualcomm) in its own crate when it lands. Adding a
+# third IP must not touch this crate at all; if it does, the seam is wrong.
+[dependencies]
+# The shared driver substrate: `Regs` (volatile MMIO, the register access
+# every IP is driven through) and the `wait` discipline's `Ack` vocabulary,
+# so this seam cannot drift from the bounded-wait rules every other kore
+# driver follows.
+kore-driver = { path = "../../crates/driver" }
+
+[features]
+# The register-file test doubles (`I2cTarget`, `MockBus`). Off by default so
+# no image can link a mock; enabled by the dev-dependencies of the crates
+# that test against it (`kore-i2c-dw`, `kore-i2c-hid`).
+mock = []

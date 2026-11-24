@@ -1,16 +1,18 @@
-//! Blocking IPv4 datagram entries in the C program's descriptor table.
+//! Blocking IPv4 stream and datagram entries in the C program's descriptor table.
 //! The program host owns each flow and serializes requests from `main`.
 
 use core::ffi::{c_int, c_void};
 use core::mem::size_of;
 
 use kore_c_shim::errno::set as set_errno;
-use kore_std::driver::net::Ipv4Addr;
+use kore_std::driver::net::{IpProto, Ipv4Addr};
 
 use crate::fd::{TABLE, errno};
 
 const AF_INET: c_int = 2;
+const SOCK_STREAM: c_int = 1;
 const SOCK_DGRAM: c_int = 2;
+const IPPROTO_TCP: c_int = 6;
 const IPPROTO_UDP: c_int = 17;
 
 pub(crate) type Endpoint = (Ipv4Addr, u16);
@@ -29,7 +31,7 @@ const _: () = assert!(size_of::<SockaddrInPrefix>() == 8);
 
 #[derive(Clone, Copy)]
 pub(crate) enum Request {
-    Open,
+    Open(IpProto),
     Connect(c_int, Endpoint),
     Close(c_int),
     Send(c_int, *const u8, usize),
@@ -48,16 +50,17 @@ fn result(value: Result<usize, c_int>) -> isize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int {
-    let opened = match (domain, kind, protocol) {
-        (AF_INET, SOCK_DGRAM, 0 | IPPROTO_UDP) => {
-            // SAFETY: this request carries no borrowed buffers.
-            unsafe { crate::program::socket(Request::Open) }
-        }
-        (AF_INET, SOCK_DGRAM, _) => Err(errno::EPROTONOSUPPORT),
+    let protocol = match (domain, kind, protocol) {
+        (AF_INET, SOCK_STREAM, 0 | IPPROTO_TCP) => Ok(IpProto::TCP),
+        (AF_INET, SOCK_DGRAM, 0 | IPPROTO_UDP) => Ok(IpProto::UDP),
+        (AF_INET, SOCK_STREAM | SOCK_DGRAM, _) => Err(errno::EPROTONOSUPPORT),
         (AF_INET, _, _) => Err(errno::ENOTSUP),
         _ => Err(errno::EAFNOSUPPORT),
     };
-    result(opened) as c_int
+    result(protocol.and_then(|protocol| {
+        // SAFETY: this request carries no borrowed buffers.
+        unsafe { crate::program::socket(Request::Open(protocol)) }
+    })) as c_int
 }
 
 /// # Safety

@@ -1,0 +1,21 @@
+[package]
+name = "kore-i2c-dw"
+version = "0.0.1"
+edition = "2024"
+description = "Synopsys DesignWare I2C master: the register map, the sans-IO transfer state machine, and the per-integration data that separates Intel LPSS from a plain AMD core. One impl of the kore-i2c seam."
+publish = false
+
+[dependencies]
+# The seam this crate implements. Nothing above it may name this crate.
+kore-i2c = { path = "../i2c" }
+# `Regs` (the volatile register window) and the bounded-wait vocabulary.
+kore-driver = { path = "../../crates/driver" }
+
+[dev-dependencies]
+# The register-file double drives a bus target, so framing is proven
+# against a device rather than asserted against a transcript.
+kore-i2c = { path = "../i2c", features = ["mock"] }
+
+[features]
+# The `MockDwI2c` register file. Off by default so no image links it.
+mock = ["kore-i2c/mock"]

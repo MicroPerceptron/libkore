@@ -1,0 +1,14 @@
+[package]
+name = "axinput"
+version = "0.1.0"
+edition = "2024"
+description = "Backend-neutral seat, pointer, and cursor policy for Axiom"
+
+[features]
+default = []
+# Speed-dependent mouse and touchpad gain (libinput's adaptive profiles).
+acceleration = ["dep:axmath"]
+pointing = ["dep:axmath"]
+
+[dependencies]
+axmath = { path = "../axmath", optional = true }

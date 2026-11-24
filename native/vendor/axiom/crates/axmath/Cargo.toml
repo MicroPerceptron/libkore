@@ -1,0 +1,13 @@
+[package]
+name = "axmath"
+version = "0.1.7"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+std = []
+alloc = []
+
+[dependencies]
+libm = { version = "0.2.16", default-features = false }

@@ -1,7 +1,8 @@
 # services/net/boot.toml — the L2 frame row's boot-manifest fragment (the
 # design lives in res/boot.toml's header).  The row rides beside the crate it
-# endows; whether and WHEN it founds is the root manifest's `services` list —
-# founding order and chain adjacency are topology, the root's to declare.
+# endows; whether and WHEN it founds is the image's `services` list
+# (res/images/<name>.toml) — founding order and chain adjacency are
+# topology, the image's to declare.
 
 # The frame service (res/NETWORK_SERVICE.md) — capability-scoped virtual
 # interfaces over a raw-frame data plane, the FOURTH driver claimant.
