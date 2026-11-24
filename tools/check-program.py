@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -62,9 +63,10 @@ def readelf(*args):
                                    text=True)
 
 
-def declared():
+def declared(tls=False):
     names = set()
-    for header in HEADERS:
+    headers = HEADERS + (('extern/c/include/kore/tls.h',) if tls else ())
+    for header in headers:
         names |= set(re.findall(r'\b(kore_[a-z][a-z0-9_]*)\s*\(', (ROOT / header).read_text()))
     if not names:
         raise SystemExit('no foreign functions found in the generated headers')
@@ -75,24 +77,56 @@ def declared():
 # names kore-c, linked with the soname and no undefined symbol.
 WRAPPER_MANIFEST = ('[package]\nname = "libkore-so"\nversion = "0.0.0"\nedition = "2024"\n'
                     '[lib]\nname = "kore"\ncrate-type = ["cdylib"]\n[workspace]\n'
-                    '[dependencies]\nkore-c = {{ path = {path} }}\n')
+                    '[dependencies]\nkore-c = {{ path = {path}{features} }}\n')
 WRAPPER_SOURCE = '#![no_std]\n// The runtime and its exports come from kore-c.\nuse kore_c as _;\n'
 LINK_CONTRACT = ['-C', 'link-arg=--soname=libkore.so', '-C', 'link-arg=--no-undefined']
 
 
-def build(arch):
+def patch_ring_for_guest(work, env):
+    """Use ring's packaged ELF assembly on the freestanding target."""
+    metadata = subprocess.check_output([
+        'cargo', 'metadata', '--locked', '--format-version=1', '--filter-platform',
+        'x86_64-unknown-none', '--features', 'kore-c/tls',
+    ], cwd=ROOT, env=env, text=True)
+    package = next(p for p in json.loads(metadata)['packages']
+                   if p['name'] == 'ring' and p['version'] == '0.17.14')
+    source = Path(package['manifest_path']).parent
+    destination = work / 'ring'
+    shutil.copytree(source, destination)
+    script = destination / 'build.rs'
+    original = script.read_text()
+    anchor = 'const LINUX_ABI: &[&str] = &[\n'
+    if original.count(anchor) != 1:
+        raise SystemExit('ring: could not locate ELF assembler target list')
+    script.write_text(original.replace(anchor, anchor + '    "none",\n', 1))
+    with (work / 'Cargo.toml').open('a') as manifest:
+        manifest.write('\n[patch.crates-io]\nring = { path = "ring" }\n')
+
+
+def build(arch, target_dir, tls=False):
     channel = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
-    target_dir = ROOT / 'target/program-consumer'
     env = dict(os.environ, RUSTUP_TOOLCHAIN=channel, CARGO_TARGET_DIR=str(target_dir),
                CARGO_INCREMENTAL='0')
+    if tls:
+        env.setdefault('CC_x86_64_unknown_kore_user', 'clang')
+        env.setdefault('AR_x86_64_unknown_kore_user', 'llvm-ar')
+        env.setdefault('RANLIB_x86_64_unknown_kore_user', 'llvm-ranlib')
+        env.setdefault('CFLAGS_x86_64_unknown_kore_user',
+                       '--target=x86_64-unknown-none-elf -ffreestanding -nostdlibinc -fPIC -mno-red-zone '
+                       '-DRING_CORE_NOSTDLIBINC=1 -g0')
     with tempfile.TemporaryDirectory(prefix='libkore-so-') as temporary:
         work = Path(temporary)
         (work / 'src').mkdir()
         (work / 'Cargo.toml').write_text(
-            WRAPPER_MANIFEST.format(path=json.dumps(str(ROOT / 'crates/c'))))
+            WRAPPER_MANIFEST.format(
+                path=json.dumps(str(ROOT / 'crates/c')),
+                features=', features = ["tls"]' if tls else '',
+            ))
         (work / 'src/lib.rs').write_text(WRAPPER_SOURCE)
         # Reuse the reviewed dependency versions while Cargo adds this fixture.
         (work / 'Cargo.lock').write_bytes((ROOT / 'Cargo.lock').read_bytes())
+        if tls:
+            patch_ring_for_guest(work, env)
         subprocess.run([
             'cargo', 'rustc', '--release', '-Zjson-target-spec',
             '--target', str(ROOT / f'targets/{arch}-unknown-kore-user.json'),
@@ -102,8 +136,8 @@ def build(arch):
     return target_dir / f'{arch}-unknown-kore-user/release/libkore.so'
 
 
-def check(arch, expected):
-    image = build(arch)
+def check(arch, expected, target_dir, tls=False):
+    image = build(arch, target_dir, tls)
     header = readelf('--file-header', str(image))
     if not re.search(r'Type:\s+DYN', header):
         raise SystemExit(f'{arch}: libkore.so is not a shared object')
@@ -135,12 +169,26 @@ def check(arch, expected):
     if found := sorted(set(DYNAMIC_TLS.findall(relocations))):
         raise SystemExit(f'{arch}: dynamic TLS relocations {found}; static initial-exec TLS required')
     print(f'libkore.so: {arch}: {len(exported)} exported symbols, the declared ABI exactly', flush=True)
+    return image
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--arch', choices=ARCHES)
+    parser.add_argument('--tls', action='store_true', help='Build the x86_64 TLS-enabled library')
     args = parser.parse_args()
-    expected = declared() | C_STDLIB | LIFECYCLE | C_LIBRARY
-    for arch in [args.arch] if args.arch else ARCHES:
-        check(arch, expected)
+    if args.tls and args.arch not in (None, 'x86_64'):
+        parser.error('--tls currently supports x86_64')
+    expected = declared(args.tls) | C_STDLIB | LIFECYCLE | C_LIBRARY
+    if args.tls:
+        with tempfile.TemporaryDirectory(prefix='libkore-tls-target-') as directory:
+            image = check('x86_64', expected, Path(directory), tls=True)
+            output = ROOT / 'target/tls/guest-x86_64'
+            include = output / 'include/kore'
+            include.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(image, output / 'libkore.so')
+            shutil.copyfile(ROOT / 'extern/c/include/kore/tls.h', include / 'tls.h')
+            shutil.copyfile(ROOT / 'crates/tls/examples/kore-tls.c', output / 'kore-tls.c')
+    else:
+        for arch in [args.arch] if args.arch else ARCHES:
+            check(arch, expected, ROOT / 'target/program-consumer')

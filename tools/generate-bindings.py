@@ -25,6 +25,10 @@ def generate(check=False):
         subprocess.run([generator, '--config', 'crates/c/cbindgen.toml', '--crate', 'kore-c',
                         '--output', str(program_header)], cwd=ROOT, check=True)
         program = program_header.read_text()
+        tls_header = Path(directory) / 'tls.h'
+        subprocess.run([generator, '--config', 'crates/tls/cbindgen.toml', '--crate', 'kore-tls',
+                        '--output', str(tls_header)], cwd=ROOT, check=True)
+        tls = tls_header.read_text()
     if 'kore_fs_run' not in program:
         raise SystemExit('missing program export: kore_fs_run')
     # cbindgen is the declaration authority. This step only groups exported
@@ -81,7 +85,8 @@ def generate(check=False):
     pthread += '#endif\n'
     for relative, data in [('extern/c/include/kore.h', source), ('extern/zig/src/root.zig', zig),
                            ('extern/c/include/kore/stdlib.h', stdlib), ('extern/c/include/kore/pthread.h', pthread),
-                           ('extern/c/include/kore/program.h', program)]:
+                           ('extern/c/include/kore/program.h', program),
+                           ('extern/c/include/kore/tls.h', tls)]:
         path = ROOT / relative
         if check:
             if not path.exists() or path.read_text() != data:

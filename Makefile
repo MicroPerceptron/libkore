@@ -17,7 +17,7 @@ check:
 	python3 tools/check-native.py
 
 fmt:
-	cargo fmt -p kore-std -p libkore-consumer -p kore-ffi -p kore-c -p kore-entry -p kore-wasi -p kore-lua -p kore-host --check
+	cargo fmt -p kore-std -p libkore-consumer -p kore-ffi -p kore-c -p kore-entry -p kore-wasi -p kore-lua -p kore-host -p kore-tls --check
 	$(ZIG) fmt --check build.zig build.zig.zon crates/ffi/tests/consumer.zig extern/zig/src/root.zig extern/zig/src/allocator.zig
 
 docs:
@@ -51,10 +51,9 @@ cross:
 	python3 tools/check-program.py
 	python3 tools/check-entry.py
 
-# kore-host drives real image files under POSIX record locks, which Miri does
-# not model; `make test` exercises its procedure.
+# Miri does not model kore-host's POSIX record locks or ring's native crypto.
 miri:
-	cargo miri test --locked --workspace --all-features --exclude kore-wasi --exclude kore-host
+	cargo miri test --locked --workspace --all-features --exclude kore-wasi --exclude kore-host --exclude kore-tls
 	cargo miri test --locked --manifest-path native/Cargo.toml -p kore-rt erased_poll_and_drop
 
 native-check:
@@ -66,3 +65,15 @@ bindings:
 
 bindings-check:
 	python3 tools/check-bindings.py
+
+# Clang builds ring's native math code for the bare-metal x86_64 target.
+.PHONY: tls-cli tls-guest
+tls-cli:
+	cargo rustc --locked -p kore-tls --release --crate-type cdylib
+	@set -eu; dir="$(CURDIR)/target/release"; \
+	$(CC) -std=c11 -Wall -Wextra -Werror -I extern/c/include \
+	  crates/tls/examples/kore-tls.c -L"$$dir" -lkore_tls \
+	  -Wl,-rpath,"$$dir" -o "$$dir/kore-tls"
+
+tls-guest:
+	python3 tools/check-program.py --tls

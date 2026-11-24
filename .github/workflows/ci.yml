@@ -1,7 +1,7 @@
 name: Alpha CI
 on:
   pull_request:
-    branches: [alpha, main, 'ft/**']
+    branches: [alpha, main, 'ft/**', 'codex/libkore-network']
   push:
     branches: [alpha, main]
   workflow_dispatch:
@@ -64,6 +64,15 @@ jobs:
           python3 tools/check-alloc-symbols.py --arch ${{ matrix.arch }}
       - name: Link libkore.so and check its exported ABI
         run: python3 tools/check-program.py --arch ${{ matrix.arch }}
+      - name: Build the TLS-enabled x86_64 runtime
+        if: matrix.arch == 'x86_64'
+        run: make tls-guest
+      - name: Upload the TLS runtime and C sources
+        if: matrix.arch == 'x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: libkore-tls-x86_64
+          path: target/tls/guest-x86_64/
   miri:
     runs-on: ubuntu-latest
     timeout-minutes: 30
