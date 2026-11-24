@@ -30,7 +30,8 @@ use kore_driver::host::{
 use kore_driver::host::{CapPool, CapRegs};
 use kore_driver::net::{
     LinkState, MacAddr, NicBackend, NicCounters, NicHost, PacketFilter, Steering, TxCompletion,
-    TxFrame, window::WINDOW_BYTES,
+    TxFrame,
+    window::{WINDOW_BYTES, WINDOW_LEASE_BYTES},
 };
 use kore_e1000e::E1000eNic;
 use kore_rt::cap::{ReturnedCapability, StashedLease, verbs};
@@ -288,14 +289,14 @@ where
             let _ = lease.try_retire();
             return Err(ShareFault::NoView);
         };
-        if window.len() < WINDOW_BYTES {
+        if window.len() < WINDOW_LEASE_BYTES {
             let _ = lease.try_retire();
             return Err(ShareFault::NoView);
         }
 
         let published = match self.device_token() {
             Ok(device) => {
-                verbs::share_window(slot, device, iova.0, WINDOW_BYTES as u64, false).is_ok()
+                verbs::share_window(slot, device, iova.0, WINDOW_LEASE_BYTES as u64, false).is_ok()
             }
             Err(_) => false,
         };
@@ -1442,16 +1443,17 @@ mod tests {
         ));
     }
 
-    /// `DERIVE` specifically, because the reason is load-bearing: the row
-    /// makes two children of one delivery -- the CPU leaf it validates frames
-    /// through and the device leaf the controller fetches them through. Drop
-    /// `DERIVE` and transmit needs a bounce buffer, so this is a performance
-    /// invariant as much as a correctness one.
+    /// The row derives CPU and device leaves under the same window lease and
+    /// revokes the lease to remove both when the vif closes.
     #[test]
-    fn the_vif_window_carries_derive_so_one_lease_parents_both_leaves() {
+    fn the_vif_window_lease_can_map_and_retire_both_leaves() {
         assert!(
             crate::client::WINDOW_RIGHTS.contains(kore_abi::cap::Rights::DERIVE),
             "the row parents a CPU leaf and a device leaf from this one lease",
+        );
+        assert!(
+            crate::client::WINDOW_RIGHTS.contains(kore_abi::cap::Rights::REVOKE),
+            "the row tears down both leaves by revoking the sublease",
         );
     }
 

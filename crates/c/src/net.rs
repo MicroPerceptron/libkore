@@ -23,7 +23,7 @@ use kore_std::runtime::transport::TrapTransport;
 use kore_std::runtime::{clock, executor::sleep_for};
 use kore_svc_mm::{MmClient, client::ProcessMm};
 use kore_svc_net::client::{ProcessNet, WINDOW_RIGHTS, attach_process_face, format_window};
-use kore_svc_net::window::WINDOW_BYTES;
+use kore_svc_net::window::{WINDOW_BYTES, WINDOW_LEASE_BYTES};
 use kore_svc_net::{EtherType, EtherTypeMatch, FrameFilter, NetRefusal, NetRequest, NetResponse};
 
 use crate::api::KoreNetStatus as Status;
@@ -281,11 +281,11 @@ impl Window {
         filter: FrameFilter,
     ) -> Result<(Self, VifId, MacAddr), WindowOpenError> {
         use WindowOpenError::{Indeterminate, Refused, Resource};
-        let (_, lease) = memory.client.supply(WINDOW_BYTES as u64).await;
+        let (_, lease) = memory.client.supply(WINDOW_LEASE_BYTES as u64).await;
         let lease = lease.ok_or(Resource)?;
         let slot = lease.slot().ok_or(Resource)?;
         let mut view = verbs::map_owned_lease_rw(slot).ok_or(Resource)?;
-        if view.len() < WINDOW_BYTES {
+        if view.len() < WINDOW_LEASE_BYTES {
             return Err(Resource);
         }
         // SAFETY: the lease has not been shared with the service yet.
@@ -296,7 +296,7 @@ impl Window {
         match network
             .client
             .open_vif_staged(filter, |stage| {
-                stage.sublease(lease, WINDOW_RIGHTS, 0, WINDOW_BYTES as u64)
+                stage.sublease(lease, WINDOW_RIGHTS, 0, WINDOW_LEASE_BYTES as u64)
             })
             .await
         {

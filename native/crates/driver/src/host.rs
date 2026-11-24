@@ -52,7 +52,7 @@ use kore_rt::service::{
 };
 
 use crate::net::MAX_VIFS;
-use crate::net::window::WINDOW_BYTES;
+use crate::net::window::WINDOW_LEASE_BYTES;
 use crate::seam::{
     Dma, DmaPool, DmaReleaseFailure, Quiet, Regs, Regs64, RegsNarrow, RegsRegion, RegsWindowError,
 };
@@ -143,12 +143,12 @@ pub const DMA_GROWTH_ALIGN: u64 = 2 << 20;
 /// [`DMA_GROWTH_ALIGN`].
 ///
 /// A vif arena is reserved whole rather than per-vif: `kore-svc-net`'s
-/// engine hands out [`WINDOW_BYTES`] strides from one base, so what a
+/// engine hands out [`WINDOW_LEASE_BYTES`] strides from one base, so what a
 /// placement has to guarantee is that *every* stride is reachable and clear
 /// of the pool — a fact about the whole span, not about the first window.
 /// At [`MAX_VIFS`] × ~132 KiB this is a single 2 MiB block.
 pub const VIF_ARENA_BYTES: u64 = {
-    let raw = (MAX_VIFS * WINDOW_BYTES) as u64;
+    let raw = (MAX_VIFS * WINDOW_LEASE_BYTES) as u64;
     (raw + (DMA_GROWTH_ALIGN - 1)) & !(DMA_GROWTH_ALIGN - 1)
 };
 
@@ -3768,15 +3768,15 @@ mod tests {
     #[test]
     fn a_narrow_master_reaches_its_last_vif_window() {
         let base = vif_iova_base(32, 0x20_0000).expect("a 32-bit master must get an arena");
-        let last = base + ((MAX_VIFS - 1) * WINDOW_BYTES) as u64 + WINDOW_BYTES as u64 - 1;
+        let last = base + (MAX_VIFS * WINDOW_LEASE_BYTES) as u64 - 1;
         assert!(
             last <= dma_iova_ceiling(32),
             "the last vif's last byte {last:#x} is past a 32-bit master's ceiling"
         );
         for ordinal in 0..MAX_VIFS {
-            let window = base + (ordinal * WINDOW_BYTES) as u64;
+            let window = base + (ordinal * WINDOW_LEASE_BYTES) as u64;
             assert!(
-                within_dma_reach(window, WINDOW_BYTES as u64, 32),
+                within_dma_reach(window, WINDOW_LEASE_BYTES as u64, 32),
                 "vif {ordinal} at {window:#x} is not an address a 32-bit master can emit"
             );
         }

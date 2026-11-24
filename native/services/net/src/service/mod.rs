@@ -37,7 +37,7 @@ use kore_abi::session::{Notice, SlotRef};
 use kore_driver::net::flow::{IpProto, Ipv4Addr};
 use kore_driver::net::window::{
     FRAME_AREA_BYTES, MAX_RX_FANOUT, RX_AREA_AT, RX_DEPTH, RX_RING_AT, SLOT_BYTES, TX_AREA_AT,
-    TX_DEPTH, WINDOW_BYTES, rx_frame_at, rx_slot_of, tx_frame_at,
+    TX_DEPTH, WINDOW_BYTES, WINDOW_LEASE_BYTES, rx_frame_at, rx_slot_of, tx_frame_at,
 };
 use kore_driver::net::{
     EtherType, FRAME_MAX, FRAME_MIN, FrameDesc, FrameFilter, FrameHead, LinkState, MAX_VIFS,
@@ -84,7 +84,7 @@ pub const RX_BATCH: u32 = 64;
 const TX_REAP: usize = 16;
 
 /// The device-address plan's stride: vif *ordinal* `n` is proposed at
-/// `base + n * WINDOW_BYTES`, where `base` is
+/// `base + n * WINDOW_LEASE_BYTES`, where `base` is
 /// [`vif_iova_base`](kore_driver::host::vif_iova_base) of the hosted
 /// device's own reach and pool span.
 ///
@@ -105,7 +105,7 @@ const TX_REAP: usize = 16;
 /// returns, the arena it reserved has to hold every stride this engine
 /// hands out.
 const _: () = assert!(
-    (MAX_VIFS * WINDOW_BYTES) as u64 <= kore_driver::host::VIF_ARENA_BYTES,
+    (MAX_VIFS * WINDOW_LEASE_BYTES) as u64 <= kore_driver::host::VIF_ARENA_BYTES,
     "the vif arena must hold every ordinal's window"
 );
 
@@ -1500,7 +1500,7 @@ impl<H: NetHost> NetService<H> {
         self.ordinals[ordinal] = true;
         Some((
             ordinal as u8,
-            IovaAddr(base + (ordinal * WINDOW_BYTES) as u64),
+            IovaAddr(base + (ordinal * WINDOW_LEASE_BYTES) as u64),
         ))
     }
 
@@ -4147,16 +4147,19 @@ mod tests {
                 open(&mut svc, 0, FrameFilter::protocol(EtherType::ARP)).unwrap_err(),
                 NetRefusal::PolicyVifs
             );
+            for base in &bases {
+                assert_eq!(base % 4096, 0, "{bits}-bit: vif IOVA is unaligned");
+            }
             for pair in bases.windows(2) {
                 assert!(
-                    pair[1] - pair[0] >= WINDOW_BYTES as u64,
+                    pair[1] - pair[0] >= WINDOW_LEASE_BYTES as u64,
                     "{bits}-bit: adjacent vif windows overlap"
                 );
             }
             if pool_bytes > 0 {
                 let pool_base =
                     kore_driver::host::dma_iova_base(bits, pool_bytes).expect("a pool placement");
-                let last = bases[MAX_VIFS - 1] + WINDOW_BYTES as u64 - 1;
+                let last = bases[MAX_VIFS - 1] + WINDOW_LEASE_BYTES as u64 - 1;
                 assert!(
                     bases[0] >= pool_base + pool_bytes || last < pool_base,
                     "{bits}-bit: the vif arena [{:#x}, {last:#x}] runs through the \
@@ -4187,7 +4190,7 @@ mod tests {
         let mut svc = service(host, MAX_VIFS as u8);
         let bases = exhaust_the_address_plan(&mut svc);
         for (ordinal, base) in bases.iter().enumerate() {
-            let last = base + WINDOW_BYTES as u64 - 1;
+            let last = base + WINDOW_LEASE_BYTES as u64 - 1;
             assert!(
                 last <= ceiling,
                 "vif {ordinal} ends at {last:#x}, past a {bits}-bit master's \

@@ -51,14 +51,9 @@ use crate::wire::NetWire;
 /// fetches them through. Both name the same frames; that identity is what
 /// "zero-copy" means here, and only a lease that can be derived parents both.
 ///
-/// **This is the single definition, and it is the contract both halves obey.**
-/// It was previously spelled twice -- here without `DERIVE`, and in
-/// [`crate::metal`] with it -- while the service's `RETURN_MODE` names its
-/// `minimum_rights` as the `metal` spelling. The kernel refuses a retained
-/// delivery below that minimum, so every real client's `OpenVif` was refused
-/// at the return post, and only the row's own self-test -- whose windows come
-/// from the row's own pool rather than a transfer -- ever worked. The two
-/// spellings are now one so they cannot drift again (#1194).
+/// The service maps the window read/write with `ACCESS | MODIFY`, installs
+/// its DMA mapping with `DERIVE`, and reaps both mappings with `REVOKE`
+/// when the vif closes. These rights cover only the transferred sublease.
 ///
 /// A client's supply lease can meet this: `MmClient::supply` hands back
 /// `SUPPLY_RIGHTS` (`ACCESS | MODIFY | DERIVE | REVOKE`,
@@ -66,7 +61,8 @@ use crate::wire::NetWire;
 /// rather than being refused one layer further down.
 pub const WINDOW_RIGHTS: Rights = Rights::ACCESS
     .union(Rights::MODIFY)
-    .union(Rights::DERIVE);
+    .union(Rights::DERIVE)
+    .union(Rights::REVOKE);
 
 /// **Format a vif window before transferring it.**
 ///
