@@ -1,0 +1,12 @@
+[package]
+name = "axshader"
+version = "0.1.0"
+edition = "2024"
+description = "Host-side WGSL compiler for allocator-owned .ax shader graphs"
+
+[dependencies]
+ax = { path = "../ax" }
+naga = { version = "30.0.1", default-features = false, features = ["wgsl-in"] }
+
+[dev-dependencies]
+ax = { path = "../ax", features = ["kernel-lowering"] }

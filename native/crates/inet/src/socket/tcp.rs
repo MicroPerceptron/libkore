@@ -33,6 +33,7 @@ use core::task::Poll;
 use kore_driver::net::flow::{IpProto, Ipv4Addr};
 
 use crate::flow::FlowCap;
+use crate::netinet::tcp::TcpError;
 use crate::netinet::{TcpRow, TcpState, TcpStorage};
 
 use super::{FlowFace, SocketRefusal, admits, local_of, peer_of};
@@ -82,13 +83,23 @@ impl<'s, F: FlowFace> TcpStream<'s, F> {
         storage: TcpStorage<'s>,
         peer: (Ipv4Addr, u16),
     ) -> Result<Self, SocketRefusal> {
+        Self::open_with_seed(flow, storage, peer, 0)
+    }
+
+    /// Start a connection with a fresh seed from the caller's entropy source.
+    pub fn open_with_seed(
+        flow: F,
+        storage: TcpStorage<'s>,
+        peer: (Ipv4Addr, u16),
+        seed: u64,
+    ) -> Result<Self, SocketRefusal> {
         let local = local_of(flow.cap())?;
         if !admits(flow.cap(), IpProto::TCP, local, peer) {
             return Err(SocketRefusal::OutsideFlow);
         }
         let identity = *flow.identity();
         let now = flow.now_ms();
-        let mut row = TcpRow::new(flow, &identity, storage, now)?;
+        let mut row = TcpRow::with_seed(flow, &identity, storage, now, seed)?;
         row.connect(peer, local.1, now)?;
         Ok(Self {
             row,
@@ -162,12 +173,47 @@ impl<'s, F: FlowFace> TcpStream<'s, F> {
     pub async fn ready(&mut self) -> Result<(), SocketRefusal> {
         poll_fn(|cx| {
             self.sweep();
+            if self.row.may_send() {
+                return Poll::Ready(Ok(()));
+            }
             match establishment(self.row.state()) {
                 Some(verdict) => Poll::Ready(verdict),
                 None => {
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
+            }
+        })
+        .await
+    }
+
+    /// Wait for transmit room and queue one prefix of `data`.
+    ///
+    /// A pending poll has queued none of the caller's bytes, so a caller can
+    /// cancel the wait before retrying. On success, only the returned prefix
+    /// was accepted.
+    pub async fn write(&mut self, data: &[u8]) -> Result<usize, SocketRefusal> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        poll_fn(|cx| {
+            self.sweep();
+            if self.row.state() == TcpState::Closed {
+                return Poll::Ready(Err(SocketRefusal::Reset));
+            }
+            if !self.row.may_send() {
+                return Poll::Ready(Err(SocketRefusal::Closed));
+            }
+            match self.row.send(data) {
+                Ok(0) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Ok(n) => {
+                    self.sweep();
+                    Poll::Ready(Ok(n))
+                }
+                Err(error) => Poll::Ready(Err(error.into())),
             }
         })
         .await
@@ -245,28 +291,44 @@ impl<'s, F: FlowFace> TcpStream<'s, F> {
     /// has to reproduce; distinguishing it from "nothing yet" is what the
     /// await is for.
     pub async fn read(&mut self, out: &mut [u8]) -> Result<usize, SocketRefusal> {
+        if out.is_empty() {
+            return Ok(0);
+        }
         poll_fn(|cx| {
             self.sweep();
-            if self.row.may_recv() {
-                return match self.row.recv(out) {
-                    Ok(0) => {
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                    Ok(n) => Poll::Ready(Ok(n)),
-                    Err(e) => Poll::Ready(Err(SocketRefusal::Tcp(e))),
-                };
+            let receiving = self.row.may_recv();
+            match self.row.recv(out) {
+                Ok(0) if receiving => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Ok(n) => {
+                    self.sweep();
+                    Poll::Ready(Ok(n))
+                }
+                Err(TcpError::Refused) if self.row.state() == TcpState::Connecting => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Err(TcpError::Refused) => Poll::Ready(Err(SocketRefusal::Reset)),
+                Err(error) => Poll::Ready(Err(error.into())),
             }
-            // Not receivable and the peer has closed: end of stream, which is
-            // a value and not a refusal.
-            if self.row.peer_closed() {
-                return Poll::Ready(Ok(0));
+        })
+        .await
+    }
+
+    /// Send FIN after queued data and wait for its acknowledgement.
+    /// The caller may continue reading until the peer sends its own FIN.
+    pub async fn finish_write(&mut self) -> Result<(), SocketRefusal> {
+        self.row.close();
+        poll_fn(|cx| {
+            self.sweep();
+            if self.row.write_finished() {
+                Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
-            if self.row.state() == TcpState::Closed {
-                return Poll::Ready(Err(SocketRefusal::Reset));
-            }
-            cx.waker().wake_by_ref();
-            Poll::Pending
         })
         .await
     }

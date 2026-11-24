@@ -1,0 +1,22 @@
+[package]
+name = "axcomp"
+version = "0.1.0"
+edition = "2024"
+description = "Allocator-typed portable compositor runtime for Axiom"
+
+[dependencies]
+ax = { path = "../ax" }
+axgfx = { path = "../axgfx" }
+axinput = { path = "../axinput" }
+axmath = { path = "../axmath" }
+# Safe SIMD materialization kernels only (`axnn_cpu::raster`); the crate
+# stays `forbid(unsafe_code)` and never touches the backend arena.
+axnn-cpu = { path = "../axnn-cpu", default-features = false }
+axui-core = { path = "../axui-core" }
+
+[dev-dependencies]
+divan = "0.1"
+
+[[bench]]
+name = "pack"
+harness = false

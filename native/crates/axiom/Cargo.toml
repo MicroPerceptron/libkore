@@ -1,0 +1,36 @@
+[package]
+name = "kore-axiom"
+version = "0.0.1"
+edition = "2024"
+description = "allocator-threaded Axiom graph adapter for Kore composition"
+publish = false
+
+[features]
+qwen-prefill16-native = ["kore-xe-kernels/qwen-prefill16-native"]
+
+[dependencies]
+kore-xe-kernels = { path = "../xe-kernels" }
+kore-window = { path = "../window", default-features = false }
+ax-exec = { path = "../../vendor/axiom/crates/ax-exec", default-features = false }
+axboot = { path = "../../vendor/axiom/crates/axboot" }
+kore-rt = { path = "../rt", default-features = false }
+ax = { path = "../../vendor/axiom/crates/ax", features = ["kernel-lowering"] }
+axnn = { path = "../../vendor/axiom/crates/axnn", default-features = false }
+axnn-cpu = { path = "../../vendor/axiom/crates/axnn-cpu", default-features = false }
+axrd = { path = "../../vendor/axiom/crates/axrd", default-features = false, features = ["graph"] }
+axinput = { path = "../../vendor/axiom/crates/axinput", features = ["acceleration"] }
+axcomp = { path = "../../vendor/axiom/crates/axcomp", default-features = false }
+axgfx = { path = "../../vendor/axiom/crates/axgfx", default-features = false }
+kore-abi = { path = "../abi" }
+kore-svc-accel = { path = "../../services/accel" }
+blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
+embedded-bitmap-fonts = { path = "../../vendor/embedded-bitmap-fonts", default-features = false, features = ["terminus"] }
+core_maths = "0.1.1"
+
+[build-dependencies]
+kore-window = { path = "../window", default-features = false }
+ax = { path = "../../vendor/axiom/crates/ax", features = ["kernel-lowering"] }
+axshader = { path = "../../vendor/axiom/crates/axshader" }
+
+[dev-dependencies]
+kore-rt = { path = "../rt", features = ["std"] }

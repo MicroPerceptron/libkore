@@ -282,7 +282,7 @@ fn a_tcp_connection_handshakes_echoes_and_closes_both_ways() {
         ),
         TcpStorage {
             rx: &mut rx_a,
-            tx: &mut tx_a,
+            tx: &mut tx_a[..256],
             sockets: &mut sock_a,
             scratch: &mut smol_a.0,
         },
@@ -395,6 +395,42 @@ fn a_tcp_connection_handshakes_echoes_and_closes_both_ways() {
     assert_eq!(&at_server[..MESSAGE.len()], MESSAGE);
     assert_eq!(client_read, Some(MESSAGE.len()), "the echo came back");
     assert_eq!(&at_client[..MESSAGE.len()], MESSAGE);
+
+    // A send queues one prefix, and a FIN follows the accepted bytes.
+    assert_eq!(step(client.read(&mut [])), Some(Ok(0)));
+    let bulk = [0x5a; 4096];
+    assert_eq!(step(client.write(&bulk)), Some(Ok(256)));
+    link.pump(client.flow_mut().ifnet_mut(), server.flow_mut().ifnet_mut());
+    let mut received = [0u8; 256];
+    let mut read = 0;
+    let mut client_finished = false;
+    let mut server_eof = false;
+    for _ in 0..TURNS {
+        clock += TICK_MS;
+        client.flow_mut().set_now_ms(clock);
+        server.flow_mut().set_now_ms(clock);
+
+        if !client_finished && let Some(result) = step(client.finish_write()) {
+            result.expect("the client FIN was acknowledged");
+            client_finished = true;
+        }
+        let mut chunk = [0u8; 31];
+        if !server_eof && let Some(result) = step(server.stream().read(&mut chunk)) {
+            let n = result.expect("the server drained data before EOF");
+            received[read..read + n].copy_from_slice(&chunk[..n]);
+            read += n;
+            server_eof = n == 0;
+        } else {
+            server.sweep();
+        }
+        link.pump(client.flow_mut().ifnet_mut(), server.flow_mut().ifnet_mut());
+        if client_finished && server_eof {
+            break;
+        }
+    }
+    assert!(client_finished && server_eof);
+    assert_eq!(read, received.len());
+    assert_eq!(received, bulk[..read]);
 
     // ── the close, FIN both ways ────────────────────────────────────────
     let mut client_closed = false;

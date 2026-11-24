@@ -1,0 +1,26 @@
+[package]
+name = "kore-i2c-hid"
+version = "0.0.1"
+edition = "2024"
+description = "HID-over-I2C (the Microsoft protocol): descriptor decode, the bring-up state machine, input framing, and a parse-once report-descriptor extraction table. Transport-generic over the kore-i2c bus trait, so one implementation serves every controller IP."
+publish = false
+
+[dependencies]
+# The narrow bus trait only — never a controller crate. This dependency
+# edge is what makes the same protocol serve Intel, AMD, and Qualcomm.
+kore-i2c = { path = "../i2c" }
+# `InputReport` and its kinds: this crate's whole output.
+kore-abi = { path = "../../crates/abi" }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+# Report-descriptor parsing, used **once** per device at bring-up and
+# never on the hot path. no_std with `default-features = false`; MIT.
+# Optional because it needs `alloc` against a global allocator, which
+# userland services have and the kernel deliberately does not.
+hidreport = { version = "0.6", default-features = false, optional = true }
+
+[dev-dependencies]
+kore-i2c = { path = "../i2c", features = ["mock"] }
+
+[features]
+# Report-descriptor parsing (`parse::build_table`). Userland only.
+alloc = ["dep:hidreport"]

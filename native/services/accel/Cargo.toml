@@ -1,0 +1,34 @@
+[package]
+name = "kore-svc-accel"
+version = "0.0.1"
+edition = "2024"
+description = "kore accelerator service: the AccelRequest class protocol (virtio-accel 1.0 semantics over kore pair rings) and the Accelerator-backend host every NPU/GPU/CPU row instantiates."
+publish = false
+
+[dependencies]
+kore-driver = { path = "../../crates/driver", features = ["accel"] }
+kore-abi = { path = "../../crates/abi" }
+kore-rt = { path = "../../crates/rt" }
+# Submit bindings are wire-bounded; transient validation lists stay inline
+# rather than allocating after the provider-facing admission path begins.
+heapless = { version = "0.9.3", default-features = false }
+# The frozen accelerator contracts (MicroPerceptron/virtio-accel, protocol
+# 1.0): `virtio-accel-core` is the transport-independent backend seam every
+# accelerator implements (the `Accelerator` trait + descriptor/validation
+# vocabulary); `virtio-accel-device` is the object-lifecycle engine this
+# host runs (kind-tagged generational ids, per-context child accounting,
+# two-phase release).  Published crates — the #266 vendoring flipped to the
+# registry on their public release, as that PR recorded it would.
+virtio-accel-core = { version = "=0.4.1", default-features = false }
+virtio-accel-device = { version = "=0.4.1", default-features = false }
+# The wire records' little-endian field types (the same substrate the
+# frozen `kore-abi` forms are built from).
+zerocopy = { version = "0.8", default-features = false }
+
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }
+# The reference backend and the frozen semantic conformance suite — the
+# in-tree oracle: the suite exercises any `Accelerator` impl, so it gates
+# this host's seam today (mock) and each hardware backend later (ivpu).
+virtio-accel-mock = "=0.4.1"
+virtio-accel-conformance = "=0.4.1"

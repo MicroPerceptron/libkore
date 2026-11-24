@@ -387,27 +387,32 @@ pub struct OutputEndowment {
     pub device: kore_rt::cap::DeviceToken,
 }
 
+/// The founding selector the output row claims: a 16550-family PCI serial
+/// card whose registers sit in a **memory** BAR0, polled (no IRQ, no DMA).
+/// Required: a line with no port is a line that cannot carry a byte.
+///
+/// Not QEMU's `-device pci-serial`: that card decodes through an I/O BAR,
+/// which the kernel's PCI inventory does not grant (it models memory BARs
+/// only), so it never matches.  The headless image's serial row claims a
+/// firmware-described COM port instead ([`crate::serial::COM_PORT`]).
+pub const PCI_SERIAL: &[kore_rt::service::DeviceRequest] = &[kore_rt::service::DeviceRequest {
+    selector: kore_rt::service::DeviceSelector::Pci(kore_rt::service::PciSelector {
+        class: 0x07,
+        subclass: 0x00,
+        progif: 0x02,
+        identity: kore_rt::service::PciIdentitySelector::ANY,
+        bars: kore_rt::service::PciBarMask::BAR0,
+        dma: false,
+        interrupts: kore_rt::service::PciInterruptRequirement::None,
+    }),
+    required: true,
+}];
+
 impl SystemService for OutputService<UartBackend> {
     const NAME: &'static str = "output";
     type Endowment = OutputEndowment;
 
-    /// The founding selector: a 16550-family PCI serial card (QEMU
-    /// `-device pci-serial`) — registers over BAR0, polled (no IRQ, no DMA).
-    /// Required: an output service with no port is a service that cannot
-    /// output.
-    const DEVICES: &'static [kore_rt::service::DeviceRequest] =
-        &[kore_rt::service::DeviceRequest {
-            selector: kore_rt::service::DeviceSelector::Pci(kore_rt::service::PciSelector {
-                class: 0x07,
-                subclass: 0x00,
-                progif: 0x02,
-                identity: kore_rt::service::PciIdentitySelector::ANY,
-                bars: kore_rt::service::PciBarMask::BAR0,
-                dma: false,
-                interrupts: kore_rt::service::PciInterruptRequirement::None,
-            }),
-            required: true,
-        }];
+    const DEVICES: &'static [kore_rt::service::DeviceRequest] = PCI_SERIAL;
 
     /// A polled 16550: no DMA, no route.  Nothing to stop on the way down.
     const DEVICE_CLASSES: &'static [kore_rt::service::DeviceClass] =
@@ -472,15 +477,52 @@ fn tx_pause() {
     let _ = kore_rt::hint::pause_until(kore_rt::pace::PROBE_PAUSE);
 }
 
-/// The v1 metal backend: a 16550-family UART over a mapped PCI-serial
-/// BAR (QEMU `-device pci-serial`: BAR0, 32 bytes, stride 1), built on
-/// `kore-uart`'s register logic.  Bytes are written verbatim — no CRLF
-/// expansion, no line discipline (`res/USERLAND.md` §5.9: opaque bytes).
-/// A failed bounded wait leaves the byte unconsumed, so a stalled UART
-/// cannot silently advance the queue cursor.
+/// The metal backend: a 16550-family UART (stride 1), built on
+/// `kore-uart`'s register logic, over either register block a 16550 comes
+/// with — a PCI card's memory BAR or a COM port's I/O ports.  Bytes are
+/// written verbatim — no CRLF expansion, no line discipline
+/// (`res/USERLAND.md` §5.9: opaque bytes).  A failed bounded wait leaves the
+/// byte unconsumed, so a stalled UART cannot silently advance the queue
+/// cursor.
 pub struct UartBackend {
-    window: Option<kore_rt::cap::BarWindow>,
+    line: Line,
     uart: kore_uart::Uart16550,
+    /// The claim the registers derive from, when this backend owns it (a
+    /// driver row's broker claim): declared after [`line`](Self::line) so
+    /// the mapping or grant goes first, and kept exactly as long as the line.
+    device: Option<Claim>,
+}
+
+/// Where a [`UartBackend`]'s registers are.
+enum Line {
+    /// Nothing claimed, or the claim's registers did not materialize.
+    Offline,
+    /// A PCI card's memory BAR, mapped for the task's life.
+    Bar(
+        #[cfg_attr(
+            not(target_os = "none"),
+            expect(dead_code, reason = "read by the metal register adapter")
+        )]
+        kore_rt::cap::BarWindow,
+    ),
+    /// A COM port's eight I/O ports from `base`, admitted to this task by
+    /// its own grant (x86; the grant is uninhabitable elsewhere).
+    #[cfg_attr(
+        not(target_os = "none"),
+        expect(dead_code, reason = "read by the metal register adapter")
+    )]
+    Ports {
+        grant: kore_rt::cap::PortGrant,
+        base: u16,
+    },
+}
+
+/// The broker claim a line's registers derive from.
+enum Claim {
+    Pci(#[expect(dead_code, reason = "held for the BAR mapping's life")] kore_rt::cap::DeviceToken),
+    Platform(
+        #[expect(dead_code, reason = "held for the port grant's life")] kore_rt::cap::PlatformToken,
+    ),
 }
 
 impl UartBackend {
@@ -489,10 +531,50 @@ impl UartBackend {
     /// every `put` is a counted stall (observable via `consumed`), never
     /// a panic at bind.
     pub fn from_device(device: &kore_rt::cap::DeviceToken) -> Self {
-        let window = kore_rt::cap::verbs::map_bar(device, 0).ok();
+        let line = match kore_rt::cap::verbs::map_bar(device, 0) {
+            Ok(window) => Line::Bar(window),
+            Err(_) => Line::Offline,
+        };
         Self {
-            window,
+            line,
             uart: kore_uart::Uart16550::new(1),
+            device: None,
+        }
+    }
+
+    /// Map BAR0 of a function this row claimed from the device broker and
+    /// keep the claim (`res/DEVICE_SERVICE.md` §10: a driver row claims its
+    /// hardware at runtime; the founder endows no device).
+    pub fn adopt(device: kore_rt::cap::DeviceToken) -> Self {
+        let mut backend = Self::from_device(&device);
+        backend.device = Some(Claim::Pci(device));
+        backend
+    }
+
+    /// Take the I/O ports of a COM port this row claimed from the device
+    /// broker, its registers starting at `base` (the firmware's `_CRS`, read
+    /// from the claim's record), and keep the claim.  The grant admits this
+    /// task's `IN`/`OUT` to exactly the ports firmware declared, so it must
+    /// be taken by the task that drives the line.
+    pub fn adopt_ports(device: kore_rt::cap::PlatformToken, base: u16) -> Self {
+        let line = match kore_rt::cap::verbs::claim_ports(&device) {
+            Some(grant) => Line::Ports { grant, base },
+            None => Line::Offline,
+        };
+        Self {
+            line,
+            uart: kore_uart::Uart16550::new(1),
+            device: Some(Claim::Platform(device)),
+        }
+    }
+
+    /// A backend with no line: every byte is a counted stall, nothing is
+    /// ever received.  What a row binds before (or without) its claim.
+    pub fn offline() -> Self {
+        Self {
+            line: Line::Offline,
+            uart: kore_uart::Uart16550::new(1),
+            device: None,
         }
     }
 
@@ -500,55 +582,102 @@ impl UartBackend {
     #[cfg(test)]
     pub fn over_window(window: kore_rt::cap::BarWindow) -> Self {
         Self {
-            window: Some(window),
+            line: Line::Bar(window),
             uart: kore_uart::Uart16550::new(1),
+            device: None,
         }
     }
 
-    /// Whether the register window materialized (the device was found and
-    /// its BAR mapped) — [`start_on_metal`](SystemService::start_on_metal)'s
+    /// Whether the registers materialized (the BAR mapped, or the ports
+    /// were granted) — [`start_on_metal`](SystemService::start_on_metal)'s
     /// fail-closed gate.
     pub fn online(&self) -> bool {
-        self.window.is_some()
+        !matches!(self.line, Line::Offline)
+    }
+
+    /// The 16550's registers, whichever block they are in.
+    #[cfg(target_os = "none")]
+    fn regs(&self) -> Option<Regs<'_>> {
+        match &self.line {
+            Line::Offline => None,
+            Line::Bar(window) => Some(Regs::Mmio(window.base())),
+            Line::Ports { grant, base } => Some(Regs::Ports(grant, *base)),
+        }
+    }
+}
+
+/// The 16550's registers — one adapter for both directions of
+/// [`UartBackend`], over whichever block the line has.
+#[cfg(target_os = "none")]
+enum Regs<'a> {
+    /// The mapped BAR window's base.
+    Mmio(*mut u8),
+    /// The port grant and the first register's port.
+    Ports(&'a kore_rt::cap::PortGrant, u16),
+}
+
+#[cfg(target_os = "none")]
+impl kore_uart::RegisterAccess for Regs<'_> {
+    fn read8(&self, offset: usize) -> u8 {
+        match *self {
+            // SAFETY: the BAR window is mapped for the task's lifetime and
+            // offset comes from the 16550's 8-register layout.
+            Regs::Mmio(base) => unsafe { base.add(offset).read_volatile() },
+            // A register outside the grant (it covers the eight firmware
+            // declared) faults this thread rather than reaching a port it
+            // does not hold.
+            Regs::Ports(grant, base) => grant.read8(base.wrapping_add(offset as u16)),
+        }
+    }
+    fn write8(&self, offset: usize, value: u8) {
+        match *self {
+            // SAFETY: as above.
+            Regs::Mmio(base) => unsafe { base.add(offset).write_volatile(value) },
+            Regs::Ports(grant, base) => grant.write8(base.wrapping_add(offset as u16), value),
+        }
+    }
+    fn read32(&self, offset: usize) -> u32 {
+        match *self {
+            // SAFETY: as above; the access is a genuine 32-bit load at the
+            // byte offset (the RegisterAccess contract — a byte widen would
+            // break any 32-bit-register backend, e.g. PL011/SBSA).
+            Regs::Mmio(base) => unsafe { (base.add(offset) as *const u32).read_volatile() },
+            // A COM port's registers are bytes and the stride-1 16550 never
+            // asks for a dword; were one asked, the byte is all there is.
+            Regs::Ports(..) => u32::from(self.read8(offset)),
+        }
+    }
+    fn write32(&self, offset: usize, value: u32) {
+        match *self {
+            // SAFETY: as above (a genuine 32-bit store).
+            Regs::Mmio(base) => unsafe { (base.add(offset) as *mut u32).write_volatile(value) },
+            Regs::Ports(..) => self.write8(offset, value as u8),
+        }
+    }
+}
+
+impl UartBackend {
+    /// The next received byte, if the line holds one — the serial row's
+    /// receive side ([`crate::serial`]).  No window means nothing received.
+    #[cfg(target_os = "none")]
+    pub fn get(&mut self) -> Option<u8> {
+        use kore_uart::Uart;
+        let regs = self.regs()?;
+        self.uart.rx_ready(&regs).then(|| self.uart.rx_byte(&regs))
+    }
+
+    /// Off the userland target the UART is inert (`res/USERLAND.md` §2.1).
+    #[cfg(not(target_os = "none"))]
+    pub fn get(&mut self) -> Option<u8> {
+        None
     }
 }
 
 impl Backend for UartBackend {
     #[cfg(target_os = "none")]
     fn put(&mut self, byte: u8) -> bool {
-        use kore_uart::RegisterAccess;
-
-        struct Mmio {
-            base: *mut u8,
-        }
-        impl RegisterAccess for Mmio {
-            fn read8(&self, offset: usize) -> u8 {
-                // SAFETY: the BAR window is mapped for the task's lifetime
-                // and offset comes from the 16550's 8-register layout.
-                unsafe { self.base.add(offset).read_volatile() }
-            }
-            fn write8(&self, offset: usize, value: u8) {
-                // SAFETY: as above.
-                unsafe { self.base.add(offset).write_volatile(value) }
-            }
-            fn read32(&self, offset: usize) -> u32 {
-                // SAFETY: as above; the access is a genuine 32-bit load at
-                // the byte offset (the RegisterAccess contract — a byte
-                // widen would break any 32-bit-register backend, e.g.
-                // PL011/SBSA).
-                unsafe { (self.base.add(offset) as *const u32).read_volatile() }
-            }
-            fn write32(&self, offset: usize, value: u32) {
-                // SAFETY: as above (a genuine 32-bit store).
-                unsafe { (self.base.add(offset) as *mut u32).write_volatile(value) }
-            }
-        }
-
-        let Some(window) = &self.window else {
+        let Some(regs) = self.regs() else {
             return false; // counted stall: consumed does not advance
-        };
-        let regs = Mmio {
-            base: window.base(),
         };
         // Share the bounded poll with both kernel console paths. A lost
         // clock refuses this byte too; the queue keeps it unconsumed.

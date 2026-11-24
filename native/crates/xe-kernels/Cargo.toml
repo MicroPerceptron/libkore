@@ -1,0 +1,14 @@
+[package]
+name = "kore-xe-kernels"
+version = "0.0.1"
+edition = "2024"
+description = "Generation-transparent, precompiled Xe kernel catalog for Kore accelerator clients"
+publish = false
+
+[features]
+# Every referenced M16 family must be sealed before this can compile.
+qwen-prefill16-native = []
+
+[dependencies]
+kore-driver = { path = "../driver", features = ["accel"] }
+virtio-accel-core = { version = "=0.4.1", default-features = false }

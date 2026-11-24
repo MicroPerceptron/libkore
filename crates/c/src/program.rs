@@ -606,7 +606,11 @@ async fn host(
         // Armed before the recheck `park` makes, so a writer that published
         // meanwhile either kicks or is seen.
         crate::stdio::arm();
-        park(&mut wake, || pending() || crate::stdio::pending()).await?;
+        let tcp_tick = network.has_tcp().then_some(1_000_000);
+        park(&mut wake, || pending() || crate::stdio::pending(), tcp_tick).await?;
+        if tcp_tick.is_some() {
+            network.sweep_tcp().await;
+        }
     }
 }
 
@@ -637,6 +641,7 @@ const WOULD_BLOCK_RETRY_NS: u64 = 100_000;
 async fn park(
     wake: &mut NoticeRx<'_, TrapTransport>,
     ready: impl Fn() -> bool,
+    backstop_ns: Option<u64>,
 ) -> Result<(), Fatal> {
     loop {
         match wake.try_recv() {
@@ -648,6 +653,10 @@ async fn park(
                 let Some(post) = wake.standing_post() else {
                     return Err(Fatal);
                 };
+                if let Some(delta) = backstop_ns {
+                    let _ = executor::next_wake_on_for(post, delta).await;
+                    return Ok(());
+                }
                 let _ = executor::next_wake_on(post).await;
             }
             Err(RecvError::Refused(Status::WouldBlock)) => {
@@ -655,6 +664,9 @@ async fn park(
                 // tree's other receivers do, rather than wait for a wake
                 // nothing armed.
                 let _ = executor::next_wake_for(WOULD_BLOCK_RETRY_NS).await;
+                if backstop_ns.is_some() {
+                    return Ok(());
+                }
             }
             Err(_) => return Err(Fatal),
         }
@@ -687,9 +699,11 @@ async fn until_exit(
             continue;
         }
         crate::stdio::arm();
-        if park(wake, || {
-            ended() || crate::stdio::pending() || crate::mmap::posted()
-        })
+        if park(
+            wake,
+            || ended() || crate::stdio::pending() || crate::mmap::posted(),
+            None,
+        )
         .await
         .is_err()
         {

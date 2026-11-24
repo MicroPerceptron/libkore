@@ -2310,6 +2310,57 @@ impl InputReport {
     /// expressible rather than unsupported.
     pub const KIND_CONTACT: u8 = 3;
 
+    /// A run of **text** from a byte-oriented source — a serial line
+    /// (`res/IMAGE_PROFILES.md` §4.3), and the shape a paste or an input
+    /// method's commit would take.
+    ///
+    /// Distinct from [`KIND_KEYBOARD`](Self::KIND_KEYBOARD) because a byte
+    /// source has no key matrix: synthesizing usage codes from bytes would
+    /// round-trip text through a keymap that cannot express most of it, and
+    /// lose every escape sequence on the way.  `state` is the byte count
+    /// (`1..=`[`TEXT_BYTES`](Self::TEXT_BYTES)); the bytes fill `data` and
+    /// then `reserved`.  Control bytes ride as themselves (CR, DEL, ETX, an
+    /// ESC sequence split across reports); interpreting them is the line
+    /// discipline's job, as it is for a keyboard's chords.
+    pub const KIND_TEXT: u8 = 4;
+    /// The most bytes one [`KIND_TEXT`](Self::KIND_TEXT) report carries:
+    /// all of `data` and `reserved`.
+    pub const TEXT_BYTES: usize = 13;
+
+    /// A text report carrying `bytes` (1 to [`TEXT_BYTES`](Self::TEXT_BYTES)
+    /// of them), or `None` for an empty or oversized run.
+    pub fn text(source: u8, bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > Self::TEXT_BYTES {
+            return None;
+        }
+        let mut payload = [0u8; Self::TEXT_BYTES];
+        payload[..bytes.len()].copy_from_slice(bytes);
+        let mut data = [0u8; 6];
+        let mut reserved = [0u8; 7];
+        data.copy_from_slice(&payload[..6]);
+        reserved.copy_from_slice(&payload[6..]);
+        Some(Self {
+            kind: Self::KIND_TEXT,
+            source,
+            state: bytes.len() as u8,
+            data,
+            reserved,
+        })
+    }
+
+    /// A text report's bytes and how many are live — `None` for any other
+    /// kind or an out-of-range count (the untrusted window's refusal).
+    pub fn text_bytes(&self) -> Option<([u8; Self::TEXT_BYTES], usize)> {
+        let len = usize::from(self.state);
+        if self.kind != Self::KIND_TEXT || len == 0 || len > Self::TEXT_BYTES {
+            return None;
+        }
+        let mut payload = [0u8; Self::TEXT_BYTES];
+        payload[..6].copy_from_slice(&self.data);
+        payload[6..].copy_from_slice(&self.reserved);
+        Some((payload, len))
+    }
+
     /// [`KIND_CONTACT`](Self::KIND_CONTACT) `state`: the tip switch —
     /// the contact is actually touching the surface, not merely hovering
     /// in range.
@@ -2475,6 +2526,23 @@ impl InputReqWire {
     /// source identity (below 256), `subscription` the lock state's
     /// [`Locks`](crate::keyboard::Locks) bits; `focus` and `reserved` zero.
     pub const OP_SET_INDICATORS: u8 = 6;
+    /// `InputRequest::Transmit` — bytes for the device to show, carried
+    /// INLINE: `focus` is the count (`1..=`[`TRANSMIT_BYTES`]), and the
+    /// bytes fill `reserved`, then `slot`, then `subscription`, in order.
+    /// Only a source that can show text (a serial line) serves it; others
+    /// refuse `REFUSE_UNSUPPORTED`.
+    ///
+    /// Inline rather than a shared queue because the client that sends it
+    /// (the headless console, `res/IMAGE_PROFILES.md` §4.3) reaches the
+    /// serial row over a declared extra pair, which the founder stages
+    /// without a return post, so no queue window can be delivered.  A
+    /// console's volume is a line at a time; the record size is unchanged.
+    ///
+    /// [`TRANSMIT_BYTES`]: Self::TRANSMIT_BYTES
+    pub const OP_TRANSMIT: u8 = 7;
+    /// The most bytes one `Transmit` carries: `reserved`, `slot` and
+    /// `subscription`, 2 + 4 + 4.
+    pub const TRANSMIT_BYTES: usize = 10;
 
     /// `SetFocus`: steer subsequent reports to nobody.
     pub const FOCUS_NONE: u8 = 0;
@@ -2556,6 +2624,10 @@ impl InputRepWire {
     pub const TAG_STATUS: u8 = 5;
     /// `InputResponse::Indicated` — the indicator state was recorded.
     pub const TAG_INDICATED: u8 = 7;
+    /// `InputResponse::Transmitted` — `subscription` carries how many of
+    /// the request's bytes the device accepted (a stalled line takes fewer;
+    /// the client sends the rest again).
+    pub const TAG_TRANSMITTED: u8 = 8;
 
     /// `InputRefusal::BadQueue` — the delivered slot was absent,
     /// non-writable, or not a well-formed report ring.
@@ -2568,6 +2640,9 @@ impl InputRepWire {
     /// `InputRefusal::Denied` — the endpoint lacks the authority for the
     /// verb (an ordinary subscriber attempting `SetFocus`, §5.8).
     pub const REFUSE_DENIED: u8 = 4;
+    /// `InputRefusal::Unsupported` — this source has no such side (a
+    /// keyboard router asked for a transmit stream).
+    pub const REFUSE_UNSUPPORTED: u8 = 5;
 }
 
 // ─── hypervisor — the userland VMM (kore-svc-hypervisor) ───────────

@@ -27,6 +27,7 @@
 extern crate std;
 
 pub mod client;
+pub mod serial;
 pub mod service;
 pub mod wire;
 
@@ -41,3 +42,9 @@ pub use service::{
 /// [`service::OutputService<B>`] stays crate-internal so the manifest's
 /// citation (`kore_svc_output::OutputService`) names one concrete service.
 pub type OutputService = service::OutputService<UartBackend>;
+
+/// The headless image's serial row: the same UART, served as an input
+/// device that also shows text (`res/IMAGE_PROFILES.md` §4.3) — the
+/// terminal's provider and the console's line.  The manifest cites this
+/// name.
+pub use serial::{SerialEndowment, SerialService};

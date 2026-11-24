@@ -1,0 +1,14 @@
+[package]
+name = "ax-exec"
+version = "0.1.0"
+edition = "2024"
+description = "Allocator-owned portable native execution for Axiom graphs"
+
+[dependencies]
+ax = { path = "../ax", features = ["kernel-lowering"] }
+axnn = { path = "../axnn", default-features = false }
+axnn-cpu = { path = "../axnn-cpu", default-features = false }
+# ByteSink arrived in 0.3.3, including Kore's patched native driver face; the
+# workspace tracks 0.4.0, whose Vulkan tier imports host memory and gates
+# submissions on the host.
+virtio-accel-core = { version = "0.4.0", default-features = false }

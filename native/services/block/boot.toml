@@ -1,5 +1,5 @@
 # services/block/boot.toml — capability-bounded block-owner row.
-# Founding order lives in res/boot.toml; this fragment declares only the
+# Founding order lives in the image (res/images/<name>.toml); this fragment declares only the
 # service-local image, bundle, and protocol citations.
 
 # The block provisioner claims an NVMe controller through its own device-
@@ -12,5 +12,5 @@ chain     = true
 endowment = "kore_svc_block::BlockEndowment"
 protocol  = "kore_svc_block::BlockService"
 endows    = ["DMA_POOL@1"]
-digest_x86_64  = "blake3:0c87e16ea60e759db18a63aa67103aa1672cc5c09b261815126ee8d8750a3100"
-digest_aarch64 = "blake3:f33c632b85bf9adc9094e709710606d2a56c10449e76d22919697cdba6f08775"
+digest_x86_64  = "blake3:8d7cf830effb07a2cc6d4693d333254625b9fa4706341972d91764271a87895a"
+digest_aarch64 = "blake3:8d29199af1fb947ad956b6f19ca807ae84ebdd8bd548b648bb7b7d241dc65c05"

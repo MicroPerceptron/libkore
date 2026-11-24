@@ -1,0 +1,10 @@
+[package]
+name = "axui-iced"
+version = "0.1.0"
+edition = "2024"
+description = "Iced frontend adapter for Axiom's backend-neutral UI display list"
+
+[dependencies]
+axinput = { path = "../axinput" }
+axui-core = { path = "../axui-core" }
+iced_core = { git = "https://github.com/MicroPerceptron/iced", rev = "3de451447bd28217bb535632867550908e29d5d0", default-features = false }

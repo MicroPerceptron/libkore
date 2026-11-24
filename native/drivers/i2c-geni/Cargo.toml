@@ -1,0 +1,10 @@
+[package]
+name = "kore-i2c-geni"
+version = "0.0.1"
+edition = "2024"
+description = "Qualcomm GENI FIFO-mode I2C master implementing the kore-i2c seam"
+publish = false
+
+[dependencies]
+kore-i2c = { path = "../i2c" }
+kore-driver = { path = "../../crates/driver" }

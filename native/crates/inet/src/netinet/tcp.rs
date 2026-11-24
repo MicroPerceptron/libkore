@@ -31,7 +31,7 @@
 //! [`IpStack`]: super::IpStack
 
 use kore_driver::net::flow::Ipv4Addr;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketStorage};
+use smoltcp::iface::{Config, Interface, SocketHandle};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
@@ -40,6 +40,8 @@ use crate::ifnet::Ifnet;
 use crate::netinet::to_ip;
 use crate::row::Identity;
 use crate::smol::{SMOL_SCRATCH_BYTES, SmolDevice, SocketBudget};
+
+pub use smoltcp::iface::SocketStorage;
 
 /// What a connection is doing, in kore's vocabulary.
 ///
@@ -125,6 +127,16 @@ impl<'a, I: Ifnet> TcpRow<'a, I> {
         storage: TcpStorage<'a>,
         now_ms: u64,
     ) -> Result<Self, TcpError> {
+        Self::with_seed(net, identity, storage, now_ms, 0)
+    }
+
+    pub(crate) fn with_seed(
+        net: I,
+        identity: &Identity,
+        storage: TcpStorage<'a>,
+        now_ms: u64,
+        seed: u64,
+    ) -> Result<Self, TcpError> {
         // An empty socket slice is a storage mistake rather than a spent
         // budget: the caller gave the row nowhere to put its one connection.
         // A slice with slots in it that are all taken is the budget, and
@@ -135,7 +147,8 @@ impl<'a, I: Ifnet> TcpRow<'a, I> {
         let hw = net.hwaddr();
         let mut device = SmolDevice::new(net, storage.scratch).ok_or(TcpError::Storage)?;
 
-        let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(hw.0)));
+        let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(hw.0)));
+        config.random_seed = seed;
         let mut iface = Interface::new(config, &mut device, Instant::from_millis(now_ms as i64));
 
         iface.update_ip_addrs(|addrs| {
@@ -265,10 +278,11 @@ impl<'a, I: Ifnet> TcpRow<'a, I> {
 
     /// Take received data, returning how much was read.
     pub fn recv(&mut self, out: &mut [u8]) -> Result<usize, TcpError> {
-        self.socket()
-            .ok_or(TcpError::NoSocket)?
-            .recv_slice(out)
-            .map_err(|_| TcpError::Refused)
+        match self.socket().ok_or(TcpError::NoSocket)?.recv_slice(out) {
+            Ok(n) => Ok(n),
+            Err(tcp::RecvError::Finished) => Ok(0),
+            Err(tcp::RecvError::InvalidState) => Err(TcpError::Refused),
+        }
     }
 
     /// The peer this connection is with, once there is one.
@@ -323,6 +337,13 @@ impl<'a, I: Ifnet> TcpRow<'a, I> {
     /// not a fact TCP carries.
     pub fn send_queued(&mut self) -> bool {
         self.socket().is_some_and(|s| s.send_queue() > 0)
+    }
+
+    /// Whether a locally initiated FIN has been acknowledged, or the stream ended.
+    pub(crate) fn write_finished(&mut self) -> bool {
+        use tcp::State as S;
+        self.socket()
+            .is_none_or(|s| matches!(s.state(), S::FinWait2 | S::TimeWait | S::Closed))
     }
 
     /// Close this end of the connection.

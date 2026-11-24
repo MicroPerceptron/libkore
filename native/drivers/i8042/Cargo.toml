@@ -1,0 +1,19 @@
+[package]
+name = "kore-i8042"
+version = "0.0.1"
+edition = "2024"
+description = "kore i8042 (PS/2) controller driver: the bring-up ladder and scancode decode, over port I/O granted by capability. No hardware double — QEMU q35 has a real controller."
+publish = false
+
+# Pure logic plus a port seam.  Deliberately NO device model of its own:
+# decode is a pure function tested with real byte sequences, and the
+# controller ladder is exercised against QEMU q35's REAL i8042 in the
+# boot gate (2026-07-24 mock-free ruling; see #419).
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+# The shared driver substrate.  Used for its **wait seam**: `handshake`
+# with a fault predicate is exactly the i8042 bring-up loop (poke a
+# command, poll the status, abandon early if the controller has vanished),
+# and reusing it means this driver cannot drift from the deadline
+# discipline every other driver already follows.
+kore-driver = { path = "../../crates/driver" }

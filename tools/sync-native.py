@@ -18,6 +18,21 @@ def export(checkout: Path, revision: str, check: bool = False):
         return subprocess.check_output(["git", "-C", str(checkout), *args])
 
     revision = git("rev-parse", revision + "^{commit}").decode().strip()
+    gitlinks = {}
+    for entry in git("ls-tree", "-rz", revision).decode().split("\0"):
+        if entry.startswith("160000 commit "):
+            header, path = entry.split("\t", 1)
+            gitlinks[path] = header.split()[2]
+
+    def source(path):
+        for prefix, commit in gitlinks.items():
+            if path.startswith(prefix + "/"):
+                return prefix, commit, path[len(prefix) + 1:]
+        return "", revision, path
+
+    def source_git(prefix, *args):
+        return subprocess.check_output(["git", "-C", str(checkout / prefix), *args])
+
     config = tomllib.loads((ROOT / "Cargo.toml").read_text())
     pending = list(config["package"]["metadata"]["kore"]["owner-paths"].values())
     packages = {}
@@ -28,7 +43,10 @@ def export(checkout: Path, revision: str, check: bool = False):
             continue
         if path.startswith("../") or PurePosixPath(path).is_absolute():
             raise ValueError("dependency path escapes Kore")
-        manifest = tomllib.loads(git("show", f"{revision}:{path}/Cargo.toml").decode())
+        prefix, commit, relative = source(path)
+        manifest = tomllib.loads(
+            source_git(prefix, "show", f"{commit}:{relative}/Cargo.toml").decode()
+        )
         packages[path] = manifest["package"]["name"]
         # Vendored packages are dependencies, so their upstream test suites
         # and dev-only dependencies do not expand the native workspace.
@@ -42,7 +60,8 @@ def export(checkout: Path, revision: str, check: bool = False):
                         if isinstance(dependency, dict) and "path" in dependency:
                             pending.append(posixpath.normpath(path + "/" + dependency["path"]))
                         elif isinstance(dependency, dict) and "git" in dependency:
-                            raise ValueError("external Git dependency needs an explicit export policy")
+                            if not prefix or len(dependency.get("rev", "")) != 40:
+                                raise ValueError("external Git dependency needs a pinned submodule revision")
                         elif isinstance(dependency, dict) and dependency.get("workspace"):
                             raise ValueError("workspace-inherited dependency needs an explicit export policy")
                 elif isinstance(value, dict):
@@ -52,19 +71,32 @@ def export(checkout: Path, revision: str, check: bool = False):
     native = ROOT / "native"
     buffers = {}
     hashes = {}
-    archive = git("archive", revision, "--", *sorted(packages), "LICENSE")
-    with tarfile.open(fileobj=io.BytesIO(archive)) as contents:
-        for member in contents:
-            path = PurePosixPath(member.name)
-            if path.is_absolute() or ".." in path.parts:
-                raise ValueError("archive path escapes the export")
-            if member.isdir():
-                continue
-            if not member.isfile():
-                raise ValueError(f"unsupported source entry: {path}")
-            data = contents.extractfile(member).read()
-            buffers[str(path)] = (data, 0o755 if member.mode & 0o111 else 0o644)
-            hashes[str(path)] = hashlib.sha256(data).hexdigest()
+    groups = {}
+    for path in sorted([*packages, "LICENSE"]):
+        prefix, commit, relative = source(path)
+        groups.setdefault((prefix, commit), []).append(relative)
+    for (prefix, commit), paths in groups.items():
+        archive = source_git(prefix, "archive", commit, "--", *paths)
+        with tarfile.open(fileobj=io.BytesIO(archive)) as contents:
+            collect_archive(contents, prefix, buffers, hashes)
+    return write_export(revision, check, native, packages, excluded, buffers, hashes)
+
+
+def collect_archive(contents, prefix, buffers, hashes):
+    for member in contents:
+        path = PurePosixPath(prefix) / member.name
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("archive path escapes the export")
+        if member.isdir():
+            continue
+        if not member.isfile():
+            raise ValueError(f"unsupported source entry: {path}")
+        data = contents.extractfile(member).read()
+        buffers[str(path)] = (data, 0o755 if member.mode & 0o111 else 0o644)
+        hashes[str(path)] = hashlib.sha256(data).hexdigest()
+
+
+def write_export(revision, check, native, packages, excluded, buffers, hashes):
     workspace = '[workspace]\nresolver = "3"\nmembers = [\n'
     workspace += "".join(f"    {json.dumps(path)},\n" for path in sorted(set(packages) - excluded)) + ']\n'
     if excluded:

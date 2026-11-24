@@ -1,0 +1,20 @@
+[package]
+name = "axboot"
+version = "0.1.0"
+edition = "2024"
+description = "Portable, build-compiled WGSL welcome surface and explicit runtime inputs"
+
+[dependencies]
+ax = { path = "../ax" }
+core_maths = "0.1.1"
+
+[build-dependencies]
+ax = { path = "../ax" }
+axshader = { path = "../axshader" }
+axrd = { path = "../axrd", features = ["font"] }
+# The turbulence table's UF16 E5M11 encoding, from the kernels that decode it.
+axnn-cpu = { path = "../axnn-cpu" }
+
+[dev-dependencies]
+axnn-vaccel = { path = "../axnn-vaccel" }
+minifb = "0.28"

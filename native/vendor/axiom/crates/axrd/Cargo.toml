@@ -1,0 +1,118 @@
+[package]
+name = "axrd"
+version = "0.1.2"
+edition = "2024"
+
+[features]
+default = []
+font = ["dep:femtofont", "dep:ttf-parser"]
+graph = ["dep:ax", "dep:core_maths"]
+# The scene program on the host: `ax-exec`'s native executor over the CPU
+# raster kernels, for examples, benches and tests.
+host = ["graph", "dep:ax-exec", "dep:axnn-cpu", "axnn-cpu/std", "axnn-cpu/alloc"]
+axui = ["graph", "dep:axui-core"]
+coreml = ["graph", "axnn-vaccel/coreml", "dep:virtio-accel-coreml"]
+openvino = ["graph", "axnn-vaccel/openvino", "dep:virtio-accel-openvino"]
+bspl = ["dep:bspl"]
+splash = ["bspl", "window"]
+window = ["host", "dep:minifb"]
+ui = ["splash"]
+pointing = ["graph", "axinput/pointing"]
+
+[dependencies]
+ax = { path = "../ax", optional = true }
+ax-exec = { path = "../ax-exec", optional = true }
+axinput = { path = "../axinput" }
+axmath = { path = "../axmath", default-features = false }
+axnn = { path = "../axnn", default-features = false }
+axnn-cpu = { path = "../axnn-cpu", optional = true }
+axui-core = { path = "../axui-core", optional = true }
+bspl = { path = "../bspl", default-features = false, optional = true }
+core_maths = { version = "0.1.1", optional = true }
+femtofont = { version = "0.5.0", default-features = false, optional = true }
+minifb = { version = "0.28", optional = true }
+# Only `GlyphId` and the horizontal advance are read here; the layout and
+# variation tables are femtofont's business (it enables them itself).
+ttf-parser = { version = "0.25.1", default-features = false, features = [
+    "no-std-float",
+], optional = true }
+virtio-accel-coreml = { version = "0.4.0", optional = true }
+virtio-accel-openvino = { version = "0.4.0", optional = true }
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dev-dependencies]
+ax-exec = { path = "../ax-exec" }
+axcomp = { path = "../axcomp" }
+axgfx = { path = "../axgfx" }
+axnn-cpu = { path = "../axnn-cpu", features = ["std", "alloc"] }
+axnn-vaccel = { path = "../axnn-vaccel" }
+axshader = { path = "../axshader" }
+axui-iced = { path = "../axui-iced" }
+divan = "0.1"
+iced_core = { git = "https://github.com/MicroPerceptron/iced", rev = "3de451447bd28217bb535632867550908e29d5d0", default-features = false }
+softbuffer = "0.4.8"
+winit = "0.30.13"
+
+[[bench]]
+name = "compositor"
+required-features = ["host"]
+harness = false
+
+[[bench]]
+name = "text"
+harness = false
+required-features = ["font"]
+
+[[example]]
+name = "pointing"
+required-features = ["pointing"]
+
+[[example]]
+name = "window"
+required-features = ["window"]
+
+[[example]]
+name = "voxel"
+required-features = ["window"]
+
+[[example]]
+name = "voxel_mt"
+required-features = ["window"]
+
+[[example]]
+name = "raster3d"
+required-features = ["window"]
+
+[[example]]
+name = "gsplat"
+required-features = ["window"]
+
+[[example]]
+name = "neural"
+required-features = ["window"]
+
+[[example]]
+name = "splash"
+required-features = ["splash"]
+
+[[example]]
+name = "ui"
+required-features = ["ui"]
+
+[[example]]
+name = "shell"
+required-features = ["window"]
+
+[[example]]
+name = "boot"
+required-features = ["window", "font", "graph"]
+
+[[example]]
+name = "axui"
+required-features = ["window", "axui"]
+
+[[example]]
+name = "wgsl"
+required-features = ["window", "graph"]

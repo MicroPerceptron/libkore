@@ -6,13 +6,18 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::ffi::c_int;
 use core::future::Future;
+use core::mem::MaybeUninit;
 use core::pin::pin;
+use core::ptr::NonNull;
 use core::task::{Context, Poll, Waker};
 
 use kore_inet::flow::{FlowCap, Powers, Scope};
 use kore_inet::netinet::ping::{Heard, Ping};
+use kore_inet::netinet::tcp::{SocketStorage, TcpError, TcpStorage};
+use kore_inet::smol::SMOL_SCRATCH_BYTES;
 use kore_inet::{
-    Event, FlowFace, Identity, Ifnet, IpStack, OutputError, SocketRefusal, UdpSocket, VifIfnet,
+    Event, FlowFace, Identity, Ifnet, IpStack, OutputError, SocketRefusal, TcpStream, UdpSocket,
+    VifIfnet,
 };
 use kore_std::abi::clock::Uptime;
 use kore_std::driver::net::{FlowMatch, IpProto, LinkState, MacAddr, VifId};
@@ -33,7 +38,7 @@ use crate::socket::{Endpoint, Request};
 pub(crate) struct Host<'t> {
     network: Option<ProcessNet<'t>>,
     memory: Option<ProcessMm>,
-    sockets: [Option<Connected>; CAPACITY],
+    sockets: [Option<Socket>; CAPACITY],
 }
 
 impl<'t> Host<'t> {
@@ -60,7 +65,11 @@ impl<'t> Host<'t> {
         let network = network.as_mut().ok_or(errno::EACCES)?;
         let memory = memory.as_mut().ok_or(errno::EACCES)?;
         let fd = match request {
-            Request::Open => return TABLE.claim_socket().map(|fd| fd as usize),
+            Request::Open(protocol) => {
+                let fd = TABLE.claim_socket()?;
+                sockets[(fd - FIRST) as usize] = Some(Socket::Unconnected(protocol));
+                return Ok(fd as usize);
+            }
             Request::Connect(fd, _)
             | Request::Close(fd)
             | Request::Send(fd, ..)
@@ -68,47 +77,103 @@ impl<'t> Host<'t> {
         };
         TABLE.require_socket(fd)?;
         let entry = &mut sockets[(fd - FIRST) as usize];
+        let socket = entry.as_mut().ok_or(errno::EBADF)?;
         match request {
-            Request::Open => unreachable!(),
+            Request::Open(_) => unreachable!(),
             Request::Connect(_, peer) => {
-                if entry.is_some() {
+                let Socket::Unconnected(protocol) = *socket else {
                     return Err(errno::EISCONN);
-                }
-                *entry = Some(Connected::open(network, memory, peer).await?);
+                };
+                *socket =
+                    Socket::Connected(Connected::open(network, memory, protocol, peer).await?);
                 Ok(0)
             }
             Request::Close(_) => {
-                if let Some(connected) = entry.as_ref() {
+                let mut finished = Ok(());
+                if let Socket::Connected(connected) = socket {
+                    if let Transport::Tcp(tcp) = &mut connected.transport {
+                        finished = match deadline() {
+                            Ok(deadline) => {
+                                drive(network, tcp.stream.finish_write(), Some(deadline), true)
+                                    .await
+                            }
+                            Err(code) => Err(code),
+                        };
+                    }
                     retire_vif(network, connected.vif).await?;
                 }
-                if let Some(Connected { socket, window, .. }) = entry.take() {
-                    drop(socket);
+                if let Some(Socket::Connected(Connected {
+                    transport, window, ..
+                })) = entry.take()
+                {
+                    drop(transport);
                     window.release();
                 }
                 TABLE.release_socket(fd)?;
-                Ok(0)
+                finished.map(|()| 0)
             }
             Request::Send(_, buf, len) => {
-                let conn = entry.as_mut().ok_or(errno::ENOTCONN)?;
+                let Socket::Connected(conn) = socket else {
+                    return Err(errno::ENOTCONN);
+                };
                 let bytes = if len == 0 {
                     &[]
                 } else {
                     // SAFETY: held by the caller while this request runs.
                     unsafe { core::slice::from_raw_parts(buf, len) }
                 };
-                let deadline = now_us().ok_or(errno::EIO)?.saturating_add(3_000_000);
-                drive(network, conn.socket.send(bytes), Some(deadline)).await
+                let deadline = Some(deadline()?);
+                match &mut conn.transport {
+                    Transport::Udp(udp) => drive(network, udp.send(bytes), deadline, true).await,
+                    Transport::Tcp(tcp) => {
+                        drive(network, tcp.stream.write(bytes), deadline, true).await
+                    }
+                }
             }
             Request::Recv(_, buf, len) => {
-                let conn = entry.as_mut().ok_or(errno::ENOTCONN)?;
+                let Socket::Connected(conn) = socket else {
+                    return Err(errno::ENOTCONN);
+                };
                 let bytes = if len == 0 {
                     &mut []
                 } else {
                     // SAFETY: held exclusively by the caller while this request runs.
                     unsafe { core::slice::from_raw_parts_mut(buf, len) }
                 };
-                drive(network, conn.socket.recv(bytes), None).await
+                match &mut conn.transport {
+                    Transport::Udp(udp) => drive(network, udp.recv(bytes), None, false).await,
+                    Transport::Tcp(tcp) => drive(network, tcp.stream.read(bytes), None, true).await,
+                }
             }
+        }
+    }
+
+    pub(crate) fn has_tcp(&self) -> bool {
+        self.sockets.iter().any(|entry| {
+            matches!(
+                entry,
+                Some(Socket::Connected(Connected {
+                    transport: Transport::Tcp(_),
+                    ..
+                }))
+            )
+        })
+    }
+
+    pub(crate) async fn sweep_tcp(&mut self) {
+        let mut kick = false;
+        for entry in &mut self.sockets {
+            if let Some(Socket::Connected(Connected {
+                transport: Transport::Tcp(tcp),
+                ..
+            })) = entry
+            {
+                tcp.stream.sweep();
+                kick |= tcp.stream.flow_mut().net.take_tx_kick();
+            }
+        }
+        if kick && let Some(network) = &self.network {
+            network.client.kick().await;
         }
     }
 
@@ -188,9 +253,19 @@ impl<'t> Host<'t> {
     }
 }
 
+enum Socket {
+    Unconnected(IpProto),
+    Connected(Connected),
+}
+
+enum Transport {
+    Udp(Box<UdpSocket<RuntimeFlow>>),
+    Tcp(Box<Tcp>),
+}
+
 struct Connected {
     // Drop the interface's ring references before the window owner.
-    socket: Box<UdpSocket<RuntimeFlow>>,
+    transport: Transport,
     window: Window,
     vif: VifId,
 }
@@ -199,6 +274,7 @@ impl Connected {
     async fn open(
         network: &mut ProcessNet<'_>,
         memory: &mut ProcessMm,
+        protocol: IpProto,
         peer: Endpoint,
     ) -> Result<Self, c_int> {
         let client = &mut network.client;
@@ -210,7 +286,18 @@ impl Connected {
         };
         let identity = Identity::new(report.addr, report.prefix_len, report.gateway)
             .map_err(|_| errno::ENETUNREACH)?;
-        let storage = Box::<UdpSocket<RuntimeFlow>>::try_new_uninit().map_err(|_| errno::ENOMEM)?;
+        let deadline = (protocol == IpProto::TCP).then(deadline).transpose()?;
+        let storage = if protocol == IpProto::TCP {
+            PendingTransport::Tcp(
+                Box::<Tcp>::try_new_uninit().map_err(|_| errno::ENOMEM)?,
+                TcpBufferOwner::new()?,
+                kore_std::random::u64().map_err(|_| errno::EIO)?,
+            )
+        } else {
+            PendingTransport::Udp(
+                Box::<UdpSocket<RuntimeFlow>>::try_new_uninit().map_err(|_| errno::ENOMEM)?,
+            )
+        };
         let (window, vif, mac) = Window::open(network, memory, FrameFilter::CLOSED)
             .await
             .map_err(|error| match error {
@@ -222,18 +309,22 @@ impl Connected {
         let flow = client
             .try_request(NetRequest::OpenFlow {
                 vif,
-                proto: IpProto::UDP,
+                proto: protocol,
                 local_port: None,
                 peer,
             })
             .await;
         let attached = match flow {
             Some(NetResponse::Flow {
-                proto: IpProto::UDP,
+                proto,
                 local,
                 peer: Some(actual),
-            }) if actual == peer && local.0 == identity.addr() && local.1 != 0 => {
-                let scope = Scope::Flow(FlowMatch::connection(IpProto::UDP, local, actual));
+            }) if proto == protocol
+                && actual == peer
+                && local.0 == identity.addr()
+                && local.1 != 0 =>
+            {
+                let scope = Scope::Flow(FlowMatch::connection(proto, local, actual));
                 // The acknowledgement describes the enforced flow. This
                 // local cap is its recipe. Transmit and receive are still
                 // gated by the service's installed filter on this vif.
@@ -243,15 +334,26 @@ impl Connected {
                         // SAFETY: window stays owned until the socket is
                         // dropped, even on cancellation or failed close.
                         let net = unsafe { window.attach(mac) }?;
-                        UdpSocket::open(RuntimeFlow { net, cap, identity }).map_err(socket_errno)
+                        let flow = RuntimeFlow { net, cap, identity };
+                        storage.attach(flow, peer)
                     })
             }
             Some(NetResponse::Refused(reason)) => Err(net_errno(reason)),
             _ => Err(errno::EIO),
         };
+        let attached = match attached {
+            Ok(Transport::Tcp(mut tcp)) => {
+                match drive(network, tcp.stream.ready(), deadline, true).await {
+                    Ok(()) => Ok(Transport::Tcp(tcp)),
+                    Err(errno::ECONNRESET) => Err(errno::ECONNREFUSED),
+                    Err(code) => Err(code),
+                }
+            }
+            other => other,
+        };
         match attached {
-            Ok(socket) => Ok(Self {
-                socket: Box::write(storage, socket),
+            Ok(transport) => Ok(Self {
+                transport,
                 window,
                 vif,
             }),
@@ -260,6 +362,90 @@ impl Connected {
                 window.release();
                 Err(code)
             }
+        }
+    }
+}
+
+enum PendingTransport {
+    Udp(Box<MaybeUninit<UdpSocket<RuntimeFlow>>>),
+    Tcp(Box<MaybeUninit<Tcp>>, TcpBufferOwner, u64),
+}
+
+impl PendingTransport {
+    fn attach(self, flow: RuntimeFlow, peer: Endpoint) -> Result<Transport, c_int> {
+        match self {
+            Self::Udp(place) => {
+                let udp = UdpSocket::open(flow).map_err(socket_errno)?;
+                Ok(Transport::Udp(Box::write(place, udp)))
+            }
+            Self::Tcp(place, buffers, seed) => {
+                // SAFETY: the storage is lent once, and the stream field drops
+                // before its backing allocation. On failure the borrow ends
+                // within open, before the owner drops.
+                let storage = unsafe { buffers.lend() };
+                let stream =
+                    TcpStream::open_with_seed(flow, storage, peer, seed).map_err(socket_errno)?;
+                Ok(Transport::Tcp(Box::write(
+                    place,
+                    Tcp {
+                        stream,
+                        _buffers: buffers,
+                    },
+                )))
+            }
+        }
+    }
+}
+
+struct Tcp {
+    stream: TcpStream<'static, RuntimeFlow>,
+    _buffers: TcpBufferOwner,
+}
+
+const TCP_BUFFER_BYTES: usize = 16 * 1024;
+
+struct TcpBuffers {
+    rx: [u8; TCP_BUFFER_BYTES],
+    tx: [u8; TCP_BUFFER_BYTES],
+    scratch: [u8; SMOL_SCRATCH_BYTES],
+    sockets: [SocketStorage<'static>; 1],
+}
+
+// Keep ownership in a raw pointer so moving the owner alongside its borrower
+// does not retag the memory behind the stream's references.
+struct TcpBufferOwner(NonNull<TcpBuffers>);
+
+impl TcpBufferOwner {
+    fn new() -> Result<Self, c_int> {
+        let buffers = Box::<TcpBuffers>::try_new_zeroed().map_err(|_| errno::ENOMEM)?;
+        let raw = Box::into_raw(buffers).cast::<TcpBuffers>();
+        // SAFETY: the byte arrays are already zeroed. Initialize the socket
+        // slot explicitly before reading or dropping the complete object.
+        unsafe { (&raw mut (*raw).sockets).write([SocketStorage::EMPTY]) };
+        Ok(Self(NonNull::new(raw).expect("Box allocation is non-null")))
+    }
+
+    /// # Safety
+    /// Call once per owner and drop all borrowers before dropping the owner.
+    unsafe fn lend(&self) -> TcpStorage<'static> {
+        let buffers = unsafe { &mut *self.0.as_ptr() };
+        TcpStorage {
+            rx: &mut buffers.rx,
+            tx: &mut buffers.tx,
+            scratch: &mut buffers.scratch,
+            sockets: &mut buffers.sockets,
+        }
+    }
+}
+
+impl Drop for TcpBufferOwner {
+    fn drop(&mut self) {
+        // SAFETY: this is the only owner of the original boxed allocation.
+        // The stream precedes this owner in Tcp's drop order.
+        unsafe {
+            let raw = self.0.as_ptr();
+            (&raw mut (*raw).sockets).drop_in_place();
+            drop(Box::from_raw(raw.cast::<MaybeUninit<TcpBuffers>>()));
         }
     }
 }
@@ -399,13 +585,14 @@ async fn drive<T>(
     network: &ProcessNet<'_>,
     operation: impl Future<Output = Result<T, SocketRefusal>>,
     deadline_us: Option<u64>,
+    kick: bool,
 ) -> Result<T, c_int> {
     let mut operation = pin!(operation);
     loop {
         let polled = operation
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()));
-        if deadline_us.is_some() {
+        if kick {
             network.client.kick().await;
         }
         if let Poll::Ready(result) = polled {
@@ -449,8 +636,15 @@ fn socket_errno(reason: SocketRefusal) -> c_int {
         SocketRefusal::Output(OutputError::Unreachable) => errno::ENETUNREACH,
         SocketRefusal::Output(OutputError::TooLong) => errno::EMSGSIZE,
         SocketRefusal::OutsideFlow => errno::EACCES,
+        SocketRefusal::Tcp(TcpError::Unreachable) => errno::ENETUNREACH,
+        SocketRefusal::Reset => errno::ECONNRESET,
+        SocketRefusal::Closed => errno::EPIPE,
         _ => errno::EIO,
     }
+}
+
+fn deadline() -> Result<u64, c_int> {
+    Ok(now_us().ok_or(errno::EIO)?.saturating_add(3_000_000))
 }
 
 fn now_us() -> Option<u64> {
