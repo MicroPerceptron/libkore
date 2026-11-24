@@ -1,0 +1,50 @@
+[package]
+name = "kore-inet"
+version = "0.0.1"
+edition = "2024"
+description = "kore internet stack: the ifnet seam every packet source implements, and the protocol engine written against it. Rides a vif; never sees a driver."
+publish = false
+
+# The class contract only. `kore-inet` is deliberately *below* the row and
+# *above* nothing: it names no hardware, no runtime and no service, so the one
+# production impl (a vif window) and the host double are the same shape to the
+# engine, and `drivers/net/{e1000e,usbnet,rtw89}` are abstracted away by the vif
+# contract before this crate can see them (res/INET_STACK.md §2.1).
+[dependencies]
+kore-driver = { path = "../driver" }
+# The frozen spsc window layout a vif's two rings live in.
+kore-ring = { path = "../ring" }
+# The borrowed wire layer, pinned and vendored (vendor/smoltcp/PATCHES.md).
+# Only what a slice needs: Ethernet framing, IPv4, and the TCP state machine
+# that one protosw row will delegate to.  DHCP and DNS are written here over
+# this crate's wire types rather than taken as its sockets, so their socket
+# features stay off.
+smoltcp = { path = "../../vendor/smoltcp", version = "=0.14.0", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    # The DHCP and DNS *wire* types only.  Their `socket-*` siblings are
+    # deliberately off: those protocols are written in `netinet` over these
+    # encodings, so enabling the sockets would pull in a second implementation
+    # of something this crate owns (vendor/smoltcp/PATCHES.md).
+    "proto-dhcpv4",
+    "proto-dns",
+    "socket-tcp",
+] }
+
+# The test double builds DHCP server replies, whose `dns_servers` field is a
+# `heapless::Vec` of smoltcp's own choosing. Same version the tree already
+# resolves, and test-only.
+[dev-dependencies]
+heapless = { version = "0.9", default-features = false }
+# The install seam is async (a production impl reaches another service over a
+# ring), so a host test needs a driver for a future that never parks.
+# `try_block_on` is the tree's own bounded one: exhaustion is proof that a
+# future wanted an executor, which is exactly what a test must not silently
+# spin on.
+kore-rt = { path = "../rt" }
+# The `inet-flow-isolation` witness builds peer datagrams with the same wire
+# types production does, so what it proves is what ships.
+smoltcp = { path = "../../vendor/smoltcp", version = "=0.14.0", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+] }

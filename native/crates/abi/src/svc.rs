@@ -918,7 +918,9 @@ pub const MAX_SPAWN_WIRING: usize = 36;
 /// 9 is the maximal plan: the shell's input/output pair rings, four queue
 /// views, exec pair, power pair, and mm supply pair.  Linked children add one
 /// exec-owned loader-ring view to their caller-authored plan, which remains
-/// within the same bound.
+/// within the same bound.  A driver row on a machine with many root
+/// complexes needs one band view per live broker; pricing that fleet
+/// (11 windows) does not fit the exec pair's ring today (#1204).
 pub const MAX_SPAWN_WINDOWS: usize = 9;
 
 /// [`SpawnWindow::flags`]: the child will **forward** this window — move
@@ -2308,6 +2310,57 @@ impl InputReport {
     /// expressible rather than unsupported.
     pub const KIND_CONTACT: u8 = 3;
 
+    /// A run of **text** from a byte-oriented source — a serial line
+    /// (`res/IMAGE_PROFILES.md` §4.3), and the shape a paste or an input
+    /// method's commit would take.
+    ///
+    /// Distinct from [`KIND_KEYBOARD`](Self::KIND_KEYBOARD) because a byte
+    /// source has no key matrix: synthesizing usage codes from bytes would
+    /// round-trip text through a keymap that cannot express most of it, and
+    /// lose every escape sequence on the way.  `state` is the byte count
+    /// (`1..=`[`TEXT_BYTES`](Self::TEXT_BYTES)); the bytes fill `data` and
+    /// then `reserved`.  Control bytes ride as themselves (CR, DEL, ETX, an
+    /// ESC sequence split across reports); interpreting them is the line
+    /// discipline's job, as it is for a keyboard's chords.
+    pub const KIND_TEXT: u8 = 4;
+    /// The most bytes one [`KIND_TEXT`](Self::KIND_TEXT) report carries:
+    /// all of `data` and `reserved`.
+    pub const TEXT_BYTES: usize = 13;
+
+    /// A text report carrying `bytes` (1 to [`TEXT_BYTES`](Self::TEXT_BYTES)
+    /// of them), or `None` for an empty or oversized run.
+    pub fn text(source: u8, bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > Self::TEXT_BYTES {
+            return None;
+        }
+        let mut payload = [0u8; Self::TEXT_BYTES];
+        payload[..bytes.len()].copy_from_slice(bytes);
+        let mut data = [0u8; 6];
+        let mut reserved = [0u8; 7];
+        data.copy_from_slice(&payload[..6]);
+        reserved.copy_from_slice(&payload[6..]);
+        Some(Self {
+            kind: Self::KIND_TEXT,
+            source,
+            state: bytes.len() as u8,
+            data,
+            reserved,
+        })
+    }
+
+    /// A text report's bytes and how many are live — `None` for any other
+    /// kind or an out-of-range count (the untrusted window's refusal).
+    pub fn text_bytes(&self) -> Option<([u8; Self::TEXT_BYTES], usize)> {
+        let len = usize::from(self.state);
+        if self.kind != Self::KIND_TEXT || len == 0 || len > Self::TEXT_BYTES {
+            return None;
+        }
+        let mut payload = [0u8; Self::TEXT_BYTES];
+        payload[..6].copy_from_slice(&self.data);
+        payload[6..].copy_from_slice(&self.reserved);
+        Some((payload, len))
+    }
+
     /// [`KIND_CONTACT`](Self::KIND_CONTACT) `state`: the tip switch —
     /// the contact is actually touching the surface, not merely hovering
     /// in range.
@@ -2473,6 +2526,23 @@ impl InputReqWire {
     /// source identity (below 256), `subscription` the lock state's
     /// [`Locks`](crate::keyboard::Locks) bits; `focus` and `reserved` zero.
     pub const OP_SET_INDICATORS: u8 = 6;
+    /// `InputRequest::Transmit` — bytes for the device to show, carried
+    /// INLINE: `focus` is the count (`1..=`[`TRANSMIT_BYTES`]), and the
+    /// bytes fill `reserved`, then `slot`, then `subscription`, in order.
+    /// Only a source that can show text (a serial line) serves it; others
+    /// refuse `REFUSE_UNSUPPORTED`.
+    ///
+    /// Inline rather than a shared queue because the client that sends it
+    /// (the headless console, `res/IMAGE_PROFILES.md` §4.3) reaches the
+    /// serial row over a declared extra pair, which the founder stages
+    /// without a return post, so no queue window can be delivered.  A
+    /// console's volume is a line at a time; the record size is unchanged.
+    ///
+    /// [`TRANSMIT_BYTES`]: Self::TRANSMIT_BYTES
+    pub const OP_TRANSMIT: u8 = 7;
+    /// The most bytes one `Transmit` carries: `reserved`, `slot` and
+    /// `subscription`, 2 + 4 + 4.
+    pub const TRANSMIT_BYTES: usize = 10;
 
     /// `SetFocus`: steer subsequent reports to nobody.
     pub const FOCUS_NONE: u8 = 0;
@@ -2554,6 +2624,10 @@ impl InputRepWire {
     pub const TAG_STATUS: u8 = 5;
     /// `InputResponse::Indicated` — the indicator state was recorded.
     pub const TAG_INDICATED: u8 = 7;
+    /// `InputResponse::Transmitted` — `subscription` carries how many of
+    /// the request's bytes the device accepted (a stalled line takes fewer;
+    /// the client sends the rest again).
+    pub const TAG_TRANSMITTED: u8 = 8;
 
     /// `InputRefusal::BadQueue` — the delivered slot was absent,
     /// non-writable, or not a well-formed report ring.
@@ -2566,6 +2640,9 @@ impl InputRepWire {
     /// `InputRefusal::Denied` — the endpoint lacks the authority for the
     /// verb (an ordinary subscriber attempting `SetFocus`, §5.8).
     pub const REFUSE_DENIED: u8 = 4;
+    /// `InputRefusal::Unsupported` — this source has no such side (a
+    /// keyboard router asked for a transmit stream).
+    pub const REFUSE_UNSUPPORTED: u8 = 5;
 }
 
 // ─── hypervisor — the userland VMM (kore-svc-hypervisor) ───────────
@@ -3325,13 +3402,72 @@ impl AccelRepWire {
 
 // ─── net — the L2 frame service (kore-svc-net) ──────────────────────
 
+/// One contiguous block of a frozen request record, and the workstream that
+/// owns it.
+///
+/// A record here grows a **block** at a time, one per feature, and two
+/// workstreams appending at once is the collision `res/INET_MIGRATION.md`
+/// §2.2 records: both sides add fields after the same reserved tail, both
+/// move the size assertion, and the resolution proposed was a human
+/// agreement about offsets reached before either side merged.
+///
+/// A block table is that agreement in a form the compiler keeps. Each block
+/// states where it starts and how long it is, [`WireBlock::check`] proves the
+/// set is ordered, gapless and exactly covers the record, and an
+/// [`offset_of!`](core::mem::offset_of) pin ties each claimed start to the
+/// field that actually begins there. Appending at the wrong offset,
+/// overlapping another workstream's bytes, or reordering a struct field out
+/// from under its block then fails the build — so the *order* two
+/// workstreams land in stops being something to negotiate, and what is left
+/// is "append after the last block", which needs no conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WireBlock {
+    /// Byte offset of the block's first field.
+    pub at: u16,
+    /// The block's length in bytes, padding included.
+    pub bytes: u16,
+    /// Whose it is — the design of record, so a reader of a conflict knows
+    /// who to ask.
+    pub owner: &'static str,
+}
+
+impl WireBlock {
+    /// Prove a record's blocks are ordered, gapless, and exactly cover it.
+    ///
+    /// Const-evaluated, so every failure is a build error whose message says
+    /// which way the table is wrong. There is no runtime form: a layout that
+    /// could still be wrong at run time is the bug this exists to prevent.
+    pub const fn check(blocks: &[Self], record_bytes: usize) {
+        assert!(!blocks.is_empty(), "a record with no block owns no bytes");
+        let mut end: usize = 0;
+        let mut i = 0;
+        while i < blocks.len() {
+            assert!(
+                blocks[i].at as usize == end,
+                "a wire block overlaps the one before it, or leaves a gap",
+            );
+            assert!(blocks[i].bytes != 0, "a wire block claims no bytes");
+            end += blocks[i].bytes as usize;
+            i += 1;
+        }
+        assert!(
+            end == record_bytes,
+            "the wire blocks do not cover the record exactly",
+        );
+    }
+}
+
 /// EtherTypes one vif filter may name on the wire — the wire mirror of
 /// `kore_driver::net::filter::MAX_FILTER_ETHERTYPES`.
 pub const MAX_NET_ETHERTYPES: usize = 4;
 
 /// Frame-service request. Carries a vif's requested filter as data; the
 /// authority to *have* that filter is the arrival pair's, never this record's.
-/// 32 bytes.
+/// 64 bytes: a 32-byte L2 head and a 32-byte flow block.
+///
+/// The flow block is all-zero for a filter that binds no flow, which is every
+/// filter that existed before flows did — so the growth is additive in
+/// meaning as well as in layout.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -3351,8 +3487,17 @@ pub struct NetReqWire {
     /// [`FLAG_BROADCAST`](Self::FLAG_BROADCAST),
     /// [`FLAG_PROMISCUOUS`](Self::FLAG_PROMISCUOUS).
     pub flags: u8,
+    /// `AdmitPeer`: which component of the peer bundle this request carries
+    /// — [`PART_RING`](Self::PART_RING), [`PART_KICK`](Self::PART_KICK),
+    /// [`PART_RETURN_RECV`](Self::PART_RETURN_RECV), or
+    /// [`PART_GRANT_BASE`](Self::PART_GRANT_BASE)` + lane`.
+    ///
+    /// Taken out of this head's own reserve rather than growing the record,
+    /// the way the flow block took the station prefix and gateway out of
+    /// its. Zero on every verb that is not assembling a bundle.
+    pub peer_part: u8,
     /// Reserved; must be zero.
-    pub reserved: [u8; 3],
+    pub reserved: [u8; 2],
     /// The vif this request names, for the verbs that name one.
     pub vif_index: U16,
     /// That vif's generation — a stale value is refused, never serviced.
@@ -3367,9 +3512,67 @@ pub struct NetReqWire {
     pub multicast_group: [u8; 6],
     /// Reserved; must be zero.
     pub reserved2: [u8; 2],
+
+    // ── the flow block; all-zero when no flow is bound ──────────────────
+    /// Flow: whether one is bound — [`FLOW_NONE`](Self::FLOW_NONE) /
+    /// [`FLOW_SOME`](Self::FLOW_SOME). Every field below is zero when none is.
+    pub flow_kind: u8,
+    /// Flow: which protocols — [`PROTO_ONLY`](Self::PROTO_ONLY) /
+    /// [`PROTO_ANY`](Self::PROTO_ANY).
+    pub proto_kind: u8,
+    /// Flow: the local endpoint — [`EP_ADDRPORT`](Self::EP_ADDRPORT) /
+    /// [`EP_ADDR`](Self::EP_ADDR) / [`EP_ANY`](Self::EP_ANY).
+    pub local_kind: u8,
+    /// Flow: the peer endpoint, same vocabulary as
+    /// [`local_kind`](Self::local_kind).
+    pub peer_kind: u8,
+    /// Flow: the IP protocol, zero unless [`PROTO_ONLY`](Self::PROTO_ONLY).
+    pub proto: u8,
+    /// Flow: the address family — [`FAMILY_IPV4`](Self::FAMILY_IPV4) is the
+    /// only value accepted today. Carried explicitly so an IPv6 sibling is a
+    /// new value here rather than a reinterpretation of these bytes.
+    pub family: u8,
+    /// Reserved; must be zero.
+    /// Configure: the station prefix length, 1..=32. Zero on every verb
+    /// that is not configuring an identity.
+    pub prefix_len: u8,
+    pub reserved3: [u8; 1],
+    /// Flow: the local port, zero unless [`EP_ADDRPORT`](Self::EP_ADDRPORT).
+    pub local_port: U16,
+    /// Flow: the peer port, zero unless [`EP_ADDRPORT`](Self::EP_ADDRPORT).
+    pub peer_port: U16,
+    /// Flow: the local address, zero unless the local endpoint names one.
+    pub local_addr: [u8; 4],
+    /// Flow: the peer address, zero unless the peer endpoint names one.
+    pub peer_addr: [u8; 4],
+    /// Reserved; must be zero. Room for the wider addresses an IPv6 sibling
+    /// needs, so that extension does not move the fields above it.
+    /// Configure: the default gateway, or all-zero for none. Zero on
+    /// every verb that is not configuring an identity.
+    pub gateway: [u8; 4],
+    pub reserved4: [u8; 8],
 }
 
 impl NetReqWire {
+    /// No flow bound — the L2-only filter, and the whole of this record's
+    /// meaning before the flow block existed.
+    pub const FLOW_NONE: u8 = 0;
+    /// A flow is bound; the block below is live.
+    pub const FLOW_SOME: u8 = 1;
+    /// Flow: exactly the named IP protocol.
+    pub const PROTO_ONLY: u8 = 0;
+    /// Flow: every protocol carried over IP — a widening power.
+    pub const PROTO_ANY: u8 = 1;
+    /// Flow endpoint: exactly this address and port.
+    pub const EP_ADDRPORT: u8 = 0;
+    /// Flow endpoint: this address, any port.
+    pub const EP_ADDR: u8 = 1;
+    /// Flow endpoint: any address and port — a widening power on the local
+    /// end, and ordinary on the peer end.
+    pub const EP_ANY: u8 = 2;
+    /// Flow: the IPv4 address family.
+    pub const FAMILY_IPV4: u8 = 4;
+
     /// Report link, address, geometry, and this pair's policy.
     pub const OP_QUERY: u8 = 1;
     /// Open a vif over the window riding the return leg.
@@ -3384,6 +3587,90 @@ impl NetReqWire {
     /// and efuse said at bring-up. Answered whether or not the radio lends a
     /// frame path; refused `UNSUPPORTED` on a host with no radio.
     pub const OP_RADIO: u8 = 6;
+    /// Replace the receive filter on a vif this pair already holds.
+    ///
+    /// Re-authorized in full against the arrival pair's policy, exactly as
+    /// [`OP_OPEN_VIF`](Self::OP_OPEN_VIF) is — holding a vif is not authority
+    /// to widen what it accepts. It reuses the filter block and the vif
+    /// identity this record already carries, so the record's layout is
+    /// unchanged and every field a pre-flow version zeroed stays zeroed.
+    pub const OP_SET_FILTER: u8 = 7;
+
+    // ── 8..=12 — reserved for PR #966's peer-link block ────────────────
+    //
+    // Unallocated here on purpose. #966 takes `OP_LINK` at 7 and the four
+    // after it; this record took 7 first, so that side renumbers, and
+    // leaving its block clear means the renumber is a shift and not a
+    // negotiation. Reserving a range rather than appending in merge order
+    // is what makes the landing order stop mattering — see
+    // `res/INET_MIGRATION.md` §2.2. The uniqueness guard below turns any
+    // mistake here into a build error rather than a silent misroute.
+
+    // ── 13..=17 — the flow program ─────────────────────────────────────
+    //
+    // The arbitrating verbs. They arbitrate the two things that must be
+    // exactly one party — the machine's address and the port space — and
+    // they are on this record rather than their own because a row serves
+    // one protocol: `SvcProtocol` is one `Request`, one `ReqWire`, one
+    // intake. Folding them here is what let the frame row absorb the flow
+    // row, so a minted flow's filter is installed by a function call and
+    // not by a verb crossing a founder face that cannot be built.
+    //
+    // None of them grew the record. Every field they need was already
+    // here but for the station prefix and the gateway, which came out of
+    // the flow block's own reserve.
+
+    /// Report the machine's address, prefix, gateway and resolver.
+    ///
+    /// Distinct from [`OP_QUERY`](Self::OP_QUERY), which answers for a vif
+    /// and the link beneath it. This answers for the station.
+    pub const OP_INET_QUERY: u8 = 13;
+    /// Set the machine's address, prefix and gateway.
+    pub const OP_CONFIGURE: u8 = 14;
+    /// Mint a flow to one peer, binding a local port.
+    pub const OP_OPEN_FLOW: u8 = 15;
+    /// Mint a listening flow: a local endpoint, any peer.
+    pub const OP_OPEN_LISTENER: u8 = 16;
+    /// Release a vif's flows and the ports they hold.
+    pub const OP_CLOSE_FLOW: u8 = 17;
+
+    // The peer-face verbs (`res/PEER_LINK.md` P1). A frame client cannot be
+    // wired by the founder — a chained driver row may be neither a
+    // `shell_client` (`founder/mod.rs`'s core-topology rule) nor a declared
+    // provider (`declared_client_topology_supported`) — so the only face it
+    // can hold is one this row MINTS onto pair 0 at runtime. These three
+    // verbs are that mint, and they are the accel row's vocabulary verbatim
+    // because the assembly they drive is `kore_rt`'s, not this row's.
+
+    /// Contribute one component of a peer bundle; the complete bundle mints
+    /// a serving pair.
+    pub const OP_ADMIT_PEER: u8 = 18;
+    /// Collect the verdict on the bundle most recently completed.
+    pub const OP_TAKE_PEER_ADMISSION: u8 = 19;
+    /// Close the minted pair this request arrives on.
+    pub const OP_CLOSE_PEER: u8 = 20;
+    /// Retire one exact minted generation, from the administration side.
+    ///
+    /// The asker's half of teardown: a launch whose face was minted and then
+    /// refused must be able to give the cell back, or a boot's worth of
+    /// refused launches fills the roster.
+    pub const OP_RETIRE_PEER: u8 = 21;
+    /// Ask whether that generation's cell is free again.
+    pub const OP_CONFIRM_RETIRED: u8 = 22;
+
+    /// `peer_part`: the pair's ring window — the bundle's first component,
+    /// and the boundary between one bundle and the next.
+    pub const PART_RING: u8 = 0;
+    /// `peer_part`: the reply kick toward the pair's client.
+    pub const PART_KICK: u8 = 1;
+    /// `peer_part`: the return leg's receive end.
+    pub const PART_RETURN_RECV: u8 = 2;
+    /// `peer_part`: grant lane `n` is `PART_GRANT_BASE + n`.
+    ///
+    /// Based well past the three named parts so a lane index can never be
+    /// read as one of them, and so adding a named part later costs no
+    /// renumbering of the lanes.
+    pub const PART_GRANT_BASE: u8 = 128;
 
     /// `ethertype_kind`: exactly the listed types.
     pub const ET_ONLY: u8 = 0;
@@ -3403,6 +3690,84 @@ impl NetReqWire {
     pub const FLAG_BROADCAST: u8 = 1 << 1;
     /// Accept frames addressed to any station — the capture bit.
     pub const FLAG_PROMISCUOUS: u8 = 1 << 2;
+}
+
+/// [`NetReqWire`]'s block allocation — the one place a byte range in this
+/// record is claimed.
+///
+/// `res/WIFI_LINK.md`'s 64-byte 802.11 tail is the next block to land
+/// (`res/INET_MIGRATION.md` §2.2, PR #966). It appends as a third row here
+/// and 64 bytes of fields at the end of the struct; the assertion below is
+/// what makes that safe to do in either merge order.
+pub const NET_REQ_BLOCKS: [WireBlock; 2] = [
+    WireBlock {
+        at: 0,
+        bytes: 32,
+        owner: "the L2 frame program — res/NETWORK_SERVICE.md",
+    },
+    WireBlock {
+        at: 32,
+        bytes: 32,
+        owner: "the flow program — res/INET_STACK.md",
+    },
+];
+
+/// The blocks above are disjoint, gapless, and exactly the record — and each
+/// one begins at the field it claims.
+const _: () = {
+    use core::mem::{offset_of, size_of};
+
+    WireBlock::check(&NET_REQ_BLOCKS, size_of::<NetReqWire>());
+    // The pins: a `#[repr(C)]` field order that drifts out from under a
+    // claimed offset is the half `check` alone cannot see.
+    assert!(offset_of!(NetReqWire, op) == NET_REQ_BLOCKS[0].at as usize);
+    assert!(offset_of!(NetReqWire, flow_kind) == NET_REQ_BLOCKS[1].at as usize);
+};
+
+/// The flow row's reply payload: what `TAG_IDENTITY`, `TAG_FLOW` and
+/// `TAG_FLOW_CLOSED` carry. 28 bytes.
+///
+/// A separate block rather than a reuse of the counter or radio bytes.
+/// Those are a different shape's, and a record whose meaning depends on
+/// reading the tag first is one a careless decoder gets wrong — the exact
+/// failure the reserved-range discipline exists to prevent. The record
+/// grows; the alternative is a misdecode nobody sees.
+#[repr(C)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+pub struct NetInetWire {
+    /// The station's address, or a flow's local address.
+    pub addr: [u8; 4],
+    /// The default gateway, all-zero for none.
+    pub gateway: [u8; 4],
+    /// The resolver, all-zero for none.
+    pub dns: [u8; 4],
+    /// The flow's peer.
+    pub peer_addr: [u8; 4],
+    /// The flow's local port.
+    pub local_port: U16,
+    /// The flow's peer port.
+    pub peer_port: U16,
+    /// How many ports a close gave back.
+    pub released: U16,
+    /// The station's prefix length.
+    pub prefix_len: u8,
+    /// The flow's IP protocol.
+    pub proto: u8,
+    /// Whether the row could install the filter that enforces a mint.
+    pub frame_policy: u8,
+    pub reserved: [u8; 3],
 }
 
 /// The bound radio's facts, as `TAG_RADIO` carries them: the chip cut, the
@@ -3594,12 +3959,28 @@ pub struct NetRepWire {
     pub tx_frames: U64,
     /// Frames dropped for it — a full ring, or fan-out exhaustion.
     pub dropped: U64,
+    /// The minted pair's arrival identity on
+    /// [`TAG_PEER_ADMITTED`](Self::TAG_PEER_ADMITTED); zero otherwise.
+    ///
+    /// The peer block's own field rather than a reuse of
+    /// [`vif_index`](Self::vif_index): a minted pair is not a vif, and a
+    /// reader that credited one identity to the other would be wrong in a
+    /// way no size assertion or test would catch. The head grows by its
+    /// natural alignment either way, so the six bytes beside it are this
+    /// block's reserve — where P1's remaining verbs put their fields.
+    pub peer_arrival: U16,
+    /// Reserved; must be zero.
+    pub reserved: [u8; 6],
     /// The device's counters on [`TAG_INFO`](Self::TAG_INFO); zero
     /// otherwise.
     pub counters: NetCountersWire,
     /// The bound radio's facts on [`TAG_RADIO`](Self::TAG_RADIO); zero
     /// otherwise.
     pub radio: NetRadioWire,
+    /// The flow row's answer: the station's identity, or a minted
+    /// flow's endpoints, or what a close released. Zero on every frame
+    /// tag, exactly as `radio` is zero on every tag but `TAG_RADIO`.
+    pub inet: NetInetWire,
 }
 
 impl NetRepWire {
@@ -3617,6 +3998,29 @@ impl NetRepWire {
     pub const TAG_REFUSED: u8 = 6;
     /// The bound radio's facts ride [`radio`](Self::radio).
     pub const TAG_RADIO: u8 = 7;
+    /// A vif's receive filter was replaced; the reply names the identity it
+    /// was replaced on, so a client cannot credit the answer to another vif.
+    pub const TAG_FILTERED: u8 = 8;
+    /// The station's identity: address, prefix, gateway, resolver.
+    ///
+    /// Answers [`OP_INET_QUERY`](NetReqWire::OP_INET_QUERY) and
+    /// [`OP_CONFIGURE`](NetReqWire::OP_CONFIGURE) alike — both end with the
+    /// row stating what the machine's address now is, and a caller that
+    /// configured wants the facts a caller that asked gets.
+    pub const TAG_IDENTITY: u8 = 9;
+    /// A flow was minted; its endpoints are in the flow block.
+    pub const TAG_FLOW: u8 = 10;
+    /// A vif's flows were released, and how many ports came back.
+    pub const TAG_FLOW_CLOSED: u8 = 11;
+    /// A peer-bundle component was taken; the bundle is not yet complete.
+    pub const TAG_PEER_ACCEPTED: u8 = 12;
+    /// A bundle completed and a pair was minted; its identity is in
+    /// [`peer_arrival`](Self::peer_arrival).
+    pub const TAG_PEER_ADMITTED: u8 = 13;
+    /// The minted pair is retiring.
+    pub const TAG_PEER_CLOSING: u8 = 14;
+    /// That generation's cell is free: nothing of it remains.
+    pub const TAG_PEER_RETIRED: u8 = 15;
 
     /// The verb is not available in this posture.
     pub const REFUSE_UNSUPPORTED: u8 = 1;
@@ -3651,18 +4055,165 @@ impl NetRepWire {
     pub const REFUSE_NO_CHANNEL: u8 = 15;
     /// A refusal the service could not attribute.
     pub const REFUSE_INTERNAL: u8 = 16;
+
+    // ── refusal code allocation ─────────────────────────────────────────
+    //
+    // One numbering shared by every workstream that adds a net verb, so the
+    // ranges are stated once rather than discovered in a merge.  Two
+    // `pub const`s with different names and the same value *compile*, and a
+    // `from_code` built from both decodes one workstream's refusal as the
+    // other's — green on every gate.  The assertion at the foot of this
+    // module makes that a build error; this table says who owns what.
+    //
+    //    1..=16   the L2 frame program          (res/NETWORK_SERVICE.md)
+    //   17..=21   the 802.11 link               (res/WIFI_LINK.md, #966)
+    //   22..=25   the flow program              (res/INET_STACK.md)
+    //   26..      unallocated
+    //
+    // Claim a range here before using it.
+
+    /// The pair may only bind a restricted flow and the request bound none.
+    pub const REFUSE_POLICY_FLOW_REQUIRED: u8 = 22;
+    /// An IP protocol outside this pair's flow grant, including a forged
+    /// [`PROTO_ANY`](NetReqWire::PROTO_ANY).
+    pub const REFUSE_POLICY_FLOW_PROTO: u8 = 23;
+    /// A local endpoint outside this pair's flow grant.
+    pub const REFUSE_POLICY_FLOW_LOCAL: u8 = 24;
+    /// A peer endpoint outside this pair's flow grant.
+    pub const REFUSE_POLICY_FLOW_PEER: u8 = 25;
+
+    // ── 26..=38 — the flow program ────────────────────────────────────
+    //
+    // The arbitrating verbs' refusals, in their own band above the frame
+    // row's. Where the two rows refused the same fact they share a code
+    // rather than carrying two spellings of it: an internal fault is
+    // `REFUSE_INTERNAL`, an unknown vif is `REFUSE_NO_VIF`, and a vif
+    // belonging to someone else is `REFUSE_NOT_OWNER`.
+    //
+    // One refusal did not survive the merge, and its absence is the
+    // point. `NoFrameFace` said the row could not install the filter that
+    // enforces a mint, because reaching the frame row meant a founder face
+    // that cannot be built (`res/INET_MIGRATION.md` §5.7a). The rows are
+    // one row now and the install is a function call, so there is no face
+    // to be missing and no state in which a capability is minted that
+    // nothing enforces.
+    /// The machine has no address, so no flow can be meaningful yet.
+    pub const REFUSE_NO_IDENTITY: u8 = 26;
+    /// The address offered is not one a station may hold —
+    /// unspecified, broadcast, multicast or loopback.
+    pub const REFUSE_NOT_A_STATION: u8 = 27;
+    /// The prefix length is outside 1..=32.
+    pub const REFUSE_BAD_PREFIX: u8 = 28;
+    /// Another vif holds that protocol and port.
+    pub const REFUSE_PORT_TAKEN: u8 = 29;
+    /// Below 1024 without the grant that permits it.
+    pub const REFUSE_PORT_PRIVILEGED: u8 = 30;
+    /// Port zero is the wire's wildcard and never a binding.
+    pub const REFUSE_PORT_RESERVED: u8 = 31;
+    /// Every ephemeral port is spoken for.
+    pub const REFUSE_NO_EPHEMERAL: u8 = 32;
+    /// The port table is full.
+    pub const REFUSE_PORTS_EXHAUSTED: u8 = 33;
+    /// No route to that peer from this station.
+    pub const REFUSE_UNREACHABLE: u8 = 34;
+    /// That vif already carries a flow; one vif holds one filter.
+    pub const REFUSE_VIF_ALREADY_BOUND: u8 = 35;
+    /// This vif has spent its socket budget.
+    pub const REFUSE_SOCKETS_EXHAUSTED: u8 = 36;
+    /// The vif went away between the mint and the install.
+    pub const REFUSE_FRAME_LOST: u8 = 37;
+    /// The arrival pair's policy refused the filter the mint
+    /// would have installed.
+    pub const REFUSE_FLOW_POLICY: u8 = 38;
+    /// The gateway is not reachable on the prefix given.
+    pub const REFUSE_GATEWAY_OFF_LINK: u8 = 39;
+
+    // The peer-face refusals (`res/PEER_LINK.md` P1).
+    /// The arrival pair may not assemble peer bundles. Only a FIXED pair
+    /// administers the mint; a minted face cannot mint another.
+    pub const REFUSE_PEER_DENIED: u8 = 40;
+    /// The component offered is not one this bundle can take — a duplicate,
+    /// a grant lane out of range, or a capability of the wrong kind.
+    pub const REFUSE_BAD_PEER_BUNDLE: u8 = 41;
 }
+
+/// Every net refusal code is distinct.
+///
+/// The failure this exists to stop is silent: two workstreams each append a
+/// refusal constant, pick the same number, and the tree compiles — then one
+/// side's refusal decodes as the other's.  No size assertion, no test and no
+/// build gate catches it, because nothing is actually ill-formed.  Here it is
+/// a compile error instead, and the table beside the constants says which
+/// range each workstream owns.
+const _: () = {
+    let codes = [
+        NetRepWire::REFUSE_UNSUPPORTED,
+        NetRepWire::REFUSE_NOT_READY,
+        NetRepWire::REFUSE_POLICY_ETHERTYPE,
+        NetRepWire::REFUSE_POLICY_MULTICAST,
+        NetRepWire::REFUSE_POLICY_BROADCAST,
+        NetRepWire::REFUSE_POLICY_PROMISCUOUS,
+        NetRepWire::REFUSE_POLICY_VIFS,
+        NetRepWire::REFUSE_NO_VIF,
+        NetRepWire::REFUSE_STALE_VIF,
+        NetRepWire::REFUSE_NOT_OWNER,
+        NetRepWire::REFUSE_BAD_WINDOW,
+        NetRepWire::REFUSE_EXHAUSTED,
+        NetRepWire::REFUSE_BUSY,
+        NetRepWire::REFUSE_NO_MAPPING,
+        NetRepWire::REFUSE_NO_CHANNEL,
+        NetRepWire::REFUSE_INTERNAL,
+        NetRepWire::REFUSE_POLICY_FLOW_REQUIRED,
+        NetRepWire::REFUSE_POLICY_FLOW_PROTO,
+        NetRepWire::REFUSE_POLICY_FLOW_LOCAL,
+        NetRepWire::REFUSE_POLICY_FLOW_PEER,
+        NetRepWire::REFUSE_NO_IDENTITY,
+        NetRepWire::REFUSE_NOT_A_STATION,
+        NetRepWire::REFUSE_BAD_PREFIX,
+        NetRepWire::REFUSE_PORT_TAKEN,
+        NetRepWire::REFUSE_PORT_PRIVILEGED,
+        NetRepWire::REFUSE_PORT_RESERVED,
+        NetRepWire::REFUSE_NO_EPHEMERAL,
+        NetRepWire::REFUSE_PORTS_EXHAUSTED,
+        NetRepWire::REFUSE_UNREACHABLE,
+        NetRepWire::REFUSE_VIF_ALREADY_BOUND,
+        NetRepWire::REFUSE_SOCKETS_EXHAUSTED,
+        NetRepWire::REFUSE_FRAME_LOST,
+        NetRepWire::REFUSE_PEER_DENIED,
+        NetRepWire::REFUSE_BAD_PEER_BUNDLE,
+        NetRepWire::REFUSE_FLOW_POLICY,
+        NetRepWire::REFUSE_GATEWAY_OFF_LINK,
+    ];
+    let mut i = 0;
+    while i < codes.len() {
+        // Zero is "not a refusal" on the wire, so no code may take it.
+        assert!(codes[i] != 0, "a net refusal code may not be zero");
+        let mut j = i + 1;
+        while j < codes.len() {
+            assert!(codes[i] != codes[j], "duplicate net refusal code");
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 const _: () = {
     use core::mem::size_of;
-    assert!(size_of::<NetReqWire>() == 32);
+    assert!(size_of::<NetReqWire>() == 64);
     assert!(size_of::<NetRadioWire>() == 36);
     assert!(size_of::<NetCountersWire>() == 24);
-    // 48-byte vif/link head ‖ 24-byte counters ‖ 36-byte radio block.
-    assert!(size_of::<NetRepWire>() == 48 + 24 + 36);
-    // 16-byte head (op ‖ 3 filter kinds ‖ flags ‖ 3 reserved ‖ vif index+generation
-    //     ‖ announced) ‖ 4×2 ethertypes ‖ 6-byte group ‖ 2 reserved.
-    assert!(size_of::<NetReqWire>() == 16 + MAX_NET_ETHERTYPES * 2 + 6 + 2);
+    assert!(size_of::<NetInetWire>() == 28);
+    // 56-byte vif/link head (48 of vif/link ‖ the peer block's arrival and
+    //     its six reserved) ‖ 24-byte counters ‖ 36-byte radio block
+    //     ‖ 28-byte flow block.
+    assert!(size_of::<NetRepWire>() == 56 + 24 + 36 + 28);
+    // 16-byte head (op ‖ 3 filter kinds ‖ flags ‖ peer part ‖ 2 reserved ‖ vif index+generation
+    //     ‖ announced) ‖ 4×2 ethertypes ‖ 6-byte group ‖ 2 reserved
+    //     ‖ 32-byte flow block (4 kinds ‖ proto ‖ family ‖ 2 reserved
+    //       ‖ 2×2 ports ‖ 2×4 addresses ‖ prefix ‖ 1 reserved ‖ gateway
+    //       ‖ 8 reserved).  The flow block absorbed the station's prefix
+    //       and gateway out of its own reserve, so the record did not grow.
+    assert!(size_of::<NetReqWire>() == 16 + MAX_NET_ETHERTYPES * 2 + 6 + 2 + 32);
     assert!(size_of::<MmReqWire>() == 32);
     assert!(size_of::<MmRepWire>() == 72);
     assert!(size_of::<MonitorReqWire>() == 104);
@@ -4466,6 +5017,253 @@ mod tests {
         }
     }
 }
+
+// ─── inet — the L3/L4 flow service (kore-svc-inet) ──────────────────
+
+/// Internet-row request. The row arbitrates the two singular things — the
+/// machine's address and the port space — and mints a flow; it is never on
+/// the datapath, so there is no send verb and no receive verb here either.
+/// 32 bytes.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct InetReqWire {
+    /// Vocabulary discriminant ([`OP_QUERY`](Self::OP_QUERY)…); 0 invalid.
+    pub op: u8,
+    /// The IP protocol a flow names, zero on the verbs that name none.
+    pub proto: u8,
+    /// [`FLAG_EPHEMERAL`](Self::FLAG_EPHEMERAL).
+    pub flags: u8,
+    /// `Configure`: the prefix length in bits, 0..=32.
+    pub prefix_len: u8,
+    /// The local port a flow binds, zero when
+    /// [`FLAG_EPHEMERAL`](Self::FLAG_EPHEMERAL) asks the row to choose.
+    pub local_port: U16,
+    /// The peer port a connected flow names.
+    pub peer_port: U16,
+    /// The vif this request's flow rides, and its generation — a stale
+    /// identifier is refused, never serviced.
+    pub vif_index: U16,
+    /// That vif's generation.
+    pub vif_generation: U16,
+    /// `Configure`: this station's address.
+    pub addr: [u8; 4],
+    /// `Configure`: the default gateway, zero for none.
+    pub gateway: [u8; 4],
+    /// The peer address a connected flow names.
+    pub peer_addr: [u8; 4],
+    /// Reserved; must be zero.
+    pub reserved: [u8; 8],
+}
+
+impl InetReqWire {
+    /// Report the row's identity and whether it has one.
+    pub const OP_QUERY: u8 = 1;
+    /// Adopt an address, prefix and gateway — from DHCP or a static plan.
+    pub const OP_CONFIGURE: u8 = 2;
+    /// Mint a connected flow: both ends pinned.
+    pub const OP_OPEN_FLOW: u8 = 3;
+    /// Mint a listening flow: a local endpoint, any peer.
+    pub const OP_OPEN_LISTENER: u8 = 4;
+    /// Release everything a vif holds.
+    pub const OP_CLOSE: u8 = 5;
+
+    /// Let the row choose the local port from the ephemeral range.
+    pub const FLAG_EPHEMERAL: u8 = 1 << 0;
+}
+
+/// Internet-row reply. 40 bytes.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct InetRepWire {
+    /// The verb answered, echoed so a reply cannot be mistaken for another's.
+    pub op: u8,
+    /// [`STATUS_OK`](Self::STATUS_OK) / [`STATUS_REFUSED`](Self::STATUS_REFUSED).
+    pub status: u8,
+    /// The refusal code when refused, zero otherwise.
+    pub refusal: u8,
+    /// The prefix length the row holds.
+    pub prefix_len: u8,
+    /// [`FLAG_CONFIGURED`](Self::FLAG_CONFIGURED).
+    pub flags: u8,
+    /// The flow's protocol.
+    pub proto: u8,
+    /// The frame row's own per-dimension policy answer, when
+    /// [`refusal`](Self::refusal) is
+    /// [`REFUSE_FRAME_POLICY`](Self::REFUSE_FRAME_POLICY); zero otherwise.
+    ///
+    /// Carried as a byte rather than spent as ten refusal codes: the ten
+    /// dimensions belong to the frame row's vocabulary, not this one's, and
+    /// re-encoding them here would make the two drift. Zero on every other
+    /// reply, so the record a pre-face peer produces is unchanged.
+    pub frame_policy: u8,
+    /// Reserved; must be zero.
+    pub reserved0: [u8; 1],
+    /// The local port the row bound — the answer when the request asked for
+    /// an ephemeral one.
+    pub local_port: U16,
+    /// The peer port the flow names.
+    pub peer_port: U16,
+    /// Ports released by a close.
+    pub released: U16,
+    /// Reserved; must be zero.
+    pub reserved1: [u8; 2],
+    /// This station's address.
+    pub addr: [u8; 4],
+    /// The default gateway, zero for none.
+    pub gateway: [u8; 4],
+    /// The resolver, zero for none.
+    pub dns: [u8; 4],
+    /// The peer address the flow names.
+    pub peer_addr: [u8; 4],
+    /// Reserved; must be zero.
+    pub reserved2: [u8; 8],
+}
+
+impl InetRepWire {
+    /// The verb succeeded.
+    pub const STATUS_OK: u8 = 1;
+    /// The verb was refused; [`refusal`](Self::refusal) says why.
+    pub const STATUS_REFUSED: u8 = 2;
+
+    /// The row holds an identity.
+    pub const FLAG_CONFIGURED: u8 = 1 << 0;
+
+    // ── refusal code allocation ─────────────────────────────────────────
+    //
+    // This row's own numbering, independent of the frame row's. Its ranges
+    // are stated here for the same reason that one's are: a duplicate is a
+    // silent decode bug, and the assertion below makes it a build error.
+    //
+    //    1..=3    the identity
+    //    4..=8    the port space
+    //    9..=10   the route and the unattributed arm
+    //   11..=15   the face onto the frame row (the enforcement half)
+    //   16..=16   the vif binding
+    //   17..=17   the per-vif socket budget
+    //   18..      unallocated
+
+    /// The row has no address yet, so no flow can name a local end.
+    pub const REFUSE_NO_IDENTITY: u8 = 1;
+    /// The address cannot be a station — unspecified, broadcast, multicast
+    /// or loopback.
+    pub const REFUSE_NOT_A_STATION: u8 = 2;
+    /// A gateway off the configured prefix, or a prefix an IPv4 address
+    /// cannot carry.
+    pub const REFUSE_BAD_PREFIX: u8 = 3;
+    /// Another vif holds this port.
+    pub const REFUSE_PORT_TAKEN: u8 = 4;
+    /// A privileged port without the grant to bind one.
+    pub const REFUSE_PORT_PRIVILEGED: u8 = 5;
+    /// Port zero is the wire's wildcard and never a binding.
+    pub const REFUSE_PORT_RESERVED: u8 = 6;
+    /// Every ephemeral port is spoken for.
+    pub const REFUSE_NO_EPHEMERAL: u8 = 7;
+    /// The port table is full.
+    pub const REFUSE_PORTS_EXHAUSTED: u8 = 8;
+    /// The peer is off-link and no gateway is configured, so the flow could
+    /// never route.
+    pub const REFUSE_UNREACHABLE: u8 = 9;
+    /// A refusal the row could not attribute.
+    pub const REFUSE_INTERNAL: u8 = 10;
+
+    // ── the face onto the frame row ─────────────────────────────────────
+    //
+    // A flow is minted only once the filter enforcing it is installed, so
+    // every way that install can fail is a way the mint can be refused. Each
+    // is named: an unwired row, a too-narrow grant and a torn face are three
+    // different problems with three different fixes.
+
+    /// No face onto the frame row was wired, so the filter that enforces a
+    /// flow cannot be installed and no flow can be minted.
+    ///
+    /// The boot manifest's problem, not the caller's.
+    pub const REFUSE_NO_FRAME_FACE: u8 = 11;
+    /// The frame row's policy refused the filter; which dimension exceeded
+    /// rides [`frame_policy`](Self::frame_policy).
+    pub const REFUSE_FRAME_POLICY: u8 = 12;
+    /// The frame row knows no such vif.
+    pub const REFUSE_FRAME_NO_VIF: u8 = 13;
+    /// The vif belongs to another holder of the frame row's.
+    pub const REFUSE_FRAME_NOT_OWNER: u8 = 14;
+    /// The face's transport failed, so whether the filter was installed is
+    /// unknown — distinct from every code above, all of which mean nothing
+    /// changed.
+    pub const REFUSE_FRAME_LOST: u8 = 15;
+
+    /// The vif already enforces a flow this row minted.
+    ///
+    /// A vif carries one filter, so a second flow on it would silently stop
+    /// enforcing the first. A holder wanting a second flow opens a second
+    /// vif.
+    pub const REFUSE_VIF_ALREADY_BOUND: u8 = 16;
+
+    /// This vif's socket budget is spent, so no further endpoint can be
+    /// opened on it.
+    ///
+    /// The budget is the socket storage the vif's own row borrows, fixed when
+    /// that row is built: per-vif, never a pool, so the refusal reaches the
+    /// holder that asked and cannot be provoked by another. Named rather than
+    /// folded into [`REFUSE_INTERNAL`](Self::REFUSE_INTERNAL) because the fix
+    /// is the holder's — open a second vif, or build the row with more
+    /// storage — and an unattributed refusal would say neither.
+    ///
+    /// The borrowed stack below answers the same condition with a `panic!`
+    /// (`vendor/smoltcp/src/iface/socket_set.rs:83`). This code is the kore
+    /// side of that seam: `crates/inet`'s `SocketBudget` refuses before the
+    /// panicking call is reached, and this is the name the refusal travels
+    /// under.
+    pub const REFUSE_SOCKETS_EXHAUSTED: u8 = 17;
+}
+
+/// Every inet refusal code is distinct — the same guard the frame row carries,
+/// for the same reason: a duplicate compiles and then decodes as the wrong
+/// refusal.
+const _: () = {
+    let codes = [
+        InetRepWire::REFUSE_NO_IDENTITY,
+        InetRepWire::REFUSE_NOT_A_STATION,
+        InetRepWire::REFUSE_BAD_PREFIX,
+        InetRepWire::REFUSE_PORT_TAKEN,
+        InetRepWire::REFUSE_PORT_PRIVILEGED,
+        InetRepWire::REFUSE_PORT_RESERVED,
+        InetRepWire::REFUSE_NO_EPHEMERAL,
+        InetRepWire::REFUSE_PORTS_EXHAUSTED,
+        InetRepWire::REFUSE_UNREACHABLE,
+        InetRepWire::REFUSE_INTERNAL,
+        InetRepWire::REFUSE_NO_FRAME_FACE,
+        InetRepWire::REFUSE_FRAME_POLICY,
+        InetRepWire::REFUSE_FRAME_NO_VIF,
+        InetRepWire::REFUSE_FRAME_NOT_OWNER,
+        InetRepWire::REFUSE_FRAME_LOST,
+        InetRepWire::REFUSE_VIF_ALREADY_BOUND,
+        InetRepWire::REFUSE_SOCKETS_EXHAUSTED,
+    ];
+    let mut i = 0;
+    while i < codes.len() {
+        assert!(codes[i] != 0, "an inet refusal code may not be zero");
+        let mut j = i + 1;
+        while j < codes.len() {
+            assert!(codes[i] != codes[j], "duplicate inet refusal code");
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
+const _: () = {
+    use core::mem::size_of;
+    // 4-byte head (op ‖ proto ‖ flags ‖ prefix) ‖ 4×2 ports/vif ‖ 3×4
+    // addresses ‖ 8 reserved.
+    assert!(size_of::<InetReqWire>() == 4 + 8 + 12 + 8);
+    assert!(size_of::<InetReqWire>() == 32);
+    // 8-byte head ‖ 4×2 ports ‖ 4×4 addresses ‖ 8 reserved.
+    assert!(size_of::<InetRepWire>() == 8 + 8 + 16 + 8);
+    assert!(size_of::<InetRepWire>() == 40);
+};
 
 // ─── surface — the virtual-framebuffer class protocol (kore-svc-compositor) ───
 //

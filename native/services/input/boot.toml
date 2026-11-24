@@ -1,0 +1,48 @@
+# services/input/boot.toml — this service's boot-manifest row (the design
+# lives in res/boot.toml's header).  The row rides beside the crate it
+# endows, redox-style; whether and WHEN it founds is the image's
+# `services` list (res/images/<name>.toml) — founding order and chain
+# adjacency are topology, the image's to declare, never a row's.
+
+[service]
+image     = "kore-svc-input"
+chain     = true                             # a driver row (chained + declares devices).
+                                             # It takes a CLIENT FACE onto every live
+                                             # broker (SVC_SEND@1 / SVC_RING@1 /
+                                             # SVC_RETURN@2 for broker 0) and claims its
+                                             # xHCI and its i8042 through it; a driver
+                                             # row founded without that face can claim
+                                             # nothing.  The terminal's `client_of` and
+                                             # the compositor's `pointer_source` name this
+                                             # row (#1202); its ordinal is derived and
+                                             # nothing keys on it.
+endowment = "kore_svc_input::InputEndowment"
+protocol  = "kore_svc_input::InputService"
+# Report-descriptor parsing expands vendor fields and collection metadata.
+# The captured ELAN 4516 descriptor alone maps about 5.2 MiB through kore-rt's
+# heap, exceeding the default 2 MiB supply. Allow concurrent parsing of the
+# captured ELAN/Synaptics pair plus USB state within the 16 MiB map-stride cap.
+# This is this process's bounded HEAP lease, not the driver DMA pool.
+heap_supply_bytes = 0x0100_0000
+# The startup linker carves the union of the writable LOADs (RELRO, `.data`,
+# `.bss`) and its 4 KiB module page from this supply. The image needed
+# exactly the default 64 KiB, so 944 bytes of RELRO growth from a runtime
+# change crossed a page and the stub refused the link at boot (rung 0x81,
+# `SupplyExhausted`); it now needs 68 KiB. 128 KiB leaves room to grow, and
+# `every_committed_private_data_fits_its_startup_supply` holds every row's
+# committed image to its budget. Bounded startup data, not the heap.
+link_supply_bytes = 0x0002_0000
+                                             # No DEVICE. This row CLAIMS its xHCI
+                                             # controller and its i8042 from the broker
+                                             # above (res/DEVICE_SERVICE.md §10), so the
+                                             # founder never has to choose them — which is
+                                             # what let the kernel stop reading CAPLENGTH
+                                             # and PORTSC through a candidate's BAR to
+                                             # decide which xHC this row should drive.
+                                             #
+                                             # The DMA pool stays founded: it is
+                                             # class-agnostic, so sizing it needs no
+                                             # driver knowledge.
+endows    = ["DMA_POOL@0"]
+digest_x86_64  = "blake3:d293cf6ca1c3aaa346ca979dca0b04db4e2ea9005a70cd78c40ec8f2b306431c"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:4ff18d755415ace8fd80fb7600914705581fe73bfbacf2b6d0853c48be1d0b6d"  # res/aarch64/; make boot-digests-aarch64

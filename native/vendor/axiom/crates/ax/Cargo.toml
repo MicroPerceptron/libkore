@@ -1,0 +1,15 @@
+[package]
+name = "ax"
+version = "0.1.0"
+edition = "2024"
+description = "Backend-agnostic, no_std tensor graph IR and scheduler core"
+
+[features]
+default = []
+kernel-lowering = []
+
+[dependencies]
+axnn = { path = "../axnn", default-features = false }
+
+[dev-dependencies]
+unsigned-float = { version = "=0.2.2", default-features = false }

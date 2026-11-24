@@ -600,6 +600,24 @@ impl<P: StorageProvider> Engine<P> {
     /// Open an attachment held by `view` into one transient command session.
     /// The command receives only a handle; the stable grant remains owned by
     /// the task view and therefore survives process teardown.
+    ///
+    /// The handle needs an edge the command holds to prove its route by, so
+    /// the grant is projected into the command's session: one edge, carrying
+    /// the grant whole, for as long as the session lives. **One per grant,
+    /// not one per open.** A command that reads a system view file by file —
+    /// a compiler and its headers — enters the same grant every time, and an
+    /// edge left behind by each entry spent the session's whole edge arena
+    /// (`MAX_EDGES_PER_SESSION`) on one view: the open after that refused
+    /// `OutOfEdges`, on a read. So an entry reuses the projection the session
+    /// already holds (`Authority::whole_projection`) and only the first
+    /// makes one.
+    ///
+    /// The projection carries the grant's own rights and the handle carries
+    /// what was asked for. That is not a widening: the request is attenuated
+    /// against the grant here, before any edge is touched, and again against
+    /// the projection when the handle is minted; a command could always ask
+    /// again for any right the grant conveys; and no request names a
+    /// projection, whose id never leaves the service.
     pub(crate) fn open_task_grant(
         &self,
         session: SessionId,
@@ -613,11 +631,17 @@ impl<P: StorageProvider> Engine<P> {
         }
         let root = edge.root();
         let rights = edge.rights().attenuate(requested)?;
-        let quota = edge.quota();
+        let standing = self.auth.whole_projection(session, view, grant, &edge)?;
+        let (whole, quota) = (edge.rights(), edge.quota());
         drop(edge);
+        if let Some(projected) = standing {
+            // Other handles may hold this projection: a refused open leaves
+            // it where it was.
+            return self.open_authority_edge(session, projected, rights);
+        }
         let projected = self
             .auth
-            .insert_grant(view, session, grant, root, rights, quota, None)?;
+            .insert_grant(view, session, grant, root, whole, quota, None)?;
         self.ns.object_mut(root)?.grants_inc();
         match self.open_authority_edge(session, projected, rights) {
             Ok(opened) => Ok(opened),

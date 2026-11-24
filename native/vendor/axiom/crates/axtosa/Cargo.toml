@@ -1,0 +1,16 @@
+[package]
+name = "axtosa"
+version = "0.1.0"
+edition = "2024"
+
+# Portable TOSA graph executor over the axnn-cpu kernel set — the CPU
+# backend of the virtio-accel / kore accelerator ecosystem.
+
+[dependencies]
+ax = { path = "../ax" }
+axmath = { path = "../axmath", default-features = false }
+axnn-cpu = { path = "../axnn-cpu", default-features = false }
+virtio-accel-tosa = { version = "0.4.0", default-features = false }
+
+[dev-dependencies]
+virtio-accel-conformance = "0.4.0"

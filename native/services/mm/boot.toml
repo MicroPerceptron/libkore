@@ -1,8 +1,8 @@
 # services/mm/boot.toml — this service's boot-manifest row (the design
 # lives in res/boot.toml's header).  The row rides beside the crate it
-# endows, redox-style; whether and WHEN it founds is the root manifest's
-# `services` list — founding order and chain adjacency are topology, the
-# root's to declare, never a row's.
+# endows, redox-style; whether and WHEN it founds is the image's
+# `services` list (res/images/<name>.toml) — founding order and chain
+# adjacency are topology, the image's to declare, never a row's.
 
 # The lessor of last resort: MEM_SUPPLY is the founder-minted heap-grant
 # lease; MEM_REGION (slice D) is the minting authority — a revocable
@@ -11,7 +11,7 @@
 # pair; the frames live and die against the region bitmap, so revoking
 # this one endowment reclaims every delegated child supply at once).
 #
-# `shell_client = true` + `exec_client = true` + `SERVE_PAIRS = 4` on the
+# `shell_pair = 1` + `init_pair = 2` + `exec_face = "mm"` + `SERVE_PAIRS = 4` on the
 # protocol: pair 0
 # stays the founder-era pair, pair 1 is the FIRST SHELL's supply face
 # (prefab-minted before the founding loop, conveyed through the
@@ -52,7 +52,8 @@ heap_supply_bytes = 0x0040_0000
 # this quota, remain what bounds everyone else.
 supply_quota_bytes = 27917287424 # 26 GiB
 endows    = ["MEM_SUPPLY@0", "MEM_REGION@0", "SYSTEM_OBSERVE@0"]  # review mirror; asserted === PROFILE.roles
-shell_client = true
-exec_client = true
-digest_x86_64  = "blake3:2ebee97309e197da6bcf90b34d7fbdd42eafa679b6afd770e3599500eefed040"  # res/x86_64/; make boot-digests
-digest_aarch64 = "blake3:693bd018cbfffac602028bcbbac3dcbc734b6e3347106f1529a9934b32c92d0b"  # res/aarch64/; make boot-digests-aarch64
+shell_pair = 1                             # pair 1 is the FIRST SHELL's supply face
+init_pair  = 2                             # pair 2 is INIT's supply face
+exec_face = "mm"                           # the final pair is exec's: per-launch mm faces
+digest_x86_64  = "blake3:70bdc7c5defbad601eb6a4c7ccc3c8bf3c06944b385df0fea0899d361d44fe70"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:0b6f82b7ae550a68b0c365f5299838099d4710ee514dbd157328d9ce7c20d780"  # res/aarch64/; make boot-digests-aarch64

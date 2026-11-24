@@ -33,6 +33,7 @@
 //! heap supply behind two cursors.
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", feature(thread_local, c_variadic))]
+#![cfg_attr(target_os = "none", feature(allocator_api))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 // The C ABI's exports are this image's reason to exist; naming the crate keeps
@@ -64,9 +65,13 @@ mod lock;
 #[cfg_attr(not(target_os = "none"), allow(dead_code))]
 mod mmap;
 #[cfg(target_os = "none")]
+mod net;
+#[cfg(target_os = "none")]
 mod posix;
 #[cfg(target_os = "none")]
 mod program;
+#[cfg(target_os = "none")]
+mod socket;
 #[cfg(any(test, target_os = "none"))]
 mod stdio;
 

@@ -1,0 +1,15 @@
+# services/output/boot.toml — the serial row's boot-manifest fragment
+# (res/IMAGE_PROFILES.md §4.3; the design lives in res/boot.toml's header).
+# The row rides beside the crate it endows; whether and WHEN it founds is the
+# image's `services` list (res/images/<name>.toml) — the headless image founds
+# it, the desktop does not.
+
+[service]
+image     = "kore-svc-output"
+chain     = true                             # a driver row: it claims its COM port
+                                             # from the brokers through its claimant face
+endowment = "kore_svc_output::SerialEndowment"
+protocol  = "kore_svc_output::SerialService"
+                                             # No DEVICE and no DMA pool: the line is
+                                             # claimed at runtime and is polled.
+endows    = []

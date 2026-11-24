@@ -75,6 +75,24 @@ pub const FOUNDING_NACKED: u16 = 1 << 3;
 // vocabulary, and the block that stores a value owns the words for reading it.
 // `kore-rt` re-exports them, so the services that SET them are unchanged.
 
+/// Testimony bit: an ICMP echo request left this station through the real
+/// `IpStack` — ARP, IPv4 and ICMP over a vif's own ring — and the reply came
+/// back.  The frame witness proves bytes reach the wire; this proves the
+/// protocol engine drives them, which is a different claim and the first one
+/// above L2 this tree has ever made on a datapath.
+pub const INET_ICMP_RT_READY: u64 = 1 << 57;
+
+/// Testimony bit: a name was resolved to an address over UDP — the resolver,
+/// the UDP binding and the datagram path, against the network's own DNS
+/// server rather than a double.
+pub const INET_DNS_READY: u64 = 1 << 56;
+
+/// Testimony bit: **the milestone.** A name was resolved and the address it
+/// named answered an echo — a host beyond this machine's own link, reached
+/// by the stack end to end.  `ping google.com`, as a fact rather than a
+/// plan.
+pub const INET_PING_WAN_READY: u64 = 1 << 55;
+
 /// Testimony bit: the frame service's founding self-test transmitted a frame
 /// and received one back — bulk OUT, the wire, bulk IN, the transfer event, the
 /// interrupt route, the classifier, and the vif's own ring, end to end.
@@ -128,6 +146,275 @@ pub const NET_WIFI_FW_ALIVE: u64 = 1 << 59;
 /// probe but not a burst honestly lacks the bit and the row still serves.
 pub const NET_LOAD_READY: u64 = 1 << 58;
 
+/// **The MT7925 bring-up ladder, as an ordinal rather than a bit each.**
+///
+/// Fifteen steps in four bits, where six steps used to take six bits.
+///
+/// The bits ran out. The carve grows downward from bit 62 and stops at 48
+/// — bit 63 is `INIT_FS_SEARCH_READY`, which a const-assert in
+/// `kore_rt::svc` forbids overlapping — so by M1 there were fifteen flags
+/// and nothing left to give `phy-up`, let alone M2 and M3. The encoding
+/// had to change before the ladder could, and this is that change.
+///
+/// What makes it possible is that **the ladder is ordered**: a part cannot
+/// have sent its RAM code without having its patch in place, nor answered
+/// an MCU command without a ring to carry it. Ordered states are a number,
+/// not a set, and the set was spending a bit on each to say what one
+/// number says. A step is the **highest** rung reached, so a reader asks
+/// `ladder >= step`, never equality.
+///
+/// Four bits rather than three, which is the arithmetic worth writing
+/// down: three bits is 0..=7 and [`MT7925_LADDER_PHY_UP`] is already 7, so
+/// three would have rebuilt the same wall one step further out. Fifteen
+/// reaches M6 — the first step IP can ride — with room over.
+///
+/// **Called a ladder, not a rung, deliberately.** A note's *rung* is its
+/// low byte and names where the row **refused**; a ladder step names how
+/// far the part **got**. They are different numbers about opposite
+/// outcomes and were one word away from being read as each other.
+///
+/// **Three facts stay bits, because none of them is a step.**
+/// [`NET_WIFI_FW_ALIVE`] is shared with the rtw89 lineage, which earns it
+/// a different way on a part that climbs differently — one bit, one
+/// meaning, two establishments — so it cannot live inside an MT7925-only
+/// ordinal. [`NET_MT7925_FW_PINNED`] is about the *image*: a QEMU boot
+/// with the modules staged earns it honestly and the part is not
+/// involved. [`NET_MT7925_PATCH_RESIDENT`] says *which way* step
+/// [`MT7925_LADDER_PATCH`] was reached, not that a further one was.
+pub const NET_MT7925_LADDER_SHIFT: u32 = 51;
+
+/// The four bits [`NET_MT7925_LADDER_SHIFT`] names — 51..=54.
+///
+/// **Bits 52, 53 and 54 carry a retired witness's history**, kept because
+/// the mistake is worth more than the bit was. Bit 52 briefly held
+/// `NET_MT7925_D1_DMA_READY`, for a rung claiming the WFDMA engine had
+/// taken the receive buffers it was handed, evidenced by `dma_idx`
+/// advancing. That witness cannot be earned where it was placed: for a
+/// receive queue `dma_idx` is how far the engine has **written received
+/// data** (`mt76_dma_rx_process`, `dma.c:1014-1025`), and a part with no
+/// firmware receives nothing. It read zero on metal, correctly — and the
+/// mock had been written to advance `dma_idx` behind `cpu_idx`, so five
+/// tests agreed with the error instead of catching it. The engine's own
+/// index is the right evidence; the round trip of [`MT7925_LADDER_D1_MCU`]
+/// is the first place it can honestly be read.
+pub const NET_MT7925_LADDER_MASK: u64 = 0xf << NET_MT7925_LADDER_SHIFT;
+
+/// No MT7925 step reached — the row bound no such part, or refused at D0.
+pub const MT7925_LADDER_NONE: u8 = 0;
+
+/// The frame row claimed the machine's **MediaTek MT7925** Wi-Fi function
+/// (`14c3:0717`, `drivers/net/mt7925`), mapped BAR0, drove the L1 remap
+/// window, read the part's own identity back through it and took driver
+/// ownership — the **D0** rung of `res/NETWORK_RESTART.md`'s lane C/M,
+/// observed from the founding claim.
+///
+/// **Deliberately not [`NET_WIFI_FW_ALIVE`].** That bit means firmware
+/// downloaded and answering; this step means the part answered its
+/// identity and nothing more. No firmware has moved when it is reached.
+/// Conflating the two would let a part that has never seen a blob earn the
+/// go/no-go bit that the whole route's cost was justified against — the
+/// exact shape of false green `res/NETWORK_RESTART.md` §1 fact 2 records.
+///
+/// Metal-only: no QEMU profile carries the part, so a boot in an emulator
+/// honestly lacks the step and cannot be made to earn it.
+pub const MT7925_LADDER_D0: u8 = 1;
+
+/// `kore-svc-net` programmed the MT7925's firmware-download ring and the
+/// engine read the base and depth back — the **D1a** rung of
+/// `res/NETWORK_RESTART.md`'s lane C/M.
+///
+/// **Three facts at once**, which is why the step is worth having before
+/// the download rather than inside it: the ring memory lies inside the
+/// part's 32-bit DMA reach, the WFDMA register bank routes, and the engine
+/// latches a ring it is given. A failing download cannot tell those apart,
+/// and on a machine with no serial port one flash is one experiment.
+///
+/// **Not even a byte moved.** The ring is handed over programmed and
+/// *empty*: `cpu_idx` is left at zero, so the part has been given nothing
+/// to fetch. This step means the engine accepted a ring, not that it used
+/// one.
+pub const MT7925_LADDER_D1_RING: u8 = 2;
+
+/// `kore-svc-net` sent the MT7925 one MCU command and the part answered it
+/// — the **D1c** rung of `res/NETWORK_C2_TO_PING.md` §2.
+///
+/// **The first step the part has to *do* something for.** D0 and D1a are
+/// satisfied by registers returning what was written to them, which proves
+/// addressing. This one needs the transmit engine to fetch a descriptor
+/// and move a command, the ROM's MCU to execute it, and the receive engine
+/// to write an answer into a buffer the driver posted — and the answer
+/// must carry back the sequence number that went out, so a stale or
+/// invented reply cannot satisfy it.
+///
+/// **Still not firmware.** The part's ROM answers MCU commands before any
+/// blob is downloaded; that is why upstream's first download step is a
+/// semaphore request (`mt76_connac_mcu.c:3330`). This step means the
+/// transport works, which is what the download needs and is not the same
+/// claim as [`NET_WIFI_FW_ALIVE`].
+pub const MT7925_LADDER_D1_MCU: u8 = 3;
+
+/// **The ROM patch is in the part** — C2b, and the first step at which
+/// this driver *changes* the silicon rather than asking it something.
+///
+/// Reached two ways, and [`NET_MT7925_PATCH_RESIDENT`] says which: cleared,
+/// a patch crossed on this boot; set, the part already held one and
+/// nothing was sent (upstream's own success path — `load_patch` returns
+/// zero on `PATCH_IS_DL`). Only the first says the download path works, so
+/// the bit survives the repack while the step does not distinguish them:
+/// a part that was patched before this boot still went on to take its RAM
+/// code, and a ladder that stalled here would report that part as never
+/// having climbed.
+pub const MT7925_LADDER_PATCH: u8 = 4;
+
+/// **The N9 RAM code crossed into the part on this boot** — C2c, and the
+/// last step before the part has running firmware.
+///
+/// Four regions, 1,087,744 bytes, 267 `FW_SCATTER` chunks. Strictly more
+/// than [`MT7925_LADDER_PATCH`]: the patch is 46 chunks that never lap the
+/// 128-slot download ring, and this is 267 that lap it twice, so this step
+/// is also the first evidence that the ring's wrap is sound.
+///
+/// **Not the same claim as [`NET_WIFI_FW_ALIVE`].** This says the bytes
+/// crossed and `FW_START_REQ` was answered; that says the N9 core came up
+/// and reported itself. A part can take every byte and fail to run it, and
+/// the two are separate so that boot is legible rather than simply absent.
+pub const MT7925_LADDER_RAM_SENT: u8 = 5;
+
+/// `MT_CONN_ON_MISC` reported the N9 core powered and up — the part's own
+/// word that the firmware it was given is running.
+///
+/// Reached together with [`NET_WIFI_FW_ALIVE`], which stays a bit of its
+/// own because the rtw89 lineage earns it from a PHY capability answer
+/// instead. Both are derived from the same reading of this part; neither
+/// is declared.
+pub const MT7925_LADDER_FW_ALIVE: u8 = 6;
+
+/// The part described itself under the unified command class, and a block
+/// of its own efuse came back carrying its MAC — **M1**.
+pub const MT7925_LADDER_PHY_UP: u8 = 7;
+
+/// The highest step this build knows how to name.
+///
+/// A row reporting beyond it was built by a newer image than the reader,
+/// which [`mt7925_ladder_name`] says plainly rather than printing a step
+/// it cannot name.
+pub const MT7925_LADDER_MAX: u8 = MT7925_LADDER_PHY_UP;
+
+/// Place `step` in a note's witness carve.
+///
+/// Saturates at [`NET_MT7925_LADDER_MASK`]'s width rather than bleeding
+/// into the neighbouring bits: a step that does not fit is a bug in the
+/// caller, and corrupting [`NET_MT7925_FW_PINNED`] to report it would be
+/// the second bug.
+pub const fn mt7925_ladder_bits(step: u8) -> u64 {
+    ((step as u64) << NET_MT7925_LADDER_SHIFT) & NET_MT7925_LADDER_MASK
+}
+
+/// Read the ladder step back out of a note's witness carve.
+///
+/// The caller must hand this the **net row's** witness
+/// ([`witness_of`]), never an arbitrary note: on any other row these bits
+/// are that row's own detail.
+pub const fn mt7925_ladder_of(witness: u64) -> u8 {
+    ((witness & NET_MT7925_LADDER_MASK) >> NET_MT7925_LADDER_SHIFT) as u8
+}
+
+/// The witness name of a ladder step, as a reader prints it.
+///
+/// One table, so the kernel's restated testimony and `status`'s two
+/// renderings cannot drift apart on a literal — the drift that
+/// `res/NETWORK_RESTART.md` §3 rule 4 is about. `None` for
+/// [`MT7925_LADDER_NONE`] and for any step past
+/// [`MT7925_LADDER_MAX`], which a reader reports as a step it cannot name
+/// rather than inventing one.
+///
+/// **[`MT7925_LADDER_PATCH`] names the download**, because that is the way
+/// it is normally reached; a reader holding [`NET_MT7925_PATCH_RESIDENT`]
+/// prints `net-mt7925-patch-resident` in its place, which is the one
+/// substitution in this table and is why the bit outlived the repack.
+pub const fn mt7925_ladder_name(step: u8) -> Option<&'static str> {
+    Some(match step {
+        MT7925_LADDER_D0 => "net-mt7925-d0",
+        MT7925_LADDER_D1_RING => "net-mt7925-d1-ring",
+        MT7925_LADDER_D1_MCU => "net-mt7925-d1-mcu",
+        MT7925_LADDER_PATCH => "net-mt7925-patch-sent",
+        MT7925_LADDER_RAM_SENT => "net-mt7925-ram-sent",
+        MT7925_LADDER_FW_ALIVE => "net-wifi-fw-alive",
+        MT7925_LADDER_PHY_UP => "net-mt7925-phy-up",
+        _ => return None,
+    })
+}
+
+/// The witness bit that already states a ladder step's fact, when one
+/// does.
+///
+/// **One fact, one line.** A reader that prints both the ladder and the
+/// bits would otherwise say [`MT7925_LADDER_FW_ALIVE`] twice — once as a
+/// step and once as [`NET_WIFI_FW_ALIVE`] — because that fact is
+/// deliberately in both places: the step keeps the ladder ordered through
+/// to [`MT7925_LADDER_PHY_UP`], and the bit is what the rtw89 lineage
+/// earns on a part that climbs differently. Asking here, rather than
+/// testing for the step by hand at each reader, is what keeps the two
+/// renderings and the kernel's restatement from drifting apart.
+pub const fn mt7925_ladder_has_own_bit(step: u8) -> Option<u64> {
+    match step {
+        MT7925_LADDER_FW_ALIVE => Some(NET_WIFI_FW_ALIVE),
+        _ => None,
+    }
+}
+
+/// The short name of a ladder step, for the bring-up line that lists every
+/// step a part reached rather than one proof per entry.
+pub const fn mt7925_ladder_short(step: u8) -> Option<&'static str> {
+    Some(match step {
+        MT7925_LADDER_D0 => "d0",
+        MT7925_LADDER_D1_RING => "d1-ring",
+        MT7925_LADDER_D1_MCU => "d1-mcu",
+        MT7925_LADDER_PATCH => "patch-sent",
+        MT7925_LADDER_RAM_SENT => "ram-sent",
+        MT7925_LADDER_FW_ALIVE => "fw-alive",
+        MT7925_LADDER_PHY_UP => "phy-up",
+        _ => return None,
+    })
+}
+
+/// **The boot carries both of this part's firmware blobs, and both are the
+/// pinned bytes** — `kore-mt7925-patch-firmware` at `FIRMWARE_STORE@5` and
+/// `kore-mt7925-ram-firmware` at `@6`.
+///
+/// A claim about the *image*, not about the silicon, and the only MT7925
+/// witness that is not metal-only: a QEMU boot with the modules staged
+/// earns it honestly, because what it attests is that the bytes shipped
+/// and hash to what `drivers/net/mt7925/firmware/manifest.toml` pins.
+/// Nothing about the part is implied — the download has not run and the
+/// MCU has not seen a byte of it.
+///
+/// A bit rather than a ladder step for exactly that reason: it is not
+/// somewhere the part got. Separate from [`MT7925_LADDER_D1_MCU`] in both
+/// directions — a machine can answer MCU commands with no firmware
+/// staged, and can carry perfect firmware with no radio in it.
+pub const NET_MT7925_FW_PINNED: u64 = 1 << 50;
+
+/// The part already held its ROM patch, so nothing was sent.
+///
+/// Upstream's own success path (`load_patch` returns zero on
+/// `PATCH_IS_DL`), and a true fact about the part — but it proves only
+/// that the semaphore was read, never that a byte can cross. It qualifies
+/// [`MT7925_LADDER_PATCH`] rather than standing beside it: the step says
+/// the patch is in place, this says the driver did not put it there, and
+/// a boot cannot report the download working on the strength of a patch
+/// somebody else loaded.
+pub const NET_MT7925_PATCH_RESIDENT: u64 = 1 << 48;
+
+/// **Bit 49 is free.** The repack above returned it: six ladder bits
+/// became four, and this is the one left over. The next witness that is a
+/// *fact* rather than a *step* belongs here; a step costs nothing and
+/// belongs in [`NET_MT7925_LADDER_MASK`].
+const _: () = assert!(
+    SERVING_WITNESS_BITS & (1 << 49) == 0,
+    "bit 49 was spent without updating the note that says it is free"
+);
+
 /// Every testimony bit a readiness note may carry, so a reader masks them in
 /// one place and a new one cannot be forgotten.
 ///
@@ -143,7 +430,13 @@ pub const SERVING_WITNESS_BITS: u64 = NET_FRAME_RT_READY
     | NET_VIF_ISOLATION_READY
     | NET_PCI_FRAME_READY
     | NET_WIFI_FW_ALIVE
-    | NET_LOAD_READY;
+    | NET_MT7925_LADDER_MASK
+    | NET_MT7925_FW_PINNED
+    | NET_MT7925_PATCH_RESIDENT
+    | NET_LOAD_READY
+    | INET_ICMP_RT_READY
+    | INET_DNS_READY
+    | INET_PING_WAN_READY;
 
 /// Whether the row named `name` carries testimony in its note's carve.
 pub fn row_carries_testimony(name: &[u8]) -> bool {
@@ -367,6 +660,49 @@ impl FoundingRow {
             58 => b"Wi-Fi bring-up: normal MAC initialization did not complete (packet memory, scheduler or CAM)",
             59 => b"Wi-Fi bring-up: PHY register configuration did not complete (RF busy or command retirement)",
             60 => b"Wi-Fi bring-up: MAC feature command completion failed",
+            // `MT7925_BRING_UP_BASE + r` for `kore-mt7925` D1 rung `r`
+            // (`kore-svc-net::note` over `kore_mt7925::d1::D1Refusal::rung`).
+            // The part passed D0 — identity and ownership — and the row
+            // serves, so these are not refusals; they say how far past D0
+            // it got. On a machine with no serial port this note is the
+            // only place the rung can be read, which is the whole reason
+            // it is a note and not a refusal.
+            65 => b"MT7925: a ring or staging buffer lies beyond the part's 32-bit reach",
+            66 => b"MT7925: the engine did not latch the ring's base address",
+            67 => b"MT7925: the engine did not latch the ring's depth",
+            68 => b"MT7925: the DMA engine would not go quiet",
+            69 => b"MT7925: the engine did not take the receive buffers it was handed",
+            70 => b"MT7925: the MCU command is longer than its staging buffer",
+            71 => b"MT7925: the MCU never answered (no firmware yet, or the command never left)",
+            72 => b"MT7925: the MCU answered, and the answer did not parse",
+            73 => b"MT7925: a ring was sized smaller than the access it was asked for",
+            74 => b"MT7925: the Wi-Fi subsystem did not come back from its reset",
+            75 => b"MT7925: the part did not hand ownership back to the driver",
+            76 => b"MT7925: the part would not hand over the ROM patch semaphore",
+            77 => b"MT7925: a firmware section or region claims bytes the image does not hold",
+            78 => b"MT7925: the download ring lapped and the engine had freed no slot",
+            79 => b"MT7925: the download request for a section or region did not complete",
+            80 => b"MT7925: the patch finish never answered [the engine's download index]",
+            81 => b"MT7925: the part answered the patch finish with a refusal",
+            // C2c. Which blob rungs 77-79 are speaking about is read off
+            // the witnesses, not the note: `net-mt7925-patch-sent PASS`
+            // beside one of them means the patch is already in and the
+            // refusal belongs to the RAM code.
+            82 => b"MT7925: the ownership handshake before the RAM code did not complete",
+            83 => b"MT7925: the firmware start never answered [the engine's download index]",
+            84 => b"MT7925: the part answered the firmware start with a refusal",
+            85 => b"MT7925: the firmware never reported its N9 core up [MT_CONN_ON_MISC]",
+            // M1. Rungs 22-24 are a command that did not complete a
+            // round trip; 25-29 are a reply that arrived and was wrong,
+            // which is a different repair and gets its own name.
+            86 => b"MT7925: the part would not describe itself [capability query]",
+            87 => b"MT7925: the efuse read did not complete",
+            88 => b"MT7925: the part would not take the efuse as its EEPROM",
+            89 => b"MT7925: the capability reply did not parse [tagged records]",
+            90 => b"MT7925: the capability reply carried no MAC address",
+            91 => b"MT7925: the capability reply described no PHY",
+            92 => b"MT7925: the efuse reply was shorter than one block",
+            93 => b"MT7925: the reply buffer could not hold the answer",
             _ => b"(unmapped note; see the row's note map)",
         }
     }
@@ -558,6 +894,41 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
+    /// **Every MT7925 bring-up rung decodes to words.**
+    ///
+    /// The note band exists so that a part which reached D1 and stopped
+    /// can say why on a machine with no serial port, where this line is
+    /// the only report there is. A rung the decoder does not name prints
+    /// as `(unmapped note)`, which is indistinguishable from the silence
+    /// the band was added to end — and that silence has now cost two
+    /// flashes.
+    ///
+    /// `kore-svc-net` owns the other half: that the refusals are distinct
+    /// and land in this band.
+    #[test]
+    fn every_mt7925_bring_up_note_is_named() {
+        // `MT7925_BRING_UP_BASE` is 64, and `kore_mt7925`'s ladder runs
+        // to M1's last rung.
+        for rung in 1..=29u64 {
+            let note = 64 + rung;
+            let meaning = FoundingRow::net_note_meaning(note);
+            assert!(
+                !meaning.starts_with(b"(unmapped"),
+                "note {note} has no name",
+            );
+            assert!(
+                meaning.starts_with(b"MT7925:"),
+                "note {note} decoded outside this part's band",
+            );
+        }
+        // And the band stops: 64 itself is not a rung, and 94 is not one
+        // yet. **The fence moves with the ladder and is the point of this
+        // test** — a rung added without a name here is a note the row
+        // renders as `(unmapped)` on the one screen that can report it.
+        assert!(FoundingRow::net_note_meaning(64).starts_with(b"(unmapped"));
+        assert!(FoundingRow::net_note_meaning(94).starts_with(b"(unmapped"));
+    }
+
     use super::*;
 
     #[test]

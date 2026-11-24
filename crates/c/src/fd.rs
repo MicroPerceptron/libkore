@@ -1,4 +1,4 @@
-//! Descriptors: C's spelling for "a capability I hold".
+//! Descriptors for named capabilities and connected sockets.
 //!
 //! A program's authority arrives as capabilities at fixed places: its boot
 //! block names each by a role and an index, and the capability itself sits in
@@ -17,6 +17,8 @@
 //!   holding the capability gets `ENXIO`, whoever opened the descriptor.
 //! - **`close` forgets the number.** The capability was the program's before
 //!   `open` and is after `close`; nothing is revoked.
+//! - A socket reserves a number in the same table. Its actual flow is owned
+//!   by the host thread, which retires it before giving the number back.
 //!
 //! Descriptors 0, 1 and 2 are the standard streams' numbers and are never
 //! handed out; the streams themselves are `<stdio.h>`'s.
@@ -45,7 +47,18 @@ pub(crate) mod errno {
     pub(crate) const EBUSY: c_int = 16;
     pub(crate) const EINVAL: c_int = 22;
     pub(crate) const EMFILE: c_int = 24;
+    pub(crate) const EPIPE: c_int = 32;
+    pub(crate) const ENOTSOCK: c_int = 88;
+    pub(crate) const EMSGSIZE: c_int = 90;
+    pub(crate) const EPROTONOSUPPORT: c_int = 93;
     pub(crate) const ENOTSUP: c_int = 95;
+    pub(crate) const EAFNOSUPPORT: c_int = 97;
+    pub(crate) const ENETUNREACH: c_int = 101;
+    pub(crate) const ECONNRESET: c_int = 104;
+    pub(crate) const EISCONN: c_int = 106;
+    pub(crate) const ENOTCONN: c_int = 107;
+    pub(crate) const ETIMEDOUT: c_int = 110;
+    pub(crate) const ECONNREFUSED: c_int = 111;
 }
 
 /// What kind of capability a name stands for: which operations its
@@ -185,6 +198,7 @@ pub(crate) struct Table<const N: usize> {
 }
 
 const LIVE: u32 = 1 << 31;
+const SOCKET: u32 = LIVE | 1 << 30;
 const ACCESS_SHIFT: u32 = 16;
 const ROW_MASK: u32 = (1 << ACCESS_SHIFT) - 1;
 
@@ -201,7 +215,14 @@ impl<const N: usize> Table<N> {
     /// Open a descriptor for `row` with `access`: the lowest free number, as
     /// POSIX has it, or `EMFILE` when every one is taken.
     pub(crate) fn claim(&self, row: usize, access: Access) -> Result<c_int, c_int> {
-        let word = LIVE | access.bits() << ACCESS_SHIFT | row as u32;
+        self.claim_word(LIVE | access.bits() << ACCESS_SHIFT | row as u32)
+    }
+
+    pub(crate) fn claim_socket(&self) -> Result<c_int, c_int> {
+        self.claim_word(SOCKET)
+    }
+
+    fn claim_word(&self, word: u32) -> Result<c_int, c_int> {
         for (at, slot) in self.words.iter().enumerate() {
             if slot
                 .compare_exchange(0, word, Ordering::AcqRel, Ordering::Relaxed)
@@ -216,6 +237,9 @@ impl<const N: usize> Table<N> {
     /// The row and access behind `fd`, or `EBADF`.
     pub(crate) fn get(&self, fd: c_int) -> Result<(usize, Access), c_int> {
         let word = self.slot(fd)?.load(Ordering::Acquire);
+        if word == SOCKET {
+            return Err(errno::ENOTSUP);
+        }
         if word & LIVE == 0 {
             return Err(errno::EBADF);
         }
@@ -227,10 +251,32 @@ impl<const N: usize> Table<N> {
 
     /// Close `fd`, or `EBADF` when it was not open.
     pub(crate) fn release(&self, fd: c_int) -> Result<(), c_int> {
-        match self.slot(fd)?.swap(0, Ordering::AcqRel) {
-            0 => Err(errno::EBADF),
-            _ => Ok(()),
+        let slot = self.slot(fd)?;
+        let word = slot.load(Ordering::Acquire);
+        match word {
+            0 => return Err(errno::EBADF),
+            SOCKET => return Err(errno::ENOTSUP),
+            _ => {}
         }
+        slot.compare_exchange(word, 0, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| errno::EBADF)
+    }
+
+    pub(crate) fn require_socket(&self, fd: c_int) -> Result<(), c_int> {
+        match self.slot(fd)?.load(Ordering::Acquire) {
+            0 => Err(errno::EBADF),
+            SOCKET => Ok(()),
+            _ => Err(errno::ENOTSOCK),
+        }
+    }
+
+    pub(crate) fn release_socket(&self, fd: c_int) -> Result<(), c_int> {
+        self.require_socket(fd)?;
+        self.slot(fd)?
+            .compare_exchange(SOCKET, 0, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| errno::EBADF)
     }
 
     fn slot(&self, fd: c_int) -> Result<&AtomicU32, c_int> {

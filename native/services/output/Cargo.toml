@@ -8,6 +8,11 @@ publish = false
 [dependencies]
 kore-abi = { path = "../../crates/abi" }
 kore-ring = { path = "../../crates/ring" }
+# The input-device protocol the serial row serves (its request/response types
+# and wire codec): the terminal's client half is founded against it.
+kore-svc-input = { path = "../input" }
+# The device-broker client a driver row claims its UART through.
+kore-svc-device = { path = "../device" }
 kore-rt = { path = "../../crates/rt" }
 kore-uart = { path = "../../crates/uart" }
 

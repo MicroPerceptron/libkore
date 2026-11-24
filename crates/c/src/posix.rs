@@ -54,6 +54,7 @@ pub extern "C" fn close(fd: c_int) -> c_int {
             }
             0
         }
+        Err(errno::ENOTSUP) => crate::socket::close(fd),
         Err(code) => refused(code),
     }
 }
@@ -74,7 +75,15 @@ const STDERR: c_int = 2;
 /// `buf` is null or valid for `count` bytes of writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
-    let answer = TABLE.get(fd).and_then(|(row, access)| {
+    let entry = TABLE.get(fd);
+    if entry == Err(errno::ENOTSUP) {
+        if count == 0 {
+            return 0;
+        }
+        // SAFETY: read and recv take the same buffer contract.
+        return unsafe { crate::socket::recv(fd, buf, count, 0) };
+    }
+    let answer = entry.and_then(|(row, access)| {
         if !access.read {
             return Err(errno::EBADF);
         }
@@ -134,7 +143,12 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> i
             refused(errno::EBADF) as isize
         };
     }
-    let answer = TABLE.get(fd).and_then(|(row, access)| {
+    let entry = TABLE.get(fd);
+    if entry == Err(errno::ENOTSUP) {
+        // SAFETY: write and send take the same buffer contract.
+        return unsafe { crate::socket::send(fd, buf, count, 0) };
+    }
+    let answer = entry.and_then(|(row, access)| {
         if !access.write {
             return Err(errno::EBADF);
         }
@@ -191,6 +205,7 @@ unsafe fn poll_pass(fds: *mut PollFd, nfds: usize) -> (c_int, bool) {
         entry.revents = match TABLE.get(entry.fd) {
             // A standard stream takes a write whenever it is asked.
             Err(_) if entry.fd == STDOUT || entry.fd == STDERR => entry.events & POLLOUT,
+            Err(errno::ENOTSUP) => POLLERR,
             Err(_) => POLLNVAL,
             Ok((row, access)) => match NAMES[row].kind {
                 // Mapping a supply never waits.

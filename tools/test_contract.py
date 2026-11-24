@@ -31,14 +31,15 @@ class DistributionContract(unittest.TestCase):
         for relative in [".", *manifest["workspace"]["members"]]:
             package_dir = (ROOT / relative).resolve()
             package = tomllib.loads((package_dir / "Cargo.toml").read_text())
-            for name, dep in package.get("dependencies", {}).items():
-                if not isinstance(dep, dict) or "path" not in dep:
-                    continue
-                dependency = (package_dir / dep["path"]).resolve()
-                if dependency.is_relative_to(ROOT / "native"):
-                    name = dep.get("package", name)
-                    path = str(dependency.relative_to(ROOT / "native"))
-                    self.assertEqual(native_roots.setdefault(name, path), path)
+            for table in [package, *package.get("target", {}).values()]:
+                for name, dep in table.get("dependencies", {}).items():
+                    if not isinstance(dep, dict) or "path" not in dep:
+                        continue
+                    dependency = (package_dir / dep["path"]).resolve()
+                    if dependency.is_relative_to(ROOT / "native"):
+                        name = dep.get("package", name)
+                        path = str(dependency.relative_to(ROOT / "native"))
+                        self.assertEqual(native_roots.setdefault(name, path), path)
         self.assertEqual(native_roots, paths)
         record = json.loads((ROOT / "native/provenance.json").read_text())
         self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", record["revision"]))

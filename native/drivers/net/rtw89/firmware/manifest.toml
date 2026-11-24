@@ -1,0 +1,52 @@
+# Pinned firmware trust root for kore-rtw89 (see README.md).
+#
+# The loader (crate::fw) consumes this file at compile time —
+# `PINNED_SIZE` / `PINNED_DIGEST` are parsed out of the entry below by a
+# const evaluator, so the numbers exist in exactly one place — and verifies
+# the leased `kore-rtw89-firmware` boot module's BLAKE3 digest against it
+# before a byte of the container is interpreted. A maintainer hashes the
+# blob obtained from the pinned `source` commit and commits the digest for
+# review — that commit IS the trust decision.
+#
+# `size` is the exact byte length; `source` pins upstream provenance.
+# Storage and the original Realtek notice live in vendor/firmware. The shared
+# catalog is checked against this driver's acceptance pin by firmware-verify.
+# The source is an immutable linux-firmware mirror commit, not a mutable branch.
+#
+# Record with the in-repo hasher, from the blob fetched at the pinned
+# commit:
+#
+#     cargo run -q -p kore-b3sum -- vendor/firmware/realtek/rtw89/rtw8922a_fw.bin
+
+# **The pin.** `rtw89/rtw8922a_fw-4.bin` at the linux-firmware commit the Xe
+# rows already trust (`drivers/xe/firmware/manifest.toml` pins `lnl_guc_70`
+# and `bmg_guc_70` from this same mirror and SHA), so this driver adds a
+# blob to an existing trust root rather than a second one. The mirror is a
+# host, not the trust decision: the digest below is, and it is what the
+# ladder checks before a byte of the container is interpreted.
+#
+# Recorded 2026-09-07 by fetching the blob and running it through this
+# crate's own loader (`FirmwareImage::suit` / `Suit::plan`): the MFW
+# wrapper is recognised, every cut from 1 up selects one `NORMAL` image —
+# firmware **0.35.80.3**, header version 1, four sections, 424 672 B of
+# payload — and the download plan builds.
+#
+# `file` is the local/boot-module name (`kore-rtw89-firmware`, staged by
+# `make fetch-realtek-firmware`), deliberately unchanged while `source`
+# carries the upstream path, exactly as the NPU pin does.
+#
+# **If the metal refuses at the bad-firmware rung with `NoImageForCut`**,
+# this chip is a cut-A (`cv == 0`) part: the format-4 blob carries no
+# cut-0 image, and the fallback is upstream's older container
+# `rtw89/rtw8922a_fw.bin` at the same commit — measured the same way, and
+# it does carry one (cut 0 → 0.34.40.0, cut 1+ → 0.35.18.0):
+#
+#     size   = 1537690
+#     blake3 = "d015ad6b472b9f682464cd8e406459728414b61a1f5d81e244ac38605a885482"
+#
+# Swapping those two values and the `source` path is the whole change.
+[firmware.rtw8922a_fw]          # RTL8922AE (Gigatron, #388 D1)
+file   = "rtw8922a_fw.bin"
+size   = 1849226
+blake3 = "5ee618f79406b2de15ee41ae1818ad9ef4c5ca0ba54809a2a654606845ae555a"
+source = "kernelorg-mirror/linux_kernel_git_firmware_linux-firmware@fb0889c0d3dec1e10a9a593a2602e832a752cd2f:rtw89/rtw8922a_fw-4.bin"

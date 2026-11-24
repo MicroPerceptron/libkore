@@ -1,0 +1,59 @@
+# services/net/boot.toml — the L2 frame row's boot-manifest fragment (the
+# design lives in res/boot.toml's header).  The row rides beside the crate it
+# endows; whether and WHEN it founds is the image's `services` list
+# (res/images/<name>.toml) — founding order and chain adjacency are
+# topology, the image's to declare.
+
+# The frame service (res/NETWORK_SERVICE.md) — capability-scoped virtual
+# interfaces over a raw-frame data plane, the FOURTH driver claimant.
+#
+# Chained, like every claiming driver: its founder must still hold the
+# broker's control-pair roots to mint the claimant face this row rides.
+#
+# No DEVICE beside the supplies — the xHCI controller is CLAIMED from the
+# broker at startup (res/DEVICE_SERVICE.md §10, the input router's posture),
+# so the founder never has to choose which controller this row drives.
+# `required = false` in the row's own DEVICES declaration is what lets a
+# machine with one controller — or none free — found this row anyway and
+# report, instead of taking the boot chain down for a missing dongle.
+#
+# DMA_POOL@0 is the ordinary size class: the controller's own structures, a
+# receive ring, and the founding self-test's one window fit inside it with
+# room to spare.  DMA_POOL@2 is a second pool of the same class for the
+# Wi-Fi function — a supply is affine per bound device, and a laptop with the
+# radio AND an Ethernet adaptor plugged in binds both (the radio for its facts
+# and firmware-alive proof, the adaptor for frames) — index 2 because index 1
+# names the LARGE class the NPU rows take.  CHANNEL_SPACE@0 roots the receive
+# doorbells `Signal` mints.
+# FIRMWARE_STORE@5 and @6 are the MT7925's ROM patch and N9 RAM code —
+# two coordinates because the part takes two images and a lease is whole
+# module.  Both optional on the same terms as @2: a boot without them
+# founds the row without its MT7925 firmware rung.
+# FIRMWARE_STORE@2 is the Realtek RTL8922AE firmware byte store — the
+# `kore-rtw89-firmware` boot module `make fetch-realtek-firmware` stages,
+# leased whole and read-only; optional, so a boot without the blob (every
+# QEMU boot, and a metal boot before the operator fetched it) founds the row
+# without its Wi-Fi rung and says so in the note.
+[service]
+image     = "kore-svc-net"
+chain     = true                             # a driver row by class (chained +
+                                             # non-empty DEVICES); its ordinal is
+                                             # derived from its place among the driver
+                                             # rows and nothing in the founder keys on
+                                             # it (#1202).
+endowment = "kore_svc_net::metal::NetEndowment"
+protocol  = "kore_svc_net::metal::NetRow"
+# The row's FINAL serving pair (pair 1 of two) goes to the resident exec
+# manager (the dagfs posture): exec issues the two read-only verbs, `Query`
+# and `Radio`, at a `PROFILE_NETWORK` launch and stamps the answers into the
+# child's process page, which is how `status net` reads the link's and the
+# radio's facts on a machine with no serial console.  That pair's policy
+# denies every vif.  Pair 0 stays the row's own; frame clients arrive as
+# minted faces on top of it (res/PEER_LINK.md P1), never through exec's.
+# An exec provider must serve at least two pairs — the founder refuses the
+# whole plan otherwise, and the manifest asserts it at build time.
+exec_face = "net"
+endows    = ["DMA_POOL@0", "DMA_POOL@2", "CHANNEL_SPACE@0", "FIRMWARE_STORE@2",
+             "FIRMWARE_STORE@5", "FIRMWARE_STORE@6"]
+digest_x86_64  = "blake3:25a68aeaaaec62b0e29c98d7edfa3a359fad084761a26d9a0da4b8c98e1bfa00"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:3e2e7ba0358f5e613d8dbffa3eba4f20ad6d425a7db3eb3b8ba76782e57f46e8"  # res/aarch64/; make boot-digests-aarch64

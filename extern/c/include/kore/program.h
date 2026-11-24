@@ -133,6 +133,31 @@
 #define KORE_VDEV_CONFIG_AREA_BYTES 3840
 
 /**
+ * The result of one capability-scoped IPv4 echo request.
+ */
+enum KoreNetStatus
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  KORE_NET_STATUS_OK = 0,
+  KORE_NET_STATUS_INVALID_ARGUMENT = 1,
+  KORE_NET_STATUS_UNAVAILABLE = 2,
+  KORE_NET_STATUS_NO_ADDRESS = 3,
+  KORE_NET_STATUS_TIMEOUT = 4,
+  KORE_NET_STATUS_UNREACHABLE = 5,
+  KORE_NET_STATUS_RESOURCE = 6,
+  KORE_NET_STATUS_INDETERMINATE = 7,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum KoreNetStatus KoreNetStatus;
+#else
+typedef uint32_t KoreNetStatus;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * What a descriptor names, as the calling thread holds it
  * ([`kore_fd_describe`]).
  */
@@ -309,6 +334,19 @@ KoreStatus kore_fs_run(KoreFsStep step, void *user, KoreFsError *error);
  * `out` is null or valid for one aligned write.
  */
 KoreStatus kore_fd_describe(int fd, struct KoreFdInfo *out);
+
+/**
+ * Send one ICMP echo to an IPv4 address as four big-endian octets (e.g. `0x0a000202`). Call from the
+ * program's main thread. The launch must have a network face and a memory face.
+ * The 1–60000 ms deadline includes address resolution. `rtt_us` is written
+ * only on success. An indeterminate result retires this process's probe face.
+ *
+ * # Safety
+ * `rtt_us` is null or valid for one aligned write of a `uint64_t`.
+ */
+KoreNetStatus kore_net_ping_ipv4(uint32_t address,
+                                 uint32_t timeout_ms,
+                                 uint64_t *rtt_us);
 
 #ifdef __cplusplus
 }  // extern "C"

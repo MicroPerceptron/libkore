@@ -52,7 +52,8 @@ C_LIBRARY = {'printf', 'fprintf', 'sprintf', 'snprintf', 'vprintf', 'vfprintf', 
              'memchr', 'strchr', 'strrchr', 'strcmp', 'strncmp', 'strcpy', 'strncpy', 'strncat',
              'strstr',
              '__errno_location',
-             'open', 'close', 'read', 'write', 'poll', 'mmap', 'munmap'}
+             'open', 'close', 'read', 'write', 'poll', 'mmap', 'munmap',
+             'socket', 'connect', 'send', 'recv'}
 DYNAMIC_TLS = re.compile(r'TLSDESC|DTPMOD|DTPOFF|TLSGD|TLSLD|TLS_DTP')
 
 

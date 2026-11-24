@@ -1,0 +1,113 @@
+[package]
+name = "axnn-cpu"
+version = "0.2.0"
+edition = "2024"
+
+[features]
+default = []
+std = []
+alloc = []
+
+# SME outer-product GEMM tier (Apple M4+/Armv9 SME). Opt-in: streaming
+# mode is runtime state the target feature set cannot promise; check
+# hw.optional.arm.FEAT_SME (or HWCAP2_SME) before enabling.
+sme = []
+
+# ── Arch-specific features ────────────────────────────────────
+# The best tier the *target* allows is auto-detected at compile
+# time (build.rs reads the target feature set): a plain build gets
+# NEON on aarch64, and AVX2/AVX-512/VNNI on x86_64 whenever the
+# target features carry them (e.g. -C target-cpu=native). The
+# features below are explicit *overrides* for cross-builds where
+# the builder asserts a CPU contract the target triple doesn't
+# carry. AMX remains strictly opt-in (OS tile-state dependent).
+#
+# `max` is retained for compatibility; auto-detection is now
+# unconditional, so it is a no-op.
+max = []
+#
+# x86_64 tiers (highest priority wins):
+amx = []      # Intel AMX tile matmul (Sapphire Rapids+)
+avx512 = []   # 512-bit qdot, FP4, FP8, BF16, and attention value kernels
+avx_vnni = ["nvfp4_vnni"] # fused vpdpbusd at 256-bit (Alder Lake+)
+nvfp4_vnni = [] # W4A8 on either 256-bit AVX-VNNI or AVX-512 VNNI
+avx2 = []     # 256-bit maddubs + full float override (FMA + F16C)
+sse42 = []    # 128-bit maddubs chain (SSSE3)
+sse2 = []     # delegates to portable (no maddubs)
+#
+# AArch64:
+neon = [] # NEON widening multiply qdot
+
+# ── Instrumentation ──────────────────────────────────────────
+# Pulls divan + std. Only for `cargo bench`, never in production.
+bench = ["dep:divan"]
+
+# ── Core dependencies (no_std, no_alloc) ─────────────────────
+[dependencies]
+axmath = { path = "../axmath", default-features = false }
+axnn = { path = "../axnn", default-features = false }
+heapless = { version = "0.9.3", default-features = false, features = [
+    "portable-atomic",
+] }
+
+# ── Host-only (bench harness, pulls std) ─────────────────────
+divan = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# Semantic oracle only. Production kernels use the exact scalar/SIMD codecs in
+# this crate and never link unsigned-float's LUT-backed UF8 arithmetic.
+unsigned-float = { version = "=0.2.2", default-features = false }
+
+[[test]]
+name = "nvfp4_checkpoint"
+required-features = ["bench"]
+
+[[bench]]
+name = "attention"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "qdot"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "raster"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "bitmat"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "vec"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "f8"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "gemv"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "splat"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "voxel"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "sparse"
+harness = false
+required-features = ["bench"]

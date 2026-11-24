@@ -69,6 +69,6 @@ pub mod host;
 
 pub use cookie::{CookieTable, MAX_SLOTS};
 pub use ring::{CompRing, CqEntry, SqEntry, SubRing, Wrap};
-pub use seam::{Dma, DmaPool, DmaRead, DmaWrite, OutOfRange, Regs, RegsNarrow};
+pub use seam::{Dma, DmaPool, DmaRead, DmaWrite, OutOfRange, Regs, RegsNarrow, within_dma_reach};
 pub use stats::RingStats;
 pub use wait::{Ack, Budget, Completion, handshake, handshake_field, handshake_until, spin_wait};

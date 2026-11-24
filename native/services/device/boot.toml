@@ -1,8 +1,8 @@
 # services/device/boot.toml — this service's boot-manifest row (the design
 # lives in res/boot.toml's header).  The row rides beside the crate it
-# endows, redox-style; whether and WHEN it founds is the root manifest's
-# `services` list — founding order and chain adjacency are topology, the
-# root's to declare, never a row's.
+# endows, redox-style; whether and WHEN it founds is the image's
+# `services` list (res/images/<name>.toml) — founding order and chain
+# adjacency are topology, the image's to declare, never a row's.
 
 # The device broker (res/DEVICE_SERVICE.md §10) — the sole holder of the
 # machine's device inventory, and the row every driver claims its hardware
@@ -32,9 +32,10 @@ image     = "kore-svc-device"
 chain     = true                             # the chain's ORIGIN: this row's founder is
                                              # retained through every chained row after it
                                              # (it holds the broker's control-pair roots
-                                             # and the claimant band, then input's roots,
-                                             # then the display's, then the terminal's,
-                                             # then exec's client pair half)
+                                             # and the claimant band, then each linked
+                                             # driver's founding pair, then the display's
+                                             # roots, then the terminal's, then exec's
+                                             # client pair half)
 endowment = "kore_svc_device::DeviceEndowment"
 protocol  = "kore_svc_device::DeviceBroker"
 # One broker row per PCIe root complex (#572): `instances` expands this
@@ -47,5 +48,5 @@ protocol  = "kore_svc_device::DeviceBroker"
 # row's own claimant band.
 instances = 8
 endows    = ["ROOT_COMPLEX@0", "PLATFORM_BUS@0", "FACE_SUPPLY@0"]
-digest_x86_64  = "blake3:f4ef9270f4c48990e242ce05f4d7c7b5c62cb2da959e148290ed073df9075379"  # res/x86_64/; make boot-digests
-digest_aarch64 = "blake3:a4d0b40e6d7ef5d6ce5d270ba91f1c09aee246d5b16e99f864001b92dbe570f4"  # res/aarch64/; make boot-digests-aarch64
+digest_x86_64  = "blake3:49183da7f4b71517e223a84d80f91de2ef4229eaefe89053a29dab2a523db052"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:90041ab50e7a9121ed27e640d26c1179dbd20c2b920d98e2b21213938b3e6f77"  # res/aarch64/; make boot-digests-aarch64

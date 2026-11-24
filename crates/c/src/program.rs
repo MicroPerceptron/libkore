@@ -135,13 +135,23 @@ struct Request {
     payload: UnsafeCell<Payload>,
 }
 
+#[derive(Clone, Copy)]
+enum Operation {
+    Filesystem { step: KoreFsStep, user: *mut c_void },
+    Ping { address: [u8; 4], timeout_ms: u32 },
+    Socket(crate::socket::Request),
+}
+
+#[derive(Clone, Copy)]
+enum Outcome {
+    Filesystem(KoreStatus, KoreFsError),
+    Ping(Result<u64, crate::api::KoreNetStatus>),
+    Socket(Result<usize, core::ffi::c_int>),
+}
+
 struct Payload {
-    // main thread → host: the session's callback program.
-    step: Option<KoreFsStep>,
-    user: *mut c_void,
-    // host → main thread: how the session ended.
-    status: KoreStatus,
-    error: KoreFsError,
+    operation: Option<Operation>,
+    outcome: Option<Outcome>,
 }
 
 // SAFETY: `payload` is touched only by the side the word hands it to (above).
@@ -150,10 +160,8 @@ unsafe impl Sync for Request {}
 static SESSION: Request = Request {
     state: AtomicU32::new(IDLE),
     payload: UnsafeCell::new(Payload {
-        step: None,
-        user: core::ptr::null_mut(),
-        status: KoreStatus::Ok,
-        error: KoreFsError::None,
+        operation: None,
+        outcome: None,
     }),
 };
 
@@ -276,16 +284,43 @@ pub extern "C" fn abort() -> ! {
 /// # Safety
 /// `kore_fs_run`'s contract for `step` and `user`.
 pub(crate) unsafe fn session(step: KoreFsStep, user: *mut c_void) -> (KoreStatus, KoreFsError) {
-    if ROLE.get() != Role::Main || !HOSTED.load(Ordering::Acquire) {
-        return (KoreStatus::Refused, KoreFsError::None);
+    match call_host(Operation::Filesystem { step, user }) {
+        Some(Outcome::Filesystem(status, error)) => (status, error),
+        _ => (KoreStatus::Refused, KoreFsError::None),
+    }
+}
+
+pub(crate) fn ping(address: [u8; 4], timeout_ms: u32) -> Result<u64, crate::api::KoreNetStatus> {
+    match call_host(Operation::Ping {
+        address,
+        timeout_ms,
+    }) {
+        Some(Outcome::Ping(result)) => result,
+        _ => Err(crate::api::KoreNetStatus::Unavailable),
+    }
+}
+
+/// # Safety
+/// Any buffer in the request remains valid and exclusively under the
+/// caller's control until this returns. The host completes or abandons the
+/// request before the main thread resumes or is stopped at the exit barrier.
+pub(crate) unsafe fn socket(request: crate::socket::Request) -> Result<usize, core::ffi::c_int> {
+    match call_host(Operation::Socket(request)) {
+        Some(Outcome::Socket(result)) => result,
+        _ => Err(crate::fd::errno::ENOTSUP),
+    }
+}
+
+fn call_host(operation: Operation) -> Option<Outcome> {
+    if !on_main() || !hosted() {
+        return None;
     }
     // The main thread is the only poster, and it waits out each request: the
     // cell is idle whenever control is here.
     {
         // SAFETY: IDLE hands the cell to the main thread.
         let payload = unsafe { SESSION.payload() };
-        payload.step = Some(step);
-        payload.user = user;
+        payload.operation = Some(operation);
     }
     SESSION.state.store(POSTED, Ordering::Release);
     // Refused only when no post stood, and then the host re-reads the word
@@ -307,9 +342,8 @@ pub(crate) unsafe fn session(step: KoreFsStep, user: *mut c_void) -> (KoreStatus
     let answer = {
         // SAFETY: SERVED hands the cell back to the main thread.
         let payload = unsafe { SESSION.payload() };
-        payload.step = None;
-        payload.user = core::ptr::null_mut();
-        (payload.status, payload.error)
+        payload.operation = None;
+        payload.outcome.take()
     };
     SESSION.state.store(IDLE, Ordering::Release);
     answer
@@ -495,6 +529,7 @@ async fn host(
     let mut wake = NoticeRx::new(transport, worker.wake_recv());
     let mut filesystem = Filesystem::new(rt, transport);
     let mut device = crate::device::Host::new(rt, transport);
+    let mut network = crate::net::Host::new(rt, transport);
     // The one writer the host can kick, woken when its room is made.
     let wake_main = || {
         let _ = worker.kick();
@@ -529,28 +564,40 @@ async fn host(
         }
         if SESSION.state.load(Ordering::Acquire) == POSTED {
             // SAFETY: POSTED hands the cell to the host until it stores SERVED.
-            let (step, user) = {
-                let payload = unsafe { SESSION.payload() };
-                (payload.step, payload.user)
-            };
-            let Some(step) = step else {
+            let operation = unsafe { SESSION.payload() }.operation;
+            let Some(operation) = operation else {
                 return Err(Fatal);
             };
             // An end requested mid-session ends the program without waiting
             // for the session: the barrier stops the waiting main thread, and
             // the abandoned session's owner is quarantined, as cancellation
             // leaves it.
-            let session = pin!(filesystem.run(step, user));
+            let session = pin!(async {
+                match operation {
+                    Operation::Filesystem { step, user } => {
+                        let (status, error) = filesystem.run(step, user).await;
+                        Outcome::Filesystem(status, error)
+                    }
+                    Operation::Ping {
+                        address,
+                        timeout_ms,
+                    } => Outcome::Ping(network.ping(address, timeout_ms).await),
+                    Operation::Socket(request) => {
+                        // SAFETY: the main thread is parked until the answer;
+                        // socket() keeps the buffers valid over that interval.
+                        Outcome::Socket(unsafe { network.socket(request).await })
+                    }
+                }
+            });
             let ended = pin!(until_exit(&mut wake, output, &wake_main));
             let outcome = race(session, ended).await;
-            let Some((status, error)) = outcome else {
+            let Some(outcome) = outcome else {
                 continue;
             };
             {
                 // SAFETY: still POSTED; the host owns the cell.
                 let payload = unsafe { SESSION.payload() };
-                payload.status = status;
-                payload.error = error;
+                payload.outcome = Some(outcome);
             }
             SESSION.state.store(SERVED, Ordering::Release);
             let _ = worker.kick();
@@ -559,7 +606,11 @@ async fn host(
         // Armed before the recheck `park` makes, so a writer that published
         // meanwhile either kicks or is seen.
         crate::stdio::arm();
-        park(&mut wake, || pending() || crate::stdio::pending()).await?;
+        let tcp_tick = network.has_tcp().then_some(1_000_000);
+        park(&mut wake, || pending() || crate::stdio::pending(), tcp_tick).await?;
+        if tcp_tick.is_some() {
+            network.sweep_tcp().await;
+        }
     }
 }
 
@@ -590,6 +641,7 @@ const WOULD_BLOCK_RETRY_NS: u64 = 100_000;
 async fn park(
     wake: &mut NoticeRx<'_, TrapTransport>,
     ready: impl Fn() -> bool,
+    backstop_ns: Option<u64>,
 ) -> Result<(), Fatal> {
     loop {
         match wake.try_recv() {
@@ -601,6 +653,10 @@ async fn park(
                 let Some(post) = wake.standing_post() else {
                     return Err(Fatal);
                 };
+                if let Some(delta) = backstop_ns {
+                    let _ = executor::next_wake_on_for(post, delta).await;
+                    return Ok(());
+                }
                 let _ = executor::next_wake_on(post).await;
             }
             Err(RecvError::Refused(Status::WouldBlock)) => {
@@ -608,6 +664,9 @@ async fn park(
                 // tree's other receivers do, rather than wait for a wake
                 // nothing armed.
                 let _ = executor::next_wake_for(WOULD_BLOCK_RETRY_NS).await;
+                if backstop_ns.is_some() {
+                    return Ok(());
+                }
             }
             Err(_) => return Err(Fatal),
         }
@@ -640,9 +699,11 @@ async fn until_exit(
             continue;
         }
         crate::stdio::arm();
-        if park(wake, || {
-            ended() || crate::stdio::pending() || crate::mmap::posted()
-        })
+        if park(
+            wake,
+            || ended() || crate::stdio::pending() || crate::mmap::posted(),
+            None,
+        )
         .await
         .is_err()
         {

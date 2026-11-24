@@ -40,4 +40,4 @@ kore-vdev = { path = "native/crates/vdev", optional = true }
 # root: the offline volume procedure (and the filesystem service closure it
 # drives) that host programs such as vKore consume; it never enters a Kore
 # executable's graph.
-owner-paths = { kore-start = "crates/start", kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-c-shim = "crates/c-shim", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver", kore-svc-vdev = "services/vdev", kore-vdev = "crates/vdev", kore-late = "crates/late", kore-ld = "crates/ld", kore-vol = "tools/kore-vol" }
+owner-paths = { kore-start = "crates/start", kore-abi = "crates/abi", kore-app = "crates/app", kore-rt = "crates/rt", kore-c-shim = "crates/c-shim", kore-dagfs = "crates/dagfs", kore-driver = "crates/driver", kore-svc-vdev = "services/vdev", kore-vdev = "crates/vdev", kore-late = "crates/late", kore-ld = "crates/ld", kore-vol = "tools/kore-vol", kore-inet = "crates/inet", kore-svc-net = "services/net", kore-svc-mm = "services/mm" }

@@ -1,0 +1,34 @@
+[package]
+name = "kore-xhci"
+version = "0.0.1"
+edition = "2024"
+description = "kore xHCI driver core over the shared kore-driver ring substrate; capability-backed userland reaches controller Running, while unit hardware doubles stay cfg(test)."
+publish = false
+
+# The driver core is pure logic over the `kore-driver` seam + ring
+# mechanics, plus
+# the vendored `xhci` crate's **spec-facts** layer (TRB + context layouts) —
+# used à la carte: its typed `ring::trb` + `context` modules, never its
+# register accessors (those do their own volatile MMIO, which would bypass
+# the `Regs` seam).
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+# The shared driver substrate: seam (Regs/Dma/DmaPool) + SubRing/CompRing/
+# CookieTable/RingStats.  kore-xhci is its second customer (kore-nvme the
+# first).
+kore-driver = { path = "../../crates/driver" }
+# Vendored (vendor/xhci — the acpi-fork / virtio-accel precedent: a
+# dormant-but-stable crate we own so we can fork-and-patch).  Spec-frozen
+# TRB + context type layouts; the register/accessor half goes unused.
+xhci = { path = "../../vendor/xhci" }
+
+# The swap-service face reuses no state here (xHCI is not a block device); the
+# feature set mirrors kore-nvme so the driver template is uniform.
+[features]
+# Userland posture: size runtime tables through the mm-backed global
+# allocator; off (the kernel boot-test): fixed inline ceilings, heapless.
+alloc = ["kore-driver/alloc"]
+# Expose the `cfg(test)` hardware double to a sibling crate's tests (the
+# `kore-uart` precedent). OFF by default, and taken only as a
+# dev-dependency, so no production build can reach it.
+mock = []

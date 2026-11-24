@@ -1710,6 +1710,19 @@ pub fn step<S: SystemService>(svc: &mut S, req: S::Request) -> Outcome<S::Respon
     step_with_return(svc, req, None, None, 0, [None; MAX_GRANTS]).0
 }
 
+/// Drive one request through [`SystemService::serve_async`].
+///
+/// The sibling of [`step`], and the one a row that overrides `serve_async`
+/// must be exercised with. Driving such a row through `step` tests the path
+/// the host does not take: the override is the whole reason the row has
+/// one, and a verb that only answers on the async seam is silently refused
+/// by the sync step while decoding perfectly off the wire.
+pub async fn step_async<S: SystemService>(svc: &mut S, req: S::Request) -> Outcome<S::Response> {
+    step_with_return_async(svc, req, None, None, 0, [None; MAX_GRANTS])
+        .await
+        .0
+}
+
 /// Drive one request while joining a retained return-channel delivery to the
 /// same serve-step scope, stamped with the arrival pair's identity (`via`).
 /// Kept crate-visible: only [`ServeHost`] witnesses the

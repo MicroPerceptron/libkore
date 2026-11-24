@@ -35,7 +35,8 @@
 //! |---|---|
 //! | [`addr`] | `MacAddr`, `EtherType` — the wire scalars |
 //! | [`frame`] | the Ethernet II header, and the ring's `FrameDesc` |
-//! | [`filter`] | what a vif accepts, and the matching that decides it |
+//! | [`filter`] | what a vif accepts at L2, and the matching that decides it |
+//! | [`flow`] | what it accepts *above* L2 — the five-tuple and its matches |
 //! | [`policy`] | what a client's authority permits it to ask for |
 //! | [`vif`] | vif identity and the generation-checked table |
 //! | [`window`] | the shared-window layout both sides compile in |
@@ -44,6 +45,7 @@
 pub mod addr;
 pub mod backend;
 pub mod filter;
+pub mod flow;
 pub mod frame;
 pub mod policy;
 pub mod vif;
@@ -55,6 +57,7 @@ pub use backend::{
     StillOutstanding, TxCompletion, TxCookie, TxError, TxFrame, TxStatus, VifMapping,
 };
 pub use filter::{EtherTypeMatch, FrameFilter, MulticastMatch};
+pub use flow::{EndpointMatch, FiveTuple, FlowMatch, IpProto, Ipv4Addr, ProtoMatch};
 pub use frame::{FRAME_MAX, FRAME_MIN, FrameDesc, FrameHead};
 pub use policy::{PolicyRefusal, VifPolicy};
 pub use vif::{MAX_VIFS, VifId, VifRefusal, VifTable};

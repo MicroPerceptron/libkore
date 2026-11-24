@@ -407,3 +407,73 @@ mod tests {
         assert_eq!(info, untouched);
     }
 }
+
+/// The result of one capability-scoped IPv4 echo request.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KoreNetStatus {
+    Ok = 0,
+    InvalidArgument = 1,
+    Unavailable = 2,
+    NoAddress = 3,
+    Timeout = 4,
+    Unreachable = 5,
+    Resource = 6,
+    Indeterminate = 7,
+}
+
+/// Send one ICMP echo to an IPv4 address as four big-endian octets (e.g. `0x0a000202`). Call from the
+/// program's main thread. The launch must have a network face and a memory face.
+/// The 1–60000 ms deadline includes address resolution. `rtt_us` is written
+/// only on success. An indeterminate result retires this process's probe face.
+///
+/// # Safety
+/// `rtt_us` is null or valid for one aligned write of a `uint64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kore_net_ping_ipv4(
+    address: u32,
+    timeout_ms: u32,
+    rtt_us: *mut u64,
+) -> KoreNetStatus {
+    if address == 0
+        || address == u32::MAX
+        || timeout_ms == 0
+        || timeout_ms > 60_000
+        || rtt_us.is_null()
+    {
+        return KoreNetStatus::InvalidArgument;
+    }
+    #[cfg(target_os = "none")]
+    let result = crate::program::ping(address.to_be_bytes(), timeout_ms);
+    #[cfg(not(target_os = "none"))]
+    let result = Err(KoreNetStatus::Unavailable);
+    match result {
+        Ok(elapsed) => {
+            // SAFETY: the pointer contract belongs to the caller.
+            unsafe { rtt_us.write(elapsed) };
+            KoreNetStatus::Ok
+        }
+        Err(status) => status,
+    }
+}
+
+#[cfg(all(test, not(target_os = "none")))]
+mod net_tests {
+    use super::{KoreNetStatus, kore_net_ping_ipv4};
+
+    #[test]
+    fn ping_reports_refusals_without_overwriting_the_result() {
+        let mut rtt = 123;
+        // SAFETY: rtt is one aligned and writable u64.
+        assert_eq!(
+            unsafe { kore_net_ping_ipv4(0x0a000202, 0, &mut rtt) },
+            KoreNetStatus::InvalidArgument,
+        );
+        // SAFETY: the same output is still live and exclusively borrowed.
+        assert_eq!(
+            unsafe { kore_net_ping_ipv4(0x0a000202, 10, &mut rtt) },
+            KoreNetStatus::Unavailable,
+        );
+        assert_eq!(rtt, 123);
+    }
+}

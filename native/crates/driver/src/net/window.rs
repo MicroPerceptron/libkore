@@ -64,6 +64,9 @@ pub const RX_AREA_BYTES: usize = RX_DEPTH as usize * SLOT_BYTES;
 /// Total bytes one vif's window occupies.
 pub const WINDOW_BYTES: usize = RX_AREA_AT + RX_AREA_BYTES;
 
+/// Whole 4 KiB pages backing one vif window's lease and DMA mapping.
+pub const WINDOW_LEASE_BYTES: usize = WINDOW_BYTES.next_multiple_of(4096);
+
 /// Byte offset of transmit slot `slot`, or `None` when out of range.
 pub const fn tx_slot_at(slot: u32) -> Option<usize> {
     if slot >= TX_DEPTH {

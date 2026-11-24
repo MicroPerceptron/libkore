@@ -1,6 +1,7 @@
 # services/vdev/boot.toml — this service's boot-manifest row (the design
 # lives in res/boot.toml's header).  The row rides beside the crate it
-# endows; whether and WHEN it founds is the root manifest's `services` list.
+# endows; whether and WHEN it founds is the image's `services` list
+# (res/images/<name>.toml).
 
 # The virtual-device service (res/VIRTUAL_DEVICE.md): hosts a device model
 # with no hardware behind it for each driver that opens one.
@@ -24,7 +25,7 @@ image     = "kore-svc-vdev"
 endowment = "kore_svc_vdev::VdevEndowment"
 protocol  = "kore_svc_vdev::VdevService"
 endows    = []
-exec_client = true                           # pair 1 administers per-launch driver faces
+exec_face = "vdev"                           # pair 1 administers per-launch driver faces
 heap_supply_bytes = 0x00C0_0000
-digest_x86_64  = "blake3:33b4bd37c5e76b836ff3bb9f041b37184483f33ba7c37c4b04b09e11cc4b1b00"  # res/x86_64/; make boot-digests
-digest_aarch64 = "blake3:344e1f6da34c1ef515b0c0b9988b5e3b9e673cf08df6f6065ecd5bc661fe42de"  # res/aarch64/; make boot-digests-aarch64
+digest_x86_64  = "blake3:b9ed88d980d837a8ae1a9ab904b69520e1a4f585db595f8d4b501c34e3f7d89c"  # res/x86_64/; make boot-digests
+digest_aarch64 = "blake3:94c9c1455b1bc38e28e327860f82728f7b4fd82d3fbabd29b6386860a17d49af"  # res/aarch64/; make boot-digests-aarch64

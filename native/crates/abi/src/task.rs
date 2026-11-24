@@ -452,6 +452,115 @@ pub const SERVICE_CLIENT_INDEX_BASE: u16 = 0x8000;
 /// It cannot collide with a capability handle: data and handles are disjoint.
 pub const SERVICE_PAIR_COUNT_DATUM: u16 = u16::MAX;
 
+/// Where a core row's boot block carries its face onto the driver row its
+/// manifest fragment names `client_of` (#1212) — **the one derivation the
+/// kernel founder stamps by and the consuming service reads by.**
+///
+/// The terminal's face onto input, the filesystem's onto block and init's
+/// onto the NPU row used to be a pair of matching literals: the founder
+/// pushed `SVC_SEND@2` and the terminal read `SVC_SEND@2`, with nothing
+/// tying the two together.  The broker faces solved the same problem with
+/// `FaceLayout` in the device client; this is the chain faces' equivalent,
+/// in the ABI because the index convention is part of the boot-block wire,
+/// not of either side.  Indices are unchanged from the literal era, so no
+/// founded row sees a different bank.
+pub mod chain_face {
+    /// One consumer row's face onto its declared chain provider: role
+    /// indices into the consumer's own boot block.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ChainFace {
+        /// `SVC_SEND` index of the kick onto the provider's service bell.
+        pub kick: u16,
+        /// `SVC_RING` index of the view of the provider's pair ring.
+        pub ring: u16,
+        /// `SVC_RETURN` index of the send onto the provider's standing
+        /// return post, when the consumer's protocol drives one (the
+        /// terminal delivers report windows to input over it; the
+        /// filesystem's block protocol carries none).
+        pub return_send: Option<u16>,
+        /// First `SVC_GRANT` index of the provider's reply-grant receive
+        /// ends — contiguous, one per reply grant the provider's protocol
+        /// exposes; `None` when it exposes none.
+        pub grant_base: Option<u16>,
+    }
+
+    impl ChainFace {
+        /// A row whose provider face follows its OWN serving pairs — the
+        /// terminal's and the filesystem's shape.  A row serving `P` pairs
+        /// occupies `SVC_SEND@0..P`, `SVC_RING@0..P` and `SVC_RETURN@0..2P`
+        /// (a receive and a landing per pair), so the face's kick and ring
+        /// take `@P`, its return send `@2P`, and the provider's grant
+        /// receives start right after the row's own grant run
+        /// (`own_grants = P × the row's reply grants`).
+        pub const fn past_own_pairs(
+            serve_pairs: u16,
+            own_grants: u16,
+            with_return: bool,
+            provider_grants: u16,
+        ) -> Self {
+            Self {
+                kick: serve_pairs,
+                ring: serve_pairs,
+                return_send: if with_return {
+                    Some(2 * serve_pairs)
+                } else {
+                    None
+                },
+                grant_base: if provider_grants == 0 {
+                    None
+                } else {
+                    Some(own_grants)
+                },
+            }
+        }
+
+        /// Init's provider face.  Init's block is already dense before it:
+        /// its own pair (`@0`), its exec face (`SVC_SEND@1`, `SVC_RING@1`,
+        /// `SVC_RETURN@2`, `SVC_GRANT@1` + the `@2` landing), the shell
+        /// runtime window (`SVC_RING@2`), its mm supply face (`SVC_SEND@2`,
+        /// `SVC_RING@3`, `SVC_GRANT@3`) and exec's remaining reply-grant
+        /// lanes (`SVC_GRANT@4 ..= @(E + 2)` for `E` exec reply grants) —
+        /// so the provider's kick is `@3`, its ring `@4`, its return send
+        /// `@3`, and its grant receives start at `@(E + 3)`.
+        pub const fn init(exec_reply_grants: u16) -> Self {
+            Self {
+                kick: 3,
+                ring: 4,
+                return_send: Some(3),
+                grant_base: Some(exec_reply_grants + 3),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::ChainFace;
+
+        /// The coordinates every founded row reads today, pinned so the
+        /// shared derivation cannot drift from the literal-era wire.
+        #[test]
+        fn the_chain_faces_are_the_historical_coordinates() {
+            // The terminal: two own pairs, no own grants, drives input's
+            // return post, input grants nothing.
+            let terminal = ChainFace::past_own_pairs(2, 0, true, 0);
+            assert_eq!((terminal.kick, terminal.ring), (2, 2));
+            assert_eq!(terminal.return_send, Some(4));
+            assert_eq!(terminal.grant_base, None);
+            // The filesystem: two own pairs, no own grants, no return,
+            // block exposes two reply grants.
+            let fs = ChainFace::past_own_pairs(2, 0, false, 2);
+            assert_eq!((fs.kick, fs.ring), (2, 2));
+            assert_eq!(fs.return_send, None);
+            assert_eq!(fs.grant_base, Some(0));
+            // Init, with exec exposing E reply grants.
+            let init = ChainFace::init(7);
+            assert_eq!((init.kick, init.ring), (3, 4));
+            assert_eq!(init.return_send, Some(3));
+            assert_eq!(init.grant_base, Some(10));
+        }
+    }
+}
+
 /// Initial inline desktop peer storage, not an admission ceiling. Dynamic
 /// owners grow from a named arena; controllers remain boot-profile authority.
 pub const DESKTOP_BOOTSTRAP_WINDOW_SLOTS: usize = 6;
@@ -464,21 +573,13 @@ pub const DESKTOP_CONTROLLER_CAPACITY: usize = 2;
 pub const INTERACTIVE_CHILD_LOADER_FACES: usize =
     DESKTOP_BOOTSTRAP_WINDOW_SLOTS + 2 * DESKTOP_CONTROLLER_CAPACITY;
 
-/// Live immutable image-generation peers the boot catalogue can hold at once:
-/// the 48-row bootstrap catalogue — the desktop's `files`, its documents
-/// `editor`, `photos`, `settings` and `power-ui`, the screenshot writer `capture`, beside
-/// the native filesystem verbs `append`, `sync` and `pack`, the two
-/// WebAssembly rows, `wasm-witness` and `wasm`, `jsapp`, the JS app host,
-/// `inference` / `model-data-witness`, `shell`, the guest shell `term`
-/// opens, `tcc`, the C compiler, `ioctl`, the device tool, and `vdev-test`,
-/// the virtual accelerator's driver — plus the
-/// founded shell, the graphical terminal, and three extraction parsers.
-/// Exec asserts this covers its catalogue (`kore-svc-exec`), the one place
-/// that sees both.  Named
-/// separately from the interactive reservation below because the two grow for
-/// unrelated reasons: this one when a row joins the catalogue, that one when
-/// the desktop admits another window or controller.
-pub const BOOTSTRAP_IMAGE_PEERS: usize = 53;
+// `BOOTSTRAP_IMAGE_PEERS`: generated from res/programs.toml and the image
+// being built (`tools/image_catalog.py`, `res/IMAGE_PROFILES.md` §4.4).
+#[cfg(not(kore_image_gen))]
+include!("catalog_gen.rs");
+// Another image's, generated per build (`res/IMAGE_PROFILES.md` §7).
+#[cfg(kore_image_gen)]
+include!(concat!(env!("KORE_IMAGE_GEN"), "/crates/abi/src/catalog_gen.rs"));
 
 /// Private image generations installed at runtime that can live at once,
 /// across every session: exec's `InstallFile` rows, each a file a task

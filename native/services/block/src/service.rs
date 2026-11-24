@@ -305,7 +305,8 @@ async fn claim_controller(
     let mut broker = MultiBroker::open(
         transport,
         boot,
-        FaceLayout::for_row(
+        FaceLayout::for_bootstrap(
+            boot,
             <BlockService as kore_rt::svc::SvcProtocol>::SERVE_PAIRS,
             <BlockService as kore_rt::svc::SvcProtocol>::BOOT_REPLY_GRANTS,
         ),

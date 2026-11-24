@@ -1,0 +1,43 @@
+[package]
+name = "kore-svc-input"
+version = "0.0.1"
+edition = "2024"
+description = "kore input service: the multiplexing keyboard/mouse router (res/USERLAND.md §5.8; the #299 successor) — the Subscribe/Unsubscribe/SetFocus control plane with structural per-endpoint caller identity, the ring::spsc report data plane, and the InputClient face; the xHCI report producer lives in kore-xhci."
+publish = false
+
+[dependencies]
+kore-abi = { path = "../../crates/abi" }
+kore-rt = { path = "../../crates/rt" }
+# The report data plane: `ring::spsc<InputReport>` producers the service
+# holds (one per subscriber; the app holds the consumer sibling) — the
+# surviving #299 "KINP" queue, homed on Phase A's spsc (§3.2/§5.8).
+kore-ring = { path = "../../crates/ring" }
+# The production driver-task intake: role::DEVICE + role::DMA_POOL resolve
+# through the live capability verbs into BAR, MSI, and zero-copy DMA windows.
+kore-driver = { path = "../../crates/driver", features = ["service"] }
+# The device broker's client seam (res/DEVICE_SERVICE.md §10) — this row
+# CLAIMS its controllers rather than being founded holding them, so it
+# links the broker's client face the way any client links a service's.
+kore-svc-device = { path = "../device" }
+# The real controller core.  The service's readiness beacon is emitted only
+# after `Controller::bring_up` has programmed the endowed xHCI BAR and its
+# capability-backed DMA rings. `alloc` retains a controller-reported
+# scratchpad set without relying on the kernel/mock leak posture.
+kore-xhci = { path = "../../drivers/xhci", features = ["alloc"] }
+# The machine's OTHER keyboard (#420): the internal one speaks PS/2
+# through an i8042, not USB, so this service owns two devices and relays
+# the legacy one from a worker thread parked on its IOAPIC pin.
+kore-i8042 = { path = "../../drivers/i8042" }
+# The third input edge: the IP-neutral I2C pump, Intel's DesignWare LPSS
+# realization, and the transport-generic HID protocol/parse-once decoder.
+kore-i2c = { path = "../../drivers/i2c" }
+kore-i2c-dw = { path = "../../drivers/i2c-dw" }
+kore-i2c-geni = { path = "../../drivers/i2c-geni" }
+kore-i2c-hid = { path = "../../drivers/i2c-hid", features = ["alloc"] }
+
+[dev-dependencies]
+kore-rt = { path = "../../crates/rt", features = ["std"] }
+# Descriptor → framed relay → compositor tests; not an input-service runtime dependency.
+kore-axiom = { path = "../../crates/axiom" }
+# The wire round-trip test compares encoded bytes (the `IntoBytes` view).
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
