@@ -1,0 +1,15 @@
+[package]
+name = "kore-tls"
+version = "0.1.0-alpha.1"
+edition = "2024"
+publish = false
+description = "Transport-independent rustls client and C ABI for Kore"
+
+[dependencies]
+ring = { version = "=0.17.14", default-features = false }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "tls12"] }
+
+[target.'cfg(target_os = "none")'.dependencies]
+getrandom = { version = "0.2.17", default-features = false, features = ["custom"] }
+kore-std = { path = "../..", default-features = false }
+ring = { version = "=0.17.14", default-features = false, features = ["less-safe-getrandom-custom-or-rdrand"] }

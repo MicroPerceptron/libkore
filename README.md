@@ -217,3 +217,28 @@ sources retain their [upstream notice](native/LICENSE), and adapted Kore files
 retain the [source notice](docs/KORE-LICENSE). The Lua vendor record is
 [here](crates/lua/KORE-VENDOR.md). See [provenance](docs/provenance.md) for
 the precise source and validation boundaries.
+
+## TLS client and command-line tools
+
+`kore-tls` provides a rustls client over caller-managed transport buffers.
+`<kore/tls.h>` exposes the client, cryptographic random bytes, and streaming
+SHA-256 to C. The client verifies the certificate chain and server name
+against a caller-supplied PEM trust bundle using the platform wall clock.
+The transport supplies the ciphertext buffers and delivers every emitted
+record before calling the client again.
+
+Build the POSIX-host tool with `make tls-cli`. The executable at
+`target/release/kore-tls` supports `version`, `rand BYTES`,
+`dgst -sha256 FILE`, and `s_client HOST PORT CA.pem`. The last command
+performs a verified handshake and sends a close notification.
+
+`make tls-guest` builds the opt-in x86_64 Kore `libkore.so` and stages it with
+the header and CLI source under `target/tls/guest-x86_64/`. It needs Clang and
+LLVM binutils. The build selects ring's packaged x86_64 ELF assembly for
+Kore's freestanding target. The guest library uses Kore's existing process
+allocator, entropy source, and wall clock.
+
+The CLI source can travel with an image. Build it with `-DKORE_TLS_OFFLINE`
+to use `version`, `rand`, and `dgst` from guest TCC with the staged header
+and runtime. The network command requires TCP stream sockets and hostname
+resolution.

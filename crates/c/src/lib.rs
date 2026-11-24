@@ -39,6 +39,8 @@
 // The C ABI's exports are this image's reason to exist; naming the crate keeps
 // them in the link.
 use kore_ffi as _;
+#[cfg(feature = "tls")]
+use kore_tls as _;
 // Kore's C library, exported whole from this image.
 #[cfg(target_os = "none")]
 use kore_c_shim as _;
